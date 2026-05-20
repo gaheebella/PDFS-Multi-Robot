@@ -17,12 +17,12 @@ class FollowerController(Node):
         self.follower_pose = None
 
         self.comm_range = 1.5
-        self.follow_distance = 0.6
+        self.follow_distance = 0.5      # 목표 거리 살짝 줄여 여유 확보
 
-        self.k_linear = 0.8
-        self.k_angular = 2.0
+        self.k_linear = 1.2             # 선속도 게인 증가
+        self.k_angular = 1.5            # 각도 게인 감소 → 진동 방지
 
-        self.max_linear = 0.3
+        self.max_linear = 0.35          # 실내 테스트용 안전 속도
         self.max_angular = 1.8
 
         self.leader_sub = self.create_subscription(
@@ -97,8 +97,12 @@ class FollowerController(Node):
         cmd.angular.z = self.k_angular * e_theta
         cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
 
-        if abs(e_theta) < 0.4 and distance > self.follow_distance:
-            cmd.linear.x = self.k_linear * (distance - self.follow_distance)
+        # [수정] 각도 오차에 따라 선속도를 연속적으로 감쇠
+        # 기존: abs(e_theta) < 0.4 일 때만 전진 → 조건 미충족 시 영원히 제자리 회전
+        # 수정: angle_factor로 부드럽게 감쇠 (정면일수록 빠르게, 옆면일수록 느리게)
+        if distance > self.follow_distance:
+            angle_factor = max(0.2, math.cos(e_theta))
+            cmd.linear.x = self.k_linear * (distance - self.follow_distance) * angle_factor
             cmd.linear.x = min(cmd.linear.x, self.max_linear)
         else:
             cmd.linear.x = 0.0
