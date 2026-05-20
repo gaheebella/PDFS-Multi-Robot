@@ -41,6 +41,7 @@
     </link>
   </model>
 
+
   <model name="rotated_dfs_map">
     <static>true</static>
     <pose>0 0 0 0 0 -1.5708</pose>
