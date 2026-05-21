@@ -1,19 +1,5 @@
 <?xml version="1.0" ?>
 <sdf version="1.8">
-  <plugin
-  filename="gz-sim-diff-drive-system"
-  name="gz::sim::systems::DiffDrive">
-  <left_joint>wheel_left_joint</left_joint>
-  <right_joint>wheel_right_joint</right_joint>
-  <wheel_separation>0.16</wheel_separation>
-  <wheel_radius>0.033</wheel_radius>
-  <topic>/follower_cmd_vel</topic>
-  <odom_topic>/follower_odom</odom_topic>
-  <tf_topic>/follower_tf</tf_topic>
-  <frame_id>follower_odom</frame_id>
-  <child_frame_id>follower_base_footprint</child_frame_id>
-</plugin>
-  
   
   <model name="turtlebot3_burger">
     <pose>0.0 0.0 0.0 0.0 0.0 0.0</pose>
@@ -152,7 +138,7 @@
         <visualize>true</visualize>
         <pose>-0.032 0 0.171 0 0 0</pose>
         <update_rate>5</update_rate>
-        <topic>scan</topic>
+        <topic>/follower_scan</topic>
         <gz_frame_id>base_scan</gz_frame_id>
         <lidar>
           <scan>

@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 
 
 class FollowerController(Node):
@@ -13,14 +14,15 @@ class FollowerController(Node):
 
         self.leader_pose = None
         self.follower_pose = None
+        self.scan_msg = None
 
         # 제어 파라미터
         self.comm_range = 2.0
         self.follow_distance = 0.45
-        self.k_linear = 0.6
-        self.k_angular = 3.0
-        self.max_linear = 0.18
-        self.max_angular = 2.5
+        self.k_linear = 0.5
+        self.k_angular = 2.0
+        self.max_linear = 0.15
+        self.max_angular = 1.5
         self.search_angular_speed = 1.8
 
         # 히스테리시스 임계값 (chattering 방지)
@@ -29,37 +31,27 @@ class FollowerController(Node):
         self._rotating = False
 
         # Breadcrumb path 파라미터
-        # Leader가 최소 이 거리 이상 이동했을 때만 경로에 점 추가
-        self.path_record_min_dist = 0.05
-        # 최대 저장 waypoint 수 (메모리 제한)
+        self.path_record_min_dist = 0.10
         self.max_path_length = 2000
-        # Follower가 waypoint에 이 거리 이내로 접근하면 다음 waypoint로 넘어감
-        self.waypoint_reach_dist = 0.10
-        # Lookahead: follower 전방으로 이 거리만큼 앞선 waypoint를 목표로 삼음
-        self.lookahead_dist = 0.30
+        self.waypoint_reach_dist = 0.15
+        self.lookahead_steps = 6
 
-        # Leader 경로 저장 덱 (오래된 점은 앞에서 제거)
+        # 장애물 회피 파라미터
+        self.obstacle_stop_dist = 0.35
+        self.obstacle_turn_speed = 1.2
+
+        # Leader 경로 저장 덱
         self.leader_path = collections.deque(maxlen=self.max_path_length)
-        # Follower가 현재 추종 중인 waypoint 인덱스
         self.waypoint_idx = 0
 
         self.leader_sub = self.create_subscription(
-            Odometry,
-            '/leader_odom',
-            self.leader_callback,
-            10
-        )
+            Odometry, '/leader_odom', self.leader_callback, 10)
         self.follower_sub = self.create_subscription(
-            Odometry,
-            '/follower_odom',
-            self.follower_callback,
-            10
-        )
+            Odometry, '/follower_odom', self.follower_callback, 10)
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/follower_scan', self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(
-            Twist,
-            '/follower_cmd_vel',
-            10
-        )
+            Twist, '/follower_cmd_vel', 10)
         self.timer = self.create_timer(0.1, self.control_loop)
 
     # ------------------------------------------------------------------ #
@@ -71,7 +63,6 @@ class FollowerController(Node):
         lx = msg.pose.pose.position.x
         ly = msg.pose.pose.position.y
 
-        # 마지막 기록 점과 충분히 멀어졌을 때만 추가
         if self.leader_path:
             last_x, last_y = self.leader_path[-1]
             if math.hypot(lx - last_x, ly - last_y) < self.path_record_min_dist:
@@ -81,6 +72,9 @@ class FollowerController(Node):
 
     def follower_callback(self, msg):
         self.follower_pose = msg.pose.pose
+
+    def scan_callback(self, msg):
+        self.scan_msg = msg
 
     # ------------------------------------------------------------------ #
     #  유틸리티
@@ -99,47 +93,27 @@ class FollowerController(Node):
         return angle
 
     # ------------------------------------------------------------------ #
-    #  Waypoint 선택 (lookahead 기반)
+    #  Waypoint 선택 (단방향 전진 + lookahead_steps)
     # ------------------------------------------------------------------ #
 
     def select_waypoint(self, fx, fy):
-        """
-        Leader_path 중에서 follower가 추종할 waypoint를 선택한다.
-
-        전략:
-        1. 이미 지나친 waypoint는 건너뜀 (waypoint_idx 전진).
-        2. waypoint_idx 이후 점들 중 lookahead_dist 이상 앞에 있는
-           가장 가까운 점을 목표로 삼는다.
-        3. 그런 점이 없으면 path 끝점을 목표로 삼는다.
-        """
-        path = self.leader_path
+        path = list(self.leader_path)
         n = len(path)
 
         if n == 0:
             return None
 
-        # deque를 리스트로 슬라이싱 (인덱스 접근 편의)
-        path_list = list(path)
-
-        # waypoint_idx 범위 보정
         self.waypoint_idx = min(self.waypoint_idx, n - 1)
 
-        # 이미 도달한 waypoint 건너뜀
         while self.waypoint_idx < n - 1:
-            wx, wy = path_list[self.waypoint_idx]
+            wx, wy = path[self.waypoint_idx]
             if math.hypot(fx - wx, fy - wy) < self.waypoint_reach_dist:
                 self.waypoint_idx += 1
             else:
                 break
 
-        # lookahead: waypoint_idx 이후에서 lookahead_dist 이상 앞에 있는 첫 점
-        for i in range(self.waypoint_idx, n):
-            wx, wy = path_list[i]
-            if math.hypot(fx - wx, fy - wy) >= self.lookahead_dist:
-                return (wx, wy)
-
-        # lookahead 점이 없으면 경로 마지막 점
-        return path_list[-1]
+        target_idx = min(self.waypoint_idx + self.lookahead_steps, n - 1)
+        return path[target_idx]
 
     # ------------------------------------------------------------------ #
     #  메인 제어 루프
@@ -156,12 +130,11 @@ class FollowerController(Node):
         fy = self.follower_pose.position.y
         fyaw = self.quaternion_to_yaw(self.follower_pose.orientation)
 
-        # Leader 현재 위치 (통신 범위 판단용)
+        # 통신 범위 판단 (Leader 현재 위치 기준)
         lx = self.leader_pose.position.x
         ly = self.leader_pose.position.y
         leader_dist = math.hypot(lx - fx, ly - fy)
 
-        # 통신 범위 밖이면 제자리 회전 탐색
         if leader_dist > self.comm_range:
             cmd.linear.x = 0.0
             cmd.angular.z = self.search_angular_speed
@@ -173,11 +146,9 @@ class FollowerController(Node):
             self.cmd_pub.publish(cmd)
             return
 
-        # 따라갈 waypoint 선택
+        # ── 1. Waypoint 선택 및 e_theta 계산 ──────────────────────────────
         waypoint = self.select_waypoint(fx, fy)
-
         if waypoint is None:
-            # 경로가 아직 없으면 정지 대기
             self.cmd_pub.publish(cmd)
             return
 
@@ -186,11 +157,39 @@ class FollowerController(Node):
         dy = wy - fy
         distance = math.hypot(dx, dy)
 
-        # Waypoint 방향 및 각도 오차
         theta_target = math.atan2(dy, dx)
         e_theta = self.normalize_angle(theta_target - fyaw)
 
-        # 히스테리시스 회전 모드 전환
+        # ── 2. 장애물 회피 (e_theta 기반 회전 방향) ───────────────────────
+        if self.scan_msg is not None:
+            ranges = list(self.scan_msg.ranges)
+            n = len(ranges)
+
+            front = ranges[0:20] + ranges[n - 20:]
+            left  = ranges[40:100]
+            right = ranges[n - 100: n - 40]
+
+            front_min = min((r for r in front if math.isfinite(r)), default=10.0)
+            left_min  = min((r for r in left  if math.isfinite(r)), default=10.0)
+            right_min = min((r for r in right if math.isfinite(r)), default=10.0)
+
+            if front_min < self.obstacle_stop_dist:
+                cmd.linear.x = 0.0
+                # 추종 목표 방향(e_theta)으로 회전 → 회피 후 자연스럽게 추종으로 복귀
+                cmd.angular.z = (
+                    self.obstacle_turn_speed if e_theta >= 0
+                    else -self.obstacle_turn_speed
+                )
+                self.get_logger().info(
+                    f'OBSTACLE: front={front_min:.2f}, '
+                    f'left={left_min:.2f}, right={right_min:.2f}, '
+                    f'turn={"L" if e_theta >= 0 else "R"}',
+                    throttle_duration_sec=0.5
+                )
+                self.cmd_pub.publish(cmd)
+                return
+
+        # ── 3. 히스테리시스 회전 모드 전환 ────────────────────────────────
         if self._rotating:
             if abs(e_theta) < self.ROTATE_EXIT:
                 self._rotating = False
@@ -198,24 +197,19 @@ class FollowerController(Node):
             if abs(e_theta) > self.ROTATE_ENTER:
                 self._rotating = True
 
-        # 각속도 계산 (항상 waypoint 방향 추적)
+        # ── 4. 각속도 (항상 waypoint 방향 추적) ───────────────────────────
         cmd.angular.z = self.k_angular * e_theta
         cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
 
-        # 선속도 결정
+        # ── 5. 선속도 결정 ─────────────────────────────────────────────────
         if distance <= self.waypoint_reach_dist:
-            # Waypoint 도달: 선속도 정지, 방향 추적은 유지
-            cmd.linear.x = 0.0
+            cmd.linear.x = 0.0                          # 도달: 방향 추적만 유지
 
         elif self._rotating:
-            # 방향 오차가 클 때: 제자리 회전
-            cmd.linear.x = 0.0
+            cmd.linear.x = 0.0                          # 큰 각도 오차: 제자리 회전
 
         else:
-            # 전진: 방향 오차에 따라 속도 감쇄
-            angle_factor = max(0.3, math.cos(e_theta))
-            cmd.linear.x = self.k_linear * distance * angle_factor
-            cmd.linear.x = min(cmd.linear.x, self.max_linear)
+            cmd.linear.x = min(self.k_linear * distance, self.max_linear)
 
         self.get_logger().info(
             f'wp=({wx:.2f},{wy:.2f}), d={distance:.2f}, '
