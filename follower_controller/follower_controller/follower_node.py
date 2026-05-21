@@ -15,6 +15,8 @@ class FollowerController(Node):
         self.leader_pose = None
         self.follower_pose = None
         self.scan_msg = None
+        self.use_breadcrumb = False
+        self.breadcrumb_start_dist = 0.8    
 
         # 제어 파라미터
         self.comm_range = 2.0
@@ -33,11 +35,11 @@ class FollowerController(Node):
         # Breadcrumb path 파라미터
         self.path_record_min_dist = 0.10
         self.max_path_length = 2000
-        self.waypoint_reach_dist = 0.15
+        self.waypoint_reach_dist = 0.20
         self.lookahead_steps = 6
 
         # 장애물 회피 파라미터
-        self.obstacle_stop_dist = 0.55
+        self.obstacle_stop_dist = 0.35
         self.obstacle_turn_speed = 1.2
 
         # Leader 경로 저장 덱
@@ -65,7 +67,7 @@ class FollowerController(Node):
 
         if self.leader_path:
             last_x, last_y = self.leader_path[-1]
-            if math.hypot(lx - last_x, ly - last_y) < self.path_record_min_dist:
+            if math.hypot(lx - last_x, ly - last_y) <= self.path_record_min_dist:
                 return
 
         self.leader_path.append((lx, ly))
@@ -139,12 +141,41 @@ class FollowerController(Node):
             cmd.linear.x = 0.0
             cmd.angular.z = self.search_angular_speed
             self._rotating = False
+            self.use_breadcrumb = False
+            self.waypoint_idx = 0
             self.get_logger().info(
                 f'OUT OF RANGE: d={leader_dist:.2f} -> searching',
                 throttle_duration_sec=1.0
             )
             self.cmd_pub.publish(cmd)
             return
+
+        # 초기에는 leader 중심을 직접 추종
+        if not self.use_breadcrumb:
+            dx = lx - fx
+            dy = ly - fy
+            distance = math.hypot(dx, dy)
+
+            theta_target = math.atan2(dy, dx)
+            e_theta = self.normalize_angle(theta_target - fyaw)
+
+            cmd.angular.z = self.k_angular * e_theta
+            cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
+
+            if len(self.leader_path) > 10 and distance > self.follow_distance and abs(e_theta) < 0.5:
+                self.use_breadcrumb = True  
+
+            if distance > self.follow_distance and abs(e_theta) < 0.6:
+                cmd.linear.x = min(
+                    self.k_linear * (distance - self.follow_distance),
+                    self.max_linear
+                )
+            else:
+                cmd.linear.x = 0.0
+
+            self.cmd_pub.publish(cmd)
+            return
+
 
         # ── 1. Waypoint 선택 및 e_theta 계산 ──────────────────────────────
         waypoint = self.select_waypoint(fx, fy)
@@ -165,15 +196,15 @@ class FollowerController(Node):
             ranges = list(self.scan_msg.ranges)
             n = len(ranges)
 
-            front = ranges[0:45] + ranges[n - 45:]
-            left  = ranges[45:120]
-            right = ranges[n - 120: n - 45]
+            front = ranges[0:30] + ranges[n - 30:]
+            left  = ranges[40:100]
+            right = ranges[n - 100: n - 40]
 
             front_min = min((r for r in front if math.isfinite(r)), default=10.0)
             left_min  = min((r for r in left  if math.isfinite(r)), default=10.0)
             right_min = min((r for r in right if math.isfinite(r)), default=10.0)
 
-            side_stop_dist = 0.25
+            side_stop_dist = 0.15
 
             if left_min < side_stop_dist:
                 cmd.linear.x = 0.0
