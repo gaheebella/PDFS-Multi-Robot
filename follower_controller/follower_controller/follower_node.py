@@ -23,31 +23,31 @@ class FollowerController(Node):
         self._init_done  = False
 
         # 제어 파라미터
+        # burger 반경 0.105m 기준
         self.comm_range = 2.0
-        self.follow_distance = 0.10   # 0.20 → 0.10
-        self.k_linear = 0.5
-        self.k_angular = 2.0
-        self.max_linear = 0.15
+        self.follow_distance = 0.025
+        self.k_linear = 0.4            # 속도 낮춰서 코너 반응 시간 확보
+        self.k_angular = 2.5           # 각도 반응 빠르게
+        self.max_linear = 0.12         # burger 최대 0.22m/s, 코너 대비 낮게
         self.max_angular = 1.5
-        self.search_angular_speed = 1.8
+        self.search_angular_speed = 1.0
 
         # 히스테리시스 임계값
-        self.ROTATE_ENTER = 0.5
-        self.ROTATE_EXIT = 0.25
+        self.ROTATE_ENTER = 0.4        # 더 민감하게 회전 모드 진입
+        self.ROTATE_EXIT = 0.15        # 방향 거의 맞을 때만 전진
         self._rotating = False
 
         # Breadcrumb path 파라미터
-        self.path_record_min_dist = 0.10
-        self.max_path_length = 2000
-        self.waypoint_reach_dist = 0.10   # 0.20 → 0.10
-        self.lookahead_steps = 6
+        self.path_record_min_dist = 0.03   # 촘촘하게 (burger 반경의 1/3)
+        self.max_path_length = 3000
+        self.waypoint_reach_dist = 0.025
+        self.lookahead_steps = 2           # 3 → 2 (코너에서 더 바짝 따라감)
 
         # 장애물 회피 파라미터
-        # 전방 장애물 정지 거리
+        # burger 반경(0.105) + 여유(0.15) = 약 0.25 → 복도 고려해서 0.35
         self.obstacle_stop_dist = 0.35
-        # 전방이 이 거리 이상 뚫려야 전진 재개
-        self.obstacle_clear_dist = 0.45
-        self.obstacle_turn_speed = 1.2
+        self.obstacle_clear_dist = 0.42
+        self.obstacle_turn_speed = 1.0     # 천천히 회전해서 overshooting 방지
         # 회피 상태 플래그
         self._avoiding = False
 
@@ -254,7 +254,7 @@ class FollowerController(Node):
                     self.k_linear * distance,
                     self.max_linear
                 )
-            elif distance > 0.05:
+            elif distance > 0.01:
                 cmd.linear.x = min(self.k_linear * distance * 0.5, self.max_linear)
             else:
                 cmd.linear.x = 0.0
