@@ -37,7 +37,7 @@ class FollowerController(Node):
         self.lookahead_steps = 6
 
         # 장애물 회피 파라미터
-        self.obstacle_stop_dist = 0.35
+        self.obstacle_stop_dist = 0.55
         self.obstacle_turn_speed = 1.2
 
         # Leader 경로 저장 덱
@@ -165,13 +165,37 @@ class FollowerController(Node):
             ranges = list(self.scan_msg.ranges)
             n = len(ranges)
 
-            front = ranges[0:20] + ranges[n - 20:]
-            left  = ranges[40:100]
-            right = ranges[n - 100: n - 40]
+            front = ranges[0:45] + ranges[n - 45:]
+            left  = ranges[45:120]
+            right = ranges[n - 120: n - 45]
 
             front_min = min((r for r in front if math.isfinite(r)), default=10.0)
             left_min  = min((r for r in left  if math.isfinite(r)), default=10.0)
             right_min = min((r for r in right if math.isfinite(r)), default=10.0)
+
+            side_stop_dist = 0.25
+
+            if left_min < side_stop_dist:
+                cmd.linear.x = 0.0
+                cmd.angular.z = -self.obstacle_turn_speed
+
+                self.get_logger().info(
+                    f'TOO CLOSE LEFT: left={left_min:.2f}'
+                )
+
+                self.cmd_pub.publish(cmd)
+                return
+
+            if right_min < side_stop_dist:
+                cmd.linear.x = 0.0
+                cmd.angular.z = self.obstacle_turn_speed
+
+                self.get_logger().info(
+                    f'TOO CLOSE RIGHT: right={right_min:.2f}'
+                )
+
+                self.cmd_pub.publish(cmd)
+                return
 
             if front_min < self.obstacle_stop_dist:
                 cmd.linear.x = 0.0
