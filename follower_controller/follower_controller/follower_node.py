@@ -25,29 +25,28 @@ class FollowerController(Node):
         # 제어 파라미터
         # burger 반경 0.105m 기준
         self.comm_range = 2.0
-        self.follow_distance = 0.025
-        self.k_linear = 0.4            # 속도 낮춰서 코너 반응 시간 확보
-        self.k_angular = 2.5           # 각도 반응 빠르게
-        self.max_linear = 0.12         # burger 최대 0.22m/s, 코너 대비 낮게
+        self.follow_distance = 0.01        # 거의 붙어서 따라감
+        self.k_linear = 0.8               # 속도 반응 높임
+        self.k_angular = 2.5
+        self.max_linear = 0.20            # burger 정격 속도 수준으로 복구
         self.max_angular = 1.5
         self.search_angular_speed = 1.0
 
         # 히스테리시스 임계값
-        self.ROTATE_ENTER = 0.4        # 더 민감하게 회전 모드 진입
-        self.ROTATE_EXIT = 0.15        # 방향 거의 맞을 때만 전진
+        self.ROTATE_ENTER = 0.4
+        self.ROTATE_EXIT = 0.15
         self._rotating = False
 
         # Breadcrumb path 파라미터
         self.path_record_min_dist = 0.03   # 촘촘하게 (burger 반경의 1/3)
         self.max_path_length = 3000
-        self.waypoint_reach_dist = 0.025
-        self.lookahead_steps = 2           # 3 → 2 (코너에서 더 바짝 따라감)
+        self.waypoint_reach_dist = 0.08    # 0.01 → 0.08 (도달 판정 확실하게)
+        self.lookahead_steps = 4           # 2 → 4 (leader 속도 따라잡기)
 
         # 장애물 회피 파라미터
-        # burger 반경(0.105) + 여유(0.15) = 약 0.25 → 복도 고려해서 0.35
         self.obstacle_stop_dist = 0.35
         self.obstacle_clear_dist = 0.42
-        self.obstacle_turn_speed = 1.0     # 천천히 회전해서 overshooting 방지
+        self.obstacle_turn_speed = 1.0
         # 회피 상태 플래그
         self._avoiding = False
 
