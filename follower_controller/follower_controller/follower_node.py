@@ -16,18 +16,22 @@ class FollowerController(Node):
         self.follower_pose = None
         self.scan_msg = None
         self.use_breadcrumb = False
-        self.breadcrumb_start_dist = 0.8    
+
+        # odom 안정화 대기 (시작 직후 쓰레기 값으로 인한 오회전 방지)
+        # 10Hz 타이머 기준 약 1초 (10 tick) 대기
+        self._init_ticks = 0
+        self._init_done  = False
 
         # 제어 파라미터
         self.comm_range = 2.0
-        self.follow_distance = 0.45
+        self.follow_distance = 0.20   # 0.45 → 0.20 (leader가 가까이 스폰되므로)
         self.k_linear = 0.5
         self.k_angular = 2.0
         self.max_linear = 0.15
         self.max_angular = 1.5
         self.search_angular_speed = 1.8
 
-        # 히스테리시스 임계값 (chattering 방지)
+        # 히스테리시스 임계값
         self.ROTATE_ENTER = 0.5
         self.ROTATE_EXIT = 0.25
         self._rotating = False
@@ -39,8 +43,13 @@ class FollowerController(Node):
         self.lookahead_steps = 6
 
         # 장애물 회피 파라미터
+        # 전방 장애물 정지 거리
         self.obstacle_stop_dist = 0.35
+        # 전방이 이 거리 이상 뚫려야 전진 재개
+        self.obstacle_clear_dist = 0.45
         self.obstacle_turn_speed = 1.2
+        # 회피 상태 플래그
+        self._avoiding = False
 
         # Leader 경로 저장 덱
         self.leader_path = collections.deque(maxlen=self.max_path_length)
@@ -94,8 +103,17 @@ class FollowerController(Node):
             angle += 2.0 * math.pi
         return angle
 
+    def get_front_min(self):
+        """전방 ±30° 내 최소 거리 반환. scan 없으면 10.0"""
+        if self.scan_msg is None:
+            return 10.0
+        ranges = self.scan_msg.ranges
+        n = len(ranges)
+        front = list(ranges[0:30]) + list(ranges[n - 30:])
+        return min((r for r in front if math.isfinite(r)), default=10.0)
+
     # ------------------------------------------------------------------ #
-    #  Waypoint 선택 (단방향 전진 + lookahead_steps)
+    #  Waypoint 선택
     # ------------------------------------------------------------------ #
 
     def select_waypoint(self, fx, fy):
@@ -118,6 +136,46 @@ class FollowerController(Node):
         return path[target_idx]
 
     # ------------------------------------------------------------------ #
+    #  장애물 회피
+    #  핵심 원칙:
+    #    - 전방 장애물 감지 시 _avoiding = True
+    #    - 전방이 clear_dist 이상 뚫릴 때까지 e_theta 방향으로 회전 유지
+    #    - 뚫리면 _avoiding = False → 추종 복귀
+    # ------------------------------------------------------------------ #
+
+    def handle_obstacle(self, cmd, e_theta):
+        """
+        반환값: (회피 중 여부, cmd)
+        회피 중이면 True 반환 → 호출자는 즉시 publish 후 return
+        """
+        front_min = self.get_front_min()
+
+        # 히스테리시스: 진입은 stop_dist, 탈출은 clear_dist
+        if not self._avoiding:
+            if front_min < self.obstacle_stop_dist:
+                self._avoiding = True
+        else:
+            if front_min >= self.obstacle_clear_dist:
+                self._avoiding = False
+
+        if self._avoiding:
+            cmd.linear.x = 0.0
+            # 추종 목표(e_theta) 방향으로 회전 → 뚫리는 순간 자연스럽게 전진 복귀
+            cmd.angular.z = (
+                self.obstacle_turn_speed if e_theta >= 0
+                else -self.obstacle_turn_speed
+            )
+            self.get_logger().info(
+                f'AVOIDING: front={front_min:.2f}, '
+                f'turn={"L" if e_theta >= 0 else "R"}, '
+                f'clear_at={self.obstacle_clear_dist:.2f}',
+                throttle_duration_sec=0.5
+            )
+            return True, cmd
+
+        return False, cmd
+
+    # ------------------------------------------------------------------ #
     #  메인 제어 루프
     # ------------------------------------------------------------------ #
 
@@ -128,19 +186,30 @@ class FollowerController(Node):
             self.cmd_pub.publish(cmd)
             return
 
+        # odom 안정화 대기: 양쪽 odom 수신 후 10 tick 동안 정지
+        if not self._init_done:
+            self._init_ticks += 1
+            if self._init_ticks >= 10:
+                self._init_done = True
+                self.get_logger().info('odom stabilized, starting control')
+            else:
+                self.cmd_pub.publish(cmd)  # 정지 유지
+                return
+
         fx = self.follower_pose.position.x
         fy = self.follower_pose.position.y
         fyaw = self.quaternion_to_yaw(self.follower_pose.orientation)
 
-        # 통신 범위 판단 (Leader 현재 위치 기준)
         lx = self.leader_pose.position.x
         ly = self.leader_pose.position.y
         leader_dist = math.hypot(lx - fx, ly - fy)
 
+        # 통신 범위 밖: 탐색 회전
         if leader_dist > self.comm_range:
             cmd.linear.x = 0.0
             cmd.angular.z = self.search_angular_speed
             self._rotating = False
+            self._avoiding = False
             self.use_breadcrumb = False
             self.waypoint_idx = 0
             self.get_logger().info(
@@ -150,11 +219,29 @@ class FollowerController(Node):
             self.cmd_pub.publish(cmd)
             return
 
-        # 초기에는 leader 중심을 직접 추종
+        # ── 초기 직접 추종 모드 ────────────────────────────────────────────
         if not self.use_breadcrumb:
             dx = lx - fx
             dy = ly - fy
-            distance = math.hypot(dx, dy)
+            distance = leader_dist
+
+            if len(self.leader_path) >= 10:
+                # 전환 시 follower에서 가장 가까운 경로 점부터 시작
+                path_list = list(self.leader_path)
+                closest_idx = min(
+                    range(len(path_list)),
+                    key=lambda i: math.hypot(fx - path_list[i][0], fy - path_list[i][1])
+                )
+                self.waypoint_idx = closest_idx
+                self.use_breadcrumb = True
+                self.get_logger().info(
+                    f'Switching to breadcrumb mode, wp_idx={self.waypoint_idx}'
+                )
+
+            # distance가 너무 작으면 atan2가 무의미 → 정지
+            if distance < 0.05:
+                self.cmd_pub.publish(cmd)
+                return
 
             theta_target = math.atan2(dy, dx)
             e_theta = self.normalize_angle(theta_target - fyaw)
@@ -162,20 +249,29 @@ class FollowerController(Node):
             cmd.angular.z = self.k_angular * e_theta
             cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
 
-            if len(self.leader_path) > 10 and distance > self.follow_distance and abs(e_theta) < 0.5:
-                self.use_breadcrumb = True  
-
-            if distance > self.follow_distance and abs(e_theta) < 0.6:
+            if distance > self.follow_distance:
                 cmd.linear.x = min(
-                    self.k_linear * (distance - self.follow_distance),
+                    self.k_linear * distance,
                     self.max_linear
                 )
+            elif distance > 0.10:
+                # follow_distance 이내지만 너무 가깝진 않으면 천천히 접근
+                cmd.linear.x = min(self.k_linear * distance * 0.5, self.max_linear)
             else:
                 cmd.linear.x = 0.0
 
+            avoided, cmd = self.handle_obstacle(cmd, e_theta)
+            if avoided:
+                self.cmd_pub.publish(cmd)
+                return
+
+            self.get_logger().info(
+                f'[DIRECT] d={distance:.2f}, e_theta={e_theta:.2f}, '
+                f'v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f}',
+                throttle_duration_sec=1.0
+            )
             self.cmd_pub.publish(cmd)
             return
-
 
         # ── 1. Waypoint 선택 및 e_theta 계산 ──────────────────────────────
         waypoint = self.select_waypoint(fx, fy)
@@ -191,60 +287,13 @@ class FollowerController(Node):
         theta_target = math.atan2(dy, dx)
         e_theta = self.normalize_angle(theta_target - fyaw)
 
-        # ── 2. 장애물 회피 (e_theta 기반 회전 방향) ───────────────────────
-        if self.scan_msg is not None:
-            ranges = list(self.scan_msg.ranges)
-            n = len(ranges)
+        # ── 2. 장애물 회피 (e_theta 계산 후 적용) ─────────────────────────
+        avoided, cmd = self.handle_obstacle(cmd, e_theta)
+        if avoided:
+            self.cmd_pub.publish(cmd)
+            return
 
-            front = ranges[0:30] + ranges[n - 30:]
-            left  = ranges[40:100]
-            right = ranges[n - 100: n - 40]
-
-            front_min = min((r for r in front if math.isfinite(r)), default=10.0)
-            left_min  = min((r for r in left  if math.isfinite(r)), default=10.0)
-            right_min = min((r for r in right if math.isfinite(r)), default=10.0)
-
-            side_stop_dist = 0.15
-
-            if left_min < side_stop_dist:
-                cmd.linear.x = 0.0
-                cmd.angular.z = -self.obstacle_turn_speed
-
-                self.get_logger().info(
-                    f'TOO CLOSE LEFT: left={left_min:.2f}'
-                )
-
-                self.cmd_pub.publish(cmd)
-                return
-
-            if right_min < side_stop_dist:
-                cmd.linear.x = 0.0
-                cmd.angular.z = self.obstacle_turn_speed
-
-                self.get_logger().info(
-                    f'TOO CLOSE RIGHT: right={right_min:.2f}'
-                )
-
-                self.cmd_pub.publish(cmd)
-                return
-
-            if front_min < self.obstacle_stop_dist:
-                cmd.linear.x = 0.0
-                # 추종 목표 방향(e_theta)으로 회전 → 회피 후 자연스럽게 추종으로 복귀
-                cmd.angular.z = (
-                    self.obstacle_turn_speed if e_theta >= 0
-                    else -self.obstacle_turn_speed
-                )
-                self.get_logger().info(
-                    f'OBSTACLE: front={front_min:.2f}, '
-                    f'left={left_min:.2f}, right={right_min:.2f}, '
-                    f'turn={"L" if e_theta >= 0 else "R"}',
-                    throttle_duration_sec=0.5
-                )
-                self.cmd_pub.publish(cmd)
-                return
-
-        # ── 3. 히스테리시스 회전 모드 전환 ────────────────────────────────
+        # ── 3. 히스테리시스 회전 모드 ─────────────────────────────────────
         if self._rotating:
             if abs(e_theta) < self.ROTATE_EXIT:
                 self._rotating = False
@@ -252,22 +301,22 @@ class FollowerController(Node):
             if abs(e_theta) > self.ROTATE_ENTER:
                 self._rotating = True
 
-        # ── 4. 각속도 (항상 waypoint 방향 추적) ───────────────────────────
+        # ── 4. 각속도 ──────────────────────────────────────────────────────
         cmd.angular.z = self.k_angular * e_theta
         cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
 
-        # ── 5. 선속도 결정 ─────────────────────────────────────────────────
+        # ── 5. 선속도 ──────────────────────────────────────────────────────
         if distance <= self.waypoint_reach_dist:
-            cmd.linear.x = 0.0                          # 도달: 방향 추적만 유지
+            cmd.linear.x = 0.0
 
         elif self._rotating:
-            cmd.linear.x = 0.0                          # 큰 각도 오차: 제자리 회전
+            cmd.linear.x = 0.0
 
         else:
             cmd.linear.x = min(self.k_linear * distance, self.max_linear)
 
         self.get_logger().info(
-            f'wp=({wx:.2f},{wy:.2f}), d={distance:.2f}, '
+            f'[BREAD] wp=({wx:.2f},{wy:.2f}), d={distance:.2f}, '
             f'e_theta={e_theta:.2f}, rotating={self._rotating}, '
             f'path_len={len(self.leader_path)}, wp_idx={self.waypoint_idx}, '
             f'v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f}',
