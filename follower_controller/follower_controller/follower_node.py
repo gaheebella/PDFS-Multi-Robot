@@ -24,7 +24,7 @@ class FollowerController(Node):
 
         # 제어 파라미터
         self.comm_range = 2.0
-        self.follow_distance = 0.20   # 0.45 → 0.20 (leader가 가까이 스폰되므로)
+        self.follow_distance = 0.10   # 0.20 → 0.10
         self.k_linear = 0.5
         self.k_angular = 2.0
         self.max_linear = 0.15
@@ -39,7 +39,7 @@ class FollowerController(Node):
         # Breadcrumb path 파라미터
         self.path_record_min_dist = 0.10
         self.max_path_length = 2000
-        self.waypoint_reach_dist = 0.20
+        self.waypoint_reach_dist = 0.10   # 0.20 → 0.10
         self.lookahead_steps = 6
 
         # 장애물 회피 파라미터
@@ -254,8 +254,7 @@ class FollowerController(Node):
                     self.k_linear * distance,
                     self.max_linear
                 )
-            elif distance > 0.10:
-                # follow_distance 이내지만 너무 가깝진 않으면 천천히 접근
+            elif distance > 0.05:
                 cmd.linear.x = min(self.k_linear * distance * 0.5, self.max_linear)
             else:
                 cmd.linear.x = 0.0
