@@ -19,11 +19,11 @@ class FollowerController(Node):
         self.comm_range = 1.5
         self.follow_distance = 0.5      # 목표 거리 살짝 줄여 여유 확보
 
-        self.k_linear = 1.2             # 선속도 게인 증가
-        self.k_angular = 1.5            # 각도 게인 감소 → 진동 방지
+        self.k_linear = 1.6             # 선속도 게인 증가
+        self.k_angular = 2.0            # 각도 게인 감소 → 진동 방지
 
-        self.max_linear = 0.35          # 실내 테스트용 안전 속도
-        self.max_angular = 1.8
+        self.max_linear = 0.55          # 실내 테스트용 안전 속도
+        self.max_angular = 2.2
 
         self.leader_sub = self.create_subscription(
             Odometry,
