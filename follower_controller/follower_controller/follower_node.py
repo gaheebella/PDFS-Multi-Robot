@@ -31,8 +31,9 @@ class FollowerController(Node):
         #   → 'follow' 복귀
         self._yield_state = 'follow'
         self._prev_leader_dist = None
-        self.approach_detect_dist = 0.80   # 0.60 → 0.80 (더 일찍 감지)
-        self.approach_clear_dist  = 0.95   # 0.70 → 0.95
+        self._prev_leader_pos = None          # leader 이전 위치 (이동 방향 감지용)
+        self.approach_detect_dist = 0.50      # 이 거리 이내에서 접근 감지
+        self.approach_clear_dist  = 0.65      # 이 거리 이상 벌어지면 복귀
         self.backoff_speed = -0.10
 
         # odom 안정화 대기 (시작 직후 쓰레기 값으로 인한 오회전 방지)
@@ -254,6 +255,7 @@ class FollowerController(Node):
             self._avoiding = False
             self._yield_state = 'follow'
             self._prev_leader_dist = None
+            self._prev_leader_pos = None
             self.use_breadcrumb = False
             self.waypoint_idx = 0
 
@@ -287,17 +289,40 @@ class FollowerController(Node):
             return
 
         # ── Leader 우선권 양보 상태머신 ───────────────────────────────────
-        # 단순 거리 기반: 가까우면 무조건 후진, 충분히 멀어지면 복귀
-        self._prev_leader_dist = leader_dist
+        # leader가 follower 쪽으로 이동 중일 때만 yielding 진입
+        # (정상 추종 중 가까워지는 건 제외)
+        #
+        # 판단 방법:
+        # leader 이동 방향 벡터와 "leader → follower" 방향의 내적
+        # 내적 > 0 : leader가 follower 쪽으로 오는 중
+        # 내적 < 0 : leader가 follower에서 멀어지는 중 (정상 추종)
+
+        # leader 이동 벡터 계산 (이전 위치 대비)
+        if self._prev_leader_pos is not None:
+            leader_vel_x = lx - self._prev_leader_pos[0]
+            leader_vel_y = ly - self._prev_leader_pos[1]
+            # follower 방향 단위벡터 (leader → follower)
+            to_f_x = fx - lx
+            to_f_y = fy - ly
+            dist_lf = math.hypot(to_f_x, to_f_y)
+            if dist_lf > 1e-6:
+                to_f_x /= dist_lf
+                to_f_y /= dist_lf
+            dot = leader_vel_x * to_f_x + leader_vel_y * to_f_y
+            leader_coming = (dot > 0.001 and leader_dist < self.approach_detect_dist)
+        else:
+            leader_coming = False
+        self._prev_leader_pos = (lx, ly)
 
         if self._yield_state == 'follow':
-            if leader_dist < self.approach_detect_dist:
+            if leader_coming:
                 self._yield_state = 'yielding'
                 self._avoiding = False
                 self.get_logger().info(
-                    f'YIELD START: d={leader_dist:.2f}'
+                    f'YIELD START: d={leader_dist:.2f}, dot={dot:.4f}'
                 )
         elif self._yield_state == 'yielding':
+            # leader가 멀어지고 충분히 벌어지면 복귀
             if leader_dist > self.approach_clear_dist:
                 self._yield_state = 'follow'
                 self.get_logger().info(
