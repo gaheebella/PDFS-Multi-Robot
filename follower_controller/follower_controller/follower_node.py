@@ -17,6 +17,24 @@ class FollowerController(Node):
         self.scan_msg = None
         self.use_breadcrumb = False
 
+        # Leader 우선권 양보 상태머신
+        # 상태: 'follow' → 'yielding' → 'follow'
+        #
+        # [follow]
+        #   leader가 follower 쪽으로 접근 중 + 거리 < approach_detect_dist
+        #   → 'yielding' 진입
+        #
+        # [yielding]
+        #   follower 후진 유지
+        #   leader가 follower를 지나쳐서 멀어지기 시작하면
+        #   (거리가 다시 증가 + 거리 > approach_clear_dist)
+        #   → 'follow' 복귀
+        self._yield_state = 'follow'          # 'follow' | 'yielding'
+        self._prev_leader_dist = None         # 직전 루프의 leader 거리 (거리 증가 감지용)
+        self.approach_detect_dist = 0.40      # 이 거리 이내 + 접근 중이면 yielding 진입
+        self.approach_clear_dist  = 0.55      # 이 거리 이상 + 멀어지면 follow 복귀
+        self.backoff_speed = -0.10            # 후진 속도 (m/s)
+
         # odom 안정화 대기 (시작 직후 쓰레기 값으로 인한 오회전 방지)
         # 10Hz 타이머 기준 약 1초 (10 tick) 대기
         self._init_ticks = 0
@@ -40,7 +58,7 @@ class FollowerController(Node):
         # Breadcrumb path 파라미터
         self.path_record_min_dist = 0.03   # 촘촘하게 (burger 반경의 1/3)
         self.max_path_length = 3000
-        self.waypoint_reach_dist = 0.08    # 0.01 → 0.08 (도달 판정 확실하게)
+        self.waypoint_reach_dist = 0.12    # 0.08 → 0.12 (경계값 문제 해결)
         self.lookahead_steps = 4           # 2 → 4 (leader 속도 따라잡기)
 
         # 장애물 회피 파라미터
@@ -124,6 +142,18 @@ class FollowerController(Node):
 
         self.waypoint_idx = min(self.waypoint_idx, n - 1)
 
+        # leader가 멀리 가버린 경우 catch-up:
+        # path 끝(leader 현재위치)부터 거꾸로 탐색해서
+        # follower가 waypoint_reach_dist 이내로 접근 가능한
+        # 가장 앞쪽 idx로 점프
+        for i in range(n - 1, self.waypoint_idx, -1):
+            wx, wy = path[i]
+            if math.hypot(fx - wx, fy - wy) < self.waypoint_reach_dist * 4:
+                # 이 점에 접근 가능하면 여기서부터 시작
+                self.waypoint_idx = i
+                break
+
+        # 현재 waypoint 도달 시 다음으로 전진
         while self.waypoint_idx < n - 1:
             wx, wy = path[self.waypoint_idx]
             if math.hypot(fx - wx, fy - wy) < self.waypoint_reach_dist:
@@ -209,11 +239,55 @@ class FollowerController(Node):
             cmd.angular.z = self.search_angular_speed
             self._rotating = False
             self._avoiding = False
+            self._yield_state = 'follow'
+            self._prev_leader_dist = None
             self.use_breadcrumb = False
             self.waypoint_idx = 0
             self.get_logger().info(
                 f'OUT OF RANGE: d={leader_dist:.2f} -> searching',
                 throttle_duration_sec=1.0
+            )
+            self.cmd_pub.publish(cmd)
+            return
+
+        # ── Leader 우선권 양보 상태머신 ───────────────────────────────────
+        is_approaching = (
+            self._prev_leader_dist is not None
+            and leader_dist < self.approach_detect_dist  # 거리 임계값 이내
+            and leader_dist < self._prev_leader_dist     # 가까워지는 중
+        )
+        # 거리가 멀어지고 + 충분히 벌어지면 복귀
+        is_clearing = (
+            self._prev_leader_dist is not None
+            and leader_dist > self._prev_leader_dist
+            and leader_dist > self.approach_clear_dist
+        )
+        # 거리 임계값 이내면 무조건 yielding 유지 (노이즈로 is_approaching 놓쳐도 유지)
+        force_yield = leader_dist < self.approach_detect_dist * 0.8
+
+        self._prev_leader_dist = leader_dist
+
+        if self._yield_state == 'follow':
+            if is_approaching or force_yield:
+                self._yield_state = 'yielding'
+                self._avoiding = False
+                self.get_logger().info(
+                    f'YIELD START: d={leader_dist:.2f}'
+                )
+        elif self._yield_state == 'yielding':
+            if is_clearing and not force_yield:
+                self._yield_state = 'follow'
+                self.get_logger().info(
+                    f'YIELD END: d={leader_dist:.2f}, resuming follow'
+                )
+
+        if self._yield_state == 'yielding':
+            cmd.linear.x = self.backoff_speed
+            cmd.angular.z = 0.0
+            self._avoiding = False  # yielding 중 장애물 회피 재진입 방지
+            self.get_logger().info(
+                f'YIELDING: d={leader_dist:.2f}, backing off',
+                throttle_duration_sec=0.5
             )
             self.cmd_pub.publish(cmd)
             return
