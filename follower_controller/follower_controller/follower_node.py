@@ -29,11 +29,11 @@ class FollowerController(Node):
         #   leader가 follower를 지나쳐서 멀어지기 시작하면
         #   (거리가 다시 증가 + 거리 > approach_clear_dist)
         #   → 'follow' 복귀
-        self._yield_state = 'follow'          # 'follow' | 'yielding'
-        self._prev_leader_dist = None         # 직전 루프의 leader 거리 (거리 증가 감지용)
-        self.approach_detect_dist = 0.40      # 이 거리 이내 + 접근 중이면 yielding 진입
-        self.approach_clear_dist  = 0.55      # 이 거리 이상 + 멀어지면 follow 복귀
-        self.backoff_speed = -0.10            # 후진 속도 (m/s)
+        self._yield_state = 'follow'
+        self._prev_leader_dist = None
+        self.approach_detect_dist = 0.80   # 0.60 → 0.80 (더 일찍 감지)
+        self.approach_clear_dist  = 0.95   # 0.70 → 0.95
+        self.backoff_speed = -0.10
 
         # odom 안정화 대기 (시작 직후 쓰레기 값으로 인한 오회전 방지)
         # 10Hz 타이머 기준 약 1초 (10 tick) 대기
@@ -58,8 +58,8 @@ class FollowerController(Node):
         # Breadcrumb path 파라미터
         self.path_record_min_dist = 0.03   # 촘촘하게 (burger 반경의 1/3)
         self.max_path_length = 3000
-        self.waypoint_reach_dist = 0.12    # 0.08 → 0.12 (경계값 문제 해결)
-        self.lookahead_steps = 4           # 2 → 4 (leader 속도 따라잡기)
+        self.waypoint_reach_dist = 0.08    # 도달 판정 거리
+        self.lookahead_steps = 4
 
         # 장애물 회피 파라미터
         self.obstacle_stop_dist = 0.35
@@ -129,9 +129,29 @@ class FollowerController(Node):
         front = list(ranges[0:30]) + list(ranges[n - 30:])
         return min((r for r in front if math.isfinite(r)), default=10.0)
 
-    # ------------------------------------------------------------------ #
-    #  Waypoint 선택
-    # ------------------------------------------------------------------ #
+    def get_rear_min(self):
+        """후방 ±30° 내 최소 거리 반환. scan 없으면 10.0"""
+        if self.scan_msg is None:
+            return 10.0
+        ranges = self.scan_msg.ranges
+        n = len(ranges)
+        rear = list(ranges[n // 2 - 30: n // 2 + 30])
+        return min((r for r in rear if math.isfinite(r)), default=10.0)
+
+    def get_side_space(self):
+        """좌우 공간 중 더 넓은 쪽 반환: ('L', dist) or ('R', dist)"""
+        if self.scan_msg is None:
+            return ('L', 10.0)
+        ranges = self.scan_msg.ranges
+        n = len(ranges)
+        left  = list(ranges[60:120])
+        right = list(ranges[n - 120: n - 60])
+        left_min  = min((r for r in left  if math.isfinite(r)), default=10.0)
+        right_min = min((r for r in right if math.isfinite(r)), default=10.0)
+        if left_min >= right_min:
+            return ('L', left_min)
+        else:
+            return ('R', right_min)
 
     def select_waypoint(self, fx, fy):
         path = list(self.leader_path)
@@ -142,24 +162,19 @@ class FollowerController(Node):
 
         self.waypoint_idx = min(self.waypoint_idx, n - 1)
 
-        # leader가 멀리 가버린 경우 catch-up:
-        # path 끝(leader 현재위치)부터 거꾸로 탐색해서
-        # follower가 waypoint_reach_dist 이내로 접근 가능한
-        # 가장 앞쪽 idx로 점프
-        for i in range(n - 1, self.waypoint_idx, -1):
-            wx, wy = path[i]
-            if math.hypot(fx - wx, fy - wy) < self.waypoint_reach_dist * 4:
-                # 이 점에 접근 가능하면 여기서부터 시작
-                self.waypoint_idx = i
-                break
-
-        # 현재 waypoint 도달 시 다음으로 전진
+        # 현재 waypoint 도달 시 다음으로 전진 (단방향)
         while self.waypoint_idx < n - 1:
             wx, wy = path[self.waypoint_idx]
             if math.hypot(fx - wx, fy - wy) < self.waypoint_reach_dist:
                 self.waypoint_idx += 1
             else:
                 break
+
+        # leader가 너무 멀리 가서 뒤처진 경우 강제 따라잡기
+        # path 끝에서 lookahead_steps 이내로 맞춤
+        lag = n - 1 - self.waypoint_idx
+        if lag > 10:  # 10개 점(약 0.3m) 이상 뒤처지면 점프
+            self.waypoint_idx = n - 1 - self.lookahead_steps
 
         target_idx = min(self.waypoint_idx + self.lookahead_steps, n - 1)
         return path[target_idx]
@@ -233,62 +248,85 @@ class FollowerController(Node):
         ly = self.leader_pose.position.y
         leader_dist = math.hypot(lx - fx, ly - fy)
 
-        # 통신 범위 밖: 탐색 회전
+        # 통신 범위 밖: leader 방향으로 적극 추적
         if leader_dist > self.comm_range:
-            cmd.linear.x = 0.0
-            cmd.angular.z = self.search_angular_speed
             self._rotating = False
             self._avoiding = False
             self._yield_state = 'follow'
             self._prev_leader_dist = None
             self.use_breadcrumb = False
             self.waypoint_idx = 0
+
+            # odom으로 leader 방향은 알 수 있으므로
+            # 방향 정렬 후 전진해서 통신 범위 안으로 복귀
+            theta_target = math.atan2(ly - fy, lx - fx)
+            e_theta = self.normalize_angle(theta_target - fyaw)
+
+            cmd.angular.z = self.k_angular * e_theta
+            cmd.angular.z = max(min(cmd.angular.z, self.max_angular), -self.max_angular)
+
+            if abs(e_theta) < 0.3:
+                # 방향 정렬됐으면 전진해서 따라잡기
+                cmd.linear.x = self.max_linear
+            else:
+                # 아직 방향 안 맞으면 제자리 회전
+                cmd.linear.x = 0.0
+
+            # 전방에 장애물 있으면 전진 금지
+            front_min = self.get_front_min()
+            if front_min < self.obstacle_stop_dist:
+                cmd.linear.x = 0.0
+
             self.get_logger().info(
-                f'OUT OF RANGE: d={leader_dist:.2f} -> searching',
+                f'OUT OF RANGE: d={leader_dist:.2f}, '
+                f'e_theta={e_theta:.2f}, '
+                f'v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f}',
                 throttle_duration_sec=1.0
             )
             self.cmd_pub.publish(cmd)
             return
 
         # ── Leader 우선권 양보 상태머신 ───────────────────────────────────
-        is_approaching = (
-            self._prev_leader_dist is not None
-            and leader_dist < self.approach_detect_dist  # 거리 임계값 이내
-            and leader_dist < self._prev_leader_dist     # 가까워지는 중
-        )
-        # 거리가 멀어지고 + 충분히 벌어지면 복귀
-        is_clearing = (
-            self._prev_leader_dist is not None
-            and leader_dist > self._prev_leader_dist
-            and leader_dist > self.approach_clear_dist
-        )
-        # 거리 임계값 이내면 무조건 yielding 유지 (노이즈로 is_approaching 놓쳐도 유지)
-        force_yield = leader_dist < self.approach_detect_dist * 0.8
-
+        # 단순 거리 기반: 가까우면 무조건 후진, 충분히 멀어지면 복귀
         self._prev_leader_dist = leader_dist
 
         if self._yield_state == 'follow':
-            if is_approaching or force_yield:
+            if leader_dist < self.approach_detect_dist:
                 self._yield_state = 'yielding'
                 self._avoiding = False
                 self.get_logger().info(
                     f'YIELD START: d={leader_dist:.2f}'
                 )
         elif self._yield_state == 'yielding':
-            if is_clearing and not force_yield:
+            if leader_dist > self.approach_clear_dist:
                 self._yield_state = 'follow'
                 self.get_logger().info(
                     f'YIELD END: d={leader_dist:.2f}, resuming follow'
                 )
 
         if self._yield_state == 'yielding':
-            cmd.linear.x = self.backoff_speed
-            cmd.angular.z = 0.0
-            self._avoiding = False  # yielding 중 장애물 회피 재진입 방지
-            self.get_logger().info(
-                f'YIELDING: d={leader_dist:.2f}, backing off',
-                throttle_duration_sec=0.5
-            )
+            self._avoiding = False
+            rear_min = self.get_rear_min()
+
+            if rear_min > 0.25:
+                # 뒤에 공간 있으면 후진
+                cmd.linear.x = self.backoff_speed
+                cmd.angular.z = 0.0
+                self.get_logger().info(
+                    f'YIELDING backoff: d={leader_dist:.2f}, rear={rear_min:.2f}',
+                    throttle_duration_sec=0.5
+                )
+            else:
+                # 뒤에 벽 있으면 옆으로 비켜서 leader가 지나갈 공간 확보
+                side, side_dist = self.get_side_space()
+                turn_dir = 1.0 if side == 'L' else -1.0
+                cmd.linear.x = 0.0
+                cmd.angular.z = turn_dir * self.obstacle_turn_speed
+                self.get_logger().info(
+                    f'YIELDING dodge: d={leader_dist:.2f}, rear={rear_min:.2f}, '
+                    f'dodge={side}({side_dist:.2f})',
+                    throttle_duration_sec=0.5
+                )
             self.cmd_pub.publish(cmd)
             return
 
@@ -332,10 +370,11 @@ class FollowerController(Node):
             else:
                 cmd.linear.x = 0.0
 
-            avoided, cmd = self.handle_obstacle(cmd, e_theta)
-            if avoided:
-                self.cmd_pub.publish(cmd)
-                return
+            if self._yield_state != 'yielding':
+                avoided, cmd = self.handle_obstacle(cmd, e_theta)
+                if avoided:
+                    self.cmd_pub.publish(cmd)
+                    return
 
             self.get_logger().info(
                 f'[DIRECT] d={distance:.2f}, e_theta={e_theta:.2f}, '
@@ -359,11 +398,12 @@ class FollowerController(Node):
         theta_target = math.atan2(dy, dx)
         e_theta = self.normalize_angle(theta_target - fyaw)
 
-        # ── 2. 장애물 회피 (e_theta 계산 후 적용) ─────────────────────────
-        avoided, cmd = self.handle_obstacle(cmd, e_theta)
-        if avoided:
-            self.cmd_pub.publish(cmd)
-            return
+        # ── 2. 장애물 회피 (yielding 중에는 건너뜀) ──────────────────────
+        if self._yield_state != 'yielding':
+            avoided, cmd = self.handle_obstacle(cmd, e_theta)
+            if avoided:
+                self.cmd_pub.publish(cmd)
+                return
 
         # ── 3. 히스테리시스 회전 모드 ─────────────────────────────────────
         if self._rotating:
@@ -389,6 +429,7 @@ class FollowerController(Node):
 
         self.get_logger().info(
             f'[BREAD] wp=({wx:.2f},{wy:.2f}), d={distance:.2f}, '
+            f'leader_d={leader_dist:.2f}, yield={self._yield_state}, '
             f'e_theta={e_theta:.2f}, rotating={self._rotating}, '
             f'path_len={len(self.leader_path)}, wp_idx={self.waypoint_idx}, '
             f'v={cmd.linear.x:.2f}, w={cmd.angular.z:.2f}',
