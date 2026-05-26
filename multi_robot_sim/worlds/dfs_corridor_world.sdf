@@ -1,0 +1,254 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+
+<world name="dfs_world">
+
+  <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+  <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+  <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+  <plugin filename="gz-sim-sensors-system"
+          name="gz::sim::systems::Sensors">
+    <render_engine>ogre2</render_engine>
+  </plugin>
+  cc
+  <light type="directional" name="main_light">
+    <cast_shadows>false</cast_shadows>
+    <pose>0 0 10 0 0 0</pose>
+    <diffuse>1 1 1 1</diffuse>
+    <specular>0.5 0.5 0.5 1</specular>
+    <direction>-0.5 0.1 -1</direction>
+  </light>
+
+  <model name="ground_plane">
+    <static>true</static>
+    <link name="link">
+      <collision name="collision">
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>10 10</size>
+          </plane>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>10 10</size>
+          </plane>
+        </geometry>
+        <material>
+          <ambient>0.8 0.8 0.8 1</ambient>
+          <diffuse>0.8 0.8 0.8 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+
+
+  <model name="rotated_dfs_map">
+    <static>true</static>
+    <pose>0 0 0 0 0 -1.5708</pose>
+
+    <!-- outer walls -->
+    <model name="wall_top">
+      <static>true</static>
+      <pose>0 3 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>6 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>6 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="wall_left">
+      <static>true</static>
+      <pose>-3 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.2 6 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 6 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="wall_right">
+      <static>true</static>
+      <pose>3 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.2 6 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 6 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <!-- bottom wall split: center entrance -->
+    <model name="wall_bottom_left">
+      <static>true</static>
+      <pose>-1.7 -3 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>2.8 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>2.8 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="wall_bottom_right">
+      <static>true</static>
+      <pose>1.7 -3 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>2.8 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>2.8 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+      <!-- corridor upper boundary with door openings to top rooms -->
+
+    <model name="corridor_top_left_room_left">
+      <static>true</static>
+      <pose>-2.6 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.9 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.6 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_top_left_room_right">
+      <static>true</static>
+      <pose>-1.48 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.5 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_top_mid_left">
+      <static>true</static>
+      <pose>-0.55 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.4 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_top_mid_right">
+      <static>true</static>
+      <pose>0.55 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.4 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_top_right_room_left">
+      <static>true</static>
+      <pose>1.38 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.3 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_top_right_room_right">
+      <static>true</static>
+      <pose>2.45 0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.9 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.9 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+
+      <!-- corridor lower boundary with door openings to bottom rooms -->
+
+    <model name="corridor_bottom_left_room_left">
+      <static>true</static>
+      <pose>-2.45 -0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.9 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.9 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_bottom_left_room_right">
+      <static>true</static>
+      <pose>-0.9 -0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.5 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>1.0 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_bottom_right_room_left">
+      <static>true</static>
+      <pose>0.9 -0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.5 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>1.1 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="corridor_bottom_right_room_right">
+      <static>true</static>
+      <pose>2.45 -0.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.9 0.2 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.9 0.2 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <!-- top room passage walls -->
+    <model name="top_passage_1_left_wall">
+      <static>true</static>
+      <pose>-1.30 1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.15 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="top_passage_1_right_wall">
+      <static>true</static>
+      <pose>-0.70 1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.15 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="top_passage_2_left_wall">
+      <static>true</static>
+      <pose>0.70 1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.15 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="top_passage_2_right_wall">
+      <static>true</static>
+      <pose>1.30 1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.15 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.15 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <!-- bottom vertical entrance corridor -->
+    <model name="vertical_left">
+      <static>true</static>
+      <pose>-0.4 -1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.2 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <model name="vertical_right">
+      <static>true</static>
+      <pose>0.4 -1.85 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.2 2.3 1</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 2.3 1</size></box></geometry></visual>
+      </link>
+    </model>
+  </model>
+
+</world>
+</sdf>
