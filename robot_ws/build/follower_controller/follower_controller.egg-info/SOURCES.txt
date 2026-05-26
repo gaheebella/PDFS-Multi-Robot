@@ -11,7 +11,9 @@ setup.py
 follower_controller/__init__.py
 follower_controller/follower_node.py
 follower_controller/topic_relay_node.py
+launch/controller_with_relay.launch.py
 launch/follower_test.launch.py
+launch/multi_robot.launch.py
 resource/follower_controller
 test/test_copyright.py
 test/test_flake8.py
