@@ -9,11 +9,13 @@ setup.py
 ../../build/follower_controller/follower_controller.egg-info/top_level.txt
 ../../build/follower_controller/follower_controller.egg-info/zip-safe
 follower_controller/__init__.py
+follower_controller/cmd_vel_relay_node.py
 follower_controller/follower_node.py
 follower_controller/topic_relay_node.py
 launch/controller_with_relay.launch.py
 launch/follower_test.launch.py
 launch/multi_robot.launch.py
+launch/real_multi_robot.launch.py
 resource/follower_controller
 test/test_copyright.py
 test/test_flake8.py

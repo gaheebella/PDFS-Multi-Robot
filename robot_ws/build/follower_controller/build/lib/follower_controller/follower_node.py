@@ -369,7 +369,7 @@ class FollowerController(Node):
                     key=lambda i: math.hypot(fx - path_list[i][0], fy - path_list[i][1])
                 )
                 self.waypoint_idx = closest_idx
-                self.use_breadcrumb = True
+                #self.use_breadcrumb = True
                 self.get_logger().info(
                     f'Switching to breadcrumb mode, wp_idx={self.waypoint_idx}'
                 )

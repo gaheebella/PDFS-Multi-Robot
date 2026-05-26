@@ -15,14 +15,17 @@ class TopicRelay(Node):
         self.follower_odom_pub = self.create_publisher(Odometry, '/follower_odom', 10)
         self.follower_scan_pub = self.create_publisher(LaserScan, '/follower_scan', 10)
 
-        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(Odometry, '/leader/odom', self.leader_odom_callback, 10)
+        self.create_subscription(Odometry, '/follower/odom', self.follower_odom_callback, 10)
+        self.create_subscription(LaserScan, '/follower/scan', self.scan_callback, 10)
 
         self.get_logger().info('Topic relay node started.')
 
-    def odom_callback(self, msg):
-        self.leader_odom_pub.publish(msg)
-        self.follower_odom_pub.publish(msg)
+    def leader_odom_callback(self, msg):
+    	self.leader_odom_pub.publish(msg)
+
+    def follower_odom_callback(self, msg):
+    	self.follower_odom_pub.publish(msg)
 
     def scan_callback(self, msg):
         self.follower_scan_pub.publish(msg)

@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'follower_node = follower_controller.follower_node:main',
             'topic_relay_node = follower_controller.topic_relay_node:main',
-        ],
+            'cmd_vel_relay_node = follower_controller.cmd_vel_relay_node:main',
+         ],
     },
 )

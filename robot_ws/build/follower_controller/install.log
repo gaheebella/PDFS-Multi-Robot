@@ -1,6 +1,8 @@
+/root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/cmd_vel_relay_node.py
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/follower_node.py
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/topic_relay_node.py
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/__init__.py
+/root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/__pycache__/cmd_vel_relay_node.cpython-312.pyc
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/__pycache__/follower_node.cpython-312.pyc
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/__pycache__/topic_relay_node.cpython-312.pyc
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/__pycache__/__init__.cpython-312.pyc
@@ -9,6 +11,7 @@
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/controller_with_relay.launch.py
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/multi_robot.launch.py
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/follower_test.launch.py
+/root/robot_ws/install/follower_controller/share/follower_controller/launch/real_multi_robot.launch.py
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/SOURCES.txt
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/requires.txt
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/PKG-INFO
@@ -16,5 +19,6 @@
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/top_level.txt
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/zip-safe
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/dependency_links.txt
+/root/robot_ws/install/follower_controller/lib/follower_controller/cmd_vel_relay_node
 /root/robot_ws/install/follower_controller/lib/follower_controller/follower_node
 /root/robot_ws/install/follower_controller/lib/follower_controller/topic_relay_node
