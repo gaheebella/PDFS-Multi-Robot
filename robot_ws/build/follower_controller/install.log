@@ -10,6 +10,7 @@
 /root/robot_ws/install/follower_controller/share/follower_controller/package.xml
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/controller_with_relay.launch.py
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/multi_robot.launch.py
+/root/robot_ws/install/follower_controller/share/follower_controller/launch/full_leader_follower.launch.py
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/follower_test.launch.py
 /root/robot_ws/install/follower_controller/share/follower_controller/launch/real_multi_robot.launch.py
 /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info/SOURCES.txt
