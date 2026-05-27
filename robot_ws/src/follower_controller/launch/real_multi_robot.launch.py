@@ -6,10 +6,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     gazebo = ExecuteProcess(
-        cmd=[
-            'gz', 'sim', '-v', '4', '-r',
-	    '/root/robot_ws/src/multi_robot_sim/worlds/dfs_corridor_world.sdf'
-	],
+        cmd=['gz', 'sim', '-v', '4', '-r', 'empty.sdf'],
         output='screen'
     )
 
@@ -18,8 +15,8 @@ def generate_launch_description():
         executable='create',
         arguments=[
             '-name', 'leader',
-            '-file', '/root/robot_ws/src/multi_robot_sim/models/turtlebot3_leader_sep/model.sdf',
-            '-x', '3.0',
+            '-file', '/root/robot_ws/src/follower_controller/models/leader_burger/model.sdf',
+            '-x', '0.0',
             '-y', '0.0',
             '-z', '0.01'
         ],
@@ -31,7 +28,7 @@ def generate_launch_description():
         executable='create',
         arguments=[
             '-name', 'follower',
-            '-file', '/root/robot_ws/src/multi_robot_sim/models/turtlebot3_follower_sep/model.sdf',
+            '-file', '/root/robot_ws/src/follower_controller/models/follower_burger/model.sdf',
             '-x', '-1.0',
             '-y', '0.0',
             '-z', '0.01'
