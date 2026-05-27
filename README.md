@@ -1,15 +1,15 @@
 
 # PDFS Multi-Robot Simulation
 
-ROS2 Jazzy + Gazebo Harmonic 기반 Dockerized Leader-Follower Multi-Robot Simulation 프로젝트입니다.
+ROS2 Jazzy + Gazebo Harmonic 기반 Dockerized Leader-Follower Multi-Robot Simulation
 
 ---
 
 # 프로젝트 개요
 
-본 프로젝트는 ROS2 Jazzy와 Gazebo Harmonic 환경에서 동작하는 멀티로봇 leader-follower 시뮬레이션 시스템입니다.
+본 프로젝트는 ROS2 Jazzy와 Gazebo Harmonic 환경에서 동작하는 멀티로봇 leader-follower 시뮬레이션 시스템.
 
-Docker 기반으로 구성되어 환경 재현성을 확보하였으며, 다음 기능들을 포함합니다.
+Docker 기반으로 구성되어 환경 재현성을 확보하였으며, 다음 기능들을 포함.
 
 - TurtleBot3 기반 멀티로봇 시뮬레이션
 - Leader-Follower 자율 추종
