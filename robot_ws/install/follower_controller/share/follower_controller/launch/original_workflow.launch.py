@@ -5,6 +5,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
 
+    # 1. Gazebo world 실행
     gazebo = ExecuteProcess(
         cmd=[
             'gz', 'sim',
@@ -13,6 +14,7 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 2. Leader robot 생성
     leader_spawn = Node(
         package='ros_gz_sim',
         executable='create',
@@ -27,6 +29,7 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 3. Follower robot 생성
     follower_spawn = Node(
         package='ros_gz_sim',
         executable='create',
@@ -41,6 +44,7 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 4. ROS2-Gazebo bridge 실행
     bridge = ExecuteProcess(
         cmd=[
             'ros2', 'run', 'ros_gz_bridge', 'parameter_bridge',
@@ -53,6 +57,7 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 5. Follower controller 실행
     follower_controller = Node(
         package='follower_controller',
         executable='follower_node',
@@ -61,9 +66,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         gazebo,
+
+        # Gazebo world가 먼저 뜬 뒤 순차적으로 실행
         TimerAction(period=3.0, actions=[leader_spawn]),
         TimerAction(period=5.0, actions=[follower_spawn]),
         TimerAction(period=7.0, actions=[bridge]),
         TimerAction(period=9.0, actions=[follower_controller]),
     ])
-

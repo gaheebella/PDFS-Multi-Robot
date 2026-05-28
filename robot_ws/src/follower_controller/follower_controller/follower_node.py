@@ -47,7 +47,7 @@ class FollowerController(Node):
         self.follow_distance = 0.01        # 거의 붙어서 따라감
         self.k_linear = 0.8               # 속도 반응 높임
         self.k_angular = 2.5
-        self.max_linear = 0.20            # burger 정격 속도 수준으로 복구
+        self.max_linear = 0.30            # burger 정격 속도 수준으로 복구
         self.max_angular = 1.5
         self.search_angular_speed = 1.0
 

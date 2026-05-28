@@ -1,0 +1,26 @@
+[1.723s] Invoking command in '/root/robot_ws/src/follower_controller': PYTHONPATH=/root/robot_ws/build/follower_controller/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/root/robot_ws/install/follower_controller/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/follower_controller build --build-base /root/robot_ws/build/follower_controller/build install --record /root/robot_ws/build/follower_controller/install.log --single-version-externally-managed install_data
+[2.333s] running egg_info
+[2.360s] writing ../../build/follower_controller/follower_controller.egg-info/PKG-INFO
+[2.361s] writing dependency_links to ../../build/follower_controller/follower_controller.egg-info/dependency_links.txt
+[2.361s] writing entry points to ../../build/follower_controller/follower_controller.egg-info/entry_points.txt
+[2.362s] writing requirements to ../../build/follower_controller/follower_controller.egg-info/requires.txt
+[2.362s] writing top-level names to ../../build/follower_controller/follower_controller.egg-info/top_level.txt
+[2.413s] reading manifest file '../../build/follower_controller/follower_controller.egg-info/SOURCES.txt'
+[2.415s] writing manifest file '../../build/follower_controller/follower_controller.egg-info/SOURCES.txt'
+[2.416s] running build
+[2.416s] running build_py
+[2.416s] copying follower_controller/follower_node.py -> /root/robot_ws/build/follower_controller/build/lib/follower_controller
+[2.417s] running install
+[2.430s] running install_lib
+[2.460s] copying /root/robot_ws/build/follower_controller/build/lib/follower_controller/follower_node.py -> /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller
+[2.461s] byte-compiling /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller/follower_node.py to follower_node.cpython-312.pyc
+[2.468s] running install_data
+[2.468s] running install_egg_info
+[2.498s] removing '/root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info' (and everything under it)
+[2.498s] Copying ../../build/follower_controller/follower_controller.egg-info to /root/robot_ws/install/follower_controller/lib/python3.12/site-packages/follower_controller-0.0.0-py3.12.egg-info
+[2.499s] running install_scripts
+[2.716s] Installing cmd_vel_relay_node script to /root/robot_ws/install/follower_controller/lib/follower_controller
+[2.716s] Installing follower_node script to /root/robot_ws/install/follower_controller/lib/follower_controller
+[2.716s] Installing topic_relay_node script to /root/robot_ws/install/follower_controller/lib/follower_controller
+[2.717s] writing list of installed files to '/root/robot_ws/build/follower_controller/install.log'
+[2.769s] Invoked command in '/root/robot_ws/src/follower_controller' returned '0': PYTHONPATH=/root/robot_ws/build/follower_controller/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/root/robot_ws/install/follower_controller/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/follower_controller build --build-base /root/robot_ws/build/follower_controller/build install --record /root/robot_ws/build/follower_controller/install.log --single-version-externally-managed install_data
