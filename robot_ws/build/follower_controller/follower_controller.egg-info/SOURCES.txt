@@ -11,6 +11,7 @@ setup.py
 follower_controller/__init__.py
 follower_controller/cmd_vel_relay_node.py
 follower_controller/follower_node.py
+follower_controller/follower_node_backup.py
 follower_controller/topic_relay_node.py
 launch/controller_with_relay.launch.py
 launch/follower_test.launch.py
