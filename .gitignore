@@ -10,3 +10,4 @@ robot_ws/log/
 *.pyc
 *.pyo
 *.save
+*follower_node_backup.py
