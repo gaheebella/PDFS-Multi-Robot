@@ -1,7 +1,7 @@
 <?xml version="1.0" ?>
 <sdf version="1.8">
   
-  <model name="turtlebot3_burger">
+  <model name="turtlebot3_follower2">
     <pose>0.0 0.0 0.0 0.0 0.0 0.0</pose>
 
     <link name="base_footprint"/>
