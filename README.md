@@ -1,9 +1,3 @@
-현재 README에 **현재 구현 범위와 한계점이 빠져 있어서**, Physical DFS가 이미 구현된 것처럼 보일 수 있습니다.
-
-아래처럼 수정하는 것을 추천합니다.
-
----
-
 # PDFS Multi-Robot Simulation
 
 **Physical DFS (PDFS) 기반 Communication-Aware Multi-Robot Exploration Simulator**
