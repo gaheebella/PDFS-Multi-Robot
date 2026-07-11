@@ -18,7 +18,7 @@ FPS = 60
 SUBSTEPS = 2
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Shepherd Pressure Boundary")
+pygame.display.set_caption("SPH + DFS Junction Anchor + Shepherd Boundary")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
@@ -30,6 +30,7 @@ WALL_COLOR = (96, 106, 124)
 TEXT_COLOR = (58, 67, 82)
 ROBOT_BASE_COLOR = (115, 165, 208)
 SHEPHERD_COLOR = (171, 145, 205)
+ANCHOR_COLOR = (102, 174, 137)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
 
@@ -64,6 +65,27 @@ junction_rect = pygame.Rect(
     center_y - half_width,
     corridor_width,
     corridor_width,
+)
+
+# Junction 내부의 작은 사각형에 가장 먼저 진입한 일반 로봇을 Anchor로 선발합니다.
+ANCHOR_REGION_SIZE = 70
+anchor_election_rect = pygame.Rect(
+    center_x - ANCHOR_REGION_SIZE // 2,
+    center_y - ANCHOR_REGION_SIZE // 2,
+    ANCHOR_REGION_SIZE,
+    ANCHOR_REGION_SIZE,
+)
+
+# 중앙 통행을 막지 않도록 Junction 가장자리 쪽에 Anchor를 주차합니다.
+ANCHOR_PARK_POSITION = pygame.Vector2(
+    center_x - half_width + 14,
+    center_y - half_width + 14,
+)
+
+# Branch 전환 중 일반 로봇이 잠시 모이는 지점입니다.
+JUNCTION_STAGING_POSITION = pygame.Vector2(
+    center_x + 10,
+    center_y + 10,
 )
 
 up_rect = pygame.Rect(
@@ -151,8 +173,8 @@ class SimulationPhase(Enum):
     FORM_SHEPHERD_BOUNDARY = auto()
     PRESSURE_PUSH = auto()
     FLOW_BACKTRACK = auto()
-    REGROUP = auto()
-    SELECT_NEXT_BRANCH = auto()
+    JUNCTION_SWITCH = auto()
+    RETURN_TO_BASE = auto()
     DONE = auto()
 
 
@@ -164,14 +186,16 @@ BRANCH_DIRECTIONS = {
 }
 
 phase = SimulationPhase.MOVE_TO_JUNCTION
-dfs_index = 0
 active_branch = DFS_ORDER[0]
 branch_states = {
     "UP": "UNVISITED",
     "LEFT": "UNVISITED",
     "RIGHT": "UNVISITED",
 }
-branch_states[active_branch] = "ACTIVE"
+
+junction_anchor = None
+simulation_time = 0.0
+junction_switch_timer = 0.0
 
 saturation_timer = 0.0
 shepherd_form_timer = 0.0
@@ -192,18 +216,23 @@ PRESSURE_GAIN = 1650.0
 STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1 = 0.9
 VISCOSITY_XI2 = 1.2
-DAMPING = 2.8
+# 전체 이동 속도 조절값입니다.
+# 1.0 = 기존 속도, 1.5 = 빠름, 2.0 = 현재 권장 속도
+MOTION_SPEED_MULTIPLIER = 2.0
+
+# 감쇠가 너무 크면 유도력이 커도 최종 속도가 낮아지므로 기존 2.8에서 낮췄습니다.
+DAMPING = 2.3
 
 SAFE_RADIUS = 7.5
 REPULSION_GAIN = 260.0
 
-ROUTE_FORCE = 52.0
-OUTLET_FORCE = 44.0
-SHEPHERD_BACKTRACK_FORCE = 50.0
+ROUTE_FORCE = 52.0 * MOTION_SPEED_MULTIPLIER
+OUTLET_FORCE = 44.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_BACKTRACK_FORCE = 50.0 * MOTION_SPEED_MULTIPLIER
 CENTERING_GAIN = 1.2
 
-MAX_SPEED = 78.0
-MAX_ACCELERATION = 520.0
+MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
+MAX_ACCELERATION = 520.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
 # 고립 로봇이 무리를 따라오도록 하는 보조항
@@ -213,6 +242,10 @@ LOCAL_COHESION_GAIN = 20.0
 
 # Junction 진입 후 첫 branch 탐색 시작 조건
 JUNCTION_ENTRY_COUNT = 18
+ANCHOR_MOVE_SPEED = 95.0 * MOTION_SPEED_MULTIPLIER
+JUNCTION_SWITCH_COUNT = 18
+JUNCTION_SWITCH_DWELL_TIME = 0.25
+RETURN_BOTTOM_TARGET_COUNT = int((ROBOT_COUNT - 1) * 0.90)
 
 # Shepherd boundary
 # dead-end에 가장 먼저 도착한 8대를 즉시 선발하기 위한 조기 감지 깊이
@@ -222,30 +255,31 @@ SHEPHERD_EDGE_MARGIN = 12
 SHEPHERD_FORM_KP = 9.0
 SHEPHERD_HOLD_KP = 9.5
 SHEPHERD_HOLD_KD = 3.8
-SHEPHERD_FORM_TOLERANCE = 5.0
-SHEPHERD_FORM_TIMEOUT = 1.4
+SHEPHERD_FORM_SPEED = 110.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_FORM_TOLERANCE = 3.0
+SHEPHERD_FORM_TIMEOUT = 0.9
 
 # Shepherd의 가상 압력
 SHEPHERD_PRESSURE_FACTOR = 5.2
 VIRTUAL_PRESSURE_RADIUS = 60.0
-VIRTUAL_PRESSURE_FORCE = 105.0
-PRESSURE_RAMP_TIME = 1.2
+VIRTUAL_PRESSURE_FORCE = 145.0
+PRESSURE_RAMP_TIME = 0.8
 
 # 일반 로봇의 backtracking 흐름이 형성되면 Shepherd를 즉시 해제
 FLOW_SPEED_THRESHOLD = 2.5
 FLOW_RATIO_THRESHOLD = 0.72
 FLOW_AVERAGE_SPEED_THRESHOLD = 3.0
-FLOW_ESTABLISH_DWELL_TIME = 0.40
+FLOW_ESTABLISH_DWELL_TIME = 0.25
 FLOW_MIN_NORMAL_COUNT = 8
-FLOW_FALLBACK_TIME = 5.0
+FLOW_FALLBACK_TIME = 3.0
 
 # 조기 해제 뒤 전체가 함께 빠져나가는 단계
-FLOW_BACKTRACK_FORCE = 46.0
+FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 BRANCH_CLEAR_LIMIT = 1
 
-# Regroup 조건
-REGROUP_BOTTOM_TARGET_COUNT = int(ROBOT_COUNT * 0.94)
-REGROUP_SPREAD_THRESHOLD = 38.0
+# 모든 Branch가 끝난 뒤에만 시작 위치로 최종 복귀합니다.
+FINAL_RETURN_DISTANCE_THRESHOLD = 48.0
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS)
 
@@ -286,8 +320,8 @@ def get_robot_region(position):
 def is_region_allowed(position):
     """현재 DFS branch 외의 통로는 가상 밸브처럼 닫습니다.
 
-    Shepherd가 일반 로봇을 밀어내고 마지막으로 복귀할 때까지
-    현재 branch는 계속 열어 둡니다.
+    Branch 사이에는 시작 위치까지 돌아가지 않고 Parent Junction에서 바로
+    다음 Branch로 전환합니다. 모든 Branch가 끝난 뒤에만 Base 쪽으로 복귀합니다.
     """
     region = get_robot_region(position)
 
@@ -299,11 +333,11 @@ def is_region_allowed(position):
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
         SimulationPhase.PRESSURE_PUSH,
         SimulationPhase.FLOW_BACKTRACK,
-        SimulationPhase.REGROUP,
+        SimulationPhase.JUNCTION_SWITCH,
     }:
         return region in {"BOTTOM", "JUNCTION", active_branch}
 
-    if phase == SimulationPhase.DONE:
+    if phase in {SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE}:
         return region in {"BOTTOM", "JUNCTION"}
 
     return region != "OUTSIDE"
@@ -461,7 +495,77 @@ class Robot:
         self.role = "NORMAL"
         self.shepherd_anchor = None
 
+        # Junction Anchor 상태
+        self.anchor_position = None
+        self.local_branch_states = None
+        self.selected_branch = None
+        self.parent_branch = "BOTTOM"
+
+        # Junction Anchor 선발용 진입 기록
+        self.anchor_region_entry_time = None
+        self.was_in_anchor_region = anchor_election_rect.collidepoint(x, y)
+
     def update(self, dt):
+        # -------------------------------------------------
+        # Junction Anchor는 선발 후 Junction 가장자리 주차점으로 이동한 뒤 고정됩니다.
+        # -------------------------------------------------
+        if self.role == "ANCHOR" and self.anchor_position is not None:
+            position_error = self.anchor_position - self.position
+
+            if position_error.length_squared() > 1.0:
+                maximum_step = ANCHOR_MOVE_SPEED * dt
+
+                if position_error.length() <= maximum_step:
+                    next_position = self.anchor_position.copy()
+                else:
+                    next_position = (
+                        self.position
+                        + position_error.normalize() * maximum_step
+                    )
+
+                if is_walkable(next_position, self.radius):
+                    self.position = next_position
+            else:
+                self.position = self.anchor_position.copy()
+
+            self.velocity.update(0.0, 0.0)
+            self.acceleration.update(0.0, 0.0)
+            return
+
+        # -------------------------------------------------
+        # Shepherd는 경계 형성 중 anchor로 빠르게 정렬하고,
+        # PRESSURE_PUSH 동안에는 고정 경계 입자로 유지합니다.
+        # 일반 로봇은 Shepherd의 압력을 받지만 Shepherd 자신은
+        # SPH 반작용으로 밀려나지 않습니다.
+        # -------------------------------------------------
+        if self.role == "SHEPHERD" and self.shepherd_anchor is not None:
+            if phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
+                position_error = self.shepherd_anchor - self.position
+
+                if position_error.length_squared() > EPSILON:
+                    maximum_step = SHEPHERD_FORM_SPEED * dt
+
+                    if position_error.length() <= maximum_step:
+                        next_position = self.shepherd_anchor.copy()
+                    else:
+                        next_position = (
+                            self.position
+                            + position_error.normalize() * maximum_step
+                        )
+
+                    if is_walkable(next_position, self.radius):
+                        self.position = next_position
+
+                self.velocity.update(0.0, 0.0)
+                self.acceleration.update(0.0, 0.0)
+                return
+
+            if phase == SimulationPhase.PRESSURE_PUSH:
+                self.position = self.shepherd_anchor.copy()
+                self.velocity.update(0.0, 0.0)
+                self.acceleration.update(0.0, 0.0)
+                return
+
         self.velocity += self.acceleration * dt
         limit_vector(self.velocity, MAX_SPEED)
 
@@ -489,7 +593,9 @@ class Robot:
         x = round(self.position.x)
         y = round(self.position.y)
 
-        if self.role == "SHEPHERD":
+        if self.role == "ANCHOR":
+            color = ANCHOR_COLOR
+        elif self.role == "SHEPHERD":
             color = SHEPHERD_COLOR
         elif show_density_color:
             color = density_to_color(
@@ -614,7 +720,100 @@ def iter_neighbor_candidates(robot, grid):
                 yield candidate
 
 # =========================================================
-# 10. Shepherd 선택 / 경계 생성
+# 10. Junction Anchor 선발 / DFS 관리
+# =========================================================
+
+
+def update_anchor_entry_records(robots, current_time):
+    """Anchor Region 경계를 처음 통과한 시간을 프레임 단위로 기록합니다."""
+    for robot in robots:
+        inside = anchor_election_rect.collidepoint(
+            robot.position.x,
+            robot.position.y,
+        )
+
+        if (
+            inside
+            and not robot.was_in_anchor_region
+            and robot.anchor_region_entry_time is None
+            and robot.role == "NORMAL"
+        ):
+            robot.anchor_region_entry_time = current_time
+
+        robot.was_in_anchor_region = inside
+
+
+def elect_junction_anchor(robots):
+    """Junction Anchor Region에 가장 먼저 진입한 일반 로봇을 선발합니다."""
+    global junction_anchor
+
+    if junction_anchor is not None:
+        return junction_anchor
+
+    candidates = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.anchor_region_entry_time is not None
+    ]
+
+    if not candidates:
+        return None
+
+    junction_anchor = min(
+        candidates,
+        key=lambda robot: (
+            robot.anchor_region_entry_time,
+            robot.robot_id,
+        ),
+    )
+
+    junction_anchor.role = "ANCHOR"
+    junction_anchor.anchor_position = ANCHOR_PARK_POSITION.copy()
+    junction_anchor.local_branch_states = branch_states
+    junction_anchor.selected_branch = None
+
+    print(
+        "[Anchor] elected: "
+        f"robot={junction_anchor.robot_id}, "
+        f"entry_time={junction_anchor.anchor_region_entry_time:.3f}"
+    )
+
+    return junction_anchor
+
+
+def anchor_select_next_branch(anchor):
+    """Anchor가 DFS 순서에서 첫 번째 UNVISITED Branch를 선택합니다."""
+    global active_branch
+
+    if anchor is None or anchor.local_branch_states is None:
+        return None
+
+    for branch in DFS_ORDER:
+        if anchor.local_branch_states[branch] == "UNVISITED":
+            anchor.local_branch_states[branch] = "ACTIVE"
+            anchor.selected_branch = branch
+            active_branch = branch
+
+            print(f"[Anchor] selected branch: {branch}")
+            return branch
+
+    anchor.selected_branch = None
+    return None
+
+
+def anchor_complete_active_branch(anchor, branch):
+    """Backtracking이 Junction까지 완료되면 현재 Branch를 VISITED로 기록합니다."""
+    if anchor is None or anchor.local_branch_states is None:
+        return
+
+    anchor.local_branch_states[branch] = "VISITED"
+    anchor.selected_branch = None
+    print(f"[Anchor] branch completed: {branch}")
+
+
+# =========================================================
+# 11. Shepherd 선택 / 경계 생성
 # =========================================================
 
 
@@ -658,7 +857,8 @@ def build_shepherd_slots(branch, count):
 
 def reset_robot_roles(robots):
     for robot in robots:
-        robot.role = "NORMAL"
+        if robot.role == "SHEPHERD":
+            robot.role = "NORMAL"
         robot.shepherd_anchor = None
 
 
@@ -753,15 +953,48 @@ def normal_backtracking_metrics(robots, branch):
 
 
 def release_shepherds_into_flow(robots):
-    """압력으로 일반 로봇의 backtracking 흐름이 형성되면 즉시 합류시킵니다."""
-    released = 0
-    for robot in robots:
-        if robot.role == "SHEPHERD":
-            robot.role = "NORMAL"
-            robot.shepherd_anchor = None
-            released += 1
+    """일반 로봇의 후진 흐름이 형성되면 Shepherd를 즉시 해제합니다.
 
-    print(f"[Shepherd] released into normal flow: {released}")
+    고정 상태에서 갑자기 0속도로 풀리면 뒤늦게 출발할 수 있으므로,
+    현재 일반 로봇 흐름의 평균 속도 이상으로 Junction 방향 초기속도를 줍니다.
+    """
+    released = 0
+    backtrack_direction = get_backtrack_direction(active_branch)
+
+    normal_signed_speeds = [
+        robot.velocity.dot(backtrack_direction)
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == active_branch
+    ]
+
+    positive_speeds = [
+        max(0.0, speed)
+        for speed in normal_signed_speeds
+    ]
+
+    if positive_speeds:
+        average_flow_speed = max(
+            SHEPHERD_RELEASE_SPEED,
+            sum(positive_speeds) / len(positive_speeds),
+        )
+    else:
+        average_flow_speed = SHEPHERD_RELEASE_SPEED
+
+    for robot in robots:
+        if robot.role != "SHEPHERD":
+            continue
+
+        robot.role = "NORMAL"
+        robot.shepherd_anchor = None
+        robot.velocity = backtrack_direction * average_flow_speed
+        robot.acceleration.update(0.0, 0.0)
+        released += 1
+
+    print(
+        "[Shepherd] released into normal flow: "
+        f"{released}, speed={average_flow_speed:.2f}"
+    )
 
 
 # =========================================================
@@ -824,6 +1057,9 @@ def compute_route_force(robot):
     bottom_hold = get_bottom_hold_point()
     force = pygame.Vector2(0.0, 0.0)
 
+    if robot.role == "ANCHOR":
+        return force
+
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         force = (
             normalized_direction_toward(robot.position, junction_target)
@@ -831,57 +1067,75 @@ def compute_route_force(robot):
         )
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
-        target = (
-            junction_target
-            if region == "BOTTOM"
-            else get_branch_tip_target(active_branch)
+        force = (
+            normalized_direction_toward(
+                robot.position,
+                get_branch_tip_target(active_branch),
+            )
+            * ROUTE_FORCE
         )
-        force = normalized_direction_toward(robot.position, target) * ROUTE_FORCE
 
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
-        if robot.role == "SHEPHERD" and robot.shepherd_anchor is not None:
-            position_error = robot.shepherd_anchor - robot.position
+        if robot.role == "SHEPHERD":
+            # 실제 anchor 정렬은 Robot.update()가 직접 처리합니다.
+            force = pygame.Vector2(0.0, 0.0)
+        elif region == active_branch:
+            # Shepherd가 경계를 만드는 동안 Branch 내부 일반 로봇은 대기합니다.
+            force = pygame.Vector2(0.0, 0.0)
+        else:
+            # Junction 및 아래쪽 로봇은 Junction에서 대기합니다.
             force = (
-                SHEPHERD_FORM_KP * position_error
-                - SHEPHERD_HOLD_KD * robot.velocity
-            )
-        elif region in {"JUNCTION", "BOTTOM"}:
-            # 뒤에서 더 많은 일반 로봇이 branch로 들어오지 않게 아래 대기지점으로 보냄
-            force = (
-                normalized_direction_toward(robot.position, bottom_hold)
+                normalized_direction_toward(
+                    robot.position,
+                    JUNCTION_STAGING_POSITION,
+                )
                 * OUTLET_FORCE
             )
-        else:
-            # Branch 안 NORMAL은 전진력을 즉시 제거하고 감쇠만 받게 함
-            force = pygame.Vector2(0.0, 0.0)
 
     elif phase == SimulationPhase.PRESSURE_PUSH:
-        if robot.role == "SHEPHERD" and robot.shepherd_anchor is not None:
-            position_error = robot.shepherd_anchor - robot.position
+        if robot.role == "SHEPHERD":
+            force = pygame.Vector2(0.0, 0.0)
+        elif region != active_branch:
             force = (
-                SHEPHERD_HOLD_KP * position_error
-                - SHEPHERD_HOLD_KD * robot.velocity
-            )
-        elif region in {"JUNCTION", "BOTTOM"}:
-            force = (
-                normalized_direction_toward(robot.position, bottom_hold)
+                normalized_direction_toward(
+                    robot.position,
+                    JUNCTION_STAGING_POSITION,
+                )
                 * OUTLET_FORCE
             )
-        # Branch 안 NORMAL에는 직접 후진력을 주지 않고 Shepherd 압력으로 흐름을 시작시킴
+        # Branch 안 NORMAL은 Shepherd의 가상 압력으로 먼저 후진합니다.
 
     elif phase == SimulationPhase.FLOW_BACKTRACK:
-        # 흐름이 만들어진 뒤에는 Shepherd 역할을 해제하고 전원이 같은 일반 로봇으로 합류
-        target = bottom_hold if region in {"JUNCTION", "BOTTOM"} else junction_target
+        # Branch 로봇은 Parent Junction까지만 복귀합니다.
+        target = (
+            junction_target
+            if region == active_branch
+            else JUNCTION_STAGING_POSITION
+        )
         force = (
             normalized_direction_toward(robot.position, target)
             * FLOW_BACKTRACK_FORCE
         )
 
-    elif phase in {SimulationPhase.REGROUP, SimulationPhase.DONE}:
+    elif phase == SimulationPhase.JUNCTION_SWITCH:
+        # 다음 Branch 결정 전 짧게 Junction 안에서 안정화합니다.
+        force = (
+            normalized_direction_toward(
+                robot.position,
+                JUNCTION_STAGING_POSITION,
+            )
+            * OUTLET_FORCE
+        )
+
+    elif phase == SimulationPhase.RETURN_TO_BASE:
+        # 모든 Branch가 VISITED 된 후에만 시작 위치로 최종 복귀합니다.
         force = (
             normalized_direction_toward(robot.position, bottom_hold)
             * OUTLET_FORCE
         )
+
+    elif phase == SimulationPhase.DONE:
+        force = pygame.Vector2(0.0, 0.0)
 
     # 복도 중심선 구속
     if region in {"UP", "BOTTOM"}:
@@ -898,6 +1152,23 @@ def compute_sph_forces(robots, grid):
     backtrack_direction = get_backtrack_direction(active_branch)
 
     for robot_i in robots:
+        if robot_i.role == "ANCHOR":
+            robot_i.acceleration.update(0.0, 0.0)
+            continue
+
+        # Shepherd는 FORM/PRESSURE_PUSH 중 움직이는 입자가 아니라
+        # 고정된 SPH 경계 입자입니다. 자신의 이동 힘 계산은 생략하지만,
+        # 다른 일반 로봇의 이웃 robot_j로는 계속 포함됩니다.
+        if (
+            robot_i.role == "SHEPHERD"
+            and phase in {
+                SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+                SimulationPhase.PRESSURE_PUSH,
+            }
+        ):
+            robot_i.acceleration.update(0.0, 0.0)
+            continue
+
         pressure_force = pygame.Vector2(0.0, 0.0)
         viscosity_force = pygame.Vector2(0.0, 0.0)
         repulsion_force = pygame.Vector2(0.0, 0.0)
@@ -1098,29 +1369,37 @@ def count_branch_roles(robots, branch):
 
 def update_simulation_state(robots, dt, reference_density):
     global phase
-    global dfs_index
     global active_branch
     global saturation_timer
     global shepherd_form_timer
     global pressure_push_timer
     global flow_establish_timer
+    global junction_switch_timer
 
-    bottom_hold = get_bottom_hold_point()
+    # Junction 최초 진입자를 Anchor로 선발합니다.
+    anchor = elect_junction_anchor(robots)
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         robots_in_junction = sum(
             get_robot_region(robot.position) == "JUNCTION"
+            and robot.role != "ANCHOR"
             for robot in robots
         )
 
-        if robots_in_junction >= JUNCTION_ENTRY_COUNT:
-            phase = SimulationPhase.EXPLORE_BRANCH
-            print(f"[DFS] Branch 탐색 시작: {active_branch}")
+        if anchor is not None and robots_in_junction >= JUNCTION_ENTRY_COUNT:
+            selected = anchor_select_next_branch(anchor)
+
+            if selected is None:
+                phase = SimulationPhase.RETURN_TO_BASE
+            else:
+                phase = SimulationPhase.EXPLORE_BRANCH
+                print(f"[DFS] Branch 탐색 시작: {active_branch}")
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
-        # 포화될 때까지 기다리지 않고 조기 감지 영역에 먼저 도착한 8대를 즉시 선발
+        # Dead-end 조기 감지 영역에 먼저 도착한 8대를 즉시 Shepherd로 선발합니다.
         capture_count = sum(
             get_robot_region(robot.position) == active_branch
+            and robot.role == "NORMAL"
             and early_capture_regions[active_branch].collidepoint(
                 robot.position.x,
                 robot.position.y,
@@ -1163,13 +1442,11 @@ def update_simulation_state(robots, dt, reference_density):
             and average_speed >= FLOW_AVERAGE_SPEED_THRESHOLD
         )
 
-        # 일반 로봇 대다수가 Junction 방향으로 움직이는 상태가 잠깐 유지되면 즉시 해제
         if flow_is_established:
             flow_establish_timer += dt
         else:
             flow_establish_timer = 0.0
 
-        # 정상 조건 또는 너무 오래 걸리는 경우의 fallback
         if (
             flow_establish_timer >= FLOW_ESTABLISH_DWELL_TIME
             or pressure_push_timer >= FLOW_FALLBACK_TIME
@@ -1189,81 +1466,78 @@ def update_simulation_state(robots, dt, reference_density):
             get_robot_region(robot.position) == active_branch
             for robot in robots
         )
-
-        if robots_remaining_in_branch <= BRANCH_CLEAR_LIMIT:
-            phase = SimulationPhase.REGROUP
-            print("[DFS] 전체 backtracking 완료, regroup 시작")
-
-    elif phase == SimulationPhase.REGROUP:
-        robots_in_bottom = sum(
-            get_robot_region(robot.position) == "BOTTOM"
-            for robot in robots
-        )
         robots_in_junction = sum(
             get_robot_region(robot.position) == "JUNCTION"
+            and robot.role != "ANCHOR"
             for robot in robots
         )
-        robots_remaining_in_branch = sum(
-            get_robot_region(robot.position) == active_branch
-            for robot in robots
-        )
-
-        average_bottom_distance = sum(
-            robot.position.distance_to(bottom_hold)
-            for robot in robots
-        ) / len(robots)
 
         if (
-            robots_in_bottom >= REGROUP_BOTTOM_TARGET_COUNT
-            and robots_in_junction <= 8
-            and robots_remaining_in_branch <= 1
-            and average_bottom_distance <= REGROUP_SPREAD_THRESHOLD
+            robots_remaining_in_branch <= BRANCH_CLEAR_LIMIT
+            and robots_in_junction >= JUNCTION_SWITCH_COUNT
         ):
-            branch_states[active_branch] = "VISITED"
-            phase = SimulationPhase.SELECT_NEXT_BRANCH
+            anchor_complete_active_branch(anchor, active_branch)
+            phase = SimulationPhase.JUNCTION_SWITCH
+            junction_switch_timer = 0.0
+            print("[DFS] Parent Junction 도착, 다음 Branch 전환 준비")
 
-    elif phase == SimulationPhase.SELECT_NEXT_BRANCH:
-        dfs_index += 1
+    elif phase == SimulationPhase.JUNCTION_SWITCH:
+        junction_switch_timer += dt
 
-        if dfs_index >= len(DFS_ORDER):
+        if junction_switch_timer >= JUNCTION_SWITCH_DWELL_TIME:
+            next_branch = anchor_select_next_branch(anchor)
+
+            if next_branch is None:
+                phase = SimulationPhase.RETURN_TO_BASE
+                print("[DFS] 모든 Branch 완료, Base로 최종 복귀")
+            else:
+                saturation_timer = 0.0
+                shepherd_form_timer = 0.0
+                pressure_push_timer = 0.0
+                flow_establish_timer = 0.0
+                phase = SimulationPhase.EXPLORE_BRANCH
+                print(f"[DFS] Junction에서 바로 다음 Branch 탐색: {active_branch}")
+
+    elif phase == SimulationPhase.RETURN_TO_BASE:
+        robots_in_bottom = sum(
+            get_robot_region(robot.position) == "BOTTOM"
+            and robot.role != "ANCHOR"
+            for robot in robots
+        )
+
+        if robots_in_bottom >= RETURN_BOTTOM_TARGET_COUNT:
             phase = SimulationPhase.DONE
-            print("[DFS] 모든 Branch 탐색 완료")
-            return
+            print("[DFS] 탐색 및 최종 Base 복귀 완료")
 
-        active_branch = DFS_ORDER[dfs_index]
-        branch_states[active_branch] = "ACTIVE"
-        saturation_timer = 0.0
-        shepherd_form_timer = 0.0
-        pressure_push_timer = 0.0
-        flow_establish_timer = 0.0
-        phase = SimulationPhase.EXPLORE_BRANCH
-        print(f"[DFS] 다음 Branch 탐색: {active_branch}")
 
 # =========================================================
-# 13. 초기화
+# 14. 초기화
 # =========================================================
 
 
 def reset_dfs_state():
     global phase
-    global dfs_index
     global active_branch
     global branch_states
+    global junction_anchor
+    global simulation_time
+    global junction_switch_timer
     global saturation_timer
     global shepherd_form_timer
     global pressure_push_timer
     global flow_establish_timer
 
     phase = SimulationPhase.MOVE_TO_JUNCTION
-    dfs_index = 0
     active_branch = DFS_ORDER[0]
     branch_states = {
         "UP": "UNVISITED",
         "LEFT": "UNVISITED",
         "RIGHT": "UNVISITED",
     }
-    branch_states[active_branch] = "ACTIVE"
 
+    junction_anchor = None
+    simulation_time = 0.0
+    junction_switch_timer = 0.0
     saturation_timer = 0.0
     shepherd_form_timer = 0.0
     pressure_push_timer = 0.0
@@ -1331,6 +1605,7 @@ while running:
                 running = False
 
     if not paused:
+        simulation_time += frame_dt
         substep_dt = frame_dt / SUBSTEPS
 
         for _ in range(SUBSTEPS):
@@ -1341,6 +1616,8 @@ while running:
 
             for robot in robots:
                 robot.update(substep_dt)
+
+        update_anchor_entry_records(robots, simulation_time)
 
         update_simulation_state(
             robots,
@@ -1362,6 +1639,14 @@ while running:
 
     if show_regions:
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
+        pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
+        pygame.draw.circle(
+            screen,
+            ANCHOR_COLOR,
+            (round(ANCHOR_PARK_POSITION.x), round(ANCHOR_PARK_POSITION.y)),
+            4,
+            width=1,
+        )
 
         for branch, rect in dead_end_regions.items():
             border_color = (
@@ -1413,12 +1698,25 @@ while running:
     )
 
     phase_text = phase.name
-    active_text = active_branch if phase != SimulationPhase.DONE else "-"
+    active_text = (
+        active_branch
+        if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.DONE}
+        else "-"
+    )
+    anchor_id = junction_anchor.robot_id if junction_anchor is not None else "-"
+    anchor_selected = (
+        junction_anchor.selected_branch
+        if junction_anchor is not None
+        and junction_anchor.selected_branch is not None
+        else "-"
+    )
 
     hud_lines = [
         f"FPS: {clock.get_fps():.1f}",
         f"Robots: {len(robots)}",
+        f"Motion speed: {MOTION_SPEED_MULTIPLIER:.1f}x",
         f"Phase: {phase_text}",
+        f"Anchor ID: {anchor_id} | selected: {anchor_selected}",
         f"Active branch: {active_text}",
         f"Shepherds: {len(get_shepherds(robots))}",
         f"In branch: normal={normal_remaining}, shepherd={shepherd_remaining}",
