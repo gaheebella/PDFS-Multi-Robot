@@ -18,17 +18,18 @@ FPS = 60
 SUBSTEPS = 2
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Soft Particle Simulation")
+pygame.display.set_caption("SPH + DFS Shepherd Pressure Boundary")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
 
-# 색상
+# 부드러운 색상
 BACKGROUND_COLOR = (248, 249, 252)
 FLOOR_COLOR = (235, 239, 246)
 WALL_COLOR = (96, 106, 124)
 TEXT_COLOR = (58, 67, 82)
 ROBOT_BASE_COLOR = (115, 165, 208)
+SHEPHERD_COLOR = (171, 145, 205)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
 
@@ -116,15 +117,40 @@ dead_end_regions = {
     ),
 }
 
+# Shepherd는 군집 전체가 포화될 때까지 기다리지 않고,
+# dead-end에 가장 먼저 도착한 로봇 8대가 이 영역에 들어오면 즉시 선발됩니다.
+early_capture_regions = {
+    "UP": pygame.Rect(
+        center_x - half_width,
+        center_y - half_width - normal_length,
+        corridor_width,
+        34,
+    ),
+    "LEFT": pygame.Rect(
+        center_x - half_width - normal_length,
+        center_y - half_width,
+        34,
+        corridor_width,
+    ),
+    "RIGHT": pygame.Rect(
+        center_x + half_width + right_length - 34,
+        center_y - half_width,
+        34,
+        corridor_width,
+    ),
+}
+
 # =========================================================
-# 3. DFS 상태
+# 3. DFS / Shepherd 상태
 # =========================================================
 
 
 class SimulationPhase(Enum):
     MOVE_TO_JUNCTION = auto()
     EXPLORE_BRANCH = auto()
-    BACKTRACK = auto()
+    FORM_SHEPHERD_BOUNDARY = auto()
+    PRESSURE_PUSH = auto()
+    FLOW_BACKTRACK = auto()
     REGROUP = auto()
     SELECT_NEXT_BRANCH = auto()
     DONE = auto()
@@ -146,10 +172,14 @@ branch_states = {
     "RIGHT": "UNVISITED",
 }
 branch_states[active_branch] = "ACTIVE"
+
 saturation_timer = 0.0
+shepherd_form_timer = 0.0
+pressure_push_timer = 0.0
+flow_establish_timer = 0.0
 
 # =========================================================
-# 4. SPH 및 이동 파라미터
+# 4. SPH / 로봇 파라미터
 # =========================================================
 
 ROBOT_COUNT = 220
@@ -168,31 +198,59 @@ SAFE_RADIUS = 7.5
 REPULSION_GAIN = 260.0
 
 ROUTE_FORCE = 52.0
-BACKTRACK_FORCE = 48.0
+OUTLET_FORCE = 44.0
+SHEPHERD_BACKTRACK_FORCE = 50.0
 CENTERING_GAIN = 1.2
-ISOLATION_NEIGHBOR_THRESHOLD = 4
-ISOLATION_ROUTE_BOOST = 1.2
-LOCAL_COHESION_GAIN = 22.0
 
 MAX_SPEED = 78.0
 MAX_ACCELERATION = 520.0
 EPSILON = 1e-8
 
-MIN_ROBOTS_AT_END = 18
-SATURATION_SPEED_THRESHOLD = 7.0
-SATURATION_DENSITY_RATIO = 1.22
-SATURATION_DWELL_TIME = 1.4
+# 고립 로봇이 무리를 따라오도록 하는 보조항
+ISOLATION_NEIGHBOR_THRESHOLD = 4
+ISOLATION_ROUTE_BOOST = 1.1
+LOCAL_COHESION_GAIN = 20.0
 
+# Junction 진입 후 첫 branch 탐색 시작 조건
 JUNCTION_ENTRY_COUNT = 18
-BACKTRACK_REMAINING_LIMIT = 1
-REGROUP_BOTTOM_TARGET_COUNT = 208
-REGROUP_SPREAD_THRESHOLD = 36.0
 
-# 공간 해싱 셀 크기: SPH support radius와 동일하게 둠
-CELL_SIZE = SMOOTHING_LENGTH
+# Shepherd boundary
+# dead-end에 가장 먼저 도착한 8대를 즉시 선발하기 위한 조기 감지 깊이
+SHEPHERD_COUNT = 8
+EARLY_CAPTURE_DEPTH = 34
+SHEPHERD_EDGE_MARGIN = 12
+SHEPHERD_FORM_KP = 9.0
+SHEPHERD_HOLD_KP = 9.5
+SHEPHERD_HOLD_KD = 3.8
+SHEPHERD_FORM_TOLERANCE = 5.0
+SHEPHERD_FORM_TIMEOUT = 1.4
+
+# Shepherd의 가상 압력
+SHEPHERD_PRESSURE_FACTOR = 5.2
+VIRTUAL_PRESSURE_RADIUS = 60.0
+VIRTUAL_PRESSURE_FORCE = 105.0
+PRESSURE_RAMP_TIME = 1.2
+
+# 일반 로봇의 backtracking 흐름이 형성되면 Shepherd를 즉시 해제
+FLOW_SPEED_THRESHOLD = 2.5
+FLOW_RATIO_THRESHOLD = 0.72
+FLOW_AVERAGE_SPEED_THRESHOLD = 3.0
+FLOW_ESTABLISH_DWELL_TIME = 0.40
+FLOW_MIN_NORMAL_COUNT = 8
+FLOW_FALLBACK_TIME = 5.0
+
+# 조기 해제 뒤 전체가 함께 빠져나가는 단계
+FLOW_BACKTRACK_FORCE = 46.0
+BRANCH_CLEAR_LIMIT = 1
+
+# Regroup 조건
+REGROUP_BOTTOM_TARGET_COUNT = int(ROBOT_COUNT * 0.94)
+REGROUP_SPREAD_THRESHOLD = 38.0
+
+CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS)
 
 # =========================================================
-# 5. 맵 마스크 및 영역 판정
+# 5. 맵 마스크 / 영역 판정
 # =========================================================
 
 floor_surface = pygame.Surface(
@@ -226,8 +284,10 @@ def get_robot_region(position):
 
 
 def is_region_allowed(position):
-    """DFS가 선택하지 않은 branch를 가상 밸브처럼 닫습니다.
-    REGROUP 동안에는 방금 탐색한 branch를 계속 열어 두어 뒤처진 로봇이 빠져나올 수 있게 합니다.
+    """현재 DFS branch 외의 통로는 가상 밸브처럼 닫습니다.
+
+    Shepherd가 일반 로봇을 밀어내고 마지막으로 복귀할 때까지
+    현재 branch는 계속 열어 둡니다.
     """
     region = get_robot_region(position)
 
@@ -236,7 +296,9 @@ def is_region_allowed(position):
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
-        SimulationPhase.BACKTRACK,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.PRESSURE_PUSH,
+        SimulationPhase.FLOW_BACKTRACK,
         SimulationPhase.REGROUP,
     }:
         return region in {"BOTTOM", "JUNCTION", active_branch}
@@ -248,7 +310,6 @@ def is_region_allowed(position):
 
 
 def is_walkable(position, radius):
-    """로봇 원이 복도 내부와 현재 허용된 DFS 영역 안에 있는지 확인합니다."""
     x = int(round(position.x))
     y = int(round(position.y))
     diagonal = int(round(radius / math.sqrt(2.0)))
@@ -272,7 +333,6 @@ def is_walkable(position, radius):
             return False
 
     return is_region_allowed(position)
-
 
 # =========================================================
 # 6. 공통 함수
@@ -313,12 +373,6 @@ def interpolate_color(color_a, color_b, ratio):
 
 
 def density_to_color(density, color_reference_density):
-    """부드러운 파스텔 색으로 밀도를 표시합니다.
-
-    낮은 밀도: 연한 하늘색
-    기준 밀도: 민트색
-    높은 밀도: 살구색
-    """
     ratio = density / max(color_reference_density, EPSILON)
 
     if ratio <= 1.0:
@@ -336,8 +390,60 @@ def density_to_color(density, color_reference_density):
     )
 
 
+def normalized_direction_toward(source, target):
+    direction = target - source
+    if direction.length_squared() > EPSILON:
+        return direction.normalize()
+    return pygame.Vector2(0.0, 0.0)
+
+
+def get_bottom_hold_point():
+    return pygame.Vector2(
+        center_x,
+        center_y + half_width + normal_length - 18,
+    )
+
+
+def get_branch_tip_target(branch):
+    if branch == "UP":
+        return pygame.Vector2(
+            center_x,
+            center_y - half_width - normal_length + 18,
+        )
+    if branch == "LEFT":
+        return pygame.Vector2(
+            center_x - half_width - normal_length + 18,
+            center_y,
+        )
+    if branch == "RIGHT":
+        return pygame.Vector2(
+            center_x + half_width + right_length - 18,
+            center_y,
+        )
+    return pygame.Vector2(center_x, center_y)
+
+
+def get_backtrack_direction(branch):
+    """Dead-end에서 Junction을 향하는 단위벡터."""
+    return -BRANCH_DIRECTIONS[branch]
+
+
+def branch_progress_position(position, branch):
+    """값이 클수록 dead-end에 가깝습니다."""
+    if branch == "UP":
+        return -position.y
+    if branch == "LEFT":
+        return -position.x
+    if branch == "RIGHT":
+        return position.x
+    return 0.0
+
+
+def branch_progress(robot, branch):
+    return branch_progress_position(robot.position, branch)
+
 # =========================================================
-# 7. 로봇 클래스
+# 7. Robot 클래스
 # =========================================================
 
 
@@ -348,14 +454,17 @@ class Robot:
         self.velocity = pygame.Vector2(0.0, 0.0)
         self.acceleration = pygame.Vector2(0.0, 0.0)
         self.radius = ROBOT_RADIUS
+
         self.density = 0.0
         self.pressure = 0.0
+
+        self.role = "NORMAL"
+        self.shepherd_anchor = None
 
     def update(self, dt):
         self.velocity += self.acceleration * dt
         limit_vector(self.velocity, MAX_SPEED)
 
-        # x, y를 따로 적분해서 벽을 따라 미끄러질 수 있게 함
         x_position = pygame.Vector2(
             self.position.x + self.velocity.x * dt,
             self.position.y,
@@ -380,13 +489,16 @@ class Robot:
         x = round(self.position.x)
         y = round(self.position.y)
 
-        color = (
-            density_to_color(self.density, color_reference_density)
-            if show_density_color
-            else ROBOT_BASE_COLOR
-        )
+        if self.role == "SHEPHERD":
+            color = SHEPHERD_COLOR
+        elif show_density_color:
+            color = density_to_color(
+                self.density,
+                color_reference_density,
+            )
+        else:
+            color = ROBOT_BASE_COLOR
 
-        # 눈처럼 보이는 테두리 원 대신 작은 둥근 사각형으로 표시
         marker_size = self.radius * 2 + 1
         marker_rect = pygame.Rect(
             x - self.radius,
@@ -401,7 +513,6 @@ class Robot:
             marker_rect,
             border_radius=self.radius,
         )
-
 
 # =========================================================
 # 8. 로봇 생성
@@ -465,9 +576,7 @@ def create_random_robots(robot_count):
             candidate.distance_to(robot.position) >= minimum_distance
             for robot in robots
         ):
-            robots.append(
-                Robot(candidate.x, candidate.y, len(robots))
-            )
+            robots.append(Robot(candidate.x, candidate.y, len(robots)))
 
     if len(robots) < robot_count:
         print(
@@ -476,7 +585,6 @@ def create_random_robots(robot_count):
         )
 
     return robots
-
 
 # =========================================================
 # 9. Spatial Hashing
@@ -505,9 +613,159 @@ def iter_neighbor_candidates(robot, grid):
             for candidate in grid.get((cx + dx, cy + dy), []):
                 yield candidate
 
+# =========================================================
+# 10. Shepherd 선택 / 경계 생성
+# =========================================================
+
+
+def build_shepherd_slots(branch, count):
+    """Dead-end 폭을 가로지르는 균일한 Shepherd anchor line."""
+    slots = []
+    usable_half_width = half_width - SHEPHERD_EDGE_MARGIN
+
+    if count <= 1:
+        lateral_values = [0.0]
+    else:
+        lateral_values = [
+            -usable_half_width
+            + 2.0 * usable_half_width * index / (count - 1)
+            for index in range(count)
+        ]
+
+    if branch == "UP":
+        y = center_y - half_width - normal_length + 14
+        slots = [
+            pygame.Vector2(center_x + lateral, y)
+            for lateral in lateral_values
+        ]
+
+    elif branch == "LEFT":
+        x = center_x - half_width - normal_length + 14
+        slots = [
+            pygame.Vector2(x, center_y + lateral)
+            for lateral in lateral_values
+        ]
+
+    elif branch == "RIGHT":
+        x = center_x + half_width + right_length - 14
+        slots = [
+            pygame.Vector2(x, center_y + lateral)
+            for lateral in lateral_values
+        ]
+
+    return slots
+
+
+def reset_robot_roles(robots):
+    for robot in robots:
+        robot.role = "NORMAL"
+        robot.shepherd_anchor = None
+
+
+def select_shepherds(robots, branch):
+    """dead-end 조기 감지 영역에 먼저 들어온 앞쪽 8대를 Shepherd로 선발합니다.
+
+    군집이 완전히 포화된 뒤 선발하지 않으므로 일반 로봇이 Shepherd 뒤,
+    즉 벽과 Shepherd 경계 사이에 끼는 현상을 줄입니다.
+    """
+    reset_robot_roles(robots)
+
+    capture_rect = early_capture_regions[branch]
+    candidates = [
+        robot
+        for robot in robots
+        if get_robot_region(robot.position) == branch
+        and capture_rect.collidepoint(robot.position.x, robot.position.y)
+    ]
+
+    # 값이 클수록 dead-end에 먼저 도착한 로봇입니다.
+    candidates.sort(
+        key=lambda robot: branch_progress(robot, branch),
+        reverse=True,
+    )
+
+    first_arrivals = candidates[:SHEPHERD_COUNT]
+    if len(first_arrivals) < SHEPHERD_COUNT:
+        return []
+
+    slots = build_shepherd_slots(branch, SHEPHERD_COUNT)
+    selected = []
+    unused = list(first_arrivals)
+
+    # 첫 도착자 8대만 이용해서 통로 폭 방향 slot에 배치합니다.
+    for slot in slots:
+        chosen = min(
+            unused,
+            key=lambda robot: robot.position.distance_squared_to(slot),
+        )
+        unused.remove(chosen)
+        chosen.role = "SHEPHERD"
+        chosen.shepherd_anchor = slot.copy()
+        selected.append(chosen)
+
+    print(f"[Shepherd] early first-arrival selected: {len(selected)}")
+    return selected
+
+
+def get_shepherds(robots):
+    return [robot for robot in robots if robot.role == "SHEPHERD"]
+
+
+def shepherd_boundary_formed(robots):
+    shepherds = get_shepherds(robots)
+    if not shepherds:
+        return False
+
+    return all(
+        robot.shepherd_anchor is not None
+        and robot.position.distance_to(robot.shepherd_anchor)
+        <= SHEPHERD_FORM_TOLERANCE
+        for robot in shepherds
+    )
+
+
+def normal_backtracking_metrics(robots, branch):
+    """Branch 안 일반 로봇이 Junction 방향으로 흐르기 시작했는지 계산합니다."""
+    normals = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == branch
+    ]
+
+    if not normals:
+        return 1.0, 0.0, 0
+
+    backtrack_direction = get_backtrack_direction(branch)
+    signed_speeds = [
+        robot.velocity.dot(backtrack_direction)
+        for robot in normals
+    ]
+
+    moving_count = sum(
+        speed >= FLOW_SPEED_THRESHOLD
+        for speed in signed_speeds
+    )
+    moving_ratio = moving_count / len(normals)
+    average_speed = sum(max(0.0, speed) for speed in signed_speeds) / len(normals)
+
+    return moving_ratio, average_speed, len(normals)
+
+
+def release_shepherds_into_flow(robots):
+    """압력으로 일반 로봇의 backtracking 흐름이 형성되면 즉시 합류시킵니다."""
+    released = 0
+    for robot in robots:
+        if robot.role == "SHEPHERD":
+            robot.role = "NORMAL"
+            robot.shepherd_anchor = None
+            released += 1
+
+    print(f"[Shepherd] released into normal flow: {released}")
+
 
 # =========================================================
-# 10. SPH 계산
+# 11. SPH 계산
 # =========================================================
 
 
@@ -543,71 +801,89 @@ def compute_pressures(robots, reference_density):
             * (density_ratio**STIFFNESS_EXPONENT - 1.0)
         )
 
-
-def get_bottom_hold_point():
-    return pygame.Vector2(
-        center_x,
-        center_y + half_width + normal_length - 18,
-    )
-
-
-def get_branch_tip_target(branch):
-    if branch == "UP":
-        return pygame.Vector2(center_x, center_y - half_width - normal_length + 18)
-    if branch == "LEFT":
-        return pygame.Vector2(center_x - half_width - normal_length + 18, center_y)
-    if branch == "RIGHT":
-        return pygame.Vector2(center_x + half_width + right_length - 18, center_y)
-    return pygame.Vector2(center_x, center_y)
-
-
-def normalized_direction_toward(source, target):
-    direction = target - source
-    if direction.length_squared() > EPSILON:
-        return direction.normalize()
-    return pygame.Vector2(0.0, 0.0)
-
-
-def get_route_target(robot):
-    region = get_robot_region(robot.position)
-    junction_target = pygame.Vector2(center_x, center_y)
-    bottom_hold = get_bottom_hold_point()
-
-    if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        return junction_target
-
-    if phase == SimulationPhase.EXPLORE_BRANCH:
-        if region == "BOTTOM":
-            return junction_target
-        return get_branch_tip_target(active_branch)
-
-    if phase == SimulationPhase.BACKTRACK:
-        if region == active_branch:
-            return junction_target
-        return bottom_hold
-
-    if phase == SimulationPhase.REGROUP:
-        return bottom_hold
-
-    if phase == SimulationPhase.DONE:
-        return bottom_hold
-
-    return junction_target
+        # PRESSURE_PUSH 동안 Shepherd를 고압 경계입자로 만듦
+        if (
+            phase == SimulationPhase.PRESSURE_PUSH
+            and robot.role == "SHEPHERD"
+        ):
+            ramp = min(
+                1.0,
+                0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON),
+            )
+            robot.pressure += (
+                PRESSURE_GAIN
+                * robot.density
+                * SHEPHERD_PRESSURE_FACTOR
+                * ramp
+            )
 
 
 def compute_route_force(robot):
     region = get_robot_region(robot.position)
+    junction_target = pygame.Vector2(center_x, center_y)
+    bottom_hold = get_bottom_hold_point()
     force = pygame.Vector2(0.0, 0.0)
 
-    target = get_route_target(robot)
-    direction = normalized_direction_toward(robot.position, target)
+    if phase == SimulationPhase.MOVE_TO_JUNCTION:
+        force = (
+            normalized_direction_toward(robot.position, junction_target)
+            * ROUTE_FORCE
+        )
 
-    if phase in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.EXPLORE_BRANCH}:
-        force = direction * ROUTE_FORCE
-    elif phase in {SimulationPhase.BACKTRACK, SimulationPhase.REGROUP, SimulationPhase.DONE}:
-        force = direction * BACKTRACK_FORCE
+    elif phase == SimulationPhase.EXPLORE_BRANCH:
+        target = (
+            junction_target
+            if region == "BOTTOM"
+            else get_branch_tip_target(active_branch)
+        )
+        force = normalized_direction_toward(robot.position, target) * ROUTE_FORCE
 
-    # 경로 중심선 쪽으로 약한 구속력 추가
+    elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
+        if robot.role == "SHEPHERD" and robot.shepherd_anchor is not None:
+            position_error = robot.shepherd_anchor - robot.position
+            force = (
+                SHEPHERD_FORM_KP * position_error
+                - SHEPHERD_HOLD_KD * robot.velocity
+            )
+        elif region in {"JUNCTION", "BOTTOM"}:
+            # 뒤에서 더 많은 일반 로봇이 branch로 들어오지 않게 아래 대기지점으로 보냄
+            force = (
+                normalized_direction_toward(robot.position, bottom_hold)
+                * OUTLET_FORCE
+            )
+        else:
+            # Branch 안 NORMAL은 전진력을 즉시 제거하고 감쇠만 받게 함
+            force = pygame.Vector2(0.0, 0.0)
+
+    elif phase == SimulationPhase.PRESSURE_PUSH:
+        if robot.role == "SHEPHERD" and robot.shepherd_anchor is not None:
+            position_error = robot.shepherd_anchor - robot.position
+            force = (
+                SHEPHERD_HOLD_KP * position_error
+                - SHEPHERD_HOLD_KD * robot.velocity
+            )
+        elif region in {"JUNCTION", "BOTTOM"}:
+            force = (
+                normalized_direction_toward(robot.position, bottom_hold)
+                * OUTLET_FORCE
+            )
+        # Branch 안 NORMAL에는 직접 후진력을 주지 않고 Shepherd 압력으로 흐름을 시작시킴
+
+    elif phase == SimulationPhase.FLOW_BACKTRACK:
+        # 흐름이 만들어진 뒤에는 Shepherd 역할을 해제하고 전원이 같은 일반 로봇으로 합류
+        target = bottom_hold if region in {"JUNCTION", "BOTTOM"} else junction_target
+        force = (
+            normalized_direction_toward(robot.position, target)
+            * FLOW_BACKTRACK_FORCE
+        )
+
+    elif phase in {SimulationPhase.REGROUP, SimulationPhase.DONE}:
+        force = (
+            normalized_direction_toward(robot.position, bottom_hold)
+            * OUTLET_FORCE
+        )
+
+    # 복도 중심선 구속
     if region in {"UP", "BOTTOM"}:
         force.x += CENTERING_GAIN * (center_x - robot.position.x)
     elif region in {"LEFT", "RIGHT"}:
@@ -618,12 +894,16 @@ def compute_route_force(robot):
 
 def compute_sph_forces(robots, grid):
     h_squared = SMOOTHING_LENGTH**2
+    virtual_radius_squared = VIRTUAL_PRESSURE_RADIUS**2
+    backtrack_direction = get_backtrack_direction(active_branch)
 
     for robot_i in robots:
         pressure_force = pygame.Vector2(0.0, 0.0)
         viscosity_force = pygame.Vector2(0.0, 0.0)
         repulsion_force = pygame.Vector2(0.0, 0.0)
+        virtual_pressure_force = pygame.Vector2(0.0, 0.0)
         cohesion_force = pygame.Vector2(0.0, 0.0)
+
         neighbor_count = 0
         neighbor_center_sum = pygame.Vector2(0.0, 0.0)
 
@@ -633,6 +913,28 @@ def compute_sph_forces(robots, grid):
 
             r_ij = robot_i.position - robot_j.position
             distance_squared = r_ij.length_squared()
+
+            # 가상 압력은 SPH support보다 넓게 쓸 수 있으므로 먼저 검사
+            if (
+                phase == SimulationPhase.PRESSURE_PUSH
+                and robot_i.role == "NORMAL"
+                and robot_j.role == "SHEPHERD"
+                and distance_squared <= virtual_radius_squared
+                and branch_progress(robot_i, active_branch)
+                <= branch_progress(robot_j, active_branch) + 2.0
+            ):
+                distance = math.sqrt(max(distance_squared, EPSILON))
+                ratio = max(0.0, 1.0 - distance / VIRTUAL_PRESSURE_RADIUS)
+                ramp = min(
+                    1.0,
+                    0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON),
+                )
+                virtual_pressure_force += (
+                    backtrack_direction
+                    * VIRTUAL_PRESSURE_FORCE
+                    * ratio**2
+                    * ramp
+                )
 
             if distance_squared <= EPSILON or distance_squared > h_squared:
                 continue
@@ -650,7 +952,7 @@ def compute_sph_forces(robots, grid):
             )
             pressure_force += -pressure_coefficient * gradient
 
-            # Monaghan 인공점성: 두 로봇이 접근할 때만 작동
+            # Monaghan 점성: 접근 중일 때만 적용
             v_ij = robot_i.velocity - robot_j.velocity
             approach_value = v_ij.dot(r_ij)
 
@@ -671,7 +973,9 @@ def compute_sph_forces(robots, grid):
                 c_i = math.sqrt(max(c_i_squared, 0.0))
                 c_j = math.sqrt(max(c_j_squared, 0.0))
                 c_ij = 0.5 * (c_i + c_j)
-                mean_density = 0.5 * (robot_i.density + robot_j.density)
+                mean_density = 0.5 * (
+                    robot_i.density + robot_j.density
+                )
 
                 pi_ij = (
                     -VISCOSITY_XI1 * c_ij * mu_ij
@@ -680,37 +984,58 @@ def compute_sph_forces(robots, grid):
 
                 viscosity_force += -pi_ij * gradient
 
-            # 최소거리 충돌 반발력은 SAFE_RADIUS 안에서만 적용
             if distance < SAFE_RADIUS:
                 direction_away = r_ij / distance
-                penetration_ratio = (SAFE_RADIUS - distance) / SAFE_RADIUS
+                penetration_ratio = (
+                    SAFE_RADIUS - distance
+                ) / SAFE_RADIUS
                 repulsion_force += (
-                    REPULSION_GAIN * penetration_ratio * direction_away
+                    REPULSION_GAIN
+                    * penetration_ratio
+                    * direction_away
                 )
 
         route_force = compute_route_force(robot_i)
 
-        # 근처 이웃이 너무 적으면, 군집 중심 쪽으로 끌어당겨 뒤처짐을 줄임
-        if 0 < neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD:
+        # 뒤처진 로봇 보정. 단 PRESSURE_PUSH 중 branch 안 NORMAL에는
+        # direct route boost를 주지 않아 압력에 의한 복귀를 유지합니다.
+        direct_pressure_phase_normal = (
+            phase == SimulationPhase.PRESSURE_PUSH
+            and robot_i.role == "NORMAL"
+            and get_robot_region(robot_i.position) == active_branch
+        )
+
+        if (
+            0 < neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD
+            and not direct_pressure_phase_normal
+        ):
             local_center = neighbor_center_sum / neighbor_count
             cohesion_direction = local_center - robot_i.position
+
             if cohesion_direction.length_squared() > EPSILON:
                 ratio = (
                     ISOLATION_NEIGHBOR_THRESHOLD - neighbor_count
                 ) / ISOLATION_NEIGHBOR_THRESHOLD
-                cohesion_force = cohesion_direction.normalize() * LOCAL_COHESION_GAIN * ratio
+                cohesion_force = (
+                    cohesion_direction.normalize()
+                    * LOCAL_COHESION_GAIN
+                    * ratio
+                )
 
-        # 완전히 고립되거나 이웃이 적으면 주행 방향 힘을 더 크게 줌
-        if neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD:
+        if (
+            neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD
+            and not direct_pressure_phase_normal
+        ):
             boost_ratio = (
                 ISOLATION_NEIGHBOR_THRESHOLD - neighbor_count
             ) / ISOLATION_NEIGHBOR_THRESHOLD
-            route_force *= (1.0 + ISOLATION_ROUTE_BOOST * boost_ratio)
+            route_force *= 1.0 + ISOLATION_ROUTE_BOOST * boost_ratio
 
         total_acceleration = (
             pressure_force
             + viscosity_force
             + repulsion_force
+            + virtual_pressure_force
             + cohesion_force
             + route_force
             - DAMPING * robot_i.velocity
@@ -721,9 +1046,8 @@ def compute_sph_forces(robots, grid):
             MAX_ACCELERATION,
         )
 
-
 # =========================================================
-# 11. DFS 포화 감지 및 상태 전이
+# 12. 포화 감지 / 상태 전이
 # =========================================================
 
 
@@ -756,11 +1080,30 @@ def is_dead_end_saturated(robots, branch, reference_density):
     )
 
 
+def count_branch_roles(robots, branch):
+    normal_count = 0
+    shepherd_count = 0
+
+    for robot in robots:
+        if get_robot_region(robot.position) != branch:
+            continue
+
+        if robot.role == "SHEPHERD":
+            shepherd_count += 1
+        else:
+            normal_count += 1
+
+    return normal_count, shepherd_count
+
+
 def update_simulation_state(robots, dt, reference_density):
     global phase
     global dfs_index
     global active_branch
     global saturation_timer
+    global shepherd_form_timer
+    global pressure_push_timer
+    global flow_establish_timer
 
     bottom_hold = get_bottom_hold_point()
 
@@ -775,42 +1118,91 @@ def update_simulation_state(robots, dt, reference_density):
             print(f"[DFS] Branch 탐색 시작: {active_branch}")
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
-        if is_dead_end_saturated(
+        # 포화될 때까지 기다리지 않고 조기 감지 영역에 먼저 도착한 8대를 즉시 선발
+        capture_count = sum(
+            get_robot_region(robot.position) == active_branch
+            and early_capture_regions[active_branch].collidepoint(
+                robot.position.x,
+                robot.position.y,
+            )
+            for robot in robots
+        )
+
+        if capture_count >= SHEPHERD_COUNT:
+            selected = select_shepherds(robots, active_branch)
+            if len(selected) == SHEPHERD_COUNT:
+                phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
+                shepherd_form_timer = 0.0
+                print(f"[DFS] dead-end first arrivals detected: {active_branch}")
+                print("[Shepherd] 조기 경계층 형성 시작")
+
+    elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
+        shepherd_form_timer += dt
+
+        if (
+            shepherd_boundary_formed(robots)
+            or shepherd_form_timer >= SHEPHERD_FORM_TIMEOUT
+        ):
+            phase = SimulationPhase.PRESSURE_PUSH
+            pressure_push_timer = 0.0
+            flow_establish_timer = 0.0
+            print("[Shepherd] 고압 경계 형성 완료")
+            print("[Pressure] 일반 로봇 backtracking 흐름 생성 시작")
+
+    elif phase == SimulationPhase.PRESSURE_PUSH:
+        pressure_push_timer += dt
+
+        moving_ratio, average_speed, normal_count = normal_backtracking_metrics(
             robots,
             active_branch,
-            reference_density,
-        ):
-            saturation_timer += dt
+        )
+
+        flow_is_established = (
+            normal_count >= FLOW_MIN_NORMAL_COUNT
+            and moving_ratio >= FLOW_RATIO_THRESHOLD
+            and average_speed >= FLOW_AVERAGE_SPEED_THRESHOLD
+        )
+
+        # 일반 로봇 대다수가 Junction 방향으로 움직이는 상태가 잠깐 유지되면 즉시 해제
+        if flow_is_established:
+            flow_establish_timer += dt
         else:
-            saturation_timer = 0.0
+            flow_establish_timer = 0.0
 
-        if saturation_timer >= SATURATION_DWELL_TIME:
-            phase = SimulationPhase.BACKTRACK
-            saturation_timer = 0.0
-            print(f"[DFS] Branch 포화 감지: {active_branch}")
-            print("[DFS] Parent Junction 방향 Backtracking 시작")
+        # 정상 조건 또는 너무 오래 걸리는 경우의 fallback
+        if (
+            flow_establish_timer >= FLOW_ESTABLISH_DWELL_TIME
+            or pressure_push_timer >= FLOW_FALLBACK_TIME
+            or normal_count == 0
+        ):
+            release_shepherds_into_flow(robots)
+            phase = SimulationPhase.FLOW_BACKTRACK
+            flow_establish_timer = 0.0
+            print(
+                "[Pressure] 흐름 형성 완료 "
+                f"(ratio={moving_ratio:.2f}, avg={average_speed:.2f})"
+            )
+            print("[Shepherd] 즉시 일반 로봇으로 합류")
 
-    elif phase == SimulationPhase.BACKTRACK:
+    elif phase == SimulationPhase.FLOW_BACKTRACK:
         robots_remaining_in_branch = sum(
             get_robot_region(robot.position) == active_branch
             for robot in robots
         )
 
-        if robots_remaining_in_branch <= BACKTRACK_REMAINING_LIMIT:
+        if robots_remaining_in_branch <= BRANCH_CLEAR_LIMIT:
             phase = SimulationPhase.REGROUP
-            print("[DFS] Branch 복귀 완료, bottom staging으로 regroup")
+            print("[DFS] 전체 backtracking 완료, regroup 시작")
 
     elif phase == SimulationPhase.REGROUP:
         robots_in_bottom = sum(
             get_robot_region(robot.position) == "BOTTOM"
             for robot in robots
         )
-
         robots_in_junction = sum(
             get_robot_region(robot.position) == "JUNCTION"
             for robot in robots
         )
-
         robots_remaining_in_branch = sum(
             get_robot_region(robot.position) == active_branch
             for robot in robots
@@ -840,16 +1232,15 @@ def update_simulation_state(robots, dt, reference_density):
 
         active_branch = DFS_ORDER[dfs_index]
         branch_states[active_branch] = "ACTIVE"
+        saturation_timer = 0.0
+        shepherd_form_timer = 0.0
+        pressure_push_timer = 0.0
+        flow_establish_timer = 0.0
         phase = SimulationPhase.EXPLORE_BRANCH
         print(f"[DFS] 다음 Branch 탐색: {active_branch}")
 
-    elif phase == SimulationPhase.DONE:
-        # 마지막 branch 이후에도 약하게 bottom 쪽 regroup을 유지
-        pass
-
-
 # =========================================================
-# 12. 초기화 / 리셋
+# 13. 초기화
 # =========================================================
 
 
@@ -859,6 +1250,9 @@ def reset_dfs_state():
     global active_branch
     global branch_states
     global saturation_timer
+    global shepherd_form_timer
+    global pressure_push_timer
+    global flow_establish_timer
 
     phase = SimulationPhase.MOVE_TO_JUNCTION
     dfs_index = 0
@@ -869,7 +1263,11 @@ def reset_dfs_state():
         "RIGHT": "UNVISITED",
     }
     branch_states[active_branch] = "ACTIVE"
+
     saturation_timer = 0.0
+    shepherd_form_timer = 0.0
+    pressure_push_timer = 0.0
+    flow_establish_timer = 0.0
 
 
 def initialize_simulation():
@@ -890,10 +1288,7 @@ def initialize_simulation():
         robot.density for robot in robots
     ) / len(robots)
 
-    # 물리 계산 기준: 초기 밀도보다 낮게 두어 집단 팽창 유도
     reference_density = initial_mean_density * 0.70
-
-    # 색 표시 기준: 더 낮게 두어 초기 고밀도도 빨갛게 보이게 함
     color_reference_density = initial_mean_density * 0.68
 
     print(f"생성된 로봇 수: {len(robots)}")
@@ -903,12 +1298,10 @@ def initialize_simulation():
     return robots, reference_density, color_reference_density
 
 
-robots, reference_density, color_reference_density = (
-    initialize_simulation()
-)
+robots, reference_density, color_reference_density = initialize_simulation()
 
 # =========================================================
-# 13. 실행 루프
+# 14. 실행 루프
 # =========================================================
 
 running = True
@@ -960,7 +1353,7 @@ while running:
         compute_pressures(robots, reference_density)
 
     # -----------------------------------------------------
-    # 화면 그리기
+    # 그리기
     # -----------------------------------------------------
 
     screen.fill(BACKGROUND_COLOR)
@@ -969,6 +1362,7 @@ while running:
 
     if show_regions:
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
+
         for branch, rect in dead_end_regions.items():
             border_color = (
                 END_REGION_COLOR
@@ -976,6 +1370,28 @@ while running:
                 else (175, 175, 175)
             )
             pygame.draw.rect(screen, border_color, rect, width=2)
+
+        # 조기 Shepherd 선발 영역을 얇은 보라색 선으로 표시
+        pygame.draw.rect(
+            screen,
+            SHEPHERD_COLOR,
+            early_capture_regions[active_branch],
+            width=1,
+        )
+
+        # Shepherd anchor 표시
+        for robot in get_shepherds(robots):
+            if robot.shepherd_anchor is not None:
+                pygame.draw.circle(
+                    screen,
+                    SHEPHERD_COLOR,
+                    (
+                        round(robot.shepherd_anchor.x),
+                        round(robot.shepherd_anchor.y),
+                    ),
+                    3,
+                    width=1,
+                )
 
     pygame.draw.circle(
         screen,
@@ -991,7 +1407,11 @@ while running:
             show_density_color,
         )
 
-    # HUD
+    normal_remaining, shepherd_remaining = count_branch_roles(
+        robots,
+        active_branch,
+    )
+
     phase_text = phase.name
     active_text = active_branch if phase != SimulationPhase.DONE else "-"
 
@@ -1000,6 +1420,8 @@ while running:
         f"Robots: {len(robots)}",
         f"Phase: {phase_text}",
         f"Active branch: {active_text}",
+        f"Shepherds: {len(get_shepherds(robots))}",
+        f"In branch: normal={normal_remaining}, shepherd={shepherd_remaining}",
         (
             "Branch state: "
             f"UP={branch_states['UP']} | "
