@@ -125,6 +125,7 @@ class SimulationPhase(Enum):
     MOVE_TO_JUNCTION = auto()
     EXPLORE_BRANCH = auto()
     BACKTRACK = auto()
+    REGROUP = auto()
     SELECT_NEXT_BRANCH = auto()
     DONE = auto()
 
@@ -169,6 +170,9 @@ REPULSION_GAIN = 260.0
 ROUTE_FORCE = 52.0
 BACKTRACK_FORCE = 48.0
 CENTERING_GAIN = 1.2
+ISOLATION_NEIGHBOR_THRESHOLD = 4
+ISOLATION_ROUTE_BOOST = 1.2
+LOCAL_COHESION_GAIN = 22.0
 
 MAX_SPEED = 78.0
 MAX_ACCELERATION = 520.0
@@ -180,7 +184,9 @@ SATURATION_DENSITY_RATIO = 1.22
 SATURATION_DWELL_TIME = 1.4
 
 JUNCTION_ENTRY_COUNT = 18
-BACKTRACK_REMAINING_LIMIT = 4
+BACKTRACK_REMAINING_LIMIT = 1
+REGROUP_BOTTOM_TARGET_COUNT = 208
+REGROUP_SPREAD_THRESHOLD = 36.0
 
 # 공간 해싱 셀 크기: SPH support radius와 동일하게 둠
 CELL_SIZE = SMOOTHING_LENGTH
@@ -220,7 +226,9 @@ def get_robot_region(position):
 
 
 def is_region_allowed(position):
-    """DFS가 선택하지 않은 branch를 가상 밸브처럼 닫습니다."""
+    """DFS가 선택하지 않은 branch를 가상 밸브처럼 닫습니다.
+    REGROUP 동안에는 방금 탐색한 branch를 계속 열어 두어 뒤처진 로봇이 빠져나올 수 있게 합니다.
+    """
     region = get_robot_region(position)
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
@@ -229,8 +237,12 @@ def is_region_allowed(position):
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
         SimulationPhase.BACKTRACK,
+        SimulationPhase.REGROUP,
     }:
         return region in {"BOTTOM", "JUNCTION", active_branch}
+
+    if phase == SimulationPhase.DONE:
+        return region in {"BOTTOM", "JUNCTION"}
 
     return region != "OUTSIDE"
 
@@ -532,38 +544,70 @@ def compute_pressures(robots, reference_density):
         )
 
 
+def get_bottom_hold_point():
+    return pygame.Vector2(
+        center_x,
+        center_y + half_width + normal_length - 18,
+    )
+
+
+def get_branch_tip_target(branch):
+    if branch == "UP":
+        return pygame.Vector2(center_x, center_y - half_width - normal_length + 18)
+    if branch == "LEFT":
+        return pygame.Vector2(center_x - half_width - normal_length + 18, center_y)
+    if branch == "RIGHT":
+        return pygame.Vector2(center_x + half_width + right_length - 18, center_y)
+    return pygame.Vector2(center_x, center_y)
+
+
+def normalized_direction_toward(source, target):
+    direction = target - source
+    if direction.length_squared() > EPSILON:
+        return direction.normalize()
+    return pygame.Vector2(0.0, 0.0)
+
+
+def get_route_target(robot):
+    region = get_robot_region(robot.position)
+    junction_target = pygame.Vector2(center_x, center_y)
+    bottom_hold = get_bottom_hold_point()
+
+    if phase == SimulationPhase.MOVE_TO_JUNCTION:
+        return junction_target
+
+    if phase == SimulationPhase.EXPLORE_BRANCH:
+        if region == "BOTTOM":
+            return junction_target
+        return get_branch_tip_target(active_branch)
+
+    if phase == SimulationPhase.BACKTRACK:
+        if region == active_branch:
+            return junction_target
+        return bottom_hold
+
+    if phase == SimulationPhase.REGROUP:
+        return bottom_hold
+
+    if phase == SimulationPhase.DONE:
+        return bottom_hold
+
+    return junction_target
+
+
 def compute_route_force(robot):
     region = get_robot_region(robot.position)
     force = pygame.Vector2(0.0, 0.0)
 
-    if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        target = pygame.Vector2(center_x, center_y)
-        direction = target - robot.position
-        if direction.length_squared() > EPSILON:
-            force = direction.normalize() * ROUTE_FORCE
+    target = get_route_target(robot)
+    direction = normalized_direction_toward(robot.position, target)
 
-    elif phase == SimulationPhase.EXPLORE_BRANCH:
-        # 아래쪽 로봇은 먼저 Junction으로 들어옴
-        if region == "BOTTOM":
-            target = pygame.Vector2(center_x, center_y)
-            direction = target - robot.position
-            if direction.length_squared() > EPSILON:
-                force = direction.normalize() * ROUTE_FORCE
-        else:
-            force = BRANCH_DIRECTIONS[active_branch] * ROUTE_FORCE
-
-    elif phase == SimulationPhase.BACKTRACK:
-        # 1차 구현에서는 branch 전체 로봇을 아래 대기지점까지 복귀시킴
-        hold_point = pygame.Vector2(
-            center_x,
-            center_y + half_width + normal_length - 18,
-        )
-        direction = hold_point - robot.position
-        if direction.length_squared() > EPSILON:
-            force = direction.normalize() * BACKTRACK_FORCE
+    if phase in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.EXPLORE_BRANCH}:
+        force = direction * ROUTE_FORCE
+    elif phase in {SimulationPhase.BACKTRACK, SimulationPhase.REGROUP, SimulationPhase.DONE}:
+        force = direction * BACKTRACK_FORCE
 
     # 경로 중심선 쪽으로 약한 구속력 추가
-    region = get_robot_region(robot.position)
     if region in {"UP", "BOTTOM"}:
         force.x += CENTERING_GAIN * (center_x - robot.position.x)
     elif region in {"LEFT", "RIGHT"}:
@@ -579,6 +623,9 @@ def compute_sph_forces(robots, grid):
         pressure_force = pygame.Vector2(0.0, 0.0)
         viscosity_force = pygame.Vector2(0.0, 0.0)
         repulsion_force = pygame.Vector2(0.0, 0.0)
+        cohesion_force = pygame.Vector2(0.0, 0.0)
+        neighbor_count = 0
+        neighbor_center_sum = pygame.Vector2(0.0, 0.0)
 
         for robot_j in iter_neighbor_candidates(robot_i, grid):
             if robot_i is robot_j:
@@ -589,6 +636,9 @@ def compute_sph_forces(robots, grid):
 
             if distance_squared <= EPSILON or distance_squared > h_squared:
                 continue
+
+            neighbor_count += 1
+            neighbor_center_sum += robot_j.position
 
             distance = math.sqrt(distance_squared)
             gradient = spiky_gradient(r_ij, SMOOTHING_LENGTH)
@@ -608,28 +658,20 @@ def compute_sph_forces(robots, grid):
                 mu_ij = (
                     SMOOTHING_LENGTH
                     * approach_value
-                    / (
-                        distance_squared
-                        + 0.01 * SMOOTHING_LENGTH**2
-                    )
+                    / (distance_squared + 0.01 * SMOOTHING_LENGTH**2)
                 )
 
-                # P + kappa*rho = kappa*rho*(rho/rho0)^lambda > 0
                 c_i_squared = (
-                    robot_i.pressure
-                    + PRESSURE_GAIN * robot_i.density
+                    robot_i.pressure + PRESSURE_GAIN * robot_i.density
                 ) / max(robot_i.density, EPSILON)
                 c_j_squared = (
-                    robot_j.pressure
-                    + PRESSURE_GAIN * robot_j.density
+                    robot_j.pressure + PRESSURE_GAIN * robot_j.density
                 ) / max(robot_j.density, EPSILON)
 
                 c_i = math.sqrt(max(c_i_squared, 0.0))
                 c_j = math.sqrt(max(c_j_squared, 0.0))
                 c_ij = 0.5 * (c_i + c_j)
-                mean_density = 0.5 * (
-                    robot_i.density + robot_j.density
-                )
+                mean_density = 0.5 * (robot_i.density + robot_j.density)
 
                 pi_ij = (
                     -VISCOSITY_XI1 * c_ij * mu_ij
@@ -641,21 +683,35 @@ def compute_sph_forces(robots, grid):
             # 최소거리 충돌 반발력은 SAFE_RADIUS 안에서만 적용
             if distance < SAFE_RADIUS:
                 direction_away = r_ij / distance
-                penetration_ratio = (
-                    SAFE_RADIUS - distance
-                ) / SAFE_RADIUS
+                penetration_ratio = (SAFE_RADIUS - distance) / SAFE_RADIUS
                 repulsion_force += (
-                    REPULSION_GAIN
-                    * penetration_ratio
-                    * direction_away
+                    REPULSION_GAIN * penetration_ratio * direction_away
                 )
 
         route_force = compute_route_force(robot_i)
+
+        # 근처 이웃이 너무 적으면, 군집 중심 쪽으로 끌어당겨 뒤처짐을 줄임
+        if 0 < neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD:
+            local_center = neighbor_center_sum / neighbor_count
+            cohesion_direction = local_center - robot_i.position
+            if cohesion_direction.length_squared() > EPSILON:
+                ratio = (
+                    ISOLATION_NEIGHBOR_THRESHOLD - neighbor_count
+                ) / ISOLATION_NEIGHBOR_THRESHOLD
+                cohesion_force = cohesion_direction.normalize() * LOCAL_COHESION_GAIN * ratio
+
+        # 완전히 고립되거나 이웃이 적으면 주행 방향 힘을 더 크게 줌
+        if neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD:
+            boost_ratio = (
+                ISOLATION_NEIGHBOR_THRESHOLD - neighbor_count
+            ) / ISOLATION_NEIGHBOR_THRESHOLD
+            route_force *= (1.0 + ISOLATION_ROUTE_BOOST * boost_ratio)
 
         total_acceleration = (
             pressure_force
             + viscosity_force
             + repulsion_force
+            + cohesion_force
             + route_force
             - DAMPING * robot_i.velocity
         )
@@ -706,6 +762,8 @@ def update_simulation_state(robots, dt, reference_density):
     global active_branch
     global saturation_timer
 
+    bottom_hold = get_bottom_hold_point()
+
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         robots_in_junction = sum(
             get_robot_region(robot.position) == "JUNCTION"
@@ -733,12 +791,42 @@ def update_simulation_state(robots, dt, reference_density):
             print("[DFS] Parent Junction 방향 Backtracking 시작")
 
     elif phase == SimulationPhase.BACKTRACK:
-        robots_remaining = sum(
+        robots_remaining_in_branch = sum(
             get_robot_region(robot.position) == active_branch
             for robot in robots
         )
 
-        if robots_remaining <= BACKTRACK_REMAINING_LIMIT:
+        if robots_remaining_in_branch <= BACKTRACK_REMAINING_LIMIT:
+            phase = SimulationPhase.REGROUP
+            print("[DFS] Branch 복귀 완료, bottom staging으로 regroup")
+
+    elif phase == SimulationPhase.REGROUP:
+        robots_in_bottom = sum(
+            get_robot_region(robot.position) == "BOTTOM"
+            for robot in robots
+        )
+
+        robots_in_junction = sum(
+            get_robot_region(robot.position) == "JUNCTION"
+            for robot in robots
+        )
+
+        robots_remaining_in_branch = sum(
+            get_robot_region(robot.position) == active_branch
+            for robot in robots
+        )
+
+        average_bottom_distance = sum(
+            robot.position.distance_to(bottom_hold)
+            for robot in robots
+        ) / len(robots)
+
+        if (
+            robots_in_bottom >= REGROUP_BOTTOM_TARGET_COUNT
+            and robots_in_junction <= 8
+            and robots_remaining_in_branch <= 1
+            and average_bottom_distance <= REGROUP_SPREAD_THRESHOLD
+        ):
             branch_states[active_branch] = "VISITED"
             phase = SimulationPhase.SELECT_NEXT_BRANCH
 
@@ -748,15 +836,16 @@ def update_simulation_state(robots, dt, reference_density):
         if dfs_index >= len(DFS_ORDER):
             phase = SimulationPhase.DONE
             print("[DFS] 모든 Branch 탐색 완료")
-            for robot in robots:
-                robot.velocity.update(0.0, 0.0)
-                robot.acceleration.update(0.0, 0.0)
             return
 
         active_branch = DFS_ORDER[dfs_index]
         branch_states[active_branch] = "ACTIVE"
         phase = SimulationPhase.EXPLORE_BRANCH
         print(f"[DFS] 다음 Branch 탐색: {active_branch}")
+
+    elif phase == SimulationPhase.DONE:
+        # 마지막 branch 이후에도 약하게 bottom 쪽 regroup을 유지
+        pass
 
 
 # =========================================================
@@ -848,7 +937,7 @@ while running:
             elif event.key == pygame.K_ESCAPE:
                 running = False
 
-    if not paused and phase != SimulationPhase.DONE:
+    if not paused:
         substep_dt = frame_dt / SUBSTEPS
 
         for _ in range(SUBSTEPS):
