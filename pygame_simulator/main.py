@@ -18,19 +18,19 @@ FPS = 60
 SUBSTEPS = 2
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Cross-Corridor Simulation")
+pygame.display.set_caption("SPH + DFS Soft Particle Simulation")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
 
 # 색상
-BACKGROUND_COLOR = (245, 245, 240)
-FLOOR_COLOR = (215, 220, 228)
-WALL_COLOR = (44, 55, 72)
-TEXT_COLOR = (35, 42, 54)
-ROBOT_OUTLINE_COLOR = (15, 70, 120)
-JUNCTION_COLOR = (135, 145, 160)
-END_REGION_COLOR = (215, 120, 80)
+BACKGROUND_COLOR = (248, 249, 252)
+FLOOR_COLOR = (235, 239, 246)
+WALL_COLOR = (96, 106, 124)
+TEXT_COLOR = (58, 67, 82)
+ROBOT_BASE_COLOR = (115, 165, 208)
+JUNCTION_COLOR = (153, 164, 181)
+END_REGION_COLOR = (224, 171, 115)
 
 # =========================================================
 # 2. 십자가 맵
@@ -153,7 +153,7 @@ saturation_timer = 0.0
 
 ROBOT_COUNT = 220
 SPAWN_MODE = "grid"  # "grid" 또는 "random"
-ROBOT_RADIUS = 3
+ROBOT_RADIUS = 2
 GRID_SPACING = 7
 
 SMOOTHING_LENGTH = 28.0
@@ -301,21 +301,25 @@ def interpolate_color(color_a, color_b, ratio):
 
 
 def density_to_color(density, color_reference_density):
-    """초기에도 고밀도가 눈에 잘 보이도록 시각화 기준을 낮게 둡니다."""
+    """부드러운 파스텔 색으로 밀도를 표시합니다.
+
+    낮은 밀도: 연한 하늘색
+    기준 밀도: 민트색
+    높은 밀도: 살구색
+    """
     ratio = density / max(color_reference_density, EPSILON)
 
     if ratio <= 1.0:
         return interpolate_color(
-            (35, 120, 230),
-            (55, 195, 120),
+            (151, 190, 226),
+            (142, 204, 190),
             ratio,
         )
 
-    # ratio=1.0부터 1.6 사이를 빠르게 초록→빨강으로 변환
-    high_ratio = min((ratio - 1.0) / 0.60, 1.0)
+    high_ratio = min((ratio - 1.0) / 0.75, 1.0)
     return interpolate_color(
-        (55, 195, 120),
-        (235, 65, 50),
+        (142, 204, 190),
+        (242, 187, 126),
         high_ratio,
     )
 
@@ -361,20 +365,29 @@ class Robot:
         self.acceleration.update(0.0, 0.0)
 
     def draw(self, surface, color_reference_density, show_density_color):
-        position = (round(self.position.x), round(self.position.y))
+        x = round(self.position.x)
+        y = round(self.position.y)
+
         color = (
             density_to_color(self.density, color_reference_density)
             if show_density_color
-            else (30, 136, 229)
+            else ROBOT_BASE_COLOR
         )
 
-        pygame.draw.circle(surface, color, position, self.radius)
-        pygame.draw.circle(
+        # 눈처럼 보이는 테두리 원 대신 작은 둥근 사각형으로 표시
+        marker_size = self.radius * 2 + 1
+        marker_rect = pygame.Rect(
+            x - self.radius,
+            y - self.radius,
+            marker_size,
+            marker_size,
+        )
+
+        pygame.draw.rect(
             surface,
-            ROBOT_OUTLINE_COLOR,
-            position,
-            self.radius,
-            width=1,
+            color,
+            marker_rect,
+            border_radius=self.radius,
         )
 
 
@@ -811,7 +824,7 @@ robots, reference_density, color_reference_density = (
 
 running = True
 paused = False
-show_density_color = True
+show_density_color = False
 show_regions = True
 
 while running:
@@ -911,7 +924,7 @@ while running:
         screen.blit(rendered, (15, 14 + index * 22))
 
     control_text = font.render(
-        "SPACE pause | R reset | D density color | V regions | ESC quit",
+        "SPACE pause | R reset | D soft density | V regions | ESC quit",
         True,
         TEXT_COLOR,
     )
