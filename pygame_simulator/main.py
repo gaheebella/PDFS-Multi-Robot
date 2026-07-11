@@ -1,6 +1,7 @@
 import math
 import random
 import sys
+from collections import deque
 from enum import Enum, auto
 
 import pygame
@@ -18,7 +19,7 @@ FPS = 60
 SUBSTEPS = 2
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Junction Anchor + Shepherd Boundary")
+pygame.display.set_caption("SPH + DFS Anchor Multi-Hop Communication")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
@@ -33,6 +34,13 @@ SHEPHERD_COLOR = (171, 145, 205)
 ANCHOR_COLOR = (102, 174, 137)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
+
+# 통신 상태 시각화 색상
+COMM_LINK_SAFE_COLOR = (132, 190, 158)
+COMM_LINK_WARNING_COLOR = (226, 177, 96)
+COMM_LINK_DANGER_COLOR = (214, 103, 103)
+DISCONNECTED_COLOR = (205, 96, 96)
+COMM_RANGE_COLOR = (142, 154, 174)
 
 # =========================================================
 # 2. 십자가 맵
@@ -202,6 +210,10 @@ shepherd_form_timer = 0.0
 pressure_push_timer = 0.0
 flow_establish_timer = 0.0
 
+# Anchor 메시지 버전과 통신 상태
+communication_sequence = 0
+last_message_signature = None
+
 # =========================================================
 # 4. SPH / 로봇 파라미터
 # =========================================================
@@ -281,7 +293,35 @@ BRANCH_CLEAR_LIMIT = 1
 # 모든 Branch가 끝난 뒤에만 시작 위치로 최종 복귀합니다.
 FINAL_RETURN_DISTANCE_THRESHOLD = 48.0
 
-CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS)
+# =========================================================
+# 4-1. 명시적 로봇 통신 / 연결성 파라미터
+# =========================================================
+
+# 두 로봇 사이 거리가 이 값 이하일 때만 직접 통신할 수 있습니다.
+COMM_RANGE = 46.0
+
+# 이 거리까지는 충분히 안전한 통신 링크로 봅니다.
+COMM_SAFE_DISTANCE = 34.0
+COMM_BARRIER_START = COMM_RANGE * 0.84
+
+# BFS 통신 트리의 부모 링크가 길어질 때 작용하는 연결 유지력
+CONNECTIVITY_GAIN = 4.5
+CONNECTIVITY_BARRIER_GAIN = 78.0
+
+# 이미 Anchor 통신망에서 떨어진 로봇이 다시 연결된 무리를 찾는 범위와 힘
+COMM_RECOVERY_RANGE = 84.0
+COMM_RECOVERY_GAIN = 2.2
+
+# 화면에 통신 트리를 표시할지의 초기값
+SHOW_COMM_LINKS_DEFAULT = True
+
+# 통신 탐색도 같은 Spatial Hashing을 사용합니다.
+CELL_SIZE = max(
+    SMOOTHING_LENGTH,
+    VIRTUAL_PRESSURE_RADIUS,
+    COMM_RANGE,
+    COMM_RECOVERY_RANGE,
+)
 
 # =========================================================
 # 5. 맵 마스크 / 영역 판정
@@ -505,6 +545,19 @@ class Robot:
         self.anchor_region_entry_time = None
         self.was_in_anchor_region = anchor_election_rect.collidepoint(x, y)
 
+        # -------------------------------------------------
+        # 명시적 국소 통신 상태
+        # -------------------------------------------------
+        self.comm_neighbors = []
+        self.connected_to_anchor = False
+        self.comm_hop = -1
+        self.comm_parent = None
+
+        # Anchor에서 다중 홉으로 수신한 메시지
+        self.received_branch = None
+        self.received_command = None
+        self.received_sequence = -1
+
     def update(self, dt):
         # -------------------------------------------------
         # Junction Anchor는 선발 후 Junction 가장자리 주차점으로 이동한 뒤 고정됩니다.
@@ -620,6 +673,20 @@ class Robot:
             border_radius=self.radius,
         )
 
+        # Anchor가 존재한 뒤 통신망에서 끊긴 로봇은 붉은 테두리로 표시합니다.
+        if (
+            junction_anchor is not None
+            and self.role != "ANCHOR"
+            and not self.connected_to_anchor
+        ):
+            pygame.draw.rect(
+                surface,
+                DISCONNECTED_COLOR,
+                marker_rect.inflate(2, 2),
+                width=1,
+                border_radius=self.radius + 1,
+            )
+
 # =========================================================
 # 8. 로봇 생성
 # =========================================================
@@ -718,6 +785,236 @@ def iter_neighbor_candidates(robot, grid):
         for dy in (-1, 0, 1):
             for candidate in grid.get((cx + dx, cy + dy), []):
                 yield candidate
+
+
+# =========================================================
+# 9-1. 명시적 국소 통신 / 다중 홉 메시지 전달
+# =========================================================
+
+
+def update_communication_neighbors(robots, grid):
+    """COMM_RANGE 안에 있는 로봇만 직접 통신 이웃으로 등록합니다."""
+    comm_range_squared = COMM_RANGE**2
+
+    for robot in robots:
+        robot.comm_neighbors = []
+
+        for other in iter_neighbor_candidates(robot, grid):
+            if robot is other:
+                continue
+
+            if (
+                robot.position.distance_squared_to(other.position)
+                <= comm_range_squared
+            ):
+                robot.comm_neighbors.append(other)
+
+
+def get_anchor_message(anchor):
+    """현재 Anchor가 전파하는 DFS 명령을 반환합니다."""
+    if anchor is None:
+        return None, None
+
+    return anchor.selected_branch, phase.name
+
+
+def propagate_anchor_message(robots, anchor):
+    """Anchor에서 시작해 통신 그래프를 BFS로 순회합니다.
+
+    직접 통신 범위 밖에 있는 로봇도 중간 로봇을 통하는 경로가 있으면
+    selected_branch와 현재 제어 명령을 수신합니다.
+    """
+    global communication_sequence
+    global last_message_signature
+
+    for robot in robots:
+        robot.connected_to_anchor = False
+        robot.comm_hop = -1
+        robot.comm_parent = None
+        robot.received_branch = None
+        robot.received_command = None
+        robot.received_sequence = -1
+
+    if anchor is None:
+        last_message_signature = None
+        return
+
+    selected_branch, command = get_anchor_message(anchor)
+    signature = (selected_branch, command)
+
+    if signature != last_message_signature:
+        communication_sequence += 1
+        last_message_signature = signature
+        print(
+            "[Communication] new message: "
+            f"seq={communication_sequence}, "
+            f"command={command}, branch={selected_branch}"
+        )
+
+    anchor.connected_to_anchor = True
+    anchor.comm_hop = 0
+    anchor.received_branch = selected_branch
+    anchor.received_command = command
+    anchor.received_sequence = communication_sequence
+
+    queue = deque([anchor])
+
+    while queue:
+        current = queue.popleft()
+
+        for neighbor in current.comm_neighbors:
+            if neighbor.connected_to_anchor:
+                continue
+
+            neighbor.connected_to_anchor = True
+            neighbor.comm_hop = current.comm_hop + 1
+            neighbor.comm_parent = current
+            neighbor.received_branch = selected_branch
+            neighbor.received_command = command
+            neighbor.received_sequence = communication_sequence
+            queue.append(neighbor)
+
+
+def update_communication_system(robots, grid):
+    update_communication_neighbors(robots, grid)
+    propagate_anchor_message(robots, junction_anchor)
+
+
+def find_nearest_connected_robot(robot, grid):
+    """통신이 끊긴 로봇 주변에서 Anchor와 연결된 가장 가까운 로봇을 찾습니다."""
+    recovery_squared = COMM_RECOVERY_RANGE**2
+    nearest = None
+    nearest_distance_squared = recovery_squared
+
+    for candidate in iter_neighbor_candidates(robot, grid):
+        if candidate is robot or not candidate.connected_to_anchor:
+            continue
+
+        distance_squared = robot.position.distance_squared_to(
+            candidate.position
+        )
+
+        if distance_squared < nearest_distance_squared:
+            nearest_distance_squared = distance_squared
+            nearest = candidate
+
+    return nearest
+
+
+def compute_connectivity_force(robot, grid):
+    """현재 BFS 통신 트리의 부모 링크를 통신 범위 안에 유지합니다.
+
+    이 항은 명령 전달 자체와 별개의 연결성 유지용 안전 보조항입니다.
+    """
+    if junction_anchor is None or robot.role == "ANCHOR":
+        return pygame.Vector2(0.0, 0.0)
+
+    force = pygame.Vector2(0.0, 0.0)
+
+    if robot.connected_to_anchor and robot.comm_parent is not None:
+        delta = robot.comm_parent.position - robot.position
+        distance = delta.length()
+
+        if distance > EPSILON:
+            direction = delta / distance
+
+            if distance > COMM_SAFE_DISTANCE:
+                force += (
+                    CONNECTIVITY_GAIN
+                    * (distance - COMM_SAFE_DISTANCE)
+                    * direction
+                )
+
+            if distance > COMM_BARRIER_START:
+                denominator = max(
+                    COMM_RANGE - COMM_BARRIER_START,
+                    EPSILON,
+                )
+                ratio = min(
+                    1.0,
+                    (distance - COMM_BARRIER_START) / denominator,
+                )
+                force += (
+                    CONNECTIVITY_BARRIER_GAIN
+                    * ratio**2
+                    * direction
+                )
+
+    elif not robot.connected_to_anchor:
+        # 이미 끊어진 경우 가장 가까운 연결 로봇 쪽으로 이동해 재접속을 시도합니다.
+        recovery_target = find_nearest_connected_robot(robot, grid)
+
+        if recovery_target is not None:
+            delta = recovery_target.position - robot.position
+            distance = delta.length()
+
+            if distance > EPSILON:
+                force += (
+                    COMM_RECOVERY_GAIN
+                    * min(distance, COMM_RECOVERY_RANGE)
+                    * (delta / distance)
+                )
+
+    return force
+
+
+def get_communication_stats(robots):
+    if junction_anchor is None:
+        return {
+            "connected": 0,
+            "disconnected": len(robots),
+            "max_hop": 0,
+            "direct_anchor_neighbors": 0,
+            "minimum_margin": 0.0,
+        }
+
+    connected = [robot for robot in robots if robot.connected_to_anchor]
+    disconnected_count = len(robots) - len(connected)
+    max_hop = max((robot.comm_hop for robot in connected), default=0)
+
+    margins = []
+    for robot in connected:
+        if robot.comm_parent is None:
+            continue
+        distance = robot.position.distance_to(robot.comm_parent.position)
+        margins.append(COMM_RANGE - distance)
+
+    return {
+        "connected": len(connected),
+        "disconnected": disconnected_count,
+        "max_hop": max_hop,
+        "direct_anchor_neighbors": len(junction_anchor.comm_neighbors),
+        "minimum_margin": min(margins) if margins else COMM_RANGE,
+    }
+
+
+def draw_communication_links(surface, robots):
+    """모든 완전 그래프가 아니라 Anchor BFS 트리 링크만 그립니다."""
+    if junction_anchor is None:
+        return
+
+    for robot in robots:
+        parent = robot.comm_parent
+        if not robot.connected_to_anchor or parent is None:
+            continue
+
+        distance = robot.position.distance_to(parent.position)
+
+        if distance <= COMM_SAFE_DISTANCE:
+            color = COMM_LINK_SAFE_COLOR
+        elif distance <= COMM_BARRIER_START:
+            color = COMM_LINK_WARNING_COLOR
+        else:
+            color = COMM_LINK_DANGER_COLOR
+
+        pygame.draw.line(
+            surface,
+            color,
+            (round(robot.position.x), round(robot.position.y)),
+            (round(parent.position.x), round(parent.position.y)),
+            width=1,
+        )
+
 
 # =========================================================
 # 10. Junction Anchor 선발 / DFS 관리
@@ -1060,6 +1357,26 @@ def compute_route_force(robot):
     if robot.role == "ANCHOR":
         return force
 
+    # Anchor 선발 이후에는 실제로 Anchor 통신망에 연결되어 있고,
+    # 현재 메시지를 수신한 로봇만 DFS 이동 명령을 수행합니다.
+    if phase != SimulationPhase.MOVE_TO_JUNCTION and junction_anchor is not None:
+        if (
+            not robot.connected_to_anchor
+            or robot.received_command != phase.name
+        ):
+            return force
+
+        if (
+            phase in {
+                SimulationPhase.EXPLORE_BRANCH,
+                SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+                SimulationPhase.PRESSURE_PUSH,
+                SimulationPhase.FLOW_BACKTRACK,
+            }
+            and robot.received_branch != active_branch
+        ):
+            return force
+
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         force = (
             normalized_direction_toward(robot.position, junction_target)
@@ -1267,6 +1584,7 @@ def compute_sph_forces(robots, grid):
                 )
 
         route_force = compute_route_force(robot_i)
+        connectivity_force = compute_connectivity_force(robot_i, grid)
 
         # 뒤처진 로봇 보정. 단 PRESSURE_PUSH 중 branch 안 NORMAL에는
         # direct route boost를 주지 않아 압력에 의한 복귀를 유지합니다.
@@ -1309,6 +1627,7 @@ def compute_sph_forces(robots, grid):
             + virtual_pressure_force
             + cohesion_force
             + route_force
+            + connectivity_force
             - DAMPING * robot_i.velocity
         )
 
@@ -1526,6 +1845,8 @@ def reset_dfs_state():
     global shepherd_form_timer
     global pressure_push_timer
     global flow_establish_timer
+    global communication_sequence
+    global last_message_signature
 
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = DFS_ORDER[0]
@@ -1542,6 +1863,8 @@ def reset_dfs_state():
     shepherd_form_timer = 0.0
     pressure_push_timer = 0.0
     flow_establish_timer = 0.0
+    communication_sequence = 0
+    last_message_signature = None
 
 
 def initialize_simulation():
@@ -1569,6 +1892,8 @@ def initialize_simulation():
     print(f"초기 평균 밀도: {initial_mean_density:.6f}")
     print(f"물리 기준 밀도 rho_0: {reference_density:.6f}")
 
+    update_communication_system(robots, grid)
+
     return robots, reference_density, color_reference_density
 
 
@@ -1582,6 +1907,7 @@ running = True
 paused = False
 show_density_color = False
 show_regions = True
+show_comm_links = SHOW_COMM_LINKS_DEFAULT
 
 while running:
     frame_dt = min(clock.tick(FPS) / 1000.0, 0.033)
@@ -1601,6 +1927,8 @@ while running:
                 show_density_color = not show_density_color
             elif event.key == pygame.K_v:
                 show_regions = not show_regions
+            elif event.key == pygame.K_c:
+                show_comm_links = not show_comm_links
             elif event.key == pygame.K_ESCAPE:
                 running = False
 
@@ -1610,6 +1938,7 @@ while running:
 
         for _ in range(SUBSTEPS):
             spatial_grid = build_spatial_grid(robots)
+            update_communication_system(robots, spatial_grid)
             compute_densities(robots, spatial_grid)
             compute_pressures(robots, reference_density)
             compute_sph_forces(robots, spatial_grid)
@@ -1624,8 +1953,13 @@ while running:
             frame_dt,
             reference_density,
         )
+
+        # 상태 전이로 Anchor 명령이 바뀌었을 수 있으므로 즉시 다시 전파합니다.
+        spatial_grid = build_spatial_grid(robots)
+        update_communication_system(robots, spatial_grid)
     else:
         spatial_grid = build_spatial_grid(robots)
+        update_communication_system(robots, spatial_grid)
         compute_densities(robots, spatial_grid)
         compute_pressures(robots, reference_density)
 
@@ -1685,6 +2019,9 @@ while running:
         5,
     )
 
+    if show_comm_links:
+        draw_communication_links(screen, robots)
+
     for robot in robots:
         robot.draw(
             screen,
@@ -1710,6 +2047,7 @@ while running:
         and junction_anchor.selected_branch is not None
         else "-"
     )
+    communication_stats = get_communication_stats(robots)
 
     hud_lines = [
         f"FPS: {clock.get_fps():.1f}",
@@ -1717,6 +2055,16 @@ while running:
         f"Motion speed: {MOTION_SPEED_MULTIPLIER:.1f}x",
         f"Phase: {phase_text}",
         f"Anchor ID: {anchor_id} | selected: {anchor_selected}",
+        (
+            "Comm: "
+            f"{communication_stats['connected']}/{len(robots)} connected | "
+            f"max hop={communication_stats['max_hop']}"
+        ),
+        (
+            "Comm link: "
+            f"direct={communication_stats['direct_anchor_neighbors']} | "
+            f"min margin={communication_stats['minimum_margin']:.1f}px"
+        ),
         f"Active branch: {active_text}",
         f"Shepherds: {len(get_shepherds(robots))}",
         f"In branch: normal={normal_remaining}, shepherd={shepherd_remaining}",
@@ -1733,7 +2081,7 @@ while running:
         screen.blit(rendered, (15, 14 + index * 22))
 
     control_text = font.render(
-        "SPACE pause | R reset | D soft density | V regions | ESC quit",
+        "SPACE pause | R reset | D density | V regions | C comm links | ESC quit",
         True,
         TEXT_COLOR,
     )
