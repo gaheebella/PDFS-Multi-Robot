@@ -19,7 +19,7 @@ FPS = 60
 SUBSTEPS = 2
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Anchor Multi-Hop Communication")
+pygame.display.set_caption("SPH + DFS Anchor + Temporary Relay Chain")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
@@ -32,6 +32,8 @@ TEXT_COLOR = (58, 67, 82)
 ROBOT_BASE_COLOR = (115, 165, 208)
 SHEPHERD_COLOR = (171, 145, 205)
 ANCHOR_COLOR = (102, 174, 137)
+RELAY_COLOR = (226, 151, 82)
+RELAY_SLOT_COLOR = (196, 129, 65)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
 
@@ -214,6 +216,12 @@ flow_establish_timer = 0.0
 communication_sequence = 0
 last_message_signature = None
 
+# 현재 Branch의 임시 Relay 배치 계획
+relay_slots = []
+relay_deploy_cooldown = 0.0
+relay_retract_cooldown = 0.0
+relay_motion_scale = 1.0
+
 # =========================================================
 # 4. SPH / 로봇 파라미터
 # =========================================================
@@ -314,6 +322,33 @@ COMM_RECOVERY_GAIN = 2.2
 
 # 화면에 통신 트리를 표시할지의 초기값
 SHOW_COMM_LINKS_DEFAULT = True
+
+# =========================================================
+# 4-2. 임시 Relay Chain 파라미터
+# =========================================================
+
+# Relay는 통신 한계보다 충분히 짧은 간격으로 Branch 측면에 배치됩니다.
+RELAY_SPACING = 30.0
+RELAY_DEPLOY_LOOKAHEAD = 12.0
+RELAY_SELECTION_RADIUS = 52.0
+RELAY_END_CLEARANCE = 24.0
+RELAY_LANE_MARGIN = 22.0
+
+# Relay가 slot으로 이동하고 위치를 유지하는 속도/허용 오차
+RELAY_MOVE_SPEED = 125.0 * MOTION_SPEED_MULTIPLIER
+RELAY_POSITION_TOLERANCE = 2.5
+RELAY_DEPLOY_COOLDOWN = 0.10
+
+# Backtracking 군집이 Relay에 도착하면 가장 먼 Relay부터 해제됩니다.
+RELAY_RETRACT_RADIUS = 30.0
+RELAY_RETRACT_COOLDOWN = 0.16
+RELAY_RELEASE_SPEED = 16.0 * MOTION_SPEED_MULTIPLIER
+
+# Relay 배치가 늦으면 탐색 군집을 감속하여 링크 단절을 예방합니다.
+RELAY_FORMING_SPEED_SCALE = 0.30
+RELAY_WAIT_SPEED_SCALE = 0.08
+RELAY_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE
+RELAY_LINK_STOP_DISTANCE = COMM_RANGE * 0.94
 
 # 통신 탐색도 같은 Spatial Hashing을 사용합니다.
 CELL_SIZE = max(
@@ -535,6 +570,10 @@ class Robot:
         self.role = "NORMAL"
         self.shepherd_anchor = None
 
+        # 임시 Relay Chain 상태
+        self.relay_anchor = None
+        self.relay_index = -1
+
         # Junction Anchor 상태
         self.anchor_position = None
         self.local_branch_states = None
@@ -580,6 +619,33 @@ class Robot:
                     self.position = next_position
             else:
                 self.position = self.anchor_position.copy()
+
+            self.velocity.update(0.0, 0.0)
+            self.acceleration.update(0.0, 0.0)
+            return
+
+        # -------------------------------------------------
+        # Relay는 Branch 측면 slot으로 이동한 뒤 고정 통신 노드가 됩니다.
+        # Backtracking 시 역할이 해제되면 다시 NORMAL로 군집에 합류합니다.
+        # -------------------------------------------------
+        if self.role == "RELAY" and self.relay_anchor is not None:
+            position_error = self.relay_anchor - self.position
+
+            if position_error.length_squared() > RELAY_POSITION_TOLERANCE**2:
+                maximum_step = RELAY_MOVE_SPEED * dt
+
+                if position_error.length() <= maximum_step:
+                    next_position = self.relay_anchor.copy()
+                else:
+                    next_position = (
+                        self.position
+                        + position_error.normalize() * maximum_step
+                    )
+
+                if is_walkable(next_position, self.radius):
+                    self.position = next_position
+            else:
+                self.position = self.relay_anchor.copy()
 
             self.velocity.update(0.0, 0.0)
             self.acceleration.update(0.0, 0.0)
@@ -648,6 +714,8 @@ class Robot:
 
         if self.role == "ANCHOR":
             color = ANCHOR_COLOR
+        elif self.role == "RELAY":
+            color = RELAY_COLOR
         elif self.role == "SHEPHERD":
             color = SHEPHERD_COLOR
         elif show_density_color:
@@ -672,6 +740,15 @@ class Robot:
             marker_rect,
             border_radius=self.radius,
         )
+
+        if self.role == "RELAY":
+            pygame.draw.circle(
+                surface,
+                RELAY_COLOR,
+                (x, y),
+                self.radius + 3,
+                width=1,
+            )
 
         # Anchor가 존재한 뒤 통신망에서 끊긴 로봇은 붉은 테두리로 표시합니다.
         if (
@@ -1017,6 +1094,396 @@ def draw_communication_links(surface, robots):
 
 
 # =========================================================
+# 9-2. 임시 Relay Chain 배치 / 회수
+# =========================================================
+
+
+def get_relay_path_endpoint(branch):
+    """통행을 막지 않도록 Branch 한쪽 측면의 Relay lane 끝점을 반환합니다."""
+    if branch == "UP":
+        return pygame.Vector2(
+            center_x - half_width + RELAY_LANE_MARGIN,
+            center_y - half_width - normal_length + RELAY_END_CLEARANCE,
+        )
+
+    if branch == "LEFT":
+        return pygame.Vector2(
+            center_x - half_width - normal_length + RELAY_END_CLEARANCE,
+            center_y - half_width + RELAY_LANE_MARGIN,
+        )
+
+    if branch == "RIGHT":
+        return pygame.Vector2(
+            center_x + half_width + right_length - RELAY_END_CLEARANCE,
+            center_y - half_width + RELAY_LANE_MARGIN,
+        )
+
+    return ANCHOR_PARK_POSITION.copy()
+
+
+def initialize_relay_plan(branch):
+    """Anchor에서 Branch 끝 방향으로 RELAY_SPACING 간격의 slot을 생성합니다."""
+    global relay_slots
+    global relay_deploy_cooldown
+    global relay_retract_cooldown
+    global relay_motion_scale
+
+    start = ANCHOR_PARK_POSITION.copy()
+    end = get_relay_path_endpoint(branch)
+    path_vector = end - start
+    path_length = path_vector.length()
+
+    relay_slots = []
+    relay_deploy_cooldown = 0.0
+    relay_retract_cooldown = 0.0
+    relay_motion_scale = 1.0
+
+    if path_length <= EPSILON:
+        return
+
+    direction = path_vector / path_length
+    distance = RELAY_SPACING
+    slot_index = 0
+
+    while distance <= path_length:
+        relay_slots.append(
+            {
+                "index": slot_index,
+                "position": start + direction * distance,
+                "path_distance": distance,
+            }
+        )
+        slot_index += 1
+        distance += RELAY_SPACING
+
+    print(
+        f"[Relay] plan initialized: branch={branch}, "
+        f"slots={len(relay_slots)}, spacing={RELAY_SPACING:.1f}px"
+    )
+
+
+def relay_path_progress(position, branch):
+    """Anchor에서 Branch relay lane 끝 방향으로 투영한 경로 진행거리입니다."""
+    start = ANCHOR_PARK_POSITION
+    end = get_relay_path_endpoint(branch)
+    path_vector = end - start
+    path_length = path_vector.length()
+
+    if path_length <= EPSILON:
+        return 0.0
+
+    direction = path_vector / path_length
+    projected = (position - start).dot(direction)
+    return max(0.0, min(path_length, projected))
+
+
+def get_relays(robots):
+    return [robot for robot in robots if robot.role == "RELAY"]
+
+
+def get_active_branch_relays(robots):
+    return sorted(
+        [
+            robot
+            for robot in robots
+            if robot.role == "RELAY" and robot.relay_index >= 0
+        ],
+        key=lambda robot: robot.relay_index,
+    )
+
+
+def get_deployed_relay_indices(robots):
+    return {
+        robot.relay_index
+        for robot in robots
+        if robot.role == "RELAY" and robot.relay_index >= 0
+    }
+
+
+def relay_at_slot_is_settled(robot):
+    return (
+        robot.role == "RELAY"
+        and robot.relay_anchor is not None
+        and robot.position.distance_to(robot.relay_anchor)
+        <= RELAY_POSITION_TOLERANCE
+    )
+
+
+def get_exploration_front_progress(robots, branch):
+    candidates = [
+        robot
+        for robot in robots
+        if robot.role in {"NORMAL", "SHEPHERD"}
+        and get_robot_region(robot.position) in {"JUNCTION", branch}
+    ]
+
+    if not candidates:
+        return 0.0
+
+    return max(
+        relay_path_progress(robot.position, branch)
+        for robot in candidates
+    )
+
+
+def select_relay_candidate(robots, slot):
+    """slot 부근의 연결된 NORMAL 로봇을 Relay로 전환합니다."""
+    candidates = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_anchor
+        and get_robot_region(robot.position) in {"JUNCTION", active_branch}
+        and robot.position.distance_to(slot["position"])
+        <= RELAY_SELECTION_RADIUS
+    ]
+
+    if not candidates:
+        return None
+
+    # slot에 가깝고 속도가 낮은 로봇을 우선 선택합니다.
+    return min(
+        candidates,
+        key=lambda robot: (
+            robot.position.distance_squared_to(slot["position"]),
+            robot.velocity.length_squared(),
+            robot.robot_id,
+        ),
+    )
+
+
+def deploy_relay_for_slot(robots, slot):
+    candidate = select_relay_candidate(robots, slot)
+
+    if candidate is None:
+        return False
+
+    candidate.role = "RELAY"
+    candidate.relay_anchor = slot["position"].copy()
+    candidate.relay_index = slot["index"]
+    candidate.velocity.update(0.0, 0.0)
+    candidate.acceleration.update(0.0, 0.0)
+
+    print(
+        f"[Relay] deployed: robot={candidate.robot_id}, "
+        f"index={candidate.relay_index}, "
+        f"slot=({candidate.relay_anchor.x:.1f}, {candidate.relay_anchor.y:.1f})"
+    )
+    return True
+
+
+def get_next_undeployed_slot(robots):
+    deployed_indices = get_deployed_relay_indices(robots)
+
+    for slot in relay_slots:
+        if slot["index"] not in deployed_indices:
+            return slot
+
+    return None
+
+
+def relay_plan_complete(robots):
+    if not relay_slots:
+        return True
+
+    relays_by_index = {
+        robot.relay_index: robot
+        for robot in get_active_branch_relays(robots)
+    }
+
+    return all(
+        slot["index"] in relays_by_index
+        and relay_at_slot_is_settled(relays_by_index[slot["index"]])
+        for slot in relay_slots
+    )
+
+
+def compute_relay_front_link_distance(robots):
+    """가장 먼 Relay와 그 앞쪽 탐색 군집 사이의 최소 거리를 계산합니다."""
+    relays = get_active_branch_relays(robots)
+    chain_end = relays[-1] if relays else junction_anchor
+
+    if chain_end is None:
+        return 0.0
+
+    chain_progress = relay_path_progress(chain_end.position, active_branch)
+    front_robots = [
+        robot
+        for robot in robots
+        if robot.role in {"NORMAL", "SHEPHERD"}
+        and get_robot_region(robot.position) in {"JUNCTION", active_branch}
+        and relay_path_progress(robot.position, active_branch)
+        >= chain_progress - 2.0
+    ]
+
+    if not front_robots:
+        return 0.0
+
+    return min(
+        chain_end.position.distance_to(robot.position)
+        for robot in front_robots
+    )
+
+
+def update_relay_deployment(robots, dt):
+    """군집이 전진할 때 필요한 slot에 Relay를 순차적으로 남깁니다."""
+    global relay_deploy_cooldown
+    global relay_motion_scale
+
+    relay_deploy_cooldown = max(0.0, relay_deploy_cooldown - dt)
+    relay_motion_scale = 1.0
+
+    if phase != SimulationPhase.EXPLORE_BRANCH or junction_anchor is None:
+        return
+
+    front_progress = get_exploration_front_progress(robots, active_branch)
+    next_slot = get_next_undeployed_slot(robots)
+
+    if next_slot is not None:
+        slot_due = (
+            front_progress
+            >= next_slot["path_distance"] - RELAY_DEPLOY_LOOKAHEAD
+        )
+
+        if slot_due and relay_deploy_cooldown <= 0.0:
+            if deploy_relay_for_slot(robots, next_slot):
+                relay_deploy_cooldown = RELAY_DEPLOY_COOLDOWN
+            else:
+                relay_motion_scale = min(
+                    relay_motion_scale,
+                    RELAY_WAIT_SPEED_SCALE,
+                )
+
+        # Relay가 필요한 위치까지 군집이 도착했는데 배치되지 않았다면 감속합니다.
+        if front_progress >= next_slot["path_distance"] - 2.0:
+            relay_motion_scale = min(
+                relay_motion_scale,
+                RELAY_WAIT_SPEED_SCALE,
+            )
+
+    # 새 Relay가 slot으로 이동 중이면 군집을 잠시 감속합니다.
+    unsettled_relays = [
+        relay
+        for relay in get_active_branch_relays(robots)
+        if not relay_at_slot_is_settled(relay)
+    ]
+    if unsettled_relays:
+        relay_motion_scale = min(
+            relay_motion_scale,
+            RELAY_FORMING_SPEED_SCALE,
+        )
+
+    # 마지막 Relay와 군집 사이 링크가 늘어날수록 선제적으로 속도를 줄입니다.
+    front_link_distance = compute_relay_front_link_distance(robots)
+
+    if front_link_distance > RELAY_LINK_WARNING_DISTANCE:
+        denominator = max(
+            RELAY_LINK_STOP_DISTANCE - RELAY_LINK_WARNING_DISTANCE,
+            EPSILON,
+        )
+        scale = (
+            RELAY_LINK_STOP_DISTANCE - front_link_distance
+        ) / denominator
+        relay_motion_scale = min(
+            relay_motion_scale,
+            max(0.0, min(1.0, scale)),
+        )
+
+    if front_link_distance >= RELAY_LINK_STOP_DISTANCE:
+        relay_motion_scale = 0.0
+
+
+def release_relay_into_backtracking(robot):
+    backtrack_direction = get_backtrack_direction(active_branch)
+    released_index = robot.relay_index
+
+    robot.role = "NORMAL"
+    robot.relay_anchor = None
+    robot.relay_index = -1
+    robot.velocity = backtrack_direction * RELAY_RELEASE_SPEED
+    robot.acceleration.update(0.0, 0.0)
+
+    print(
+        f"[Relay] retracted into flow: robot={robot.robot_id}, "
+        f"index={released_index}"
+    )
+
+
+def update_relay_retraction(robots, dt):
+    """Backtracking 군집이 도착하면 Branch 끝쪽 Relay부터 하나씩 회수합니다."""
+    global relay_retract_cooldown
+
+    relay_retract_cooldown = max(0.0, relay_retract_cooldown - dt)
+
+    if phase != SimulationPhase.FLOW_BACKTRACK:
+        return
+
+    relays = get_active_branch_relays(robots)
+    if not relays or relay_retract_cooldown > 0.0:
+        return
+
+    farthest_relay = relays[-1]
+    relay_progress = relay_path_progress(
+        farthest_relay.position,
+        active_branch,
+    )
+
+    returning_robots = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) in {active_branch, "JUNCTION"}
+        and relay_path_progress(robot.position, active_branch)
+        >= relay_progress - RELAY_RETRACT_RADIUS
+    ]
+
+    reached = any(
+        robot.position.distance_to(farthest_relay.position)
+        <= RELAY_RETRACT_RADIUS
+        for robot in returning_robots
+    )
+
+    if reached:
+        release_relay_into_backtracking(farthest_relay)
+        relay_retract_cooldown = RELAY_RETRACT_COOLDOWN
+
+
+def draw_relay_plan(surface, robots):
+    """계획 slot과 현재 Relay chain을 시각화합니다."""
+    for slot in relay_slots:
+        pygame.draw.circle(
+            surface,
+            RELAY_SLOT_COLOR,
+            (
+                round(slot["position"].x),
+                round(slot["position"].y),
+            ),
+            3,
+            width=1,
+        )
+
+    chain_nodes = []
+    if junction_anchor is not None:
+        chain_nodes.append(junction_anchor)
+    chain_nodes.extend(get_active_branch_relays(robots))
+
+    for first, second in zip(chain_nodes, chain_nodes[1:]):
+        pygame.draw.line(
+            surface,
+            RELAY_COLOR,
+            (
+                round(first.position.x),
+                round(first.position.y),
+            ),
+            (
+                round(second.position.x),
+                round(second.position.y),
+            ),
+            width=2,
+        )
+
+
+# =========================================================
 # 10. Junction Anchor 선발 / DFS 관리
 # =========================================================
 
@@ -1091,6 +1558,7 @@ def anchor_select_next_branch(anchor):
             anchor.local_branch_states[branch] = "ACTIVE"
             anchor.selected_branch = branch
             active_branch = branch
+            initialize_relay_plan(branch)
 
             print(f"[Anchor] selected branch: {branch}")
             return branch
@@ -1171,7 +1639,8 @@ def select_shepherds(robots, branch):
     candidates = [
         robot
         for robot in robots
-        if get_robot_region(robot.position) == branch
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == branch
         and capture_rect.collidepoint(robot.position.x, robot.position.y)
     ]
 
@@ -1354,7 +1823,7 @@ def compute_route_force(robot):
     bottom_hold = get_bottom_hold_point()
     force = pygame.Vector2(0.0, 0.0)
 
-    if robot.role == "ANCHOR":
+    if robot.role in {"ANCHOR", "RELAY"}:
         return force
 
     # Anchor 선발 이후에는 실제로 Anchor 통신망에 연결되어 있고,
@@ -1390,6 +1859,7 @@ def compute_route_force(robot):
                 get_branch_tip_target(active_branch),
             )
             * ROUTE_FORCE
+            * relay_motion_scale
         )
 
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
@@ -1469,7 +1939,7 @@ def compute_sph_forces(robots, grid):
     backtrack_direction = get_backtrack_direction(active_branch)
 
     for robot_i in robots:
-        if robot_i.role == "ANCHOR":
+        if robot_i.role in {"ANCHOR", "RELAY"}:
             robot_i.acceleration.update(0.0, 0.0)
             continue
 
@@ -1673,6 +2143,7 @@ def is_dead_end_saturated(robots, branch, reference_density):
 def count_branch_roles(robots, branch):
     normal_count = 0
     shepherd_count = 0
+    relay_count = 0
 
     for robot in robots:
         if get_robot_region(robot.position) != branch:
@@ -1680,10 +2151,12 @@ def count_branch_roles(robots, branch):
 
         if robot.role == "SHEPHERD":
             shepherd_count += 1
+        elif robot.role == "RELAY":
+            relay_count += 1
         else:
             normal_count += 1
 
-    return normal_count, shepherd_count
+    return normal_count, shepherd_count, relay_count
 
 
 def update_simulation_state(robots, dt, reference_density):
@@ -1715,6 +2188,9 @@ def update_simulation_state(robots, dt, reference_density):
                 print(f"[DFS] Branch 탐색 시작: {active_branch}")
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
+        # 군집이 전진하는 동안 필요한 일부 로봇만 Relay로 순차 배치합니다.
+        update_relay_deployment(robots, dt)
+
         # Dead-end 조기 감지 영역에 먼저 도착한 8대를 즉시 Shepherd로 선발합니다.
         capture_count = sum(
             get_robot_region(robot.position) == active_branch
@@ -1726,7 +2202,10 @@ def update_simulation_state(robots, dt, reference_density):
             for robot in robots
         )
 
-        if capture_count >= SHEPHERD_COUNT:
+        if (
+            capture_count >= SHEPHERD_COUNT
+            and relay_plan_complete(robots)
+        ):
             selected = select_shepherds(robots, active_branch)
             if len(selected) == SHEPHERD_COUNT:
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
@@ -1781,6 +2260,9 @@ def update_simulation_state(robots, dt, reference_density):
             print("[Shepherd] 즉시 일반 로봇으로 합류")
 
     elif phase == SimulationPhase.FLOW_BACKTRACK:
+        # 복귀 군집이 Relay에 닿을 때마다 가장 먼 Relay부터 NORMAL로 합류합니다.
+        update_relay_retraction(robots, dt)
+
         robots_remaining_in_branch = sum(
             get_robot_region(robot.position) == active_branch
             for robot in robots
@@ -1847,6 +2329,10 @@ def reset_dfs_state():
     global flow_establish_timer
     global communication_sequence
     global last_message_signature
+    global relay_slots
+    global relay_deploy_cooldown
+    global relay_retract_cooldown
+    global relay_motion_scale
 
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = DFS_ORDER[0]
@@ -1865,6 +2351,10 @@ def reset_dfs_state():
     flow_establish_timer = 0.0
     communication_sequence = 0
     last_message_signature = None
+    relay_slots = []
+    relay_deploy_cooldown = 0.0
+    relay_retract_cooldown = 0.0
+    relay_motion_scale = 1.0
 
 
 def initialize_simulation():
@@ -2012,6 +2502,9 @@ while running:
                     width=1,
                 )
 
+        # 현재 Branch의 Relay slot과 실제 Relay chain 표시
+        draw_relay_plan(screen, robots)
+
     pygame.draw.circle(
         screen,
         JUNCTION_COLOR,
@@ -2029,7 +2522,7 @@ while running:
             show_density_color,
         )
 
-    normal_remaining, shepherd_remaining = count_branch_roles(
+    normal_remaining, shepherd_remaining, relay_remaining = count_branch_roles(
         robots,
         active_branch,
     )
@@ -2066,8 +2559,17 @@ while running:
             f"min margin={communication_stats['minimum_margin']:.1f}px"
         ),
         f"Active branch: {active_text}",
+        (
+            f"Relays: {len(get_relays(robots))}/{len(relay_slots)} | "
+            f"motion scale={relay_motion_scale:.2f}"
+        ),
         f"Shepherds: {len(get_shepherds(robots))}",
-        f"In branch: normal={normal_remaining}, shepherd={shepherd_remaining}",
+        (
+            "In branch: "
+            f"normal={normal_remaining}, "
+            f"relay={relay_remaining}, "
+            f"shepherd={shepherd_remaining}"
+        ),
         (
             "Branch state: "
             f"UP={branch_states['UP']} | "
