@@ -220,6 +220,7 @@ last_message_signature = None
 relay_slots = []
 relay_deploy_cooldown = 0.0
 relay_retract_cooldown = 0.0
+relay_retract_clear_timer = 0.0
 relay_motion_scale = 1.0
 
 # =========================================================
@@ -262,10 +263,15 @@ LOCAL_COHESION_GAIN = 20.0
 
 # Junction 진입 후 첫 branch 탐색 시작 조건
 JUNCTION_ENTRY_COUNT = 18
-ANCHOR_MOVE_SPEED = 95.0 * MOTION_SPEED_MULTIPLIER
+# Junction Anchor는 일반 탐색 속도 배율과 분리합니다.
+# 선발 직후 주차점으로 너무 빨리 달리면 주변 로봇과 직접 링크가 끊어지므로
+# 낮은 기본 속도 + 통신 여유거리 기반 자동 감속을 사용합니다.
+ANCHOR_MOVE_SPEED = 42.0
+ANCHOR_POSITION_TOLERANCE = 2.5
 JUNCTION_SWITCH_COUNT = 18
 JUNCTION_SWITCH_DWELL_TIME = 0.25
-RETURN_BOTTOM_TARGET_COUNT = int((ROBOT_COUNT - 1) * 0.90)
+# 최종에는 Anchor까지 역할을 해제하고 220대 전부 시작 통로로 복귀해야 완료합니다.
+RETURN_BOTTOM_TARGET_COUNT = ROBOT_COUNT
 
 # Shepherd boundary
 # dead-end에 가장 먼저 도착한 8대를 즉시 선발하기 위한 조기 감지 깊이
@@ -323,6 +329,14 @@ COMM_RECOVERY_GAIN = 2.2
 # 화면에 통신 트리를 표시할지의 초기값
 SHOW_COMM_LINKS_DEFAULT = True
 
+# Junction Anchor 배치 중 통신 보호
+# Anchor와 가장 가까운 일반 로봇의 거리가 WARNING을 넘으면 감속하고,
+# STOP에 도달하면 주차점 이동을 멈춘 채 군집이 따라올 때까지 기다립니다.
+ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
+ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
+ANCHOR_MIN_DIRECT_NEIGHBORS = 1
+ANCHOR_READY_DIRECT_NEIGHBORS = 3
+
 # =========================================================
 # 4-2. 임시 Relay Chain 파라미터
 # =========================================================
@@ -341,7 +355,11 @@ RELAY_DEPLOY_COOLDOWN = 0.10
 
 # Backtracking 군집이 Relay에 도착하면 가장 먼 Relay부터 해제됩니다.
 RELAY_RETRACT_RADIUS = 30.0
-RELAY_RETRACT_COOLDOWN = 0.16
+# 첫 번째 복귀 로봇이 Relay에 닿았다고 바로 회수하지 않습니다.
+# 해당 Relay보다 Branch 끝쪽에 남은 이동 로봇이 0대인 상태가 일정 시간 유지돼야 합니다.
+RELAY_PASS_MARGIN = 6.0
+RELAY_RETRACT_DWELL_TIME = 0.40
+RELAY_RETRACT_COOLDOWN = 0.45
 RELAY_RELEASE_SPEED = 16.0 * MOTION_SPEED_MULTIPLIER
 
 # Relay 배치가 늦으면 탐색 군집을 감속하여 링크 단절을 예방합니다.
@@ -604,19 +622,26 @@ class Robot:
         if self.role == "ANCHOR" and self.anchor_position is not None:
             position_error = self.anchor_position - self.position
 
-            if position_error.length_squared() > 1.0:
-                maximum_step = ANCHOR_MOVE_SPEED * dt
+            if (
+                position_error.length_squared()
+                > ANCHOR_POSITION_TOLERANCE**2
+            ):
+                # 선발 직후 Anchor가 군집에서 이탈하지 않도록 현재 직접 통신
+                # 이웃과의 거리로 주차 이동 속도를 자동 제한합니다.
+                motion_scale = get_anchor_deployment_motion_scale(self)
+                maximum_step = ANCHOR_MOVE_SPEED * motion_scale * dt
 
-                if position_error.length() <= maximum_step:
-                    next_position = self.anchor_position.copy()
-                else:
-                    next_position = (
-                        self.position
-                        + position_error.normalize() * maximum_step
-                    )
+                if maximum_step > 0.0:
+                    if position_error.length() <= maximum_step:
+                        next_position = self.anchor_position.copy()
+                    else:
+                        next_position = (
+                            self.position
+                            + position_error.normalize() * maximum_step
+                        )
 
-                if is_walkable(next_position, self.radius):
-                    self.position = next_position
+                    if is_walkable(next_position, self.radius):
+                        self.position = next_position
             else:
                 self.position = self.anchor_position.copy()
 
@@ -887,6 +912,68 @@ def update_communication_neighbors(robots, grid):
                 robot.comm_neighbors.append(other)
 
 
+def get_anchor_deployment_motion_scale(anchor):
+    """Anchor 주차 이동 중 직접 통신 링크가 끊어지지 않도록 속도를 제한합니다.
+
+    반환값 1.0은 정상 이동, 0.0은 통신 이웃이 따라올 때까지 정지를 뜻합니다.
+    MOVE_TO_JUNCTION 이후 주차가 완료된 Anchor에는 이 값이 사용되지 않습니다.
+    """
+    if anchor is None or anchor.role != "ANCHOR":
+        return 0.0
+
+    direct_neighbors = [
+        neighbor
+        for neighbor in anchor.comm_neighbors
+        if neighbor.role != "ANCHOR"
+    ]
+
+    if len(direct_neighbors) < ANCHOR_MIN_DIRECT_NEIGHBORS:
+        return 0.0
+
+    nearest_distance = min(
+        anchor.position.distance_to(neighbor.position)
+        for neighbor in direct_neighbors
+    )
+
+    if nearest_distance <= ANCHOR_LINK_WARNING_DISTANCE:
+        return 1.0
+
+    if nearest_distance >= ANCHOR_LINK_STOP_DISTANCE:
+        return 0.0
+
+    # WARNING~STOP 구간에서 선형 감속합니다.
+    return max(
+        0.0,
+        min(
+            1.0,
+            (ANCHOR_LINK_STOP_DISTANCE - nearest_distance)
+            / (ANCHOR_LINK_STOP_DISTANCE - ANCHOR_LINK_WARNING_DISTANCE),
+        ),
+    )
+
+
+def anchor_deployment_ready(anchor, robots):
+    """Anchor가 주차점에 도착했고 안전한 직접 이웃을 확보했는지 검사합니다."""
+    if anchor is None or anchor.anchor_position is None:
+        return False
+
+    if (
+        anchor.position.distance_to(anchor.anchor_position)
+        > ANCHOR_POSITION_TOLERANCE
+    ):
+        return False
+
+    safe_neighbors = sum(
+        robot is not anchor
+        and robot.role != "ANCHOR"
+        and anchor.position.distance_to(robot.position)
+        <= COMM_SAFE_DISTANCE
+        for robot in robots
+    )
+
+    return safe_neighbors >= ANCHOR_READY_DIRECT_NEIGHBORS
+
+
 def get_anchor_message(anchor):
     """현재 Anchor가 전파하는 DFS 명령을 반환합니다."""
     if anchor is None:
@@ -1126,6 +1213,7 @@ def initialize_relay_plan(branch):
     global relay_slots
     global relay_deploy_cooldown
     global relay_retract_cooldown
+    global relay_retract_clear_timer
     global relay_motion_scale
 
     start = ANCHOR_PARK_POSITION.copy()
@@ -1136,6 +1224,7 @@ def initialize_relay_plan(branch):
     relay_slots = []
     relay_deploy_cooldown = 0.0
     relay_retract_cooldown = 0.0
+    relay_retract_clear_timer = 0.0
     relay_motion_scale = 1.0
 
     if path_length <= EPSILON:
@@ -1410,16 +1499,28 @@ def release_relay_into_backtracking(robot):
 
 
 def update_relay_retraction(robots, dt):
-    """Backtracking 군집이 도착하면 Branch 끝쪽 Relay부터 하나씩 회수합니다."""
+    """복귀 군집의 마지막 로봇이 Relay를 지난 뒤에만 역순으로 회수합니다.
+
+    기존에는 첫 번째 로봇 한 대가 먼 Relay 근처에 도착하는 즉시 Relay를
+    해제했기 때문에 Branch 끝에 남아 있던 로봇들의 통신 경로가 끊어질 수
+    있었습니다. 이제는 다음 조건을 모두 만족해야 회수합니다.
+
+    1. 현재 가장 먼 Relay보다 Branch 끝쪽에 남은 이동 로봇이 없음
+    2. Branch/Junction의 이동 로봇들이 Anchor 통신망에 연결되어 있음
+    3. 위 상태가 RELAY_RETRACT_DWELL_TIME 동안 연속 유지됨
+    """
     global relay_retract_cooldown
+    global relay_retract_clear_timer
 
     relay_retract_cooldown = max(0.0, relay_retract_cooldown - dt)
 
     if phase != SimulationPhase.FLOW_BACKTRACK:
+        relay_retract_clear_timer = 0.0
         return
 
     relays = get_active_branch_relays(robots)
-    if not relays or relay_retract_cooldown > 0.0:
+    if not relays:
+        relay_retract_clear_timer = 0.0
         return
 
     farthest_relay = relays[-1]
@@ -1428,25 +1529,43 @@ def update_relay_retraction(robots, dt):
         active_branch,
     )
 
-    returning_robots = [
+    # Relay보다 Branch 끝쪽에 남은 NORMAL/SHEPHERD가 한 대라도 있으면
+    # 아직 Relay를 회수하면 안 됩니다.
+    mobile_robots = [
         robot
         for robot in robots
-        if robot.role == "NORMAL"
+        if robot.role in {"NORMAL", "SHEPHERD"}
         and get_robot_region(robot.position) in {active_branch, "JUNCTION"}
-        and relay_path_progress(robot.position, active_branch)
-        >= relay_progress - RELAY_RETRACT_RADIUS
     ]
 
-    reached = any(
-        robot.position.distance_to(farthest_relay.position)
-        <= RELAY_RETRACT_RADIUS
-        for robot in returning_robots
+    robots_still_beyond_relay = [
+        robot
+        for robot in mobile_robots
+        if get_robot_region(robot.position) == active_branch
+        and relay_path_progress(robot.position, active_branch)
+        > relay_progress + RELAY_PASS_MARGIN
+    ]
+
+    # 회수 직전까지 현재 이동 집단이 Anchor와 연결되어 있는지도 확인합니다.
+    all_mobile_connected = all(
+        robot.connected_to_anchor
+        for robot in mobile_robots
     )
 
-    if reached:
+    tail_has_passed = len(robots_still_beyond_relay) == 0
+
+    if tail_has_passed and all_mobile_connected:
+        relay_retract_clear_timer += dt
+    else:
+        relay_retract_clear_timer = 0.0
+
+    if (
+        relay_retract_clear_timer >= RELAY_RETRACT_DWELL_TIME
+        and relay_retract_cooldown <= 0.0
+    ):
         release_relay_into_backtracking(farthest_relay)
         relay_retract_cooldown = RELAY_RETRACT_COOLDOWN
-
+        relay_retract_clear_timer = 0.0
 
 def draw_relay_plan(surface, robots):
     """계획 slot과 현재 Relay chain을 시각화합니다."""
@@ -1575,6 +1694,38 @@ def anchor_complete_active_branch(anchor, branch):
     anchor.local_branch_states[branch] = "VISITED"
     anchor.selected_branch = None
     print(f"[Anchor] branch completed: {branch}")
+
+
+def release_anchor_for_final_return(anchor):
+    """모든 Branch 완료 후 Junction Anchor를 일반 로봇으로 복귀시킵니다."""
+    if anchor is None:
+        return
+
+    anchor.role = "NORMAL"
+    anchor.anchor_position = None
+    anchor.selected_branch = None
+    anchor.relay_anchor = None
+    anchor.relay_index = -1
+    anchor.velocity = pygame.Vector2(0.0, 0.0)
+    anchor.acceleration.update(0.0, 0.0)
+
+    print(
+        f"[Anchor] robot={anchor.robot_id} released; "
+        "returning to Base with the swarm"
+    )
+
+
+def begin_final_return(anchor):
+    """Relay plan을 종료하고 Anchor를 포함한 전체 군집의 최종 복귀를 시작합니다."""
+    global phase
+    global relay_slots
+    global relay_motion_scale
+
+    relay_slots = []
+    relay_motion_scale = 1.0
+    release_anchor_for_final_return(anchor)
+    phase = SimulationPhase.RETURN_TO_BASE
+    print("[DFS] 모든 Branch 완료, Anchor 포함 전체 로봇 Base 복귀")
 
 
 # =========================================================
@@ -2178,11 +2329,19 @@ def update_simulation_state(robots, dt, reference_density):
             for robot in robots
         )
 
-        if anchor is not None and robots_in_junction >= JUNCTION_ENTRY_COUNT:
+        # Anchor가 주차점에 도착하고 안전한 직접 통신 이웃을 확보한 뒤에만
+        # 첫 Branch 명령을 전파합니다. 배치 중 링크가 불안정하면 군집을 기다립니다.
+        anchor_ready = anchor_deployment_ready(anchor, robots)
+
+        if (
+            anchor is not None
+            and anchor_ready
+            and robots_in_junction >= JUNCTION_ENTRY_COUNT
+        ):
             selected = anchor_select_next_branch(anchor)
 
             if selected is None:
-                phase = SimulationPhase.RETURN_TO_BASE
+                begin_final_return(anchor)
             else:
                 phase = SimulationPhase.EXPLORE_BRANCH
                 print(f"[DFS] Branch 탐색 시작: {active_branch}")
@@ -2273,9 +2432,12 @@ def update_simulation_state(robots, dt, reference_density):
             for robot in robots
         )
 
+        remaining_relays = len(get_active_branch_relays(robots))
+
         if (
             robots_remaining_in_branch <= BRANCH_CLEAR_LIMIT
             and robots_in_junction >= JUNCTION_SWITCH_COUNT
+            and remaining_relays == 0
         ):
             anchor_complete_active_branch(anchor, active_branch)
             phase = SimulationPhase.JUNCTION_SWITCH
@@ -2289,8 +2451,7 @@ def update_simulation_state(robots, dt, reference_density):
             next_branch = anchor_select_next_branch(anchor)
 
             if next_branch is None:
-                phase = SimulationPhase.RETURN_TO_BASE
-                print("[DFS] 모든 Branch 완료, Base로 최종 복귀")
+                begin_final_return(anchor)
             else:
                 saturation_timer = 0.0
                 shepherd_form_timer = 0.0
@@ -2302,13 +2463,22 @@ def update_simulation_state(robots, dt, reference_density):
     elif phase == SimulationPhase.RETURN_TO_BASE:
         robots_in_bottom = sum(
             get_robot_region(robot.position) == "BOTTOM"
-            and robot.role != "ANCHOR"
+            for robot in robots
+        )
+        remaining_special_roles = sum(
+            robot.role in {"ANCHOR", "RELAY", "SHEPHERD"}
             for robot in robots
         )
 
-        if robots_in_bottom >= RETURN_BOTTOM_TARGET_COUNT:
+        if (
+            robots_in_bottom >= RETURN_BOTTOM_TARGET_COUNT
+            and remaining_special_roles == 0
+        ):
             phase = SimulationPhase.DONE
-            print("[DFS] 탐색 및 최종 Base 복귀 완료")
+            print(
+                "[DFS] 탐색 및 최종 Base 복귀 완료: "
+                f"{robots_in_bottom}/{len(robots)} robots"
+            )
 
 
 # =========================================================
@@ -2332,6 +2502,7 @@ def reset_dfs_state():
     global relay_slots
     global relay_deploy_cooldown
     global relay_retract_cooldown
+    global relay_retract_clear_timer
     global relay_motion_scale
 
     phase = SimulationPhase.MOVE_TO_JUNCTION
@@ -2354,6 +2525,7 @@ def reset_dfs_state():
     relay_slots = []
     relay_deploy_cooldown = 0.0
     relay_retract_cooldown = 0.0
+    relay_retract_clear_timer = 0.0
     relay_motion_scale = 1.0
 
 
@@ -2540,6 +2712,25 @@ while running:
         and junction_anchor.selected_branch is not None
         else "-"
     )
+
+    anchor_parked = (
+        junction_anchor is not None
+        and junction_anchor.anchor_position is not None
+        and junction_anchor.position.distance_to(
+            junction_anchor.anchor_position
+        ) <= ANCHOR_POSITION_TOLERANCE
+    )
+    anchor_direct_safe = (
+        sum(
+            robot is not junction_anchor
+            and junction_anchor is not None
+            and junction_anchor.position.distance_to(robot.position)
+            <= COMM_SAFE_DISTANCE
+            for robot in robots
+        )
+        if junction_anchor is not None
+        else 0
+    )
     communication_stats = get_communication_stats(robots)
 
     hud_lines = [
@@ -2547,7 +2738,12 @@ while running:
         f"Robots: {len(robots)}",
         f"Motion speed: {MOTION_SPEED_MULTIPLIER:.1f}x",
         f"Phase: {phase_text}",
-        f"Anchor ID: {anchor_id} | selected: {anchor_selected}",
+        (
+            f"Anchor ID: {anchor_id} | role="
+            f"{junction_anchor.role if junction_anchor is not None else '-'} | "
+            f"selected: {anchor_selected}"
+        ),
+        f"Anchor deploy: parked={anchor_parked} | safe neighbors={anchor_direct_safe}",
         (
             "Comm: "
             f"{communication_stats['connected']}/{len(robots)} connected | "
@@ -2562,6 +2758,11 @@ while running:
         (
             f"Relays: {len(get_relays(robots))}/{len(relay_slots)} | "
             f"motion scale={relay_motion_scale:.2f}"
+        ),
+        (
+            "Return to Base: "
+            f"{sum(get_robot_region(robot.position) == 'BOTTOM' for robot in robots)}"
+            f"/{len(robots)}"
         ),
         f"Shepherds: {len(get_shepherds(robots))}",
         (
