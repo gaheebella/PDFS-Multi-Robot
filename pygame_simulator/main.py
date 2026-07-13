@@ -1,3 +1,4 @@
+import heapq
 import math
 import random
 import sys
@@ -16,10 +17,10 @@ pygame.init()
 SCREEN_WIDTH = 1000
 SCREEN_HEIGHT = 700
 FPS = 60
-SUBSTEPS = 2
+SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Anchor + Temporary Relay Chain")
+pygame.display.set_caption("SPH + DFS Adaptive Relay + Fast Initial Ingress")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
@@ -88,8 +89,8 @@ anchor_election_rect = pygame.Rect(
 
 # 중앙 통행을 막지 않도록 Junction 가장자리 쪽에 Anchor를 주차합니다.
 ANCHOR_PARK_POSITION = pygame.Vector2(
-    center_x - half_width + 14,
-    center_y - half_width + 14,
+    center_x - 25,
+    center_y - 25,
 )
 
 # Branch 전환 중 일반 로봇이 잠시 모이는 지점입니다.
@@ -258,6 +259,16 @@ MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
 MAX_ACCELERATION = 520.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
+# 초기 Base→Junction 이동은 Anchor와 통신 그래프가 아직 없으므로
+# 무거운 SPH/LOS 계산 대신 전용 2차 속도 추종 제어를 사용합니다.
+# 저사양 환경에서 FPS가 낮아도 첫 이동이 멈춰 보이지 않도록 실제 경과시간을
+# 최대 0.12초까지 반영합니다. Junction 진입 후에는 기존 SPH 제어로 전환합니다.
+INITIAL_INGRESS_SPEED = 76.0
+INITIAL_INGRESS_RESPONSE = 7.0
+INITIAL_INGRESS_CENTERING = 1.6
+INITIAL_INGRESS_MAX_DT = 0.12
+NORMAL_PHYSICS_MAX_DT = 0.05
+
 # 고립 로봇이 무리를 따라오도록 하는 보조항
 ISOLATION_NEIGHBOR_THRESHOLD = 4
 ISOLATION_ROUTE_BOOST = 1.1
@@ -316,8 +327,15 @@ FINAL_RETURN_DISTANCE_THRESHOLD = 48.0
 # 4-1. 명시적 로봇 통신 / 연결성 파라미터
 # =========================================================
 
-# 두 로봇 사이 거리가 이 값 이하일 때만 직접 통신할 수 있습니다.
+# 두 로봇 사이 거리가 이 값 이하이고, 두 로봇 사이에 벽이 없을 때만
+# 직접 통신할 수 있습니다. Base는 통신 루트가 아니며 Junction Anchor가
+# 현재 활성 Branch 통신망의 루트입니다.
 COMM_RANGE = 46.0
+
+# LOS(Line of Sight) 검사 간격입니다. 값이 작을수록 벽 차단을 더 촘촘히
+# 검사하지만 계산량이 늘어납니다.
+COMM_LOS_SAMPLE_SPACING = 6.0
+COMM_LOS_CLEARANCE = 0.0
 
 # 이 거리까지는 충분히 안전한 통신 링크로 봅니다.
 COMM_SAFE_DISTANCE = 34.0
@@ -333,6 +351,7 @@ COMM_RECOVERY_GAIN = 2.2
 
 # 화면에 통신 트리를 표시할지의 초기값
 SHOW_COMM_LINKS_DEFAULT = True
+COMM_UPDATE_INTERVAL_FRAMES = 3
 
 # Junction Anchor 배치 중 통신 보호
 # Anchor와 가장 가까운 일반 로봇의 거리가 WARNING을 넘으면 감속하고,
@@ -340,7 +359,7 @@ SHOW_COMM_LINKS_DEFAULT = True
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
 ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
 ANCHOR_MIN_DIRECT_NEIGHBORS = 1
-ANCHOR_READY_DIRECT_NEIGHBORS = 3
+ANCHOR_READY_DIRECT_NEIGHBORS = 1
 
 # =========================================================
 # 4-2. 임시 Relay Chain 파라미터
@@ -368,17 +387,24 @@ RELAY_RETRACT_COOLDOWN = 0.45
 RELAY_RELEASE_SPEED = 16.0 * MOTION_SPEED_MULTIPLIER
 
 # Relay 배치가 늦으면 탐색 군집을 감속하여 링크 단절을 예방합니다.
-RELAY_FORMING_SPEED_SCALE = 0.30
-RELAY_WAIT_SPEED_SCALE = 0.08
+RELAY_FORMING_SPEED_SCALE = 0.40
+RELAY_WAIT_SPEED_SCALE = 0.18
 RELAY_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE
 RELAY_LINK_STOP_DISTANCE = COMM_RANGE * 0.94
+
+# Relay는 Branch 길이만 보고 미리 전부 배치하지 않습니다.
+# 탐색 전방 군집의 Anchor 연결 여유가 작아지거나 일부가 단절될 때만
+# 통신 공백을 메우기 위해 필요한 다음 Relay를 배치합니다.
+RELAY_DEPLOY_MARGIN = 5.0
+RELAY_FRONT_FRACTION = 0.20
+RELAY_FRONT_MIN_COUNT = 10
+RELAY_FRONT_REQUIRED_CONNECTED_RATIO = 0.90
 
 # 통신 탐색도 같은 Spatial Hashing을 사용합니다.
 CELL_SIZE = max(
     SMOOTHING_LENGTH,
     VIRTUAL_PRESSURE_RADIUS,
     COMM_RANGE,
-    COMM_RECOVERY_RANGE,
 )
 
 # =========================================================
@@ -474,6 +500,71 @@ def is_walkable(position, radius):
             return False
 
     return is_region_allowed(position)
+
+
+def is_mask_clear_at(position, clearance=0.0):
+    """통신 LOS 샘플점과 주변 여유 영역이 복도 내부인지 확인합니다."""
+    x = int(round(position.x))
+    y = int(round(position.y))
+    radius = max(0, int(math.ceil(clearance)))
+
+    offsets = [(0, 0)]
+    if radius > 0:
+        offsets.extend(
+            [
+                (radius, 0),
+                (-radius, 0),
+                (0, radius),
+                (0, -radius),
+            ]
+        )
+
+    for dx, dy in offsets:
+        px = x + dx
+        py = y + dy
+
+        if not (0 <= px < SCREEN_WIDTH and 0 <= py < SCREEN_HEIGHT):
+            return False
+        if walkable_mask.get_at((px, py)) == 0:
+            return False
+
+    return True
+
+
+def has_line_of_sight(position_a, position_b):
+    """두 로봇 사이의 직선이 벽을 통과하지 않을 때만 True를 반환합니다.
+
+    단순 거리 조건만 사용하면 서로 다른 복도에 있는 로봇들이 벽을
+    관통해 통신하는 문제가 생깁니다. 이 함수는 두 위치 사이를 일정한
+    간격으로 샘플링하여 모든 점이 이동 가능 복도 내부인지 검사합니다.
+    """
+    delta = position_b - position_a
+    distance = delta.length()
+
+    if distance <= EPSILON:
+        return True
+
+    # 같은 직사각형 복도/영역 안의 두 점은 해당 영역의 볼록성 때문에
+    # 직선이 벽을 통과하지 않습니다. 대부분의 근거리 쌍을 즉시 처리해
+    # 220대 환경의 LOS 계산량을 크게 줄입니다.
+    region_a = get_robot_region(position_a)
+    region_b = get_robot_region(position_b)
+    if region_a != "OUTSIDE" and region_a == region_b:
+        return True
+
+    sample_count = max(
+        1,
+        int(math.ceil(distance / COMM_LOS_SAMPLE_SPACING)),
+    )
+
+    for index in range(1, sample_count):
+        ratio = index / sample_count
+        sample = position_a + delta * ratio
+
+        if not is_mask_clear_at(sample, COMM_LOS_CLEARANCE):
+            return False
+
+    return True
 
 # =========================================================
 # 6. 공통 함수
@@ -623,6 +714,9 @@ class Robot:
         self.connected_to_anchor = False
         self.comm_hop = -1
         self.comm_parent = None
+        # Anchor까지 가는 경로에서 가장 작은 링크 여유거리의 최댓값.
+        # 값이 클수록 더 안정적인 다중 홉 경로입니다.
+        self.comm_path_margin = float("-inf")
 
         # Anchor에서 다중 홉으로 수신한 메시지
         self.received_branch = None
@@ -909,21 +1003,29 @@ def iter_neighbor_candidates(robot, grid):
 
 
 def update_communication_neighbors(robots, grid):
-    """COMM_RANGE 안에 있는 로봇만 직접 통신 이웃으로 등록합니다."""
+    """거리와 LOS를 만족하는 무방향 통신 그래프를 한 번만 계산합니다.
+
+    기존 코드는 A→B와 B→A에서 LOS를 각각 다시 검사해 계산량이 컸습니다.
+    이제 각 로봇 쌍을 한 번만 검사한 뒤 양쪽 이웃 목록에 함께 추가합니다.
+    """
     comm_range_squared = COMM_RANGE**2
 
     for robot in robots:
         robot.comm_neighbors = []
 
+    for robot in robots:
         for other in iter_neighbor_candidates(robot, grid):
-            if robot is other:
+            if other.robot_id <= robot.robot_id:
                 continue
 
-            if (
-                robot.position.distance_squared_to(other.position)
-                <= comm_range_squared
-            ):
-                robot.comm_neighbors.append(other)
+            if robot.position.distance_squared_to(other.position) > comm_range_squared:
+                continue
+
+            if not has_line_of_sight(robot.position, other.position):
+                continue
+
+            robot.comm_neighbors.append(other)
+            other.comm_neighbors.append(robot)
 
 
 def get_anchor_deployment_motion_scale(anchor):
@@ -967,26 +1069,25 @@ def get_anchor_deployment_motion_scale(anchor):
 
 
 def anchor_deployment_ready(anchor, robots):
-    """Anchor가 주차점에 도착했고 안전한 직접 이웃을 확보했는지 검사합니다."""
+    """Anchor가 주차점에 도착하고 직접 LOS 이웃을 확보했는지 검사합니다.
+
+    이전 주차점은 Junction 모서리에 너무 가까워 안전거리 이웃이 0명이 되는
+    경우가 있었고, 그 결과 MOVE_TO_JUNCTION 상태에서 영구 정지했습니다.
+    """
     if anchor is None or anchor.anchor_position is None:
         return False
 
-    if (
-        anchor.position.distance_to(anchor.anchor_position)
-        > ANCHOR_POSITION_TOLERANCE
-    ):
+    if anchor.position.distance_to(anchor.anchor_position) > ANCHOR_POSITION_TOLERANCE:
         return False
 
-    safe_neighbors = sum(
-        robot is not anchor
-        and robot.role != "ANCHOR"
-        and anchor.position.distance_to(robot.position)
-        <= COMM_SAFE_DISTANCE
-        for robot in robots
-    )
+    usable_neighbors = [
+        neighbor
+        for neighbor in anchor.comm_neighbors
+        if neighbor.role != "ANCHOR"
+        and anchor.position.distance_to(neighbor.position) <= COMM_RANGE * 0.92
+    ]
 
-    return safe_neighbors >= ANCHOR_READY_DIRECT_NEIGHBORS
-
+    return len(usable_neighbors) >= ANCHOR_READY_DIRECT_NEIGHBORS
 
 def get_anchor_message(anchor):
     """현재 Anchor가 전파하는 DFS 명령을 반환합니다."""
@@ -997,10 +1098,12 @@ def get_anchor_message(anchor):
 
 
 def propagate_anchor_message(robots, anchor):
-    """Anchor에서 시작해 통신 그래프를 BFS로 순회합니다.
+    """Anchor에서 LOS 통신 그래프의 가장 안정적인 경로를 계산합니다.
 
-    직접 통신 범위 밖에 있는 로봇도 중간 로봇을 통하는 경로가 있으면
-    selected_branch와 현재 제어 명령을 수신합니다.
+    단순 BFS는 먼저 발견된 임의의 부모 링크를 선택하므로, 더 좋은 대체
+    경로가 있어도 통신 한계에 가까운 링크를 부모로 잡을 수 있습니다.
+    여기서는 각 경로의 최소 링크 여유거리 중 가장 큰 경로를 선택하는
+    widest-path 방식으로 통신 부모와 메시지 전달 경로를 정합니다.
     """
     global communication_sequence
     global last_message_signature
@@ -1009,6 +1112,7 @@ def propagate_anchor_message(robots, anchor):
         robot.connected_to_anchor = False
         robot.comm_hop = -1
         robot.comm_parent = None
+        robot.comm_path_margin = float("-inf")
         robot.received_branch = None
         robot.received_command = None
         robot.received_sequence = -1
@@ -1031,29 +1135,53 @@ def propagate_anchor_message(robots, anchor):
 
     anchor.connected_to_anchor = True
     anchor.comm_hop = 0
+    anchor.comm_path_margin = float("inf")
     anchor.received_branch = selected_branch
     anchor.received_command = command
     anchor.received_sequence = communication_sequence
 
-    queue = deque([anchor])
+    # 최대 여유 경로부터 확장하기 위한 max-heap 역할입니다.
+    heap = [(-1.0e12, anchor.robot_id, anchor)]
 
-    while queue:
-        current = queue.popleft()
+    while heap:
+        _, _, current = heapq.heappop(heap)
 
         for neighbor in current.comm_neighbors:
-            if neighbor.connected_to_anchor:
+            distance = current.position.distance_to(neighbor.position)
+            edge_margin = COMM_RANGE - distance
+            candidate_margin = min(current.comm_path_margin, edge_margin)
+
+            if candidate_margin <= neighbor.comm_path_margin + EPSILON:
                 continue
 
             neighbor.connected_to_anchor = True
-            neighbor.comm_hop = current.comm_hop + 1
             neighbor.comm_parent = current
+            neighbor.comm_hop = current.comm_hop + 1
+            neighbor.comm_path_margin = candidate_margin
             neighbor.received_branch = selected_branch
             neighbor.received_command = command
             neighbor.received_sequence = communication_sequence
-            queue.append(neighbor)
+
+            heapq.heappush(
+                heap,
+                (-candidate_margin, neighbor.robot_id, neighbor),
+            )
 
 
 def update_communication_system(robots, grid):
+    # Anchor 선발 전에는 통신 그래프가 제어에 사용되지 않으므로 LOS 계산을 생략합니다.
+    if junction_anchor is None:
+        for robot in robots:
+            robot.comm_neighbors = []
+            robot.connected_to_anchor = False
+            robot.comm_hop = -1
+            robot.comm_parent = None
+            robot.comm_path_margin = float("-inf")
+            robot.received_branch = None
+            robot.received_command = None
+            robot.received_sequence = -1
+        return
+
     update_communication_neighbors(robots, grid)
     propagate_anchor_message(robots, junction_anchor)
 
@@ -1072,68 +1200,49 @@ def find_nearest_connected_robot(robot, grid):
             candidate.position
         )
 
-        if distance_squared < nearest_distance_squared:
-            nearest_distance_squared = distance_squared
-            nearest = candidate
+        if distance_squared >= nearest_distance_squared:
+            continue
+
+        if not has_line_of_sight(
+            robot.position,
+            candidate.position,
+        ):
+            continue
+
+        nearest_distance_squared = distance_squared
+        nearest = candidate
 
     return nearest
 
 
 def compute_connectivity_force(robot, grid):
-    """현재 BFS 통신 트리의 부모 링크를 통신 범위 안에 유지합니다.
+    """통신이 끊긴 로봇에만 재접속 힘을 적용합니다.
 
-    이 항은 명령 전달 자체와 별개의 연결성 유지용 안전 보조항입니다.
+    연결된 모든 일반 로봇을 임의의 BFS 부모 쪽으로 당기면 군집이 Anchor나
+    이전 통로 방향에 묶이는 현상이 생깁니다. 연결된 로봇은 mesh 통신을
+    이용해 자유롭게 SPH 이동을 하고, 전용 Relay만 자신의 slot을 유지합니다.
     """
-    if junction_anchor is None or robot.role == "ANCHOR":
+    if junction_anchor is None or robot.role in {"ANCHOR", "RELAY"}:
         return pygame.Vector2(0.0, 0.0)
 
-    force = pygame.Vector2(0.0, 0.0)
+    if robot.connected_to_anchor:
+        return pygame.Vector2(0.0, 0.0)
 
-    if robot.connected_to_anchor and robot.comm_parent is not None:
-        delta = robot.comm_parent.position - robot.position
-        distance = delta.length()
+    recovery_target = find_nearest_connected_robot(robot, grid)
+    if recovery_target is None:
+        return pygame.Vector2(0.0, 0.0)
 
-        if distance > EPSILON:
-            direction = delta / distance
+    delta = recovery_target.position - robot.position
+    distance = delta.length()
 
-            if distance > COMM_SAFE_DISTANCE:
-                force += (
-                    CONNECTIVITY_GAIN
-                    * (distance - COMM_SAFE_DISTANCE)
-                    * direction
-                )
+    if distance <= EPSILON:
+        return pygame.Vector2(0.0, 0.0)
 
-            if distance > COMM_BARRIER_START:
-                denominator = max(
-                    COMM_RANGE - COMM_BARRIER_START,
-                    EPSILON,
-                )
-                ratio = min(
-                    1.0,
-                    (distance - COMM_BARRIER_START) / denominator,
-                )
-                force += (
-                    CONNECTIVITY_BARRIER_GAIN
-                    * ratio**2
-                    * direction
-                )
-
-    elif not robot.connected_to_anchor:
-        # 이미 끊어진 경우 가장 가까운 연결 로봇 쪽으로 이동해 재접속을 시도합니다.
-        recovery_target = find_nearest_connected_robot(robot, grid)
-
-        if recovery_target is not None:
-            delta = recovery_target.position - robot.position
-            distance = delta.length()
-
-            if distance > EPSILON:
-                force += (
-                    COMM_RECOVERY_GAIN
-                    * min(distance, COMM_RECOVERY_RANGE)
-                    * (delta / distance)
-                )
-
-    return force
+    return (
+        COMM_RECOVERY_GAIN
+        * min(distance, COMM_RECOVERY_RANGE)
+        * (delta / distance)
+    )
 
 
 def get_communication_stats(robots):
@@ -1150,12 +1259,12 @@ def get_communication_stats(robots):
     disconnected_count = len(robots) - len(connected)
     max_hop = max((robot.comm_hop for robot in connected), default=0)
 
-    margins = []
-    for robot in connected:
-        if robot.comm_parent is None:
-            continue
-        distance = robot.position.distance_to(robot.comm_parent.position)
-        margins.append(COMM_RANGE - distance)
+    margins = [
+        robot.comm_path_margin
+        for robot in connected
+        if robot is not junction_anchor
+        and math.isfinite(robot.comm_path_margin)
+    ]
 
     return {
         "connected": len(connected),
@@ -1385,6 +1494,76 @@ def get_next_undeployed_slot(robots):
     return None
 
 
+def get_front_communication_status(robots, branch):
+    """현재 Branch 전방 군집의 Anchor 통신 상태를 반환합니다.
+
+    단 한 로봇의 매우 작은 여유거리 때문에 전체 군집이 정지하지 않도록
+    연결된 전방 로봇 경로 여유의 20% 분위값을 사용합니다.
+    """
+    branch_robots = [
+        robot
+        for robot in robots
+        if robot.role in {"NORMAL", "SHEPHERD"}
+        and get_robot_region(robot.position) == branch
+    ]
+
+    if not branch_robots:
+        return {
+            "count": 0,
+            "connected_ratio": 1.0,
+            "minimum_margin": COMM_RANGE,
+            "needs_relay": False,
+        }
+
+    branch_robots.sort(
+        key=lambda robot: relay_path_progress(robot.position, branch),
+        reverse=True,
+    )
+
+    front_count = min(
+        len(branch_robots),
+        max(
+            RELAY_FRONT_MIN_COUNT,
+            int(math.ceil(len(branch_robots) * RELAY_FRONT_FRACTION)),
+        ),
+    )
+    front = branch_robots[:front_count]
+    connected = [robot for robot in front if robot.connected_to_anchor]
+    connected_ratio = len(connected) / max(len(front), 1)
+
+    margins = sorted(
+        robot.comm_path_margin
+        for robot in connected
+        if math.isfinite(robot.comm_path_margin)
+    )
+
+    if margins:
+        percentile_index = min(len(margins) - 1, int(0.20 * len(margins)))
+        robust_margin = margins[percentile_index]
+    else:
+        robust_margin = -COMM_RANGE
+
+    needs_relay = (
+        connected_ratio < RELAY_FRONT_REQUIRED_CONNECTED_RATIO
+        or robust_margin < RELAY_DEPLOY_MARGIN
+    )
+
+    return {
+        "count": len(front),
+        "connected_ratio": connected_ratio,
+        "minimum_margin": robust_margin,
+        "needs_relay": needs_relay,
+    }
+
+def active_front_ready_for_shepherd(robots, branch):
+    status = get_front_communication_status(robots, branch)
+    return (
+        status["connected_ratio"]
+        >= RELAY_FRONT_REQUIRED_CONNECTED_RATIO
+        and status["minimum_margin"] >= 0.0
+    )
+
+
 def relay_plan_complete(robots):
     if not relay_slots:
         return True
@@ -1429,7 +1608,12 @@ def compute_relay_front_link_distance(robots):
 
 
 def update_relay_deployment(robots, dt):
-    """군집이 전진할 때 필요한 slot에 Relay를 순차적으로 남깁니다."""
+    """통신 위험 시 필요한 Relay만 배치하되 군집을 완전히 얼리지 않습니다.
+
+    기존에는 여유가 작아지는 순간 motion scale을 0으로 만들었지만, 아직
+    다음 slot 근처에 후보 로봇이 없어 Relay도 배치되지 않는 교착이 생겼습니다.
+    이제 심각한 단절이 아니면 최소 저속으로 전진해 후보가 slot에 도달합니다.
+    """
     global relay_deploy_cooldown
     global relay_motion_scale
 
@@ -1440,61 +1624,35 @@ def update_relay_deployment(robots, dt):
         return
 
     front_progress = get_exploration_front_progress(robots, active_branch)
+    status = get_front_communication_status(robots, active_branch)
     next_slot = get_next_undeployed_slot(robots)
 
-    if next_slot is not None:
-        slot_due = (
-            front_progress
-            >= next_slot["path_distance"] - RELAY_DEPLOY_LOOKAHEAD
-        )
+    if status["needs_relay"]:
+        # 연결이 일부 약해도 후보 로봇이 slot까지 갈 수 있도록 저속 이동을 허용합니다.
+        relay_motion_scale = RELAY_WAIT_SPEED_SCALE
 
-        if slot_due and relay_deploy_cooldown <= 0.0:
-            if deploy_relay_for_slot(robots, next_slot):
-                relay_deploy_cooldown = RELAY_DEPLOY_COOLDOWN
-            else:
-                relay_motion_scale = min(
-                    relay_motion_scale,
-                    RELAY_WAIT_SPEED_SCALE,
-                )
-
-        # Relay가 필요한 위치까지 군집이 도착했는데 배치되지 않았다면 감속합니다.
-        if front_progress >= next_slot["path_distance"] - 2.0:
-            relay_motion_scale = min(
-                relay_motion_scale,
-                RELAY_WAIT_SPEED_SCALE,
+        if next_slot is not None:
+            slot_reached = (
+                front_progress
+                >= next_slot["path_distance"] - RELAY_DEPLOY_LOOKAHEAD
             )
 
-    # 새 Relay가 slot으로 이동 중이면 군집을 잠시 감속합니다.
+            if slot_reached and relay_deploy_cooldown <= 0.0:
+                if deploy_relay_for_slot(robots, next_slot):
+                    relay_deploy_cooldown = RELAY_DEPLOY_COOLDOWN
+                    relay_motion_scale = RELAY_FORMING_SPEED_SCALE
+
     unsettled_relays = [
         relay
         for relay in get_active_branch_relays(robots)
         if not relay_at_slot_is_settled(relay)
     ]
     if unsettled_relays:
-        relay_motion_scale = min(
-            relay_motion_scale,
-            RELAY_FORMING_SPEED_SCALE,
-        )
+        relay_motion_scale = min(relay_motion_scale, RELAY_FORMING_SPEED_SCALE)
 
-    # 마지막 Relay와 군집 사이 링크가 늘어날수록 선제적으로 속도를 줄입니다.
-    front_link_distance = compute_relay_front_link_distance(robots)
-
-    if front_link_distance > RELAY_LINK_WARNING_DISTANCE:
-        denominator = max(
-            RELAY_LINK_STOP_DISTANCE - RELAY_LINK_WARNING_DISTANCE,
-            EPSILON,
-        )
-        scale = (
-            RELAY_LINK_STOP_DISTANCE - front_link_distance
-        ) / denominator
-        relay_motion_scale = min(
-            relay_motion_scale,
-            max(0.0, min(1.0, scale)),
-        )
-
-    if front_link_distance >= RELAY_LINK_STOP_DISTANCE:
+    # 전방 대부분이 실제로 단절된 경우에만 완전히 정지합니다.
+    if status["connected_ratio"] < 0.55:
         relay_motion_scale = 0.0
-
 
 def release_relay_into_backtracking(robot):
     backtrack_direction = get_backtrack_direction(active_branch)
@@ -1948,8 +2106,42 @@ def release_shepherds_into_flow(robots):
 
 
 # =========================================================
-# 11. SPH 계산
+# 11. 초기 Junction 진입 / SPH 계산
 # =========================================================
+
+
+def update_initial_ingress(robots, dt):
+    """Anchor 선발 전 Base에서 Junction까지 로봇을 확실하게 이동시킵니다.
+
+    초기 단계에서는 아직 통신 루트가 없고 모든 로봇이 같은 직선 복도에 있으므로,
+    전체 SPH·LOS 그래프를 매 프레임 계산할 필요가 없습니다. NORMAL 로봇은
+    Junction 방향 목표속도를 추종하고, 좌우 중심 정렬만 약하게 적용합니다.
+    Anchor가 선발되면 Anchor 자체는 기존 Robot.update()의 안전 배치 제어를 사용합니다.
+    """
+    junction_entry_target_y = center_y + 8.0
+
+    for robot in robots:
+        if robot.role == "ANCHOR":
+            robot.update(dt)
+            continue
+
+        if robot.role != "NORMAL":
+            robot.update(dt)
+            continue
+
+        # Junction 입구까지는 위쪽으로 전진하고, 복도 중심선에서 멀어진 만큼
+        # x방향 복원속도를 더합니다.
+        y_error = junction_entry_target_y - robot.position.y
+        upward_speed = -INITIAL_INGRESS_SPEED if y_error < 0.0 else 0.0
+        lateral_speed = INITIAL_INGRESS_CENTERING * (center_x - robot.position.x)
+        lateral_speed = max(-28.0, min(28.0, lateral_speed))
+
+        desired_velocity = pygame.Vector2(lateral_speed, upward_speed)
+        robot.acceleration = (
+            desired_velocity - robot.velocity
+        ) * INITIAL_INGRESS_RESPONSE
+        limit_vector(robot.acceleration, MAX_ACCELERATION)
+        robot.update(dt)
 
 
 def compute_densities(robots, grid):
@@ -2424,7 +2616,7 @@ def update_simulation_state(robots, dt, reference_density):
 
         if (
             capture_count >= SHEPHERD_COUNT
-            and relay_plan_complete(robots)
+            and active_front_ready_for_shepherd(robots, active_branch)
         ):
             selected = select_shepherds(robots, active_branch)
             if len(selected) == SHEPHERD_COUNT:
@@ -2648,6 +2840,9 @@ def initialize_simulation():
     return robots, reference_density, color_reference_density
 
 
+print("[MODE] Anchor-rooted LOS communication enabled")
+print("[MODE] Base communication and trunk relays are disabled")
+print("[MODE] Fast initial ingress enabled: movement starts without pre-anchor LOS/SPH overhead")
 robots, reference_density, color_reference_density = initialize_simulation()
 
 # =========================================================
@@ -2659,9 +2854,16 @@ paused = False
 show_density_color = False
 show_regions = True
 show_comm_links = SHOW_COMM_LINKS_DEFAULT
+communication_frame_counter = 0
 
 while running:
-    frame_dt = min(clock.tick(FPS) / 1000.0, 0.033)
+    raw_frame_dt = max(clock.tick(FPS) / 1000.0, 1.0 / 240.0)
+    frame_dt = min(
+        raw_frame_dt,
+        INITIAL_INGRESS_MAX_DT
+        if phase == SimulationPhase.MOVE_TO_JUNCTION
+        else NORMAL_PHYSICS_MAX_DT,
+    )
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -2685,29 +2887,45 @@ while running:
 
     if not paused:
         simulation_time += frame_dt
-        substep_dt = frame_dt / SUBSTEPS
+        communication_frame_counter += 1
 
-        for _ in range(SUBSTEPS):
+        if phase == SimulationPhase.MOVE_TO_JUNCTION:
+            # Anchor가 선발되기 전에는 통신/LOS와 전체 SPH 계산을 생략하여
+            # 초기 이동이 저 FPS에서 정지한 것처럼 보이는 문제를 제거합니다.
+            # Anchor가 생긴 뒤에는 안전 주차를 위해 국소 통신 그래프를 갱신합니다.
             spatial_grid = build_spatial_grid(robots)
-            update_communication_system(robots, spatial_grid)
-            compute_densities(robots, spatial_grid)
-            compute_pressures(robots, reference_density)
-            compute_sph_forces(robots, spatial_grid)
+            if junction_anchor is not None:
+                update_communication_system(robots, spatial_grid)
 
-            for robot in robots:
-                robot.update(substep_dt)
+            update_initial_ingress(robots, frame_dt)
+            update_anchor_entry_records(robots, simulation_time)
+            update_simulation_state(robots, frame_dt, reference_density)
 
-        update_anchor_entry_records(robots, simulation_time)
+            # 이번 프레임에 Anchor가 막 선발됐다면 바로 통신 상태를 초기화합니다.
+            if junction_anchor is not None:
+                spatial_grid = build_spatial_grid(robots)
+                update_communication_system(robots, spatial_grid)
 
-        update_simulation_state(
-            robots,
-            frame_dt,
-            reference_density,
-        )
+        else:
+            substep_dt = frame_dt / SUBSTEPS
 
-        # 상태 전이로 Anchor 명령이 바뀌었을 수 있으므로 즉시 다시 전파합니다.
-        spatial_grid = build_spatial_grid(robots)
-        update_communication_system(robots, spatial_grid)
+            # 통신/LOS 그래프는 몇 프레임마다 한 번 갱신하고 그 사이에는
+            # 마지막 그래프를 재사용합니다. 물리 계산은 매 프레임 유지합니다.
+            spatial_grid = build_spatial_grid(robots)
+            if communication_frame_counter % COMM_UPDATE_INTERVAL_FRAMES == 0:
+                update_communication_system(robots, spatial_grid)
+
+            for _ in range(SUBSTEPS):
+                spatial_grid = build_spatial_grid(robots)
+                compute_densities(robots, spatial_grid)
+                compute_pressures(robots, reference_density)
+                compute_sph_forces(robots, spatial_grid)
+
+                for robot in robots:
+                    robot.update(substep_dt)
+
+            update_anchor_entry_records(robots, simulation_time)
+            update_simulation_state(robots, frame_dt, reference_density)
     else:
         spatial_grid = build_spatial_grid(robots)
         update_communication_system(robots, spatial_grid)
@@ -2816,18 +3034,19 @@ while running:
     )
     anchor_direct_safe = (
         sum(
-            robot is not junction_anchor
-            and junction_anchor is not None
-            and junction_anchor.position.distance_to(robot.position)
+            neighbor.role != "ANCHOR"
+            and junction_anchor.position.distance_to(neighbor.position)
             <= COMM_SAFE_DISTANCE
-            for robot in robots
+            for neighbor in junction_anchor.comm_neighbors
         )
         if junction_anchor is not None
         else 0
     )
     communication_stats = get_communication_stats(robots)
+    front_comm_status = get_front_communication_status(robots, active_branch)
 
     hud_lines = [
+        "Mode: Anchor-rooted LOS | Fast ingress ON | Base/Trunk OFF",
         f"FPS: {clock.get_fps():.1f}",
         f"Robots: {len(robots)}",
         f"Motion speed: {MOTION_SPEED_MULTIPLIER:.1f}x",
@@ -2839,12 +3058,12 @@ while running:
         ),
         f"Anchor deploy: parked={anchor_parked} | safe neighbors={anchor_direct_safe}",
         (
-            "Comm: "
+            "Anchor LOS comm: "
             f"{communication_stats['connected']}/{len(robots)} connected | "
             f"max hop={communication_stats['max_hop']}"
         ),
         (
-            "Comm link: "
+            "LOS link: "
             f"direct={communication_stats['direct_anchor_neighbors']} | "
             f"min margin={communication_stats['minimum_margin']:.1f}px"
         ),
@@ -2855,8 +3074,14 @@ while running:
             f"connected={communication_stats['connected']}/{len(robots)}"
         ),
         (
-            f"Relays: {len(get_relays(robots))}/{len(relay_slots)} | "
+            f"Adaptive relays: {len(get_relays(robots))} active | "
             f"motion scale={relay_motion_scale:.2f}"
+        ),
+        (
+            "Front comm: "
+            f"ratio={front_comm_status['connected_ratio']:.2f} | "
+            f"margin={front_comm_status['minimum_margin']:.1f}px | "
+            f"need relay={front_comm_status['needs_relay']}"
         ),
         (
             "Return to Base: "
