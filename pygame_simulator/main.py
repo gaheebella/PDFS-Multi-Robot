@@ -184,6 +184,7 @@ class SimulationPhase(Enum):
     PRESSURE_PUSH = auto()
     FLOW_BACKTRACK = auto()
     JUNCTION_SWITCH = auto()
+    FINAL_JUNCTION_GATHER = auto()
     RETURN_TO_BASE = auto()
     DONE = auto()
 
@@ -206,6 +207,7 @@ branch_states = {
 junction_anchor = None
 simulation_time = 0.0
 junction_switch_timer = 0.0
+final_gather_timer = 0.0
 
 saturation_timer = 0.0
 shepherd_form_timer = 0.0
@@ -270,8 +272,11 @@ ANCHOR_MOVE_SPEED = 42.0
 ANCHOR_POSITION_TOLERANCE = 2.5
 JUNCTION_SWITCH_COUNT = 18
 JUNCTION_SWITCH_DWELL_TIME = 0.25
-# 최종에는 Anchor까지 역할을 해제하고 220대 전부 시작 통로로 복귀해야 완료합니다.
+# 마지막 Branch 뒤에는 먼저 모든 잔여 로봇을 Junction으로 회수한 다음,
+# Anchor까지 역할을 해제하고 220대 전부 시작 통로로 복귀해야 완료합니다.
 RETURN_BOTTOM_TARGET_COUNT = ROBOT_COUNT
+FINAL_GATHER_DWELL_TIME = 0.55
+FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
 
 # Shepherd boundary
 # dead-end에 가장 먼저 도착한 8대를 즉시 선발하기 위한 조기 감지 깊이
@@ -430,7 +435,16 @@ def is_region_allowed(position):
     }:
         return region in {"BOTTOM", "JUNCTION", active_branch}
 
-    if phase in {SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE}:
+    # 마지막 회수 단계에서는 과거 Branch에 남은 로봇이 스스로 Junction으로
+    # 빠져나올 수 있도록 모든 복도를 열어 둡니다. Branch를 즉시 닫으면
+    # 경계 밖에 남은 로봇이 이동 불가능 상태로 고정될 수 있습니다.
+    if phase in {
+        SimulationPhase.FINAL_JUNCTION_GATHER,
+        SimulationPhase.RETURN_TO_BASE,
+    }:
+        return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
+
+    if phase == SimulationPhase.DONE:
         return region in {"BOTTOM", "JUNCTION"}
 
     return region != "OUTSIDE"
@@ -1715,8 +1729,27 @@ def release_anchor_for_final_return(anchor):
     )
 
 
+def begin_final_gather():
+    """마지막 Branch 완료 후 모든 잔여 로봇을 먼저 Junction으로 회수합니다.
+
+    이 단계에서는 Anchor를 Junction에 유지하고 모든 Branch를 열어 둡니다.
+    통신이 끊긴 로봇도 Known map의 Junction 위치를 이용해 자율 복귀하므로,
+    전역 통신 명령을 받지 못했다는 이유로 Branch에 고립되지 않습니다.
+    """
+    global phase
+    global relay_slots
+    global relay_motion_scale
+    global final_gather_timer
+
+    relay_slots = []
+    relay_motion_scale = 1.0
+    final_gather_timer = 0.0
+    phase = SimulationPhase.FINAL_JUNCTION_GATHER
+    print("[DFS] 모든 Branch 완료, 잔여 로봇 Junction 최종 회수 시작")
+
+
 def begin_final_return(anchor):
-    """Relay plan을 종료하고 Anchor를 포함한 전체 군집의 최종 복귀를 시작합니다."""
+    """모든 로봇이 Junction 측 군집으로 재결합한 뒤 Base 복귀를 시작합니다."""
     global phase
     global relay_slots
     global relay_motion_scale
@@ -1725,7 +1758,7 @@ def begin_final_return(anchor):
     relay_motion_scale = 1.0
     release_anchor_for_final_return(anchor)
     phase = SimulationPhase.RETURN_TO_BASE
-    print("[DFS] 모든 Branch 완료, Anchor 포함 전체 로봇 Base 복귀")
+    print("[DFS] 전 로봇 재결합 완료, Anchor 포함 전체 로봇 Base 복귀")
 
 
 # =========================================================
@@ -1977,9 +2010,17 @@ def compute_route_force(robot):
     if robot.role in {"ANCHOR", "RELAY"}:
         return force
 
-    # Anchor 선발 이후에는 실제로 Anchor 통신망에 연결되어 있고,
-    # 현재 메시지를 수신한 로봇만 DFS 이동 명령을 수행합니다.
-    if phase != SimulationPhase.MOVE_TO_JUNCTION and junction_anchor is not None:
+    # 일반 탐색 중에는 실제로 Anchor 통신망에 연결되고 현재 메시지를
+    # 수신한 로봇만 DFS 명령을 수행합니다. 다만 마지막 회수/귀환 단계는
+    # 통신 단절 로봇 구조를 위해 Known map 기반 자율 귀환을 허용합니다.
+    communication_independent_phases = {
+        SimulationPhase.MOVE_TO_JUNCTION,
+        SimulationPhase.FINAL_JUNCTION_GATHER,
+        SimulationPhase.RETURN_TO_BASE,
+        SimulationPhase.DONE,
+    }
+
+    if phase not in communication_independent_phases and junction_anchor is not None:
         if (
             not robot.connected_to_anchor
             or robot.received_command != phase.name
@@ -2065,10 +2106,29 @@ def compute_route_force(robot):
             * OUTLET_FORCE
         )
 
-    elif phase == SimulationPhase.RETURN_TO_BASE:
-        # 모든 Branch가 VISITED 된 후에만 시작 위치로 최종 복귀합니다.
+    elif phase == SimulationPhase.FINAL_JUNCTION_GATHER:
+        # 이전 Branch에 남은 로봇은 먼저 Junction 중심으로 복귀합니다.
+        # 이미 Junction/BOTTOM에 들어온 로봇은 Junction 대기 위치로 모입니다.
+        target = (
+            junction_target
+            if region in {"UP", "LEFT", "RIGHT"}
+            else JUNCTION_STAGING_POSITION
+        )
         force = (
-            normalized_direction_toward(robot.position, bottom_hold)
+            normalized_direction_toward(robot.position, target)
+            * FINAL_GATHER_FORCE
+        )
+
+    elif phase == SimulationPhase.RETURN_TO_BASE:
+        # 정상적으로는 전 로봇이 Junction에 모인 뒤 시작하지만, 혹시 Branch에
+        # 잔여 로봇이 있더라도 먼저 Junction을 경유하도록 경로를 분리합니다.
+        target = (
+            junction_target
+            if region in {"UP", "LEFT", "RIGHT"}
+            else bottom_hold
+        )
+        force = (
+            normalized_direction_toward(robot.position, target)
             * OUTLET_FORCE
         )
 
@@ -2318,6 +2378,7 @@ def update_simulation_state(robots, dt, reference_density):
     global pressure_push_timer
     global flow_establish_timer
     global junction_switch_timer
+    global final_gather_timer
 
     # Junction 최초 진입자를 Anchor로 선발합니다.
     anchor = elect_junction_anchor(robots)
@@ -2341,7 +2402,7 @@ def update_simulation_state(robots, dt, reference_density):
             selected = anchor_select_next_branch(anchor)
 
             if selected is None:
-                begin_final_return(anchor)
+                begin_final_gather()
             else:
                 phase = SimulationPhase.EXPLORE_BRANCH
                 print(f"[DFS] Branch 탐색 시작: {active_branch}")
@@ -2451,7 +2512,7 @@ def update_simulation_state(robots, dt, reference_density):
             next_branch = anchor_select_next_branch(anchor)
 
             if next_branch is None:
-                begin_final_return(anchor)
+                begin_final_gather()
             else:
                 saturation_timer = 0.0
                 shepherd_form_timer = 0.0
@@ -2459,6 +2520,32 @@ def update_simulation_state(robots, dt, reference_density):
                 flow_establish_timer = 0.0
                 phase = SimulationPhase.EXPLORE_BRANCH
                 print(f"[DFS] Junction에서 바로 다음 Branch 탐색: {active_branch}")
+
+    elif phase == SimulationPhase.FINAL_JUNCTION_GATHER:
+        # 활성 Branch뿐 아니라 과거 Branch 전체를 검사합니다. 마지막 화면에서
+        # 보였던 2대처럼 UP/LEFT에 남은 로봇이 있으면 Base 복귀를 시작하지 않습니다.
+        branch_stragglers = sum(
+            get_robot_region(robot.position) in {"UP", "LEFT", "RIGHT"}
+            for robot in robots
+        )
+        remaining_relays = len(get_relays(robots))
+        remaining_shepherds = len(get_shepherds(robots))
+        connected_count = sum(robot.connected_to_anchor for robot in robots)
+
+        gather_ready = (
+            branch_stragglers == 0
+            and remaining_relays == 0
+            and remaining_shepherds == 0
+            and connected_count == len(robots)
+        )
+
+        if gather_ready:
+            final_gather_timer += dt
+        else:
+            final_gather_timer = 0.0
+
+        if final_gather_timer >= FINAL_GATHER_DWELL_TIME:
+            begin_final_return(anchor)
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
         robots_in_bottom = sum(
@@ -2493,6 +2580,7 @@ def reset_dfs_state():
     global junction_anchor
     global simulation_time
     global junction_switch_timer
+    global final_gather_timer
     global saturation_timer
     global shepherd_form_timer
     global pressure_push_timer
@@ -2516,6 +2604,7 @@ def reset_dfs_state():
     junction_anchor = None
     simulation_time = 0.0
     junction_switch_timer = 0.0
+    final_gather_timer = 0.0
     saturation_timer = 0.0
     shepherd_form_timer = 0.0
     pressure_push_timer = 0.0
@@ -2702,7 +2791,12 @@ while running:
     phase_text = phase.name
     active_text = (
         active_branch
-        if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.DONE}
+        if phase not in {
+            SimulationPhase.MOVE_TO_JUNCTION,
+            SimulationPhase.FINAL_JUNCTION_GATHER,
+            SimulationPhase.RETURN_TO_BASE,
+            SimulationPhase.DONE,
+        }
         else "-"
     )
     anchor_id = junction_anchor.robot_id if junction_anchor is not None else "-"
@@ -2755,6 +2849,11 @@ while running:
             f"min margin={communication_stats['minimum_margin']:.1f}px"
         ),
         f"Active branch: {active_text}",
+        (
+            "Final gather: "
+            f"stragglers={sum(get_robot_region(robot.position) in {'UP', 'LEFT', 'RIGHT'} for robot in robots)} | "
+            f"connected={communication_stats['connected']}/{len(robots)}"
+        ),
         (
             f"Relays: {len(get_relays(robots))}/{len(relay_slots)} | "
             f"motion scale={relay_motion_scale:.2f}"
