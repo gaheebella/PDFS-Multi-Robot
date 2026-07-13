@@ -20,7 +20,7 @@ FPS = 60
 SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("SPH + DFS Adaptive Relay + Fast Initial Ingress")
+pygame.display.set_caption("SPH + DFS Adaptive Relay + Fast Shepherd Release")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 20)
@@ -259,14 +259,18 @@ MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
 MAX_ACCELERATION = 520.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
-# 초기 Base→Junction 이동은 Anchor와 통신 그래프가 아직 없으므로
-# 무거운 SPH/LOS 계산 대신 전용 2차 속도 추종 제어를 사용합니다.
-# 저사양 환경에서 FPS가 낮아도 첫 이동이 멈춰 보이지 않도록 실제 경과시간을
-# 최대 0.12초까지 반영합니다. Junction 진입 후에는 기존 SPH 제어로 전환합니다.
-INITIAL_INGRESS_SPEED = 76.0
-INITIAL_INGRESS_RESPONSE = 7.0
-INITIAL_INGRESS_CENTERING = 1.6
-INITIAL_INGRESS_MAX_DT = 0.12
+# 초기 Base→Junction 이동에서도 SPH 압력·점성·반발력을 계속 계산합니다.
+# 모든 로봇을 Junction 중심 한 점으로 끌어당기지 않고, 각 로봇이 시작할 때의
+# 횡방향 lane을 약하게 유지하면서 위쪽으로 이동하도록 합니다.
+INITIAL_INGRESS_FORCE = 44.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_INGRESS_LANE_GAIN = 1.0
+INITIAL_INGRESS_LANE_MAX_FORCE = 20.0
+INITIAL_INGRESS_TARGET_Y = center_y + 10.0
+INITIAL_INGRESS_BRAKE_DISTANCE = 34.0
+INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
+
+# SPH 적분이 불안정해지지 않도록 초기 단계도 큰 dt를 사용하지 않습니다.
+INITIAL_INGRESS_MAX_DT = 0.04
 NORMAL_PHYSICS_MAX_DT = 0.05
 
 # 고립 로봇이 무리를 따라오도록 하는 보조항
@@ -298,7 +302,7 @@ SHEPHERD_FORM_KP = 9.0
 SHEPHERD_HOLD_KP = 9.5
 SHEPHERD_HOLD_KD = 3.8
 SHEPHERD_FORM_SPEED = 110.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_RELEASE_SPEED = 18.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_FORM_TOLERANCE = 3.0
 SHEPHERD_FORM_TIMEOUT = 0.9
 
@@ -308,13 +312,17 @@ VIRTUAL_PRESSURE_RADIUS = 60.0
 VIRTUAL_PRESSURE_FORCE = 145.0
 PRESSURE_RAMP_TIME = 0.8
 
-# 일반 로봇의 backtracking 흐름이 형성되면 Shepherd를 즉시 해제
-FLOW_SPEED_THRESHOLD = 2.5
-FLOW_RATIO_THRESHOLD = 0.72
-FLOW_AVERAGE_SPEED_THRESHOLD = 3.0
-FLOW_ESTABLISH_DWELL_TIME = 0.25
-FLOW_MIN_NORMAL_COUNT = 8
-FLOW_FALLBACK_TIME = 3.0
+# Shepherd 바로 앞의 국소 로봇층이 Junction 방향으로 움직이기 시작하면
+# Branch 전체가 뒤집힐 때까지 기다리지 않고 Shepherd를 즉시 해제합니다.
+SHEPHERD_LOCAL_FLOW_DEPTH = 58.0
+SHEPHERD_LOCAL_FLOW_FORWARD_ALLOWANCE = 6.0
+SHEPHERD_MIN_PUSH_TIME = 0.18
+FLOW_SPEED_THRESHOLD = 1.5
+FLOW_RATIO_THRESHOLD = 0.45
+FLOW_AVERAGE_SPEED_THRESHOLD = 1.8
+FLOW_ESTABLISH_DWELL_TIME = 0.12
+FLOW_MIN_NORMAL_COUNT = 6
+FLOW_FALLBACK_TIME = 1.0
 
 # 조기 해제 뒤 전체가 함께 빠져나가는 단계
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
@@ -683,6 +691,11 @@ class Robot:
     def __init__(self, x, y, robot_id):
         self.robot_id = robot_id
         self.position = pygame.Vector2(x, y)
+
+        # 초기 Junction 진입 시 모든 로봇이 중앙 한 점으로 몰리지 않도록
+        # 생성 당시의 횡방향 위치를 약한 lane 기준으로 저장합니다.
+        self.ingress_lane_x = float(x)
+
         self.velocity = pygame.Vector2(0.0, 0.0)
         self.acceleration = pygame.Vector2(0.0, 0.0)
         self.radius = ROBOT_RADIUS
@@ -2032,14 +2045,50 @@ def shepherd_boundary_formed(robots):
     )
 
 
-def normal_backtracking_metrics(robots, branch):
-    """Branch 안 일반 로봇이 Junction 방향으로 흐르기 시작했는지 계산합니다."""
+def get_local_pressure_front_normals(robots, branch):
+    """Shepherd 경계 바로 앞의 국소 일반 로봇층만 반환합니다.
+
+    기존에는 Branch 전체 NORMAL 로봇의 72%가 후진해야 Shepherd를 해제했기
+    때문에, 이미 압력 전달이 시작돼도 Shepherd가 dead-end에 오래 고정됐습니다.
+    실제 해제 판단에는 Shepherd와 직접 상호작용하는 첫 번째 국소 로봇층만
+    사용하는 것이 더 자연스럽습니다.
+    """
+    shepherds = [
+        robot
+        for robot in robots
+        if robot.role == "SHEPHERD"
+        and get_robot_region(robot.position) == branch
+    ]
+
     normals = [
         robot
         for robot in robots
         if robot.role == "NORMAL"
         and get_robot_region(robot.position) == branch
     ]
+
+    if not shepherds:
+        return normals
+
+    boundary_progress = sum(
+        branch_progress(robot, branch)
+        for robot in shepherds
+    ) / len(shepherds)
+
+    return [
+        robot
+        for robot in normals
+        if (
+            boundary_progress - SHEPHERD_LOCAL_FLOW_DEPTH
+            <= branch_progress(robot, branch)
+            <= boundary_progress + SHEPHERD_LOCAL_FLOW_FORWARD_ALLOWANCE
+        )
+    ]
+
+
+def normal_backtracking_metrics(robots, branch):
+    """Shepherd 인접 국소층의 Junction 방향 흐름 형성 정도를 계산합니다."""
+    normals = get_local_pressure_front_normals(robots, branch)
 
     if not normals:
         return 1.0, 0.0, 0
@@ -2069,11 +2118,13 @@ def release_shepherds_into_flow(robots):
     released = 0
     backtrack_direction = get_backtrack_direction(active_branch)
 
+    local_normals = get_local_pressure_front_normals(
+        robots,
+        active_branch,
+    )
     normal_signed_speeds = [
         robot.velocity.dot(backtrack_direction)
-        for robot in robots
-        if robot.role == "NORMAL"
-        and get_robot_region(robot.position) == active_branch
+        for robot in local_normals
     ]
 
     positive_speeds = [
@@ -2082,12 +2133,16 @@ def release_shepherds_into_flow(robots):
     ]
 
     if positive_speeds:
+        measured_flow_speed = sum(positive_speeds) / len(positive_speeds)
         average_flow_speed = max(
             SHEPHERD_RELEASE_SPEED,
-            sum(positive_speeds) / len(positive_speeds),
+            measured_flow_speed * 1.15,
         )
     else:
         average_flow_speed = SHEPHERD_RELEASE_SPEED
+
+    # 과도한 초기속도로 로봇층을 다시 압축하지 않도록 제한합니다.
+    average_flow_speed = min(average_flow_speed, MAX_SPEED * 0.45)
 
     for robot in robots:
         if robot.role != "SHEPHERD":
@@ -2111,38 +2166,14 @@ def release_shepherds_into_flow(robots):
 
 
 def update_initial_ingress(robots, dt):
-    """Anchor 선발 전 Base에서 Junction까지 로봇을 확실하게 이동시킵니다.
+    """초기 단계에서 이미 계산된 SPH 가속도를 적분합니다.
 
-    초기 단계에서는 아직 통신 루트가 없고 모든 로봇이 같은 직선 복도에 있으므로,
-    전체 SPH·LOS 그래프를 매 프레임 계산할 필요가 없습니다. NORMAL 로봇은
-    Junction 방향 목표속도를 추종하고, 좌우 중심 정렬만 약하게 적용합니다.
-    Anchor가 선발되면 Anchor 자체는 기존 Robot.update()의 안전 배치 제어를 사용합니다.
+    이전 버전은 여기에서 모든 NORMAL 로봇에 같은 중심선 목표속도를 직접
+    부여해 밀도·압력 계산을 우회했습니다. 현재 버전은 메인 루프에서 먼저
+    밀도→압력→SPH 힘을 계산하고, 이 함수는 위치 적분만 수행합니다.
     """
-    junction_entry_target_y = center_y + 8.0
-
     for robot in robots:
-        if robot.role == "ANCHOR":
-            robot.update(dt)
-            continue
-
-        if robot.role != "NORMAL":
-            robot.update(dt)
-            continue
-
-        # Junction 입구까지는 위쪽으로 전진하고, 복도 중심선에서 멀어진 만큼
-        # x방향 복원속도를 더합니다.
-        y_error = junction_entry_target_y - robot.position.y
-        upward_speed = -INITIAL_INGRESS_SPEED if y_error < 0.0 else 0.0
-        lateral_speed = INITIAL_INGRESS_CENTERING * (center_x - robot.position.x)
-        lateral_speed = max(-28.0, min(28.0, lateral_speed))
-
-        desired_velocity = pygame.Vector2(lateral_speed, upward_speed)
-        robot.acceleration = (
-            desired_velocity - robot.velocity
-        ) * INITIAL_INGRESS_RESPONSE
-        limit_vector(robot.acceleration, MAX_ACCELERATION)
         robot.update(dt)
-
 
 def compute_densities(robots, grid):
     self_contribution = spiky_kernel(0.0, SMOOTHING_LENGTH)
@@ -2231,9 +2262,30 @@ def compute_route_force(robot):
             return force
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        force = (
-            normalized_direction_toward(robot.position, junction_target)
-            * ROUTE_FORCE
+        # 초기 이동에서도 한 점 목표를 사용하지 않습니다. 한 점 목표는 좌우의
+        # 로봇을 중앙으로 압축하므로, 위쪽 진행력과 약한 lane 유지력만 줍니다.
+        # 밀도·압력·점성·반발력은 compute_sph_forces()에서 동시에 적용됩니다.
+        y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
+
+        if y_distance > 0.0:
+            # Junction 진입선에 가까워질수록 진행력을 부드럽게 줄여 앞줄이
+            # 정지한 뒤 뒤쪽 로봇이 과도하게 밀어 넣는 현상을 줄입니다.
+            approach_scale = max(
+                INITIAL_INGRESS_MIN_FORCE_SCALE,
+                min(1.0, y_distance / INITIAL_INGRESS_BRAKE_DISTANCE),
+            )
+            force.y = -INITIAL_INGRESS_FORCE * approach_scale
+        else:
+            # 이미 진입선에 도달한 로봇은 더 위쪽 벽으로 계속 밀지 않습니다.
+            force.y = 0.0
+
+        lane_error = robot.ingress_lane_x - robot.position.x
+        force.x = max(
+            -INITIAL_INGRESS_LANE_MAX_FORCE,
+            min(
+                INITIAL_INGRESS_LANE_MAX_FORCE,
+                INITIAL_INGRESS_LANE_GAIN * lane_error,
+            ),
         )
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
@@ -2647,7 +2699,8 @@ def update_simulation_state(robots, dt, reference_density):
         )
 
         flow_is_established = (
-            normal_count >= FLOW_MIN_NORMAL_COUNT
+            pressure_push_timer >= SHEPHERD_MIN_PUSH_TIME
+            and normal_count >= FLOW_MIN_NORMAL_COUNT
             and moving_ratio >= FLOW_RATIO_THRESHOLD
             and average_speed >= FLOW_AVERAGE_SPEED_THRESHOLD
         )
@@ -2842,7 +2895,9 @@ def initialize_simulation():
 
 print("[MODE] Anchor-rooted LOS communication enabled")
 print("[MODE] Base communication and trunk relays are disabled")
-print("[MODE] Fast initial ingress enabled: movement starts without pre-anchor LOS/SPH overhead")
+print("[MODE] Initial ingress uses always-on SPH density, pressure, viscosity, and repulsion")
+print("[MODE] Relay slots are candidates only; relays deploy only on communication risk")
+print("[MODE] Shepherds release from local front-flow detection")
 robots, reference_density, color_reference_density = initialize_simulation()
 
 # =========================================================
@@ -2890,14 +2945,18 @@ while running:
         communication_frame_counter += 1
 
         if phase == SimulationPhase.MOVE_TO_JUNCTION:
-            # Anchor가 선발되기 전에는 통신/LOS와 전체 SPH 계산을 생략하여
-            # 초기 이동이 저 FPS에서 정지한 것처럼 보이는 문제를 제거합니다.
-            # Anchor가 생긴 뒤에는 안전 주차를 위해 국소 통신 그래프를 갱신합니다.
+            # 초기 단계부터 HydroSwarm 기반 SPH 계산을 생략하지 않습니다.
+            # 통신은 Anchor가 선발된 뒤에만 계산하지만, 밀도·압력·점성·반발력은
+            # 첫 프레임부터 적용되어 로봇들이 중앙에 비현실적으로 압축되지 않습니다.
             spatial_grid = build_spatial_grid(robots)
             if junction_anchor is not None:
                 update_communication_system(robots, spatial_grid)
 
+            compute_densities(robots, spatial_grid)
+            compute_pressures(robots, reference_density)
+            compute_sph_forces(robots, spatial_grid)
             update_initial_ingress(robots, frame_dt)
+
             update_anchor_entry_records(robots, simulation_time)
             update_simulation_state(robots, frame_dt, reference_density)
 
@@ -3046,7 +3105,7 @@ while running:
     front_comm_status = get_front_communication_status(robots, active_branch)
 
     hud_lines = [
-        "Mode: Anchor-rooted LOS | Fast ingress ON | Base/Trunk OFF",
+        "Mode: Anchor LOS | Initial SPH ON | Base/Trunk OFF",
         f"FPS: {clock.get_fps():.1f}",
         f"Robots: {len(robots)}",
         f"Motion speed: {MOTION_SPEED_MULTIPLIER:.1f}x",
