@@ -3,7 +3,7 @@
 Implemented research components
 -------------------------------
 1. Multi-criteria Junction Anchor election.
-2. Cost-guided DFS child-branch ordering for the current junction.
+2. SPH-state-aware and relay-aware DFS child-branch ordering for the current junction.
 3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
 4. Width-adaptive Shepherd count, scored candidate election, and
@@ -52,7 +52,7 @@ SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base-Connected SPH DFS | Adaptive Shepherd + Saturation Piston"
+    "Base SPH DFS | SPH-State Branch Ordering + Adaptive Shepherd"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
@@ -415,13 +415,25 @@ RELAY_FRONT_FRACTION = 0.20
 RELAY_FRONT_MIN_COUNT = 10
 RELAY_FRONT_REQUIRED_CONNECTED_RATIO = 0.90
 
-# Cost-guided branch ordering
-BRANCH_COST_LENGTH_WEIGHT = 0.22
-BRANCH_COST_RELAY_WEIGHT = 0.20
-BRANCH_COST_BACKTRACK_WEIGHT = 0.22
-BRANCH_COST_COMM_WEIGHT = 0.16
-BRANCH_COST_SWITCH_WEIGHT = 0.10
-BRANCH_COST_LOSS_PRIORITY_WEIGHT = 0.10
+# SPH-state-aware and relay-aware branch ordering
+# Structural complete-exploration loss is handled lexicographically before
+# this weighted efficiency cost; it is not mixed into the weighted sum.
+BRANCH_COST_TRANSPORT_WEIGHT = 0.28
+BRANCH_COST_SHAPE_WEIGHT = 0.12
+BRANCH_COST_FLOW_WEIGHT = 0.08
+BRANCH_COST_CONGESTION_WEIGHT = 0.12
+BRANCH_COST_RELAY_WEIGHT = 0.14
+BRANCH_COST_COMM_WEIGHT = 0.12
+BRANCH_COST_BACKTRACK_WEIGHT = 0.10
+BRANCH_COST_SWITCH_WEIGHT = 0.04
+
+# Branch-entrance/SPH-state measurement parameters
+BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0
+FLOW_DIRECTION_MIN_SPEED = 1.0
+FLOW_DIRECTION_REFERENCE_SPEED = 12.0
+CONGESTION_EXCESS_NORMALIZER = 1.0
+# Longest corridor-to-opposite-branch path in the current cross map.
+MAX_TRANSPORT_DISTANCE = max(BRANCH_LENGTHS.values()) + corridor_width
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 
@@ -678,6 +690,7 @@ class ExperimentMetrics:
     safety_violations: int = 0
     saturation_events: list[dict] = field(default_factory=list)
     branch_events: list[dict] = field(default_factory=list)
+    branch_selection_events: list[dict] = field(default_factory=list)
     pressure_events: list[dict] = field(default_factory=list)
     saved: bool = False
 
@@ -719,6 +732,20 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         ])
         writer.writerow(["safety_violations", metrics.safety_violations])
         writer.writerow(["branch_order", " > ".join(branch_order_plan)])
+        writer.writerow(["branch_selection_event_count", len(metrics.branch_selection_events)])
+        for index, event in enumerate(metrics.branch_selection_events, start=1):
+            component_text = "; ".join(
+                f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
+                for key, value in event["components"].items()
+            )
+            writer.writerow([
+                f"branch_selection_{index}",
+                (
+                    f"time={event['time']:.6f}; selected={event['selected']}; "
+                    f"cost={event['cost']:.6f}; max_structural_loss={event['max_structural_loss']}; "
+                    f"{component_text}"
+                ),
+            ])
         writer.writerow(["saturation_event_count", len(metrics.saturation_events)])
         writer.writerow(["pressure_event_count", len(metrics.pressure_events)])
     print(f"[Log] saved: {output}")
@@ -1699,57 +1726,347 @@ def estimate_branch_comm_risk(branch: str) -> float:
     return clamp(required_relays / max(relay_capacity, 1), 0.0, 1.5)
 
 
-def branch_cost(branch: str, incoming_direction: pygame.Vector2):
-    length_norm = BRANCH_LENGTHS[branch] / max(BRANCH_LENGTHS.values())
-    relay_count = max(0, math.ceil(BRANCH_LENGTHS[branch] / RELAY_SPACING) - 1)
-    max_relays = max(1, max(math.ceil(length / RELAY_SPACING) - 1 for length in BRANCH_LENGTHS.values()))
-    relay_norm = relay_count / max_relays
-    backtrack_norm = length_norm
-    comm_risk = estimate_branch_comm_risk(branch)
-    switch_norm = angle_between(incoming_direction, BRANCH_DIRECTIONS[branch]) / math.pi
-    loss = structural_loss(branch)
-    max_loss = max(1, sum(branch_states[candidate] != "VISITED" for candidate in BRANCHES))
-    loss_priority = loss / max_loss
-    total = (
-        BRANCH_COST_LENGTH_WEIGHT * length_norm
-        + BRANCH_COST_RELAY_WEIGHT * relay_norm
-        + BRANCH_COST_BACKTRACK_WEIGHT * backtrack_norm
-        + BRANCH_COST_COMM_WEIGHT * comm_risk
-        + BRANCH_COST_SWITCH_WEIGHT * switch_norm
-        - BRANCH_COST_LOSS_PRIORITY_WEIGHT * loss_priority
+def get_branch_entrance(branch: str) -> pygame.Vector2:
+    """Return the center point of a branch entrance at the Junction boundary."""
+    if branch == "UP":
+        return pygame.Vector2(center_x, center_y - half_width)
+    if branch == "LEFT":
+        return pygame.Vector2(center_x - half_width, center_y)
+    if branch == "RIGHT":
+        return pygame.Vector2(center_x + half_width, center_y)
+    raise ValueError(f"Unknown branch: {branch}")
+
+
+def get_region_entrance(region: str) -> Optional[pygame.Vector2]:
+    """Return the Junction-side entrance of a corridor region."""
+    if region == "UP":
+        return pygame.Vector2(center_x, center_y - half_width)
+    if region == "LEFT":
+        return pygame.Vector2(center_x - half_width, center_y)
+    if region == "RIGHT":
+        return pygame.Vector2(center_x + half_width, center_y)
+    if region == "BOTTOM":
+        return pygame.Vector2(center_x, center_y + half_width)
+    return None
+
+
+def free_space_distance_to_branch(
+    position: pygame.Vector2,
+    branch: str,
+) -> float:
+    """Approximate wall-respecting geodesic distance to a branch entrance.
+
+    The current map is a convex rectangular Junction connected to four convex
+    corridor rectangles. A robot in another corridor must first reach that
+    corridor's Junction entrance, pass through the Junction center, and then
+    reach the candidate branch entrance. This prevents straight-line distances
+    from incorrectly cutting through walls.
+    """
+    target_entrance = get_branch_entrance(branch)
+    region = get_robot_region(position)
+    junction_center = pygame.Vector2(center_x, center_y)
+
+    if region == "JUNCTION":
+        return position.distance_to(target_entrance)
+
+    current_entrance = get_region_entrance(region)
+    if current_entrance is not None:
+        if region == branch:
+            return position.distance_to(target_entrance)
+        return (
+            position.distance_to(current_entrance)
+            + current_entrance.distance_to(junction_center)
+            + junction_center.distance_to(target_entrance)
+        )
+
+    # Defensive fallback for a numerical boundary point.
+    return position.distance_to(junction_center) + junction_center.distance_to(target_entrance)
+
+
+def get_branch_ordering_robots(robots) -> list["Robot"]:
+    """Return mobile Base-connected mass used by the branch-ordering layer."""
+    eligible = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_base
+        and get_robot_region(robot.position) != "OUTSIDE"
+    ]
+    if eligible:
+        return eligible
+
+    # During the first communication update, connectivity can be one frame old.
+    # Falling back to NORMAL robots avoids an undefined branch score.
+    return [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) != "OUTSIDE"
+    ]
+
+
+def compute_swarm_principal_axis(robots) -> tuple[pygame.Vector2, float]:
+    """Return the 2-D principal axis and anisotropy confidence in [0, 1]."""
+    if len(robots) < 2:
+        return pygame.Vector2(0.0, 0.0), 0.0
+
+    mean_x = sum(robot.position.x for robot in robots) / len(robots)
+    mean_y = sum(robot.position.y for robot in robots) / len(robots)
+    cov_xx = sum((robot.position.x - mean_x) ** 2 for robot in robots) / len(robots)
+    cov_yy = sum((robot.position.y - mean_y) ** 2 for robot in robots) / len(robots)
+    cov_xy = sum(
+        (robot.position.x - mean_x) * (robot.position.y - mean_y)
+        for robot in robots
+    ) / len(robots)
+
+    trace = cov_xx + cov_yy
+    discriminant = math.sqrt(max(0.0, (cov_xx - cov_yy) ** 2 + 4.0 * cov_xy**2))
+    lambda_max = 0.5 * (trace + discriminant)
+    lambda_min = 0.5 * (trace - discriminant)
+    confidence = clamp(
+        (lambda_max - lambda_min) / max(lambda_max + lambda_min, EPSILON),
+        0.0,
+        1.0,
     )
+
+    if lambda_max <= EPSILON:
+        return pygame.Vector2(0.0, 0.0), 0.0
+
+    # Principal eigenvector of the symmetric 2x2 covariance matrix.
+    if abs(cov_xy) > EPSILON:
+        axis = pygame.Vector2(lambda_max - cov_yy, cov_xy)
+    elif cov_xx >= cov_yy:
+        axis = pygame.Vector2(1.0, 0.0)
+    else:
+        axis = pygame.Vector2(0.0, 1.0)
+
+    if axis.length_squared() <= EPSILON:
+        return pygame.Vector2(0.0, 0.0), 0.0
+    return axis.normalize(), confidence
+
+
+def compute_transport_cost(branch: str, robots) -> float:
+    if not robots:
+        return 0.0
+    average_distance = sum(
+        free_space_distance_to_branch(robot.position, branch)
+        for robot in robots
+    ) / len(robots)
+    return clamp(average_distance / max(MAX_TRANSPORT_DISTANCE, EPSILON), 0.0, 1.0)
+
+
+def compute_shape_cost(
+    branch: str,
+    principal_axis: pygame.Vector2,
+    shape_confidence: float,
+) -> float:
+    if principal_axis.length_squared() <= EPSILON or shape_confidence <= EPSILON:
+        return 0.0
+    alignment = abs(principal_axis.dot(BRANCH_DIRECTIONS[branch]))
+    return clamp((1.0 - alignment) * shape_confidence, 0.0, 1.0)
+
+
+def compute_flow_cost(branch: str, robots) -> float:
+    if not robots:
+        return 0.0
+    mean_velocity = sum(
+        (robot.velocity for robot in robots),
+        pygame.Vector2(0.0, 0.0),
+    ) / len(robots)
+    mean_speed = mean_velocity.length()
+    if mean_speed < FLOW_DIRECTION_MIN_SPEED:
+        return 0.0
+
+    alignment = clamp(
+        mean_velocity.normalize().dot(BRANCH_DIRECTIONS[branch]),
+        -1.0,
+        1.0,
+    )
+    direction_cost = 0.5 * (1.0 - alignment)
+    confidence = clamp(
+        mean_speed / max(FLOW_DIRECTION_REFERENCE_SPEED, EPSILON),
+        0.0,
+        1.0,
+    )
+    return clamp(direction_cost * confidence, 0.0, 1.0)
+
+
+def compute_congestion_cost(
+    branch: str,
+    robots,
+    reference_density: float,
+) -> float:
+    entrance = get_branch_entrance(branch)
+    nearby = [
+        robot
+        for robot in robots
+        if robot.position.distance_to(entrance) <= BRANCH_ENTRANCE_CONGESTION_RADIUS
+        and has_line_of_sight(robot.position, entrance)
+    ]
+    if not nearby:
+        return 0.0
+
+    excess_squared = [
+        max(0.0, robot.density / max(reference_density, EPSILON) - 1.0) ** 2
+        for robot in nearby
+    ]
+    raw = sum(excess_squared) / len(excess_squared)
+    return clamp(raw / max(CONGESTION_EXCESS_NORMALIZER, EPSILON), 0.0, 1.0)
+
+
+def branch_efficiency_cost(
+    branch: str,
+    robots,
+    incoming_direction: pygame.Vector2,
+    reference_density: float,
+    principal_axis: pygame.Vector2,
+    shape_confidence: float,
+):
+    ordering_robots = get_branch_ordering_robots(robots)
+    transport = compute_transport_cost(branch, ordering_robots)
+    shape = compute_shape_cost(branch, principal_axis, shape_confidence)
+    flow = compute_flow_cost(branch, ordering_robots)
+    congestion = compute_congestion_cost(
+        branch,
+        ordering_robots,
+        reference_density,
+    )
+
+    relay_count = max(
+        0,
+        math.ceil(BRANCH_LENGTHS[branch] / RELAY_SPACING) - 1,
+    )
+    max_relays = max(
+        1,
+        max(
+            math.ceil(length / RELAY_SPACING) - 1
+            for length in BRANCH_LENGTHS.values()
+        ),
+    )
+    relay = relay_count / max_relays
+    comm = clamp(estimate_branch_comm_risk(branch), 0.0, 1.0)
+    backtrack = BRANCH_LENGTHS[branch] / max(BRANCH_LENGTHS.values())
+    switch = angle_between(
+        incoming_direction,
+        BRANCH_DIRECTIONS[branch],
+    ) / math.pi
+
+    total = (
+        BRANCH_COST_TRANSPORT_WEIGHT * transport
+        + BRANCH_COST_SHAPE_WEIGHT * shape
+        + BRANCH_COST_FLOW_WEIGHT * flow
+        + BRANCH_COST_CONGESTION_WEIGHT * congestion
+        + BRANCH_COST_RELAY_WEIGHT * relay
+        + BRANCH_COST_COMM_WEIGHT * comm
+        + BRANCH_COST_BACKTRACK_WEIGHT * backtrack
+        + BRANCH_COST_SWITCH_WEIGHT * switch
+    )
+
     return total, {
-        "length": length_norm,
-        "relay": relay_norm,
-        "backtrack": backtrack_norm,
-        "comm": comm_risk,
-        "switch": switch_norm,
-        "loss": loss,
+        "transport": transport,
+        "shape": shape,
+        "shape_confidence": shape_confidence,
+        "flow": flow,
+        "congestion": congestion,
+        "relay": relay,
+        "comm": comm,
+        "backtrack": backtrack,
+        "switch": switch,
+        "structural_loss": structural_loss(branch),
+        "ordering_robot_count": len(ordering_robots),
     }
 
 
-def choose_next_branch(anchor):
+def branch_is_feasible(branch: str, robots) -> bool:
+    """Check deterministic resource/connectivity feasibility before scoring."""
+    connected_normals = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL" and robot.connected_to_base
+    ]
+    required_branch_relays = max(
+        0,
+        math.ceil(BRANCH_LENGTHS[branch] / RELAY_SPACING) - 1,
+    )
+    required_mobile_roles = required_branch_relays + adaptive_shepherd_count()
+    return len(connected_normals) >= required_mobile_roles
+
+
+def choose_next_branch(anchor, robots, reference_density: float):
+    """Select one DFS child using hierarchical loss priority and SPH cost.
+
+    1. Keep only UNVISITED and resource-feasible branches.
+    2. Preserve complete exploration priority by retaining branches with the
+       maximum structural loss if their entrance edge were removed.
+    3. Among that priority set, minimize current SPH mass-transport, shape,
+       flow, congestion, relay, communication, backtracking, and turn cost.
+    """
     global active_branch, previous_branch_direction, branch_order_plan
+
     if anchor is None or anchor.local_branch_states is None:
         return None
-    candidates = [branch for branch in BRANCHES if anchor.local_branch_states[branch] == "UNVISITED"]
-    if not candidates:
+
+    unvisited = [
+        branch
+        for branch in BRANCHES
+        if anchor.local_branch_states[branch] == "UNVISITED"
+    ]
+    if not unvisited:
         anchor.selected_branch = None
         return None
+
+    feasible = [branch for branch in unvisited if branch_is_feasible(branch, robots)]
+    candidates = feasible if feasible else unvisited
+    if not feasible:
+        print("[DFS] warning: no branch passed resource feasibility; using UNVISITED fallback")
+
+    losses = {branch: structural_loss(branch) for branch in candidates}
+    maximum_loss = max(losses.values())
+    priority_candidates = [
+        branch for branch in candidates if losses[branch] == maximum_loss
+    ]
+
+    ordering_robots = get_branch_ordering_robots(robots)
+    principal_axis, shape_confidence = compute_swarm_principal_axis(ordering_robots)
+
     scored = []
-    for branch in candidates:
-        cost, components = branch_cost(branch, previous_branch_direction)
+    for branch in priority_candidates:
+        cost, components = branch_efficiency_cost(
+            branch,
+            robots,
+            previous_branch_direction,
+            reference_density,
+            principal_axis,
+            shape_confidence,
+        )
         scored.append((cost, branch, components))
+        print(
+            f"[DFS Cost] branch={branch}, loss={losses[branch]}, "
+            f"cost={cost:.4f}, components={components}"
+        )
+
     scored.sort(key=lambda item: (item[0], item[1]))
     cost, selected, components = scored[0]
+
     anchor.local_branch_states[selected] = "ACTIVE"
     anchor.selected_branch = selected
     active_branch = selected
     branch_order_plan.append(selected)
     initialize_relay_plan(selected)
-    print(f"[DFS] selected={selected}, cost={cost:.3f}, components={components}")
-    return selected
 
+    metrics.branch_selection_events.append({
+        "time": simulation_time,
+        "selected": selected,
+        "cost": cost,
+        "max_structural_loss": maximum_loss,
+        "components": components,
+    })
+
+    print(
+        f"[DFS] selected={selected}, cost={cost:.4f}, "
+        f"max_loss={maximum_loss}, components={components}"
+    )
+    return selected
 
 def complete_active_branch(anchor, branch):
     global previous_branch_direction
@@ -2334,7 +2651,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             and anchor_deployment_ready(anchor, robots)
             and robots_in_junction >= JUNCTION_ENTRY_COUNT
         ):
-            selected = choose_next_branch(anchor)
+            selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -2431,7 +2748,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
         if junction_switch_timer >= JUNCTION_SWITCH_DWELL_TIME:
-            selected = choose_next_branch(anchor)
+            selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -2623,6 +2940,17 @@ while running:
         f"Anchor={junction_anchor.robot_id if junction_anchor else '-'} | score={junction_anchor.anchor_election_score:.3f}" if junction_anchor else "Anchor=-",
         f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
         f"Order={' > '.join(branch_order_plan) if branch_order_plan else '-'}",
+        (
+            "Last branch cost: "
+            + (
+                f"T={metrics.branch_selection_events[-1]['components']['transport']:.2f} "
+                f"S={metrics.branch_selection_events[-1]['components']['shape']:.2f} "
+                f"F={metrics.branch_selection_events[-1]['components']['flow']:.2f} "
+                f"C={metrics.branch_selection_events[-1]['components']['congestion']:.2f}"
+                if metrics.branch_selection_events
+                else "-"
+            )
+        ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
         f"Base direct={communication_stats['direct']} | Anchor linked={communication_stats['anchor_connected']} | trunk={len(get_trunk_relays(robots))}/{len(trunk_relay_slots)}",
