@@ -346,10 +346,11 @@ RETURN_LANE_GAIN = 1.15
 RETURN_LANE_MAX_FORCE = 22.0
 RETURN_BRAKE_DISTANCE = 34.0
 RETURN_MIN_FORCE_SCALE = 0.20
-RETURN_TRUNK_RETRACT_DWELL = 0.30
+RETURN_TRUNK_RETRACT_DWELL = 0.55
 RETURN_TRUNK_RELEASE_INITIAL_SPEED = 12.0
 RETURN_TRUNK_READY_BOTTOM_TOLERANCE = 2
-RETURN_TRUNK_READY_CONNECTED_RATIO = 0.98
+RETURN_TRUNK_READY_CONNECTED_RATIO = 0.97
+RETURN_TRUNK_FORCE_RELEASE_TIMEOUT = 2.50
 NORMAL_PHYSICS_MAX_DT = 0.05
 
 ISOLATION_NEIGHBOR_THRESHOLD = 4
@@ -523,6 +524,7 @@ branch_entry_timer = 0.0
 return_trunk_release_pending = False
 return_trunk_retract_timer = 0.0
 return_trunk_last_released_id = None
+return_trunk_force_timer = 0.0
 
 # Branch-entrance/SPH-state measurement parameters
 BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0
@@ -3350,13 +3352,14 @@ def begin_final_gather():
 
 def begin_final_return(anchor, robots):
     global phase, relay_slots, relay_motion_scale
-    global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id
+    global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
     relay_slots = []
     relay_motion_scale = 1.0
     release_anchor_for_final_return(anchor)
     return_trunk_release_pending = True
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
+    return_trunk_force_timer = 0.0
     phase = SimulationPhase.RETURN_TO_BASE
     print("[DFS] return to base")
 
@@ -4020,7 +4023,7 @@ def update_metrics_per_frame(robots, dt):
 def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global junction_switch_timer, final_gather_timer, branch_entry_timer
-    global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id
+    global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
@@ -4181,50 +4184,39 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             begin_final_return(anchor, robots)
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
-        global return_trunk_last_released_id
+        global return_trunk_last_released_id, return_trunk_force_timer
         in_bottom = sum(get_robot_region(robot.position) == "BOTTOM" for robot in robots)
         trunk_relays = get_trunk_relays(robots)
-        mobile_robots = [robot for robot in robots if robot.role != "TRUNK_RELAY"]
-        mobile_outside_bottom = sum(
-            get_robot_region(robot.position) != "BOTTOM"
-            for robot in mobile_robots
-        )
-        mobile_connected_count = sum(robot.connected_to_base for robot in mobile_robots)
-        mobile_connected_ratio = mobile_connected_count / max(len(mobile_robots), 1)
+        connected_count = sum(robot.connected_to_base for robot in robots)
+        connected_ratio = connected_count / max(len(robots), 1)
         special = sum(
             robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY", "SHEPHERD"}
             for robot in robots
         )
 
         if return_trunk_release_pending:
-            retract_ready = False
-
-            if return_trunk_last_released_id is None:
-                retract_ready = (
-                    mobile_outside_bottom <= RETURN_TRUNK_READY_BOTTOM_TOLERANCE
-                    and mobile_connected_ratio >= RETURN_TRUNK_READY_CONNECTED_RATIO
-                )
-            else:
-                last_robot = next(
-                    (robot for robot in robots if robot.robot_id == return_trunk_last_released_id),
-                    None,
-                )
-                retract_ready = (
-                    last_robot is not None
-                    and last_robot.role != "TRUNK_RELAY"
-                    and get_robot_region(last_robot.position) == "BOTTOM"
-                    and last_robot.connected_to_base
-                )
-
+            # Sequentially retract the Junction-side Trunk Relay.  Requiring a
+            # particular released robot to be classified as BOTTOM caused the
+            # chain to stall permanently when that robot hovered on a region
+            # boundary.  Instead, use the live Base-connected ratio as the
+            # safety guard and release one relay per dwell interval.
+            safe_to_retract = connected_ratio >= RETURN_TRUNK_READY_CONNECTED_RATIO
             return_trunk_retract_timer = (
-                return_trunk_retract_timer + dt if retract_ready else 0.0
+                return_trunk_retract_timer + dt if safe_to_retract else 0.0
+            )
+            return_trunk_force_timer += dt
+
+            release_due = (
+                return_trunk_retract_timer >= RETURN_TRUNK_RETRACT_DWELL
+                or return_trunk_force_timer >= RETURN_TRUNK_FORCE_RELEASE_TIMEOUT
             )
 
-            if trunk_relays and return_trunk_retract_timer >= RETURN_TRUNK_RETRACT_DWELL:
+            if trunk_relays and release_due:
                 released = release_next_trunk_relay_for_return(robots)
                 if released is not None:
                     return_trunk_last_released_id = released.robot_id
                 return_trunk_retract_timer = 0.0
+                return_trunk_force_timer = 0.0
                 if not get_trunk_relays(robots):
                     return_trunk_release_pending = False
                 return
@@ -4232,6 +4224,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             if not trunk_relays:
                 return_trunk_release_pending = False
                 return_trunk_retract_timer = 0.0
+                return_trunk_force_timer = 0.0
                 return_trunk_last_released_id = None
 
         if in_bottom >= RETURN_BOTTOM_TARGET_COUNT and special == 0:
@@ -4460,6 +4453,7 @@ def reset_dfs_state():
     return_trunk_release_pending = False
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
+    return_trunk_force_timer = 0.0
     initialize_trunk_relay_plan()
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
