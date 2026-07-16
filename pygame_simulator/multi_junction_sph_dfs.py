@@ -279,6 +279,14 @@ class TopologyEdge:
     path_points: list[pygame.Vector2] = field(default_factory=list)
     visit_state: VisitState = VisitState.UNVISITED
 
+@dataclass
+class DFSFrame:
+    junction_id: str
+    parent_edge_id: Optional[str]
+    child_edge_ids: list[str] = field(default_factory=list)
+    active_edge_id: Optional[str] = None
+    completed_edge_ids: set[str] = field(default_factory=set)
+
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
 BRANCH_DIRECTIONS = {
@@ -905,6 +913,62 @@ EDGE_TO_BRANCH = {
     for branch, edge_id in BRANCH_TO_EDGE.items()
 }
 
+dfs_stack: list[DFSFrame] = []
+
+def initialize_dfs_stack():
+    """Initialize the DFS stack with the root junction J0."""
+
+    dfs_stack.clear()
+
+    root_junction = topology_nodes["J0"]
+
+    dfs_stack.append(
+        DFSFrame(
+            junction_id=root_junction.node_id,
+            parent_edge_id=root_junction.parent_edge_id,
+            child_edge_ids=list(root_junction.child_edge_ids),
+        )
+    )
+
+
+def get_current_dfs_frame() -> Optional[DFSFrame]:
+    """Return the DFS frame for the currently active junction."""
+
+    if not dfs_stack:
+        return None
+
+    return dfs_stack[-1]
+
+
+def update_current_dfs_frame(
+    edge_id: str,
+    visit_state: VisitState,
+):
+    """Synchronize the current DFS frame with an edge-state change."""
+
+    frame = get_current_dfs_frame()
+
+    if frame is None:
+        return
+
+    if edge_id not in frame.child_edge_ids:
+        return
+
+    if visit_state == VisitState.ACTIVE:
+        frame.active_edge_id = edge_id
+
+    elif visit_state == VisitState.VISITED:
+        frame.completed_edge_ids.add(edge_id)
+
+        if frame.active_edge_id == edge_id:
+            frame.active_edge_id = None
+
+    print(
+        f"[DFS Stack] junction={frame.junction_id}, "
+        f"active={frame.active_edge_id}, "
+        f"completed={sorted(frame.completed_edge_ids)}"
+    )
+
 def validate_topology():
     """Validate topology node-edge references at startup."""
 
@@ -947,6 +1011,8 @@ def validate_topology():
 
 validate_topology()
 
+initialize_dfs_stack()
+
 def set_branch_visit_state(
     branch: str,
     visit_state: VisitState,
@@ -960,6 +1026,7 @@ def set_branch_visit_state(
 
     branch_states[branch] = visit_state.name
     topology_edges[edge_id].visit_state = visit_state
+    update_current_dfs_frame(edge_id, visit_state)
 
 
 def reset_topology_visit_states():
@@ -972,6 +1039,8 @@ def reset_topology_visit_states():
     topology_nodes["BASE"].visit_state = VisitState.VISITED
     topology_nodes["J0"].visit_state = VisitState.UNVISITED
     topology_edges["E_BASE_J0"].visit_state = VisitState.VISITED
+    
+    initialize_dfs_stack()
 
 
 def get_backtrack_direction(branch: str):
