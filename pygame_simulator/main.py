@@ -52,7 +52,7 @@ SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base SPH DFS | Flow-Preserving SPH Rollout Ordering"
+    "Base SPH DFS | Vivid Proxy Regions + Leak-Proof Shepherd Curtain"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
@@ -75,6 +75,21 @@ COMM_LINK_SAFE_COLOR = (132, 190, 158)
 COMM_LINK_WARNING_COLOR = (226, 177, 96)
 COMM_LINK_DANGER_COLOR = (214, 103, 103)
 DISCONNECTED_COLOR = (205, 96, 96)
+
+# Branch colour identity is shared by the physical branch, its proxy subregion,
+# projected proxy particles, branch labels, and branch boundaries.  The same
+# RGB hue is drawn with different alpha values rather than using unrelated
+# colours for the map and the analytical proxy partition.
+BRANCH_COLORS = {
+    "UP": (35, 112, 238),       # vivid blue
+    "LEFT": (171, 63, 204),    # vivid purple
+    "RIGHT": (242, 126, 32),   # vivid orange
+}
+BRANCH_PROXY_ALPHA = 112
+BRANCH_FLOOR_ALPHA = 48
+BRANCH_ASSIGNMENT_ALPHA = 220
+BRANCH_BOUNDARY_WIDTH = 2
+
 
 # =========================================================
 # 2. Cross map
@@ -366,6 +381,17 @@ SHEPHERD_FORM_SPEED = 110.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_RELEASE_SPEED = 18.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_FORM_TOLERANCE = 3.0
 SHEPHERD_FORM_TIMEOUT = 2.4
+
+# Continuous virtual Shepherd curtain.  The selected robots still form the
+# visible SPH boundary, but this full-width virtual plane becomes active
+# immediately after election.  It closes the temporary gaps between moving
+# Shepherds so ordinary robots cannot leak toward the dead-end wall.
+SHEPHERD_CURTAIN_CLEARANCE = max(ROBOT_RADIUS * 2.5, 6.0)
+SHEPHERD_CURTAIN_INTERACTION_DEPTH = 24.0
+SHEPHERD_CURTAIN_FORCE = 860.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_CURTAIN_VELOCITY_DAMPING = 18.0
+SHEPHERD_CURTAIN_RECOVERY_SPEED = 10.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_CURTAIN_DRAW_HALF_WIDTH = 3
 
 # Piston motion: Shepherd boundary advances toward the parent junction.
 SHEPHERD_PISTON_SPEED = 10.0 * MOTION_SPEED_MULTIPLIER
@@ -751,6 +777,112 @@ def get_saturation_rect(branch: str) -> pygame.Rect:
     return pygame.Rect(int(left), center_y - half_width, int(right - left), corridor_width)
 
 
+
+def shepherd_curtain_active() -> bool:
+    """Whether the continuous full-width Shepherd gate must be enforced."""
+    return phase in {
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+        SimulationPhase.PRESSURE_PUSH,
+    }
+
+
+def get_shepherd_curtain_depth(branch: str) -> float:
+    """Current gate depth from the Junction mouth.
+
+    During formation/filling, the gate is already closed at the planned
+    Shepherd line.  During pressure push it follows the moving piston toward
+    the Junction so robots cannot slip around or through individual Shepherds.
+    """
+    depth = get_shepherd_boundary_depth(branch)
+    if phase == SimulationPhase.PRESSURE_PUSH:
+        travel = min(
+            SHEPHERD_PISTON_MAX_TRAVEL,
+            pressure_push_timer * SHEPHERD_PISTON_SPEED,
+        )
+        depth -= travel
+    return max(0.0, depth)
+
+
+def get_shepherd_normal_limit_depth(branch: str) -> float:
+    return max(
+        0.0,
+        get_shepherd_curtain_depth(branch) - SHEPHERD_CURTAIN_CLEARANCE,
+    )
+
+
+def compute_shepherd_curtain_force(robot: "Robot") -> pygame.Vector2:
+    """Continuous repulsion from the full-width virtual Shepherd curtain."""
+    if (
+        not shepherd_curtain_active()
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != active_branch
+    ):
+        return pygame.Vector2()
+
+    depth = branch_depth_from_junction(robot.position, active_branch)
+    limit_depth = get_shepherd_normal_limit_depth(active_branch)
+    activation_depth = limit_depth - SHEPHERD_CURTAIN_INTERACTION_DEPTH
+    if depth <= activation_depth:
+        return pygame.Vector2()
+
+    ratio = clamp(
+        (depth - activation_depth)
+        / max(SHEPHERD_CURTAIN_INTERACTION_DEPTH, EPSILON),
+        0.0,
+        1.5,
+    )
+    forward_speed = max(
+        0.0,
+        robot.velocity.dot(BRANCH_DIRECTIONS[active_branch]),
+    )
+    magnitude = (
+        SHEPHERD_CURTAIN_FORCE * ratio**2
+        + SHEPHERD_CURTAIN_VELOCITY_DAMPING * forward_speed
+    )
+    return get_backtrack_direction(active_branch) * magnitude
+
+
+def constrain_normal_behind_shepherd_curtain(robot: "Robot") -> None:
+    """Hard safety projection preventing leakage through Shepherd gaps.
+
+    The force above provides smooth behaviour.  This projection is the final
+    guard against a fast particle crossing the virtual plane in one time step.
+    """
+    if (
+        not shepherd_curtain_active()
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != active_branch
+    ):
+        return
+
+    limit_depth = get_shepherd_normal_limit_depth(active_branch)
+    depth = branch_depth_from_junction(robot.position, active_branch)
+    if depth <= limit_depth:
+        return
+
+    penetration = depth - limit_depth
+    if active_branch == "UP":
+        robot.position.y = center_y - half_width - limit_depth
+    elif active_branch == "LEFT":
+        robot.position.x = center_x - half_width - limit_depth
+    else:
+        robot.position.x = center_x + half_width + limit_depth
+
+    forward_direction = BRANCH_DIRECTIONS[active_branch]
+    forward_speed = robot.velocity.dot(forward_direction)
+    if forward_speed > 0.0:
+        robot.velocity -= forward_direction * forward_speed
+    robot.velocity += get_backtrack_direction(active_branch) * min(
+        SHEPHERD_CURTAIN_RECOVERY_SPEED,
+        penetration * 2.0,
+    )
+
+
+def enforce_shepherd_curtain_for_swarm(robots) -> None:
+    for robot in robots:
+        constrain_normal_behind_shepherd_curtain(robot)
+
 def angle_between(a: pygame.Vector2, b: pygame.Vector2) -> float:
     if a.length_squared() <= EPSILON or b.length_squared() <= EPSILON:
         return 0.0
@@ -1010,6 +1142,11 @@ class Robot:
             self.position.y = y_position.y
         else:
             self.velocity.y = 0.0
+
+        # Smooth virtual pressure is backed by a hard one-step guard so a fast
+        # ordinary robot cannot pass through a temporary gap while Shepherds
+        # are still moving laterally into their slots.
+        constrain_normal_behind_shepherd_curtain(self)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
         self._record_motion()
@@ -3749,6 +3886,7 @@ def compute_sph_forces(robots, grid):
 
         route_force = compute_route_force(robot_i)
         connectivity_force = compute_connectivity_force(robot_i, grid)
+        shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
         pressure_phase_normal = (
             phase == SimulationPhase.PRESSURE_PUSH
             and robot_i.role == "NORMAL"
@@ -3771,6 +3909,7 @@ def compute_sph_forces(robots, grid):
             + cohesion_force
             + route_force
             + connectivity_force
+            + shepherd_curtain_force
             - DAMPING * robot_i.velocity
         )
         robot_i.acceleration = limit_vector(total, MAX_ACCELERATION)
@@ -3853,6 +3992,10 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             if len(selected) == adaptive_shepherd_count():
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
                 shepherd_form_timer = 0.0
+                # Close a continuous full-width virtual gate immediately.  Any
+                # ordinary robot already beyond the planned line is moved to
+                # its safe Junction side before the next physics frame.
+                enforce_shepherd_curtain_for_swarm(robots)
                 print(
                     f"[Shepherd] capture-region election: branch={active_branch}, "
                     f"count={len(selected)}"
@@ -3967,16 +4110,55 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             print(f"[DFS] done, robots={in_bottom}/{len(robots)}")
             save_experiment_logs(robots, "DONE")
 
+def draw_branch_colour_fields(surface):
+    """Tint each physical branch using the same hue as its proxy subregion."""
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    branch_rectangles = {
+        "UP": up_rect,
+        "LEFT": left_rect,
+        "RIGHT": right_rect,
+    }
+    for branch, rect in branch_rectangles.items():
+        pygame.draw.rect(
+            overlay,
+            (*BRANCH_COLORS[branch], BRANCH_FLOOR_ALPHA),
+            rect,
+        )
+        pygame.draw.rect(
+            overlay,
+            (*BRANCH_COLORS[branch], 230),
+            rect,
+            width=3,
+        )
+    surface.blit(overlay, (0, 0))
+
+    label_positions = {
+        "UP": (center_x, up_rect.top + 18),
+        "LEFT": (left_rect.left + 32, center_y),
+        "RIGHT": (right_rect.right - 38, center_y),
+    }
+    for branch, position in label_positions.items():
+        label = small_font.render(branch, True, (255, 255, 255))
+        badge = label.get_rect(center=position).inflate(12, 6)
+        pygame.draw.rect(
+            surface,
+            BRANCH_COLORS[branch],
+            badge,
+            border_radius=6,
+        )
+        surface.blit(label, label.get_rect(center=position))
+
+
 def draw_proxy_partition(surface):
-    """Draw the last decision-time temporary HydroSwarm proxy subregions."""
+    """Draw vivid, clearly separated decision-time proxy subregions."""
     if not last_proxy_partition or not last_proxy_cell_centers:
         return
-    branch_colors = {
-        "UP": (126, 166, 211),
-        "LEFT": (177, 151, 205),
-        "RIGHT": (221, 166, 111),
-    }
+
     overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    centroids = {branch: pygame.Vector2() for branch in BRANCHES}
+    counts = {branch: 0 for branch in BRANCHES}
+
+    # Strong translucent fill using the exact same Branch RGB identity.
     for key, branch in last_proxy_partition.items():
         center = last_proxy_cell_centers[key]
         rect = pygame.Rect(
@@ -3985,23 +4167,69 @@ def draw_proxy_partition(surface):
             PROXY_CELL_SIZE,
             PROXY_CELL_SIZE,
         )
-        pygame.draw.rect(overlay, (*branch_colors[branch], 35), rect)
+        pygame.draw.rect(
+            overlay,
+            (*BRANCH_COLORS[branch], BRANCH_PROXY_ALPHA),
+            rect,
+        )
+        centroids[branch] += center
+        counts[branch] += 1
+
+    # Draw only inter-region boundaries, not every cell grid line.
+    neighbour_offsets = {
+        "left": (-1, 0),
+        "right": (1, 0),
+        "top": (0, -1),
+        "bottom": (0, 1),
+    }
+    for (col, row), branch in last_proxy_partition.items():
+        center = last_proxy_cell_centers[(col, row)]
+        left = int(center.x - PROXY_CELL_SIZE / 2)
+        top = int(center.y - PROXY_CELL_SIZE / 2)
+        right = left + PROXY_CELL_SIZE
+        bottom = top + PROXY_CELL_SIZE
+        for side, (dc, dr) in neighbour_offsets.items():
+            neighbour_branch = last_proxy_partition.get((col + dc, row + dr))
+            if neighbour_branch == branch:
+                continue
+            if side == "left":
+                p1, p2 = (left, top), (left, bottom)
+            elif side == "right":
+                p1, p2 = (right, top), (right, bottom)
+            elif side == "top":
+                p1, p2 = (left, top), (right, top)
+            else:
+                p1, p2 = (left, bottom), (right, bottom)
+            pygame.draw.line(
+                overlay,
+                (*BRANCH_COLORS[branch], 255),
+                p1,
+                p2,
+                BRANCH_BOUNDARY_WIDTH,
+            )
+
     surface.blit(overlay, (0, 0))
+
+    # Branch name badge at the centroid of each temporary proxy subregion.
+    for branch in last_proxy_candidates:
+        if counts.get(branch, 0) <= 0:
+            continue
+        center = centroids[branch] / counts[branch]
+        label = small_font.render(branch, True, (255, 255, 255))
+        badge = label.get_rect(center=(round(center.x), round(center.y))).inflate(10, 5)
+        pygame.draw.rect(
+            surface,
+            BRANCH_COLORS[branch],
+            badge,
+            border_radius=5,
+        )
+        surface.blit(label, label.get_rect(center=badge.center))
 
 
 def draw_proxy_robot_assignments(surface, robots):
-    """Visualize decision-only robot-to-proxy-region assignments.
-
-    Dots are drawn at projected proxy positions, not at physical positions, to
-    emphasize that the assignment is analytical and does not split the swarm.
-    """
+    """Draw projected analytical assignments in the same Branch colours."""
     if not last_proxy_robot_assignment:
         return
-    branch_colors = {
-        "UP": (88, 139, 196),
-        "LEFT": (153, 112, 188),
-        "RIGHT": (207, 135, 67),
-    }
     overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
     for robot in robots:
         branch = last_proxy_robot_assignment.get(robot.robot_id)
@@ -4010,9 +4238,46 @@ def draw_proxy_robot_assignments(surface, robots):
         point = project_robot_to_proxy(robot.position)
         pygame.draw.circle(
             overlay,
-            (*branch_colors[branch], 145),
+            (*BRANCH_COLORS[branch], BRANCH_ASSIGNMENT_ALPHA),
             (round(point.x), round(point.y)),
             2,
+        )
+    surface.blit(overlay, (0, 0))
+
+
+def draw_shepherd_curtain(surface):
+    """Visualize the continuous gate that seals gaps between Shepherd robots."""
+    if not shepherd_curtain_active():
+        return
+    depth = get_shepherd_curtain_depth(active_branch)
+    color = BRANCH_COLORS[active_branch]
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    if active_branch == "UP":
+        y = round(center_y - half_width - depth)
+        pygame.draw.line(
+            overlay,
+            (*color, 235),
+            (center_x - half_width + 2, y),
+            (center_x + half_width - 2, y),
+            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
+        )
+    elif active_branch == "LEFT":
+        x = round(center_x - half_width - depth)
+        pygame.draw.line(
+            overlay,
+            (*color, 235),
+            (x, center_y - half_width + 2),
+            (x, center_y + half_width - 2),
+            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
+        )
+    else:
+        x = round(center_x + half_width + depth)
+        pygame.draw.line(
+            overlay,
+            (*color, 235),
+            (x, center_y - half_width + 2),
+            (x, center_y + half_width - 2),
+            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
         )
     surface.blit(overlay, (0, 0))
 
@@ -4146,6 +4411,7 @@ while running:
 
     screen.fill(BACKGROUND_COLOR)
     pygame.draw.polygon(screen, FLOOR_COLOR, cross_points)
+    draw_branch_colour_fields(screen)
     pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=5)
 
     if show_regions:
@@ -4157,26 +4423,33 @@ while running:
         pygame.draw.circle(screen, BASE_COLOR, BASE_POSITION, 7, width=2)
         pygame.draw.rect(
             screen,
-            SHEPHERD_COLOR,
+            BRANCH_COLORS[active_branch],
             early_capture_regions[active_branch],
-            width=1,
+            width=2,
         )
         pygame.draw.rect(
             screen,
-            END_REGION_COLOR,
+            BRANCH_COLORS[active_branch],
             get_saturation_rect(active_branch),
-            width=1,
+            width=2,
         )
         for branch, rect in dead_end_regions.items():
             pygame.draw.rect(
                 screen,
-                END_REGION_COLOR if branch == active_branch else (175, 175, 175),
+                BRANCH_COLORS[branch],
                 rect,
-                width=2,
+                width=3 if branch == active_branch else 2,
             )
         for robot in get_shepherds(robots):
             if robot.shepherd_anchor is not None:
-                pygame.draw.circle(screen, SHEPHERD_COLOR, robot.shepherd_anchor, 3, width=1)
+                pygame.draw.circle(
+                    screen,
+                    BRANCH_COLORS[active_branch],
+                    robot.shepherd_anchor,
+                    4,
+                    width=2,
+                )
+        draw_shepherd_curtain(screen)
         draw_trunk_relay_plan(screen, robots)
         draw_relay_plan(screen, robots)
 
