@@ -62,12 +62,14 @@ BACKGROUND_COLOR = (248, 249, 252)
 FLOOR_COLOR = (235, 239, 246)
 WALL_COLOR = (96, 106, 124)
 TEXT_COLOR = (58, 67, 82)
-ROBOT_BASE_COLOR = (115, 165, 208)
-SHEPHERD_COLOR = (171, 145, 205)
-ANCHOR_COLOR = (102, 174, 137)
-BASE_COLOR = (73, 94, 128)
-TRUNK_RELAY_COLOR = (201, 123, 85)
-RELAY_COLOR = (226, 151, 82)
+ROBOT_BASE_COLOR = (36, 184, 232)
+SHEPHERD_COLOR = (162, 86, 214)
+ANCHOR_COLOR = (50, 176, 108)
+BASE_COLOR = (44, 72, 120)
+TRUNK_RELAY_COLOR = (191, 92, 58)
+RELAY_COLOR = (236, 143, 44)
+ROBOT_OUTLINE_COLOR = (22, 42, 58)
+DISCONNECTED_FILL_COLOR = (235, 126, 126)
 RELAY_SLOT_COLOR = (196, 129, 65)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
@@ -333,6 +335,12 @@ INITIAL_INGRESS_TARGET_Y = center_y + 10.0
 INITIAL_INGRESS_BRAKE_DISTANCE = 34.0
 INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
 INITIAL_INGRESS_MAX_DT = 0.04
+
+RETURN_EGRESS_FORCE = 42.0 * MOTION_SPEED_MULTIPLIER
+RETURN_LANE_GAIN = 1.15
+RETURN_LANE_MAX_FORCE = 22.0
+RETURN_BRAKE_DISTANCE = 34.0
+RETURN_MIN_FORCE_SCALE = 0.20
 NORMAL_PHYSICS_MAX_DT = 0.05
 
 ISOLATION_NEIGHBOR_THRESHOLD = 4
@@ -503,6 +511,7 @@ STIFFNESS_EXPONENT_PRESSURE_PUSH = max(STIFFNESS_EXPONENT_RIGID, 0.62)
 BRANCH_STIFFNESS_RECOVERY_TIME = 1.20
 selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
 branch_entry_timer = 0.0
+return_trunk_release_pending = False
 
 # Branch-entrance/SPH-state measurement parameters
 BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0
@@ -1165,24 +1174,24 @@ class Robot:
             color = density_to_color(self.density, color_reference_density)
         else:
             color = ROBOT_BASE_COLOR
-        marker = pygame.Rect(
-            x - self.radius,
-            y - self.radius,
-            self.radius * 2 + 1,
-            self.radius * 2 + 1,
-        )
-        pygame.draw.rect(surface, color, marker, border_radius=self.radius)
+
+        if base_station is not None and self.role != "BASE" and not self.connected_to_base:
+            color = interpolate_color(color, DISCONNECTED_FILL_COLOR, 0.45)
+
+        draw_radius = self.radius + 1
+        pygame.draw.circle(surface, color, (x, y), draw_radius)
+        pygame.draw.circle(surface, ROBOT_OUTLINE_COLOR, (x, y), draw_radius, width=1)
+
         if self.role in {"RELAY", "TRUNK_RELAY"}:
             ring_color = TRUNK_RELAY_COLOR if self.role == "TRUNK_RELAY" else RELAY_COLOR
-            pygame.draw.circle(surface, ring_color, (x, y), self.radius + 3, width=1)
+            pygame.draw.circle(surface, ring_color, (x, y), draw_radius + 3, width=1)
+        elif self.role == "ANCHOR":
+            pygame.draw.circle(surface, ANCHOR_COLOR, (x, y), draw_radius + 2, width=1)
+        elif self.role == "SHEPHERD":
+            pygame.draw.circle(surface, SHEPHERD_COLOR, (x, y), draw_radius + 2, width=1)
+
         if base_station is not None and self.role != "BASE" and not self.connected_to_base:
-            pygame.draw.rect(
-                surface,
-                DISCONNECTED_COLOR,
-                marker.inflate(2, 2),
-                width=1,
-                border_radius=self.radius + 1,
-            )
+            pygame.draw.circle(surface, DISCONNECTED_COLOR, (x, y), draw_radius + 2, width=1)
 
 # =========================================================
 # 9. Robot creation and spatial hash
@@ -3141,7 +3150,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
     global last_proxy_mass_stats, last_proxy_robot_assignment
     global last_proxy_candidates
     global last_flow_rollout_scores
-    global selected_branch_entry_lambda, branch_entry_timer
+    global selected_branch_entry_lambda, branch_entry_timer, return_trunk_release_pending
 
     if anchor is None or anchor.local_branch_states is None:
         return None
@@ -3282,11 +3291,11 @@ def begin_final_gather():
 
 
 def begin_final_return(anchor, robots):
-    global phase, relay_slots, relay_motion_scale
+    global phase, relay_slots, relay_motion_scale, return_trunk_release_pending
     relay_slots = []
     relay_motion_scale = 1.0
     release_anchor_for_final_return(anchor)
-    release_trunk_relays_for_return(robots)
+    return_trunk_release_pending = True
     phase = SimulationPhase.RETURN_TO_BASE
     print("[DFS] return to base")
 
@@ -3798,8 +3807,16 @@ def compute_route_force(robot):
         target = junction_target if region in BRANCHES else JUNCTION_STAGING_POSITION
         force = normalized_direction_toward(robot.position, target) * FINAL_GATHER_FORCE
     elif phase == SimulationPhase.RETURN_TO_BASE:
-        target = junction_target if region in BRANCHES else get_bottom_hold_point()
-        force = normalized_direction_toward(robot.position, target) * OUTLET_FORCE
+        if region in BRANCHES:
+            force = normalized_direction_toward(robot.position, junction_target) * OUTLET_FORCE
+        else:
+            bottom_target = get_bottom_hold_point()
+            y_distance = bottom_target.y - robot.position.y
+            if y_distance > 0.0:
+                scale = max(RETURN_MIN_FORCE_SCALE, min(1.0, y_distance / RETURN_BRAKE_DISTANCE))
+                force.y = RETURN_EGRESS_FORCE * scale
+            lane_error = robot.ingress_lane_x - robot.position.x
+            force.x = clamp(RETURN_LANE_GAIN * lane_error, -RETURN_LANE_MAX_FORCE, RETURN_LANE_MAX_FORCE)
 
     force += compute_virtual_valve_force(robot)
 
@@ -4102,8 +4119,16 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             begin_final_return(anchor, robots)
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
+        global return_trunk_release_pending
         in_bottom = sum(get_robot_region(robot.position) == "BOTTOM" for robot in robots)
+        connected_count = sum(robot.connected_to_base for robot in robots)
         special = sum(robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY", "SHEPHERD"} for robot in robots)
+
+        if return_trunk_release_pending and in_bottom >= RETURN_BOTTOM_TARGET_COUNT and connected_count == len(robots):
+            release_trunk_relays_for_return(robots)
+            return_trunk_release_pending = False
+            return
+
         if in_bottom >= RETURN_BOTTOM_TARGET_COUNT and special == 0:
             phase = SimulationPhase.DONE
             metrics.completion_time = simulation_time
@@ -4326,6 +4351,7 @@ def reset_dfs_state():
     last_flow_rollout_scores = {}
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
     branch_entry_timer = 0.0
+    return_trunk_release_pending = False
     initialize_trunk_relay_plan()
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
