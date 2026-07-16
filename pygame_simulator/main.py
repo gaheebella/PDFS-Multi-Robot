@@ -45,18 +45,25 @@ pygame.init()
 # 1. Display
 # =========================================================
 
-SCREEN_WIDTH = 1000
+SCREEN_WIDTH = 1380
 SCREEN_HEIGHT = 700
+SIMULATION_VIEW_WIDTH = 840
+HUD_PANEL_X = 850
+HUD_PANEL_MARGIN = 14
+HUD_PANEL_WIDTH = SCREEN_WIDTH - HUD_PANEL_X
+HUD_PANEL_COLOR = (244, 247, 252)
+HUD_PANEL_BORDER_COLOR = (196, 204, 218)
 FPS = 60
 SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base SPH DFS | Vivid Proxy Regions + Leak-Proof Shepherd Curtain"
+    "Base SPH DFS | Proxy Regions + Separate HUD Panel"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 small_font = pygame.font.SysFont(None, 19)
+hud_font = pygame.font.SysFont(None, 18)
 
 BACKGROUND_COLOR = (248, 249, 252)
 FLOOR_COLOR = (235, 239, 246)
@@ -4483,6 +4490,65 @@ robots, reference_density, color_reference_density = initialize_simulation()
 
 running = True
 paused = False
+def wrap_hud_text(text: str, font_obj, max_width: int):
+    """Wrap one HUD string to the width of the separate side panel."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if font_obj.size(candidate)[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def draw_hud_panel(surface, lines):
+    panel_rect = pygame.Rect(
+        HUD_PANEL_X,
+        0,
+        HUD_PANEL_WIDTH,
+        SCREEN_HEIGHT,
+    )
+    pygame.draw.rect(surface, HUD_PANEL_COLOR, panel_rect)
+    pygame.draw.line(
+        surface,
+        HUD_PANEL_BORDER_COLOR,
+        (HUD_PANEL_X, 0),
+        (HUD_PANEL_X, SCREEN_HEIGHT),
+        width=2,
+    )
+
+    x = HUD_PANEL_X + HUD_PANEL_MARGIN
+    y = 12
+    max_width = HUD_PANEL_WIDTH - 2 * HUD_PANEL_MARGIN
+    line_height = hud_font.get_linesize() + 2
+
+    for line in lines:
+        wrapped = wrap_hud_text(line, hud_font, max_width)
+        for wrapped_line in wrapped:
+            if y + line_height >= SCREEN_HEIGHT - 72:
+                break
+            surface.blit(hud_font.render(wrapped_line, True, TEXT_COLOR), (x, y))
+            y += line_height
+        if y + line_height >= SCREEN_HEIGHT - 72:
+            break
+
+    controls = [
+        "SPACE pause | R reset | D density",
+        "V regions | C communication | ESC quit",
+    ]
+    controls_y = SCREEN_HEIGHT - 58
+    for control in controls:
+        surface.blit(hud_font.render(control, True, TEXT_COLOR), (x, controls_y))
+        controls_y += line_height
+
+
 show_density_color = False
 show_regions = True
 show_comm_links = SHOW_COMM_LINKS_DEFAULT
@@ -4651,15 +4717,7 @@ while running:
         f"Shepherd target={adaptive_shepherd_count()} | formed={shepherd_boundary_formed(robots)} | pressure t={pressure_push_timer:.2f}",
         f"Distance total={sum(robot.total_distance for robot in robots):.0f} | disconnect robot-s={metrics.disconnected_robot_seconds:.1f}",
     ]
-    for index, text in enumerate(hud_lines):
-        screen.blit(small_font.render(text, True, TEXT_COLOR), (15, 12 + index * 21))
-
-    control_text = font.render(
-        "SPACE pause | R reset | D density | V regions | C communication | ESC quit",
-        True,
-        TEXT_COLOR,
-    )
-    screen.blit(control_text, (15, SCREEN_HEIGHT - 30))
+    draw_hud_panel(screen, hud_lines)
     pygame.display.flip()
 
 if not metrics.saved:
