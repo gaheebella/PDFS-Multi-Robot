@@ -1028,6 +1028,51 @@ def set_branch_visit_state(
     topology_edges[edge_id].visit_state = visit_state
     update_current_dfs_frame(edge_id, visit_state)
 
+def set_topology_cursor_for_branch(branch: str):
+    """Set the topological cursor to the selected child edge."""
+
+    global current_node_id
+    global current_junction_id
+    global current_edge_id
+
+    if branch not in BRANCH_TO_EDGE:
+        raise ValueError(f"Unknown branch: {branch}")
+
+    edge_id = BRANCH_TO_EDGE[branch]
+    edge = topology_edges[edge_id]
+
+    current_node_id = edge.start_node_id
+    current_junction_id = edge.start_node_id
+    current_edge_id = edge_id
+
+    print(
+        f"[Topology Cursor] "
+        f"junction={current_junction_id}, "
+        f"edge={current_edge_id}"
+    )
+
+
+def set_topology_cursor_at_junction(junction_id: str):
+    """Set the topological cursor after returning to a junction."""
+
+    global current_node_id
+    global current_junction_id
+    global current_edge_id
+
+    if junction_id not in topology_nodes:
+        raise ValueError(f"Unknown junction: {junction_id}")
+
+    current_node_id = junction_id
+    current_junction_id = junction_id
+    current_edge_id = None
+
+    print(
+        f"[Topology Cursor] "
+        f"junction={current_junction_id}, "
+        f"edge={current_edge_id}"
+    )
+
+
 
 def reset_topology_visit_states():
     """Reset the current single-junction topology states."""
@@ -1039,7 +1084,7 @@ def reset_topology_visit_states():
     topology_nodes["BASE"].visit_state = VisitState.VISITED
     topology_nodes["J0"].visit_state = VisitState.UNVISITED
     topology_edges["E_BASE_J0"].visit_state = VisitState.VISITED
-    
+
     initialize_dfs_stack()
 
 
@@ -3592,6 +3637,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
         selected,
         VisitState.ACTIVE,
     )
+    set_topology_cursor_for_branch(selected)
 
     anchor.selected_branch = selected
     active_branch = selected
@@ -3626,6 +3672,8 @@ def complete_active_branch(anchor, branch):
     branch,
     VisitState.VISITED,
     )
+
+    set_topology_cursor_at_junction("J0")
 
     anchor.selected_branch = None
     previous_branch_direction = get_backtrack_direction(branch)
@@ -4764,11 +4812,19 @@ def reset_dfs_state():
     global selected_branch_entry_lambda, branch_entry_timer
     global return_trunk_release_pending, return_trunk_retract_timer
     global metrics
+    global current_node_id
+    global current_junction_id
+    global current_edge_id
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
 
     branch_states = {branch: "UNVISITED" for branch in BRANCHES}
     reset_topology_visit_states()
+    
+    current_node_id = "BASE"
+    current_junction_id = None
+    current_edge_id = "E_BASE_J0"
+
     branch_order_plan = []
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
     junction_anchor = None
