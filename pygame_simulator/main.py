@@ -3,7 +3,7 @@
 Implemented research components
 -------------------------------
 1. Multi-criteria Junction Anchor election.
-2. Flow-preserving SPH short-rollout, HydroSwarm proxy-region, EDF, and relay-aware DFS child-branch ordering.
+2. Proxy-region-based Flow-Preserving SPH short-rollout, EDF, and relay-aware DFS child-branch ordering.
 3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
 4. Width-adaptive Shepherd count, scored candidate election, and
@@ -275,6 +275,7 @@ base_station: Optional["BaseStation"] = None
 last_proxy_partition: dict[tuple[int, int], str] = {}
 last_proxy_cell_centers: dict[tuple[int, int], pygame.Vector2] = {}
 last_proxy_mass_stats: dict[str, dict] = {}
+last_proxy_robot_assignment: dict[int, str] = {}
 last_proxy_candidates: tuple[str, ...] = ()
 # Candidate-by-candidate virtual SPH rollout results from the latest Junction
 # decision.  They are display/logging data only and never alter real robots.
@@ -426,29 +427,29 @@ RELAY_FRONT_FRACTION = 0.20
 RELAY_FRONT_MIN_COUNT = 10
 RELAY_FRONT_REQUIRED_CONNECTED_RATIO = 0.90
 
-# Flow-Preserving SPH-Aware DFS ordering.
+# Proxy-Region-Based Flow-Preserving SPH-Aware DFS ordering.
 # Structural complete-exploration loss is handled lexicographically first.
-# Among equally important branches, a short candidate-specific SPH rollout
-# rewards natural gate flux and penalizes density/velocity disturbance, wall
-# and collision risk, Base communication risk, relay demand, and material-mode
-# softening.  The older proxy/EDF/shape terms remain as low-weight priors.
-BRANCH_COST_PREDICTED_FLOW_REWARD = 0.30
-BRANCH_COST_DENSITY_DISTURBANCE_WEIGHT = 0.14
-BRANCH_COST_VELOCITY_DISTURBANCE_WEIGHT = 0.12
-BRANCH_COST_WALL_RISK_WEIGHT = 0.09
-BRANCH_COST_COLLISION_RISK_WEIGHT = 0.09
-BRANCH_COST_ROLLOUT_COMM_WEIGHT = 0.11
-BRANCH_COST_RELAY_WEIGHT = 0.08
-BRANCH_COST_LAMBDA_MODE_WEIGHT = 0.05
-BRANCH_COST_STABILIZATION_WEIGHT = 0.05
+# Each candidate is evaluated only with the mobile robots assigned to its
+# demand-constrained proxy subregion plus SPH-support boundary context.
+# Therefore proxy mass, regional flow and regional disturbance are primary
+# decision terms rather than a weak display-only prior.
+BRANCH_COST_PREDICTED_FLOW_REWARD = 0.24
+BRANCH_COST_DENSITY_DISTURBANCE_WEIGHT = 0.11
+BRANCH_COST_VELOCITY_DISTURBANCE_WEIGHT = 0.10
+BRANCH_COST_WALL_RISK_WEIGHT = 0.07
+BRANCH_COST_COLLISION_RISK_WEIGHT = 0.07
+BRANCH_COST_ROLLOUT_COMM_WEIGHT = 0.09
+BRANCH_COST_RELAY_WEIGHT = 0.07
+BRANCH_COST_LAMBDA_MODE_WEIGHT = 0.04
+BRANCH_COST_STABILIZATION_WEIGHT = 0.04
 
-BRANCH_COST_TRANSPORT_WEIGHT = 0.05
-BRANCH_COST_PROXY_MASS_WEIGHT = 0.04
-BRANCH_COST_SHAPE_WEIGHT = 0.03
-BRANCH_COST_FLOW_PRIOR_WEIGHT = 0.03
-BRANCH_COST_CONGESTION_WEIGHT = 0.05
-BRANCH_COST_BACKTRACK_WEIGHT = 0.03
-BRANCH_COST_SWITCH_WEIGHT = 0.03
+BRANCH_COST_TRANSPORT_WEIGHT = 0.08
+BRANCH_COST_PROXY_MASS_WEIGHT = 0.12
+BRANCH_COST_SHAPE_WEIGHT = 0.05
+BRANCH_COST_FLOW_PRIOR_WEIGHT = 0.06
+BRANCH_COST_CONGESTION_WEIGHT = 0.08
+BRANCH_COST_BACKTRACK_WEIGHT = 0.04
+BRANCH_COST_SWITCH_WEIGHT = 0.04
 
 # Candidate-specific short virtual rollout.  It is evaluated only at Junction
 # decisions, so several candidates can be tested without affecting frame rate.
@@ -495,6 +496,10 @@ PROXY_DENSITY_MASS_MIN = 0.50
 PROXY_DENSITY_MASS_MAX = 2.00
 PROXY_FRONT_LAYER_LENGTH = SMOOTHING_LENGTH
 PROXY_FRONT_LATERAL_SPACING = max(SAFE_RADIUS * 1.8, 1.0)
+PROXY_ROLLOUT_CONTEXT_DISTANCE = SMOOTHING_LENGTH * 1.10
+PROXY_ROLLOUT_MIN_PRIMARY = 6
+PROXY_CONTEXT_HOLD_GAIN = 3.2
+PROXY_CONTEXT_MAX_SPEED_SCALE = 0.28
 
 # Geodesic EDF guidance and smooth virtual valves at unselected branch mouths.
 EDF_FINITE_EPSILON = 1e-6
@@ -2247,28 +2252,112 @@ def compute_congestion_cost(
 
 @dataclass
 class RolloutParticle:
-    """Lightweight copy used only by candidate-specific virtual SPH rollout."""
+    """Lightweight proxy-region particle for candidate-specific SPH rollout.
+
+    Primary particles belong to the candidate Branch subregion and are used
+    for all branch metrics. Context particles lie within one SPH support of
+    the proxy boundary; they participate in kernels and communication but are
+    softly held near their original positions so that the candidate does not
+    incorrectly pull the whole swarm into every virtual Branch.
+    """
 
     robot_id: int
     position: pygame.Vector2
     velocity: pygame.Vector2
+    initial_position: pygame.Vector2
     initial_velocity: pygame.Vector2
     initial_density: float
+    is_primary: bool
     density: float = 0.0
     pressure: float = 0.0
 
 
-def get_flow_rollout_robots(robots) -> list["Robot"]:
-    """Use the Base-connected mobile mass nearest the active Junction."""
+def get_proxy_boundary_centers(
+    branch: str,
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> list[pygame.Vector2]:
+    """Return cell centers on the decision boundary of one proxy subregion."""
+    boundary = []
+    for key, owner in partition.items():
+        if owner != branch:
+            continue
+        col, row = key
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            neighbor = (col + dx, row + dy)
+            if neighbor in partition and partition[neighbor] != branch:
+                boundary.append(centers[key])
+                break
+    # A single remaining Branch owns all cells and has no internal boundary.
+    if not boundary:
+        boundary = [get_branch_entrance(branch)]
+    return boundary
+
+
+def get_proxy_region_rollout_robots(
+    robots,
+    branch: str,
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> tuple[list["Robot"], set[int], set[int]]:
+    """Select candidate-region robots plus one-support boundary context.
+
+    Robots are never physically divided by this assignment. The sets exist
+    only inside the branch decision layer.
+    """
     eligible = get_branch_ordering_robots(robots)
-    junction_center = pygame.Vector2(center_x, center_y)
-    eligible.sort(
-        key=lambda robot: (
-            robot.position.distance_squared_to(junction_center),
-            robot.robot_id,
+    primary = [
+        robot for robot in eligible
+        if robot_assignment.get(robot.robot_id) == branch
+    ]
+
+    # Numerical fallback: guarantee a minimally meaningful regional sample.
+    if len(primary) < PROXY_ROLLOUT_MIN_PRIMARY:
+        already = {robot.robot_id for robot in primary}
+        supplements = sorted(
+            (robot for robot in eligible if robot.robot_id not in already),
+            key=lambda robot: (
+                free_space_distance_to_branch(robot.position, branch),
+                robot.robot_id,
+            ),
         )
-    )
-    return eligible[:FLOW_ROLLOUT_MAX_ROBOTS]
+        primary.extend(supplements[: PROXY_ROLLOUT_MIN_PRIMARY - len(primary)])
+
+    primary_ids = {robot.robot_id for robot in primary}
+    boundary_centers = get_proxy_boundary_centers(branch, partition, centers)
+    context_candidates = []
+    for robot in eligible:
+        if robot.robot_id in primary_ids:
+            continue
+        proxy_point = project_robot_to_proxy(robot.position)
+        distance = min(
+            proxy_point.distance_to(center)
+            for center in boundary_centers
+        )
+        if distance <= PROXY_ROLLOUT_CONTEXT_DISTANCE:
+            context_candidates.append((distance, robot.robot_id, robot))
+
+    context_candidates.sort(key=lambda item: (item[0], item[1]))
+    remaining_capacity = max(0, FLOW_ROLLOUT_MAX_ROBOTS - len(primary))
+    context = [item[2] for item in context_candidates[:remaining_capacity]]
+    context_ids = {robot.robot_id for robot in context}
+
+    # Preserve all primary particles whenever possible; trim only pathological
+    # cases after prioritizing robots closest to the candidate entrance.
+    if len(primary) > FLOW_ROLLOUT_MAX_ROBOTS:
+        primary.sort(
+            key=lambda robot: (
+                free_space_distance_to_branch(robot.position, branch),
+                robot.robot_id,
+            )
+        )
+        primary = primary[:FLOW_ROLLOUT_MAX_ROBOTS]
+        primary_ids = {robot.robot_id for robot in primary}
+        context = []
+        context_ids = set()
+
+    return primary + context, primary_ids, context_ids
 
 
 def rollout_region_allowed(position: pygame.Vector2, branch: str) -> bool:
@@ -2400,7 +2489,11 @@ def evaluate_rollout_communication_risk(
     particles: list[RolloutParticle],
     robots,
 ) -> tuple[float, float, float]:
-    """Predict Base connectivity after the virtual candidate transition."""
+    """Predict Base connectivity of the candidate proxy-region particles.
+
+    Context particles may provide physically valid intermediate links, but the
+    connected ratio and robust margin are evaluated only for primary particles.
+    """
     if base_station is None:
         return 1.0, 0.0, 0.0
 
@@ -2441,11 +2534,19 @@ def evaluate_rollout_communication_risk(
             best_margin[neighbor] = candidate_margin
             heapq.heappush(heap, (-candidate_margin, neighbor))
 
-    mobile_margins = best_margin[fixed_count:]
-    connected = [margin for margin in mobile_margins if math.isfinite(margin)]
-    connected_ratio = len(connected) / max(len(mobile_margins), 1)
+    primary_margins = [
+        best_margin[fixed_count + index]
+        for index, particle in enumerate(particles)
+        if particle.is_primary
+    ]
+    connected = [margin for margin in primary_margins if math.isfinite(margin)]
+    connected_ratio = len(connected) / max(len(primary_margins), 1)
     robust_margin = min(connected) if connected else -COMM_RANGE
-    margin_quality = clamp(robust_margin / max(COMM_SAFE_DISTANCE, EPSILON), 0.0, 1.0)
+    margin_quality = clamp(
+        robust_margin / max(COMM_SAFE_DISTANCE, EPSILON),
+        0.0,
+        1.0,
+    )
     risk = clamp(
         0.75 * (1.0 - connected_ratio)
         + 0.25 * (1.0 - margin_quality),
@@ -2460,16 +2561,24 @@ def evaluate_flow_preserving_rollout(
     robots,
     reference_density: float,
     incoming_direction: pygame.Vector2,
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
 ) -> dict:
-    """Run a short non-mutating SPH look-ahead for one candidate Branch.
+    """Run a short non-mutating SPH look-ahead for one proxy subregion.
 
-    The rollout directly estimates the quantity described by the proposed
-    Flow-Preserving SPH-Aware DFS policy: expected gate flux is rewarded while
-    changes in density and velocity, wall/collision exposure, Base-link risk,
-    and stiffness-mode transition are penalized.
+    Only robots assigned to the candidate Branch region receive the candidate
+    EDF/valve control and contribute to branch metrics. Nearby robots from
+    other regions are included as softly held SPH boundary context.
     """
-    source_robots = get_flow_rollout_robots(robots)
-    if not source_robots:
+    source_robots, primary_ids, context_ids = get_proxy_region_rollout_robots(
+        robots,
+        branch,
+        robot_assignment,
+        partition,
+        centers,
+    )
+    if not source_robots or not primary_ids:
         return {
             "predicted_flow": 0.0,
             "density_disturbance": 1.0,
@@ -2484,6 +2593,8 @@ def evaluate_flow_preserving_rollout(
             "rollout_lambda": STIFFNESS_EXPONENT_SOFT,
             "predicted_entry_ratio": 0.0,
             "rollout_robot_count": 0,
+            "proxy_primary_count": 0,
+            "proxy_context_count": 0,
         }
 
     rollout_lambda, lambda_mode_cost = rollout_stiffness_for_branch(
@@ -2495,8 +2606,10 @@ def evaluate_flow_preserving_rollout(
             robot_id=robot.robot_id,
             position=robot.position.copy(),
             velocity=robot.velocity.copy(),
+            initial_position=robot.position.copy(),
             initial_velocity=robot.velocity.copy(),
             initial_density=max(robot.density, EPSILON),
+            is_primary=robot.robot_id in primary_ids,
         )
         for robot in source_robots
     ]
@@ -2508,6 +2621,7 @@ def evaluate_flow_preserving_rollout(
     density_samples = 0
     velocity_samples = 0
     collision_samples = 0
+    primary_count = sum(particle.is_primary for particle in particles)
     h_squared = SMOOTHING_LENGTH**2
 
     for _ in range(FLOW_ROLLOUT_STEPS):
@@ -2525,13 +2639,15 @@ def evaluate_flow_preserving_rollout(
                 particle_j = particles[j]
                 r_ij = particle_i.position - particle_j.position
                 distance_squared = r_ij.length_squared()
+                pair_is_relevant = particle_i.is_primary or particle_j.is_primary
                 if distance_squared <= EPSILON:
-                    collision_risk_sum += 1.0
-                    collision_samples += 1
+                    if pair_is_relevant:
+                        collision_risk_sum += 1.0
+                        collision_samples += 1
                     continue
 
                 distance = math.sqrt(distance_squared)
-                if distance < FLOW_ROLLOUT_COLLISION_DISTANCE:
+                if pair_is_relevant and distance < FLOW_ROLLOUT_COLLISION_DISTANCE:
                     penetration = (
                         FLOW_ROLLOUT_COLLISION_DISTANCE - distance
                     ) / max(FLOW_ROLLOUT_COLLISION_DISTANCE, EPSILON)
@@ -2594,14 +2710,22 @@ def evaluate_flow_preserving_rollout(
 
         for index, particle in enumerate(particles):
             region = get_robot_region(particle.position)
-            route_force = (
-                rollout_edf_direction(particle.position, branch)
-                * FLOW_ROLLOUT_ROUTE_GAIN
-            )
-            route_force += rollout_virtual_valve_force(
-                particle.position,
-                branch,
-            )
+            if particle.is_primary:
+                route_force = (
+                    rollout_edf_direction(particle.position, branch)
+                    * FLOW_ROLLOUT_ROUTE_GAIN
+                )
+                route_force += rollout_virtual_valve_force(
+                    particle.position,
+                    branch,
+                )
+            else:
+                # Context particles approximate the neighboring fluid boundary
+                # rather than being virtually assigned to this candidate.
+                route_force = (
+                    particle.initial_position - particle.position
+                ) * PROXY_CONTEXT_HOLD_GAIN
+
             if region in {"UP", "BOTTOM"}:
                 route_force.x += CENTERING_GAIN * (center_x - particle.position.x)
             elif region in {"LEFT", "RIGHT"}:
@@ -2614,7 +2738,12 @@ def evaluate_flow_preserving_rollout(
             )
             limit_vector(acceleration, FLOW_ROLLOUT_MAX_ACCELERATION)
             particle.velocity += acceleration * FLOW_ROLLOUT_DT
-            limit_vector(particle.velocity, FLOW_ROLLOUT_MAX_SPEED)
+            speed_limit = (
+                FLOW_ROLLOUT_MAX_SPEED
+                if particle.is_primary
+                else FLOW_ROLLOUT_MAX_SPEED * PROXY_CONTEXT_MAX_SPEED_SCALE
+            )
+            limit_vector(particle.velocity, speed_limit)
 
             proposed_x = pygame.Vector2(
                 particle.position.x + particle.velocity.x * FLOW_ROLLOUT_DT,
@@ -2623,7 +2752,8 @@ def evaluate_flow_preserving_rollout(
             if is_rollout_walkable(proposed_x, ROBOT_RADIUS, branch):
                 particle.position.x = proposed_x.x
             else:
-                wall_risk_sum += 1.0
+                if particle.is_primary:
+                    wall_risk_sum += 1.0
                 particle.velocity.x = 0.0
 
             proposed_y = pygame.Vector2(
@@ -2633,30 +2763,31 @@ def evaluate_flow_preserving_rollout(
             if is_rollout_walkable(proposed_y, ROBOT_RADIUS, branch):
                 particle.position.y = proposed_y.y
             else:
-                wall_risk_sum += 1.0
+                if particle.is_primary:
+                    wall_risk_sum += 1.0
                 particle.velocity.y = 0.0
 
-            if not is_rollout_walkable(
+            if particle.is_primary and not is_rollout_walkable(
                 particle.position,
                 ROBOT_RADIUS + FLOW_ROLLOUT_WALL_CLEARANCE,
                 branch,
             ):
                 wall_risk_sum += 0.35
 
-            relative_density_change = (
-                particle.density - particle.initial_density
-            ) / max(particle.initial_density, reference_density, EPSILON)
-            density_disturbance_sum += relative_density_change**2
-            density_samples += 1
+            if particle.is_primary:
+                relative_density_change = (
+                    particle.density - particle.initial_density
+                ) / max(particle.initial_density, reference_density, EPSILON)
+                density_disturbance_sum += relative_density_change**2
+                density_samples += 1
 
-            velocity_change = particle.velocity - particle.initial_velocity
-            velocity_disturbance_sum += (
-                velocity_change.length()
-                / max(FLOW_ROLLOUT_VELOCITY_NORMALIZER, EPSILON)
-            ) ** 2
-            velocity_samples += 1
+                velocity_change = particle.velocity - particle.initial_velocity
+                velocity_disturbance_sum += (
+                    velocity_change.length()
+                    / max(FLOW_ROLLOUT_VELOCITY_NORMALIZER, EPSILON)
+                ) ** 2
+                velocity_samples += 1
 
-    # Refresh final densities for final-state metrics.
     compute_rollout_densities(particles)
 
     entrance = get_branch_entrance(branch)
@@ -2665,6 +2796,8 @@ def evaluate_flow_preserving_rollout(
     weight_sum = 0.0
     entered = 0
     for particle in particles:
+        if not particle.is_primary:
+            continue
         distance = particle.position.distance_to(entrance)
         weight = math.exp(
             -(distance**2)
@@ -2694,15 +2827,15 @@ def evaluate_flow_preserving_rollout(
     )
     wall_risk = clamp(
         wall_risk_sum
-        / max(len(particles) * FLOW_ROLLOUT_STEPS * 2.35, 1.0),
+        / max(primary_count * FLOW_ROLLOUT_STEPS * 2.35, 1.0),
         0.0,
         1.0,
     )
-    collision_risk = clamp(
-        collision_risk_sum / max(collision_samples, 1),
-        0.0,
-        1.0,
-    ) if collision_samples else 0.0
+    collision_risk = (
+        clamp(collision_risk_sum / max(collision_samples, 1), 0.0, 1.0)
+        if collision_samples
+        else 0.0
+    )
     rollout_comm, connected_ratio, robust_margin = evaluate_rollout_communication_risk(
         particles,
         robots,
@@ -2725,35 +2858,56 @@ def evaluate_flow_preserving_rollout(
         "stabilization": stabilization,
         "lambda_mode": lambda_mode_cost,
         "rollout_lambda": rollout_lambda,
-        "predicted_entry_ratio": entered / max(len(particles), 1),
+        "predicted_entry_ratio": entered / max(primary_count, 1),
         "rollout_robot_count": len(particles),
+        "proxy_primary_count": primary_count,
+        "proxy_context_count": len(context_ids),
     }
+
 
 def branch_efficiency_cost(
     branch: str,
     robots,
     incoming_direction: pygame.Vector2,
     reference_density: float,
-    principal_axis: pygame.Vector2,
-    shape_confidence: float,
     proxy_mass_stats: dict[str, dict],
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
 ):
     ordering_robots = get_branch_ordering_robots(robots)
+    region_robots = [
+        robot for robot in ordering_robots
+        if robot_assignment.get(robot.robot_id) == branch
+    ]
+    if not region_robots:
+        region_robots = ordering_robots
+
+    region_axis, region_shape_confidence = compute_swarm_principal_axis(
+        region_robots
+    )
     rollout = evaluate_flow_preserving_rollout(
         branch,
         robots,
         reference_density,
         incoming_direction,
+        robot_assignment,
+        partition,
+        centers,
     )
 
-    # Low-weight decision priors retained from the previous implementation.
-    transport = compute_transport_cost(branch, ordering_robots)
+    # Every state prior is now measured from this Branch's proxy-region mass.
+    transport = compute_transport_cost(branch, region_robots)
     proxy_mass = proxy_mass_stats.get(branch, {}).get("mass_deficit_cost", 1.0)
-    shape = compute_shape_cost(branch, principal_axis, shape_confidence)
-    flow_prior = compute_flow_cost(branch, ordering_robots)
+    shape = compute_shape_cost(
+        branch,
+        region_axis,
+        region_shape_confidence,
+    )
+    flow_prior = compute_flow_cost(branch, region_robots)
     congestion = compute_congestion_cost(
         branch,
-        ordering_robots,
+        region_robots,
         reference_density,
     )
 
@@ -2802,7 +2956,7 @@ def branch_efficiency_cost(
         "proxy_actual_mass": proxy_mass_stats.get(branch, {}).get("actual_mass_fraction", 0.0),
         "proxy_robot_count": proxy_mass_stats.get(branch, {}).get("robot_count", 0),
         "shape": shape,
-        "shape_confidence": shape_confidence,
+        "shape_confidence": region_shape_confidence,
         "flow_prior": flow_prior,
         "congestion": congestion,
         "relay": relay,
@@ -2810,8 +2964,10 @@ def branch_efficiency_cost(
         "switch": switch,
         "structural_loss": structural_loss(branch),
         "ordering_robot_count": len(ordering_robots),
+        "regional_robot_count": len(region_robots),
     }
     return total, components
+
 
 def branch_is_feasible(branch: str, robots) -> bool:
     """Check deterministic resource/connectivity feasibility before scoring."""
@@ -2834,16 +2990,19 @@ def choose_next_branch(anchor, robots, reference_density: float):
     1. Keep only UNVISITED and resource-feasible branches.
     2. Preserve complete-exploration priority lexicographically through
        structural loss.
-    3. Clone the current mobile swarm state and briefly open each candidate
-       valve in a non-mutating SPH rollout.
-    4. Select the branch with the highest predicted natural flux and the
+    3. Partition the Junction proxy by branch-mouth proximity under each
+       branch demand quota, then assign mobile robots only for decision use.
+    4. Roll out each candidate with its assigned regional robots plus one-SPH-
+       support boundary context; the real swarm is never physically divided.
+    5. Select the branch with the highest regional natural flux and the
        smallest density/velocity disturbance, wall/collision exposure,
        communication risk, relay demand, and lambda-mode transition cost.
-    5. Repeat this evaluation whenever the swarm returns to the Junction.
+    6. Repeat this evaluation whenever the swarm returns to the Junction.
     """
     global active_branch, previous_branch_direction, branch_order_plan
     global last_proxy_partition, last_proxy_cell_centers
-    global last_proxy_mass_stats, last_proxy_candidates
+    global last_proxy_mass_stats, last_proxy_robot_assignment
+    global last_proxy_candidates
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
 
@@ -2879,13 +3038,10 @@ def choose_next_branch(anchor, robots, reference_density: float):
     ]
 
     ordering_robots = get_branch_ordering_robots(robots)
-    principal_axis, shape_confidence = compute_swarm_principal_axis(
-        ordering_robots
-    )
     partition, cell_centers, quotas = build_capacity_constrained_proxy_partition(
         priority_candidates
     )
-    proxy_stats, _ = compute_proxy_mass_statistics(
+    proxy_stats, robot_assignment = compute_proxy_mass_statistics(
         ordering_robots,
         priority_candidates,
         partition,
@@ -2896,6 +3052,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
     last_proxy_partition = partition
     last_proxy_cell_centers = cell_centers
     last_proxy_mass_stats = proxy_stats
+    last_proxy_robot_assignment = robot_assignment
     last_proxy_candidates = tuple(priority_candidates)
 
     scored = []
@@ -2906,9 +3063,10 @@ def choose_next_branch(anchor, robots, reference_density: float):
             robots,
             previous_branch_direction,
             reference_density,
-            principal_axis,
-            shape_confidence,
             proxy_stats,
+            robot_assignment,
+            partition,
+            cell_centers,
         )
         scored.append((cost, branch, components))
         candidate_score_map[branch] = {
@@ -2916,14 +3074,16 @@ def choose_next_branch(anchor, robots, reference_density: float):
             "components": components,
         }
         print(
-            f"[Flow Rollout] branch={branch}, loss={losses[branch]}, "
+            f"[Proxy Rollout] branch={branch}, loss={losses[branch]}, "
             f"cost={cost:.4f}, Q={components['predicted_flow']:.3f}, "
             f"dRho={components['density_disturbance']:.3f}, "
             f"dV={components['velocity_disturbance']:.3f}, "
             f"wall={components['wall_risk']:.3f}, "
             f"collision={components['collision_risk']:.3f}, "
             f"comm={components['rollout_comm']:.3f}, "
-            f"lambda={components['rollout_lambda']:.3f}"
+            f"lambda={components['rollout_lambda']:.3f}, "
+            f"primary={components['proxy_primary_count']}, "
+            f"context={components['proxy_context_count']}"
         )
 
     scored.sort(key=lambda item: (item[0], item[1]))
@@ -3829,6 +3989,34 @@ def draw_proxy_partition(surface):
     surface.blit(overlay, (0, 0))
 
 
+def draw_proxy_robot_assignments(surface, robots):
+    """Visualize decision-only robot-to-proxy-region assignments.
+
+    Dots are drawn at projected proxy positions, not at physical positions, to
+    emphasize that the assignment is analytical and does not split the swarm.
+    """
+    if not last_proxy_robot_assignment:
+        return
+    branch_colors = {
+        "UP": (88, 139, 196),
+        "LEFT": (153, 112, 188),
+        "RIGHT": (207, 135, 67),
+    }
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    for robot in robots:
+        branch = last_proxy_robot_assignment.get(robot.robot_id)
+        if branch is None:
+            continue
+        point = project_robot_to_proxy(robot.position)
+        pygame.draw.circle(
+            overlay,
+            (*branch_colors[branch], 145),
+            (round(point.x), round(point.y)),
+            2,
+        )
+    surface.blit(overlay, (0, 0))
+
+
 # =========================================================
 # 17. Initialization
 # =========================================================
@@ -3843,7 +4031,8 @@ def reset_dfs_state():
     global relay_retract_cooldown, relay_retract_clear_timer, relay_motion_scale
     global trunk_relay_slots, trunk_relay_deploy_cooldown, base_station
     global last_proxy_partition, last_proxy_cell_centers
-    global last_proxy_mass_stats, last_proxy_candidates
+    global last_proxy_mass_stats, last_proxy_robot_assignment
+    global last_proxy_candidates
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
     global metrics
@@ -3867,6 +4056,7 @@ def reset_dfs_state():
     last_proxy_partition = {}
     last_proxy_cell_centers = {}
     last_proxy_mass_stats = {}
+    last_proxy_robot_assignment = {}
     last_proxy_candidates = ()
     last_flow_rollout_scores = {}
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
@@ -3960,6 +4150,7 @@ while running:
 
     if show_regions:
         draw_proxy_partition(screen)
+        draw_proxy_robot_assignments(screen, robots)
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
         pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
         pygame.draw.circle(screen, ANCHOR_COLOR, ANCHOR_PARK_POSITION, 4, width=1)
@@ -4000,7 +4191,7 @@ while running:
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
     hud_lines = [
-        "Base-rooted DFS: Flow-Preserving SPH rollout + proxy/EDF",
+        "Base-rooted DFS: Proxy-Region Flow-Preserving SPH + EDF",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
         f"Anchor={junction_anchor.robot_id if junction_anchor else '-'} | score={junction_anchor.anchor_election_score:.3f}" if junction_anchor else "Anchor=-",
         f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
@@ -4027,13 +4218,14 @@ while running:
             else "Proxy mass: -"
         ),
         (
-            "Rollout candidates: "
+            "Proxy rollout candidates: "
             + " | ".join(
-                f"{branch}:J={data['cost']:.2f},Q={data['components']['predicted_flow']:.2f}"
+                f"{branch}:J={data['cost']:.2f},Q={data['components']['predicted_flow']:.2f},"
+                f"n={data['components']['proxy_primary_count']}+{data['components']['proxy_context_count']}"
                 for branch, data in sorted(last_flow_rollout_scores.items())
             )
             if last_flow_rollout_scores
-            else "Rollout candidates: -"
+            else "Proxy rollout candidates: -"
         ),
         (
             f"Adaptive lambda={get_effective_stiffness_exponent():.3f} "
