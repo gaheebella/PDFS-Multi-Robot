@@ -62,14 +62,19 @@ BACKGROUND_COLOR = (248, 249, 252)
 FLOOR_COLOR = (235, 239, 246)
 WALL_COLOR = (96, 106, 124)
 TEXT_COLOR = (58, 67, 82)
-ROBOT_BASE_COLOR = (36, 184, 232)
-SHEPHERD_COLOR = (162, 86, 214)
-ANCHOR_COLOR = (50, 176, 108)
+ROBOT_BASE_COLOR = (44, 92, 118)
+SHEPHERD_COLOR = (106, 70, 150)
+ANCHOR_COLOR = (48, 118, 82)
 BASE_COLOR = (44, 72, 120)
-TRUNK_RELAY_COLOR = (191, 92, 58)
-RELAY_COLOR = (236, 143, 44)
+TRUNK_RELAY_COLOR = (142, 82, 60)
+RELAY_COLOR = (168, 112, 44)
 ROBOT_OUTLINE_COLOR = (22, 42, 58)
-DISCONNECTED_FILL_COLOR = (235, 126, 126)
+DISCONNECTED_FILL_COLOR = (180, 92, 92)
+PROXY_POINT_COLORS = {
+    "UP": (46, 76, 130),
+    "LEFT": (92, 54, 120),
+    "RIGHT": (132, 86, 36),
+}
 RELAY_SLOT_COLOR = (196, 129, 65)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
@@ -341,6 +346,8 @@ RETURN_LANE_GAIN = 1.15
 RETURN_LANE_MAX_FORCE = 22.0
 RETURN_BRAKE_DISTANCE = 34.0
 RETURN_MIN_FORCE_SCALE = 0.20
+RETURN_TRUNK_RETRACT_DWELL = 0.30
+RETURN_TRUNK_RELEASE_INITIAL_SPEED = 12.0
 NORMAL_PHYSICS_MAX_DT = 0.05
 
 ISOLATION_NEIGHBOR_THRESHOLD = 4
@@ -512,6 +519,7 @@ BRANCH_STIFFNESS_RECOVERY_TIME = 1.20
 selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
 branch_entry_timer = 0.0
 return_trunk_release_pending = False
+return_trunk_retract_timer = 0.0
 
 # Branch-entrance/SPH-state measurement parameters
 BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0
@@ -1176,22 +1184,18 @@ class Robot:
             color = ROBOT_BASE_COLOR
 
         if base_station is not None and self.role != "BASE" and not self.connected_to_base:
-            color = interpolate_color(color, DISCONNECTED_FILL_COLOR, 0.45)
+            color = DISCONNECTED_FILL_COLOR
 
         draw_radius = self.radius + 1
         pygame.draw.circle(surface, color, (x, y), draw_radius)
-        pygame.draw.circle(surface, ROBOT_OUTLINE_COLOR, (x, y), draw_radius, width=1)
 
         if self.role in {"RELAY", "TRUNK_RELAY"}:
             ring_color = TRUNK_RELAY_COLOR if self.role == "TRUNK_RELAY" else RELAY_COLOR
-            pygame.draw.circle(surface, ring_color, (x, y), draw_radius + 3, width=1)
+            pygame.draw.circle(surface, ring_color, (x, y), draw_radius + 2, width=1)
         elif self.role == "ANCHOR":
             pygame.draw.circle(surface, ANCHOR_COLOR, (x, y), draw_radius + 2, width=1)
         elif self.role == "SHEPHERD":
             pygame.draw.circle(surface, SHEPHERD_COLOR, (x, y), draw_radius + 2, width=1)
-
-        if base_station is not None and self.role != "BASE" and not self.connected_to_base:
-            pygame.draw.circle(surface, DISCONNECTED_COLOR, (x, y), draw_radius + 2, width=1)
 
 # =========================================================
 # 9. Robot creation and spatial hash
@@ -1598,7 +1602,39 @@ def trunk_plan_ready(robots):
     )
 
 
+def release_next_trunk_relay_for_return(robots):
+    """Release one Trunk Relay from the Junction side toward the Base.
+
+    Sequential release prevents the fixed trunk from becoming a permanent
+    deadlock while preserving a Base-rooted communication backbone during the
+    final return.  The released robot becomes NORMAL and must reach BOTTOM and
+    reconnect before the next Trunk Relay is released.
+    """
+    relays = sorted(
+        (robot for robot in robots if robot.role == "TRUNK_RELAY"),
+        key=lambda robot: robot.relay_index,
+        reverse=True,
+    )
+    if not relays:
+        return None
+
+    robot = relays[0]
+    released_index = robot.relay_index
+    robot.role = "NORMAL"
+    robot.relay_anchor = None
+    robot.relay_index = -1
+    robot.ingress_lane_x = float(robot.position.x)
+    robot.velocity.update(0.0, RETURN_TRUNK_RELEASE_INITIAL_SPEED)
+    robot.acceleration.update(0.0, 0.0)
+    print(
+        f"[Base Trunk] retract robot={robot.robot_id}, "
+        f"index={released_index}, remaining={len(relays) - 1}"
+    )
+    return robot
+
+
 def release_trunk_relays_for_return(robots):
+    """Emergency fallback: release every remaining Trunk Relay."""
     released = 0
     for robot in robots:
         if robot.role != "TRUNK_RELAY":
@@ -1606,9 +1642,11 @@ def release_trunk_relays_for_return(robots):
         robot.role = "NORMAL"
         robot.relay_anchor = None
         robot.relay_index = -1
-        robot.velocity.update(0.0, 0.0)
+        robot.ingress_lane_x = float(robot.position.x)
+        robot.velocity.update(0.0, RETURN_TRUNK_RELEASE_INITIAL_SPEED)
+        robot.acceleration.update(0.0, 0.0)
         released += 1
-    print(f"[Base Trunk] released for final return={released}")
+    print(f"[Base Trunk] emergency release={released}")
 
 
 def draw_trunk_relay_plan(surface, robots):
@@ -3150,7 +3188,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
     global last_proxy_mass_stats, last_proxy_robot_assignment
     global last_proxy_candidates
     global last_flow_rollout_scores
-    global selected_branch_entry_lambda, branch_entry_timer, return_trunk_release_pending
+    global selected_branch_entry_lambda, branch_entry_timer
 
     if anchor is None or anchor.local_branch_states is None:
         return None
@@ -3291,11 +3329,13 @@ def begin_final_gather():
 
 
 def begin_final_return(anchor, robots):
-    global phase, relay_slots, relay_motion_scale, return_trunk_release_pending
+    global phase, relay_slots, relay_motion_scale
+    global return_trunk_release_pending, return_trunk_retract_timer
     relay_slots = []
     relay_motion_scale = 1.0
     release_anchor_for_final_return(anchor)
     return_trunk_release_pending = True
+    return_trunk_retract_timer = 0.0
     phase = SimulationPhase.RETURN_TO_BASE
     print("[DFS] return to base")
 
@@ -3959,6 +3999,7 @@ def update_metrics_per_frame(robots, dt):
 def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global junction_switch_timer, final_gather_timer, branch_entry_timer
+    global return_trunk_release_pending, return_trunk_retract_timer
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
@@ -4119,15 +4160,38 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             begin_final_return(anchor, robots)
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
-        global return_trunk_release_pending
         in_bottom = sum(get_robot_region(robot.position) == "BOTTOM" for robot in robots)
-        connected_count = sum(robot.connected_to_base for robot in robots)
-        special = sum(robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY", "SHEPHERD"} for robot in robots)
+        trunk_relays = get_trunk_relays(robots)
+        mobile_robots = [robot for robot in robots if robot.role != "TRUNK_RELAY"]
+        mobile_outside_bottom = sum(
+            get_robot_region(robot.position) != "BOTTOM"
+            for robot in mobile_robots
+        )
+        mobile_connected = all(robot.connected_to_base for robot in mobile_robots)
+        special = sum(
+            robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY", "SHEPHERD"}
+            for robot in robots
+        )
 
-        if return_trunk_release_pending and in_bottom >= RETURN_BOTTOM_TARGET_COUNT and connected_count == len(robots):
-            release_trunk_relays_for_return(robots)
-            return_trunk_release_pending = False
-            return
+        if return_trunk_release_pending:
+            # Keep the remaining fixed Trunk Relay chain while the previously
+            # released relay travels to BOTTOM and reconnects.  Only then
+            # retract the next relay, starting from the Junction side.
+            retract_ready = mobile_outside_bottom == 0 and mobile_connected
+            return_trunk_retract_timer = (
+                return_trunk_retract_timer + dt if retract_ready else 0.0
+            )
+
+            if trunk_relays and return_trunk_retract_timer >= RETURN_TRUNK_RETRACT_DWELL:
+                release_next_trunk_relay_for_return(robots)
+                return_trunk_retract_timer = 0.0
+                if not get_trunk_relays(robots):
+                    return_trunk_release_pending = False
+                return
+
+            if not trunk_relays:
+                return_trunk_release_pending = False
+                return_trunk_retract_timer = 0.0
 
         if in_bottom >= RETURN_BOTTOM_TARGET_COUNT and special == 0:
             phase = SimulationPhase.DONE
@@ -4252,7 +4316,7 @@ def draw_proxy_partition(surface):
 
 
 def draw_proxy_robot_assignments(surface, robots):
-    """Draw projected analytical assignments in the same Branch colours."""
+    """Draw projected analytical assignments as darker dots for readability."""
     if not last_proxy_robot_assignment:
         return
     overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
@@ -4263,7 +4327,7 @@ def draw_proxy_robot_assignments(surface, robots):
         point = project_robot_to_proxy(robot.position)
         pygame.draw.circle(
             overlay,
-            (*BRANCH_COLORS[branch], BRANCH_ASSIGNMENT_ALPHA),
+            (*PROXY_POINT_COLORS[branch], 210),
             (round(point.x), round(point.y)),
             2,
         )
@@ -4325,6 +4389,7 @@ def reset_dfs_state():
     global last_proxy_candidates
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
+    global return_trunk_release_pending, return_trunk_retract_timer
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
@@ -4352,6 +4417,7 @@ def reset_dfs_state():
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
     branch_entry_timer = 0.0
     return_trunk_release_pending = False
+    return_trunk_retract_timer = 0.0
     initialize_trunk_relay_plan()
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
