@@ -562,14 +562,31 @@ VIRTUAL_VALVE_RADIUS = 46.0
 VIRTUAL_VALVE_GAIN = 92.0
 
 # Centralized sampled-data approximation of HydroSwarm's local stability
-# consensus.  A physical distributed implementation can replace the ratio by
-# the paper's min-consensus index s_i without changing the phase interface.
-JUNCTION_CONSENSUS_MIN_COUNT = JUNCTION_SWITCH_COUNT
-JUNCTION_CONSENSUS_STABLE_RATIO = 0.72
-JUNCTION_CONSENSUS_SPEED_THRESHOLD = 4.0
-JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO = 0.10
-JUNCTION_CONSENSUS_DWELL_TIME = 0.36
-JUNCTION_CONSENSUS_FALLBACK_TIME = 1.40
+# consensus. A dual-threshold readiness rule shortens Junction waiting while
+# preserving the Base link, Anchor deployment, and minimum robot-count guards.
+#
+# Normal path: a moderately stable group may switch after a short dwell.
+# Fast path: when enough robots have already gathered, a looser transient
+# stability condition allows immediate Branch scoring instead of waiting for
+# every particle to become nearly stationary.
+JUNCTION_CONSENSUS_MIN_COUNT = 14
+JUNCTION_CONSENSUS_STABLE_RATIO = 0.62
+JUNCTION_CONSENSUS_SPEED_THRESHOLD = 5.5
+JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO = 0.14
+JUNCTION_CONSENSUS_DWELL_TIME = 0.18
+
+JUNCTION_FAST_READY_MIN_COUNT = JUNCTION_ENTRY_COUNT
+JUNCTION_FAST_READY_STABLE_RATIO = 0.50
+JUNCTION_FAST_READY_SPEED_THRESHOLD = 8.0
+JUNCTION_FAST_READY_DENSITY_DELTA_RATIO = 0.22
+JUNCTION_FAST_READY_DWELL_TIME = 0.10
+
+# The old unconditional 1.40 s timeout made every child switch visibly pause.
+# The shortened fallback still requires a minimally coherent Junction group.
+JUNCTION_CONSENSUS_FALLBACK_TIME = 0.85
+JUNCTION_FALLBACK_MIN_COUNT = 12
+JUNCTION_FALLBACK_STABLE_RATIO = 0.35
+JUNCTION_FALLBACK_SPEED_THRESHOLD = 10.0
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 
@@ -3378,22 +3395,26 @@ def begin_final_return(anchor, robots):
 @dataclass
 class JunctionConsensusTracker:
     dwell: float = 0.0
+    fast_dwell: float = 0.0
     elapsed: float = 0.0
     candidate_count: int = 0
     stable_ratio: float = 0.0
     mean_speed: float = 0.0
     mean_density_delta_ratio: float = 0.0
     ready: bool = False
+    ready_mode: str = "WAIT"
     previous_density: dict[int, float] = field(default_factory=dict)
 
     def reset(self):
         self.dwell = 0.0
+        self.fast_dwell = 0.0
         self.elapsed = 0.0
         self.candidate_count = 0
         self.stable_ratio = 0.0
         self.mean_speed = 0.0
         self.mean_density_delta_ratio = 0.0
         self.ready = False
+        self.ready_mode = "WAIT"
         self.previous_density.clear()
 
     def update(self, robots, dt: float, reference_density: float) -> bool:
@@ -3433,14 +3454,31 @@ class JunctionConsensusTracker:
         self.stable_ratio = stable_count / len(candidates)
         self.mean_speed = sum(speeds) / len(speeds)
         self.mean_density_delta_ratio = sum(density_deltas) / len(density_deltas)
-        conditions = (
+        normal_conditions = (
             self.candidate_count >= JUNCTION_CONSENSUS_MIN_COUNT
             and self.stable_ratio >= JUNCTION_CONSENSUS_STABLE_RATIO
             and self.mean_speed <= JUNCTION_CONSENSUS_SPEED_THRESHOLD
             and self.mean_density_delta_ratio <= JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO
         )
-        self.dwell = self.dwell + dt if conditions else 0.0
-        self.ready = self.dwell >= JUNCTION_CONSENSUS_DWELL_TIME
+        fast_conditions = (
+            self.candidate_count >= JUNCTION_FAST_READY_MIN_COUNT
+            and self.stable_ratio >= JUNCTION_FAST_READY_STABLE_RATIO
+            and self.mean_speed <= JUNCTION_FAST_READY_SPEED_THRESHOLD
+            and self.mean_density_delta_ratio
+            <= JUNCTION_FAST_READY_DENSITY_DELTA_RATIO
+        )
+
+        self.dwell = self.dwell + dt if normal_conditions else 0.0
+        self.fast_dwell = self.fast_dwell + dt if fast_conditions else 0.0
+
+        normal_ready = self.dwell >= JUNCTION_CONSENSUS_DWELL_TIME
+        fast_ready = self.fast_dwell >= JUNCTION_FAST_READY_DWELL_TIME
+        self.ready = normal_ready or fast_ready
+        self.ready_mode = (
+            "FAST" if fast_ready
+            else "STABLE" if normal_ready
+            else "WAIT"
+        )
         return self.ready
 
 
@@ -4165,10 +4203,27 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             dt,
             reference_density,
         )
-        fallback_ready = junction_switch_timer >= JUNCTION_CONSENSUS_FALLBACK_TIME
+        fallback_ready = (
+            junction_switch_timer >= JUNCTION_CONSENSUS_FALLBACK_TIME
+            and junction_consensus_tracker.candidate_count
+            >= JUNCTION_FALLBACK_MIN_COUNT
+            and junction_consensus_tracker.stable_ratio
+            >= JUNCTION_FALLBACK_STABLE_RATIO
+            and junction_consensus_tracker.mean_speed
+            <= JUNCTION_FALLBACK_SPEED_THRESHOLD
+        )
         if consensus_ready or fallback_ready:
-            if fallback_ready and not consensus_ready:
-                print("[Consensus] fallback selection after stabilization timeout")
+            if consensus_ready:
+                print(
+                    "[Consensus] Junction ready via "
+                    f"{junction_consensus_tracker.ready_mode.lower()} path "
+                    f"after {junction_switch_timer:.2f}s"
+                )
+            else:
+                print(
+                    "[Consensus] relaxed fallback selection after "
+                    f"{junction_switch_timer:.2f}s"
+                )
             selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
                 begin_final_gather()
@@ -4703,7 +4758,9 @@ while running:
             f"Junction consensus: n={junction_consensus_tracker.candidate_count} "
             f"stable={junction_consensus_tracker.stable_ratio:.2f} "
             f"dv={junction_consensus_tracker.mean_density_delta_ratio:.3f} "
-            f"dwell={junction_consensus_tracker.dwell:.2f}"
+            f"dwell={junction_consensus_tracker.dwell:.2f} "
+            f"fast={junction_consensus_tracker.fast_dwell:.2f} "
+            f"mode={junction_consensus_tracker.ready_mode}"
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
