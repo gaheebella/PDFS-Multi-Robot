@@ -244,6 +244,41 @@ class SimulationPhase(Enum):
     RETURN_TO_BASE = auto()
     DONE = auto()
 
+class NodeType(Enum):
+    BASE = auto()
+    JUNCTION = auto()
+    ROOM = auto()
+    DEAD_END = auto()
+
+
+class VisitState(Enum):
+    UNVISITED = auto()
+    ACTIVE = auto()
+    VISITED = auto()
+    BLOCKED = auto()
+
+
+@dataclass
+class TopologyNode:
+    node_id: str
+    node_type: NodeType
+    position: pygame.Vector2
+    parent_edge_id: Optional[str] = None
+    child_edge_ids: list[str] = field(default_factory=list)
+    visit_state: VisitState = VisitState.UNVISITED
+
+
+@dataclass
+class TopologyEdge:
+    edge_id: str
+    start_node_id: str
+    end_node_id: str
+    length: float
+    width: float
+    direction: pygame.Vector2
+    path_points: list[pygame.Vector2] = field(default_factory=list)
+    visit_state: VisitState = VisitState.UNVISITED
+
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
 BRANCH_DIRECTIONS = {
@@ -773,6 +808,144 @@ def get_branch_tip_target(branch: str):
         return pygame.Vector2(center_x - half_width - normal_length + 18, center_y)
     return pygame.Vector2(center_x + half_width + right_length - 18, center_y)
 
+def build_initial_topology():
+    """Represent the current single-junction map as a topology graph."""
+
+    nodes = {
+        "BASE": TopologyNode(
+            node_id="BASE",
+            node_type=NodeType.BASE,
+            position=BASE_POSITION.copy(),
+            child_edge_ids=["E_BASE_J0"],
+            visit_state=VisitState.VISITED,
+        ),
+        "J0": TopologyNode(
+            node_id="J0",
+            node_type=NodeType.JUNCTION,
+            position=pygame.Vector2(center_x, center_y),
+            parent_edge_id="E_BASE_J0",
+            child_edge_ids=[
+                "E_J0_UP",
+                "E_J0_LEFT",
+                "E_J0_RIGHT",
+            ],
+        ),
+        "UP_ROOM": TopologyNode(
+            node_id="UP_ROOM",
+            node_type=NodeType.ROOM,
+            position=get_branch_tip_target("UP"),
+            parent_edge_id="E_J0_UP",
+        ),
+        "LEFT_ROOM": TopologyNode(
+            node_id="LEFT_ROOM",
+            node_type=NodeType.ROOM,
+            position=get_branch_tip_target("LEFT"),
+            parent_edge_id="E_J0_LEFT",
+        ),
+        "RIGHT_ROOM": TopologyNode(
+            node_id="RIGHT_ROOM",
+            node_type=NodeType.ROOM,
+            position=get_branch_tip_target("RIGHT"),
+            parent_edge_id="E_J0_RIGHT",
+        ),
+    }
+
+    edges = {
+        "E_BASE_J0": TopologyEdge(
+            edge_id="E_BASE_J0",
+            start_node_id="BASE",
+            end_node_id="J0",
+            length=float(normal_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(0.0, -1.0),
+            visit_state=VisitState.VISITED,
+        ),
+        "E_J0_UP": TopologyEdge(
+            edge_id="E_J0_UP",
+            start_node_id="J0",
+            end_node_id="UP_ROOM",
+            length=float(normal_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(0.0, -1.0),
+        ),
+        "E_J0_LEFT": TopologyEdge(
+            edge_id="E_J0_LEFT",
+            start_node_id="J0",
+            end_node_id="LEFT_ROOM",
+            length=float(normal_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(-1.0, 0.0),
+        ),
+        "E_J0_RIGHT": TopologyEdge(
+            edge_id="E_J0_RIGHT",
+            start_node_id="J0",
+            end_node_id="RIGHT_ROOM",
+            length=float(right_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(1.0, 0.0),
+        ),
+    }
+
+    return nodes, edges
+
+topology_nodes, topology_edges = build_initial_topology()
+
+current_node_id = "BASE"
+current_junction_id: Optional[str] = None
+current_edge_id: Optional[str] = "E_BASE_J0"
+
+BRANCH_TO_EDGE = {
+    "UP": "E_J0_UP",
+    "LEFT": "E_J0_LEFT",
+    "RIGHT": "E_J0_RIGHT",
+}
+
+EDGE_TO_BRANCH = {
+    edge_id: branch
+    for branch, edge_id in BRANCH_TO_EDGE.items()
+}
+
+def validate_topology():
+    """Validate topology node-edge references at startup."""
+
+    for node_id, node in topology_nodes.items():
+        if (
+            node.parent_edge_id is not None
+            and node.parent_edge_id not in topology_edges
+        ):
+            raise ValueError(
+                f"Node {node_id} has invalid parent edge "
+                f"{node.parent_edge_id}"
+            )
+
+        for edge_id in node.child_edge_ids:
+            if edge_id not in topology_edges:
+                raise ValueError(
+                    f"Node {node_id} has invalid child edge "
+                    f"{edge_id}"
+                )
+
+    for edge_id, edge in topology_edges.items():
+        if edge.start_node_id not in topology_nodes:
+            raise ValueError(
+                f"Edge {edge_id} has invalid start node "
+                f"{edge.start_node_id}"
+            )
+
+        if edge.end_node_id not in topology_nodes:
+            raise ValueError(
+                f"Edge {edge_id} has invalid end node "
+                f"{edge.end_node_id}"
+            )
+
+    print(
+        f"[Topology] valid: "
+        f"nodes={len(topology_nodes)}, "
+        f"edges={len(topology_edges)}"
+    )
+
+
+validate_topology()
 
 def get_backtrack_direction(branch: str):
     return -BRANCH_DIRECTIONS[branch]
