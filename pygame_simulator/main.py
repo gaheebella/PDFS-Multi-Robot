@@ -3,7 +3,7 @@
 Implemented research components
 -------------------------------
 1. Multi-criteria Junction Anchor election.
-2. SPH-state-aware and relay-aware DFS child-branch ordering for the current junction.
+2. Flow-preserving SPH short-rollout, HydroSwarm proxy-region, EDF, and relay-aware DFS child-branch ordering.
 3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
 4. Width-adaptive Shepherd count, scored candidate election, and
@@ -52,7 +52,7 @@ SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base SPH DFS | SPH-State Branch Ordering + Adaptive Shepherd"
+    "Base SPH DFS | Flow-Preserving SPH Rollout Ordering"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
@@ -269,6 +269,17 @@ trunk_relay_slots: list[dict] = []
 trunk_relay_deploy_cooldown = 0.0
 base_station: Optional["BaseStation"] = None
 
+# HydroSwarm-inspired Junction proxy partition state.  The partition is used
+# only to score one DFS child at a time; robots are never dispatched to several
+# branches simultaneously.
+last_proxy_partition: dict[tuple[int, int], str] = {}
+last_proxy_cell_centers: dict[tuple[int, int], pygame.Vector2] = {}
+last_proxy_mass_stats: dict[str, dict] = {}
+last_proxy_candidates: tuple[str, ...] = ()
+# Candidate-by-candidate virtual SPH rollout results from the latest Junction
+# decision.  They are display/logging data only and never alter real robots.
+last_flow_rollout_scores: dict[str, dict] = {}
+
 # =========================================================
 # 4. Physics and control parameters
 # =========================================================
@@ -415,17 +426,56 @@ RELAY_FRONT_FRACTION = 0.20
 RELAY_FRONT_MIN_COUNT = 10
 RELAY_FRONT_REQUIRED_CONNECTED_RATIO = 0.90
 
-# SPH-state-aware and relay-aware branch ordering
-# Structural complete-exploration loss is handled lexicographically before
-# this weighted efficiency cost; it is not mixed into the weighted sum.
-BRANCH_COST_TRANSPORT_WEIGHT = 0.28
-BRANCH_COST_SHAPE_WEIGHT = 0.12
-BRANCH_COST_FLOW_WEIGHT = 0.08
-BRANCH_COST_CONGESTION_WEIGHT = 0.12
-BRANCH_COST_RELAY_WEIGHT = 0.14
-BRANCH_COST_COMM_WEIGHT = 0.12
-BRANCH_COST_BACKTRACK_WEIGHT = 0.10
-BRANCH_COST_SWITCH_WEIGHT = 0.04
+# Flow-Preserving SPH-Aware DFS ordering.
+# Structural complete-exploration loss is handled lexicographically first.
+# Among equally important branches, a short candidate-specific SPH rollout
+# rewards natural gate flux and penalizes density/velocity disturbance, wall
+# and collision risk, Base communication risk, relay demand, and material-mode
+# softening.  The older proxy/EDF/shape terms remain as low-weight priors.
+BRANCH_COST_PREDICTED_FLOW_REWARD = 0.30
+BRANCH_COST_DENSITY_DISTURBANCE_WEIGHT = 0.14
+BRANCH_COST_VELOCITY_DISTURBANCE_WEIGHT = 0.12
+BRANCH_COST_WALL_RISK_WEIGHT = 0.09
+BRANCH_COST_COLLISION_RISK_WEIGHT = 0.09
+BRANCH_COST_ROLLOUT_COMM_WEIGHT = 0.11
+BRANCH_COST_RELAY_WEIGHT = 0.08
+BRANCH_COST_LAMBDA_MODE_WEIGHT = 0.05
+BRANCH_COST_STABILIZATION_WEIGHT = 0.05
+
+BRANCH_COST_TRANSPORT_WEIGHT = 0.05
+BRANCH_COST_PROXY_MASS_WEIGHT = 0.04
+BRANCH_COST_SHAPE_WEIGHT = 0.03
+BRANCH_COST_FLOW_PRIOR_WEIGHT = 0.03
+BRANCH_COST_CONGESTION_WEIGHT = 0.05
+BRANCH_COST_BACKTRACK_WEIGHT = 0.03
+BRANCH_COST_SWITCH_WEIGHT = 0.03
+
+# Candidate-specific short virtual rollout.  It is evaluated only at Junction
+# decisions, so several candidates can be tested without affecting frame rate.
+FLOW_ROLLOUT_HORIZON = 0.50
+FLOW_ROLLOUT_DT = 0.05
+FLOW_ROLLOUT_STEPS = max(1, int(round(FLOW_ROLLOUT_HORIZON / FLOW_ROLLOUT_DT)))
+FLOW_ROLLOUT_MAX_ROBOTS = 190
+FLOW_ROLLOUT_TARGET_DEPTH = 54.0
+FLOW_ROLLOUT_ROUTE_GAIN = ROUTE_FORCE * 0.82
+FLOW_ROLLOUT_VALVE_GAIN = 92.0
+FLOW_ROLLOUT_GATE_SIGMA = 72.0
+FLOW_ROLLOUT_REFERENCE_SPEED = 28.0
+FLOW_ROLLOUT_MAX_SPEED = MAX_SPEED * 0.55
+FLOW_ROLLOUT_MAX_ACCELERATION = MAX_ACCELERATION * 0.70
+FLOW_ROLLOUT_WALL_CLEARANCE = 7.0
+FLOW_ROLLOUT_COLLISION_DISTANCE = SAFE_RADIUS
+FLOW_ROLLOUT_DENSITY_NORMALIZER = 0.35
+FLOW_ROLLOUT_VELOCITY_NORMALIZER = FLOW_ROLLOUT_REFERENCE_SPEED
+
+# Adaptive stiffness used both in virtual rollouts and in the real branch-entry
+# phase.  A large turn temporarily lowers lambda; it then recovers smoothly.
+STIFFNESS_EXPONENT_RIGID = STIFFNESS_EXPONENT
+STIFFNESS_EXPONENT_SOFT = 0.22
+STIFFNESS_EXPONENT_PRESSURE_PUSH = max(STIFFNESS_EXPONENT_RIGID, 0.62)
+BRANCH_STIFFNESS_RECOVERY_TIME = 1.20
+selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
+branch_entry_timer = 0.0
 
 # Branch-entrance/SPH-state measurement parameters
 BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0
@@ -434,6 +484,32 @@ FLOW_DIRECTION_REFERENCE_SPEED = 12.0
 CONGESTION_EXCESS_NORMALIZER = 1.0
 # Longest corridor-to-opposite-branch path in the current cross map.
 MAX_TRANSPORT_DISTANCE = max(BRANCH_LENGTHS.values()) + corridor_width
+
+# HydroSwarm proxy region.  The Junction is treated as the aggregate proxy
+# Ω_proxy.  It is partitioned into area-constrained temporary subregions whose
+# quotas are proportional to the robot demand of each unvisited branch.
+PROXY_CELL_SIZE = 10
+PROXY_PARTITION_ITERATIONS = 160
+PROXY_BIAS_LEARNING_RATE = 0.075
+PROXY_DENSITY_MASS_MIN = 0.50
+PROXY_DENSITY_MASS_MAX = 2.00
+PROXY_FRONT_LAYER_LENGTH = SMOOTHING_LENGTH
+PROXY_FRONT_LATERAL_SPACING = max(SAFE_RADIUS * 1.8, 1.0)
+
+# Geodesic EDF guidance and smooth virtual valves at unselected branch mouths.
+EDF_FINITE_EPSILON = 1e-6
+VIRTUAL_VALVE_RADIUS = 46.0
+VIRTUAL_VALVE_GAIN = 92.0
+
+# Centralized sampled-data approximation of HydroSwarm's local stability
+# consensus.  A physical distributed implementation can replace the ratio by
+# the paper's min-consensus index s_i without changing the phase interface.
+JUNCTION_CONSENSUS_MIN_COUNT = JUNCTION_SWITCH_COUNT
+JUNCTION_CONSENSUS_STABLE_RATIO = 0.72
+JUNCTION_CONSENSUS_SPEED_THRESHOLD = 4.0
+JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO = 0.10
+JUNCTION_CONSENSUS_DWELL_TIME = 0.36
+JUNCTION_CONSENSUS_FALLBACK_TIME = 1.40
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 
@@ -746,6 +822,16 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
                     f"{component_text}"
                 ),
             ])
+            for candidate, candidate_data in event.get("candidate_scores", {}).items():
+                candidate_components = candidate_data.get("components", {})
+                candidate_text = "; ".join(
+                    f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}"
+                    for key, value in candidate_components.items()
+                )
+                writer.writerow([
+                    f"branch_selection_{index}_{candidate}",
+                    f"cost={candidate_data.get('cost', 0.0):.6f}; {candidate_text}",
+                ])
         writer.writerow(["saturation_event_count", len(metrics.saturation_events)])
         writer.writerow(["pressure_event_count", len(metrics.pressure_events)])
     print(f"[Log] saved: {output}")
@@ -1783,6 +1869,250 @@ def free_space_distance_to_branch(
     return position.distance_to(junction_center) + junction_center.distance_to(target_entrance)
 
 
+
+def estimate_branch_robot_demand(branch: str) -> float:
+    """Estimate fluid mass needed by a branch for proportional proxy sizing.
+
+    The demand combines width-adaptive Shepherds, communication relays, and a
+    length-dependent front-fluid term.  Only ratios are used, so this is a
+    practical sizing rule analogous to HydroSwarm's target-area proportion.
+    """
+    shepherd_demand = adaptive_shepherd_count()
+    relay_demand = max(0, math.ceil(BRANCH_LENGTHS[branch] / RELAY_SPACING) - 1)
+    longitudinal_layers = max(
+        1,
+        math.ceil(BRANCH_LENGTHS[branch] / max(PROXY_FRONT_LAYER_LENGTH, EPSILON)),
+    )
+    lateral_robots = max(
+        1,
+        math.ceil(
+            (corridor_width - 2.0 * SHEPHERD_EDGE_MARGIN)
+            / max(PROXY_FRONT_LATERAL_SPACING, EPSILON)
+        ),
+    )
+    front_fluid_demand = longitudinal_layers * lateral_robots
+    return float(shepherd_demand + relay_demand + front_fluid_demand)
+
+
+def proxy_cell_grid() -> tuple[dict[tuple[int, int], pygame.Vector2], int, int]:
+    cols = max(1, int(math.ceil(junction_rect.width / PROXY_CELL_SIZE)))
+    rows = max(1, int(math.ceil(junction_rect.height / PROXY_CELL_SIZE)))
+    centers: dict[tuple[int, int], pygame.Vector2] = {}
+    for row in range(rows):
+        for col in range(cols):
+            x = min(
+                junction_rect.right - 0.5,
+                junction_rect.left + (col + 0.5) * PROXY_CELL_SIZE,
+            )
+            y = min(
+                junction_rect.bottom - 0.5,
+                junction_rect.top + (row + 0.5) * PROXY_CELL_SIZE,
+            )
+            centers[(col, row)] = pygame.Vector2(x, y)
+    return centers, cols, rows
+
+
+def build_capacity_constrained_proxy_partition(
+    branches: list[str],
+) -> tuple[dict[tuple[int, int], str], dict[tuple[int, int], pygame.Vector2], dict[str, float]]:
+    """Partition Ω_proxy using capacity-constrained geodesic Voronoi cells.
+
+    Additive branch biases are iteratively adapted until each branch receives
+    approximately its demand-proportional area quota.  Because every cell is
+    assigned by distance to a branch mouth plus one branch-wide bias, the
+    resulting subregions remain spatially coherent rather than arbitrary robot
+    assignments.
+    """
+    branches = sorted(branches)
+    centers, _, _ = proxy_cell_grid()
+    if not branches:
+        return {}, centers, {}
+    if len(branches) == 1:
+        only = branches[0]
+        return {key: only for key in centers}, centers, {only: 1.0}
+
+    demands = {branch: estimate_branch_robot_demand(branch) for branch in branches}
+    total_demand = max(sum(demands.values()), EPSILON)
+    quotas = {branch: demands[branch] / total_demand for branch in branches}
+    biases = {branch: 0.0 for branch in branches}
+    diagonal = max(math.hypot(junction_rect.width, junction_rect.height), EPSILON)
+    partition: dict[tuple[int, int], str] = {}
+
+    for _ in range(PROXY_PARTITION_ITERATIONS):
+        counts = {branch: 0 for branch in branches}
+        partition = {}
+        for key, center in centers.items():
+            selected = min(
+                branches,
+                key=lambda branch: (
+                    center.distance_to(get_branch_entrance(branch)) / diagonal
+                    + biases[branch],
+                    branch,
+                ),
+            )
+            partition[key] = selected
+            counts[selected] += 1
+
+        total_cells = max(len(centers), 1)
+        maximum_error = 0.0
+        for branch in branches:
+            actual = counts[branch] / total_cells
+            error = actual - quotas[branch]
+            maximum_error = max(maximum_error, abs(error))
+            # Too much area -> increase its additive distance penalty.
+            biases[branch] += PROXY_BIAS_LEARNING_RATE * error
+        if maximum_error <= 1.0 / total_cells:
+            break
+
+    return partition, centers, quotas
+
+
+def project_robot_to_proxy(position: pygame.Vector2) -> pygame.Vector2:
+    """Project a robot into Ω_proxy while retaining its lateral placement."""
+    region = get_robot_region(position)
+    margin = 1.0
+    if region == "JUNCTION":
+        x = clamp(position.x, junction_rect.left + margin, junction_rect.right - margin)
+        y = clamp(position.y, junction_rect.top + margin, junction_rect.bottom - margin)
+        return pygame.Vector2(x, y)
+    if region == "UP":
+        return pygame.Vector2(
+            clamp(position.x, junction_rect.left + margin, junction_rect.right - margin),
+            junction_rect.top + margin,
+        )
+    if region == "LEFT":
+        return pygame.Vector2(
+            junction_rect.left + margin,
+            clamp(position.y, junction_rect.top + margin, junction_rect.bottom - margin),
+        )
+    if region == "RIGHT":
+        return pygame.Vector2(
+            junction_rect.right - margin,
+            clamp(position.y, junction_rect.top + margin, junction_rect.bottom - margin),
+        )
+    return pygame.Vector2(
+        clamp(position.x, junction_rect.left + margin, junction_rect.right - margin),
+        junction_rect.bottom - margin,
+    )
+
+
+def nearest_proxy_cell(
+    point: pygame.Vector2,
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> Optional[tuple[int, int]]:
+    if not centers:
+        return None
+    col = int((point.x - junction_rect.left) // PROXY_CELL_SIZE)
+    row = int((point.y - junction_rect.top) // PROXY_CELL_SIZE)
+    key = (col, row)
+    if key in centers:
+        return key
+    return min(centers, key=lambda candidate: centers[candidate].distance_squared_to(point))
+
+
+def compute_proxy_mass_statistics(
+    robots,
+    branches: list[str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+    quotas: dict[str, float],
+    reference_density: float,
+) -> tuple[dict[str, dict], dict[int, str]]:
+    """Measure uniform-particle and density-weighted fluid mass per subregion."""
+    stats = {
+        branch: {
+            "quota_fraction": quotas.get(branch, 0.0),
+            "cell_count": sum(value == branch for value in partition.values()),
+            "robot_count": 0,
+            "density_mass": 0.0,
+            "actual_mass_fraction": 0.0,
+            "mass_deficit_cost": 1.0,
+        }
+        for branch in branches
+    }
+    robot_assignment: dict[int, str] = {}
+    total_mass = 0.0
+    for robot in robots:
+        proxy_point = project_robot_to_proxy(robot.position)
+        cell = nearest_proxy_cell(proxy_point, centers)
+        if cell is None or cell not in partition:
+            continue
+        branch = partition[cell]
+        density_mass = clamp(
+            robot.density / max(reference_density, EPSILON),
+            PROXY_DENSITY_MASS_MIN,
+            PROXY_DENSITY_MASS_MAX,
+        )
+        stats[branch]["robot_count"] += 1
+        stats[branch]["density_mass"] += density_mass
+        robot_assignment[robot.robot_id] = branch
+        total_mass += density_mass
+
+    for branch in branches:
+        quota = stats[branch]["quota_fraction"]
+        actual = stats[branch]["density_mass"] / max(total_mass, EPSILON)
+        stats[branch]["actual_mass_fraction"] = actual
+        stats[branch]["mass_deficit_cost"] = clamp(
+            max(0.0, quota - actual) / max(quota, EPSILON),
+            0.0,
+            1.0,
+        )
+    return stats, robot_assignment
+
+
+def geodesic_edf_direction(
+    position: pygame.Vector2,
+    branch: str,
+    final_target: Optional[pygame.Vector2] = None,
+) -> pygame.Vector2:
+    """Negative gradient direction of a piecewise geodesic EDF.
+
+    For this rectilinear cross map the exact shortest free-space route is:
+    current corridor -> its Junction mouth -> selected mouth -> branch target.
+    The returned unit vector is therefore the analytic counterpart of
+    -∇phi/||∇phi|| used by HydroSwarm, without a raster distance-field lookup.
+    """
+    region = get_robot_region(position)
+    if region == branch:
+        target = final_target if final_target is not None else get_branch_tip_target(branch)
+        return normalized_direction_toward(position, target)
+    if region == "JUNCTION":
+        return normalized_direction_toward(position, get_branch_entrance(branch))
+    current_entrance = get_region_entrance(region)
+    if current_entrance is not None:
+        return normalized_direction_toward(position, current_entrance)
+    return normalized_direction_toward(position, pygame.Vector2(center_x, center_y))
+
+
+def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
+    """Smooth virtual-particle barrier at every unselected branch mouth."""
+    if phase not in {
+        SimulationPhase.EXPLORE_BRANCH,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+        SimulationPhase.PRESSURE_PUSH,
+        SimulationPhase.FLOW_BACKTRACK,
+    }:
+        return pygame.Vector2()
+    if get_robot_region(robot.position) != "JUNCTION":
+        return pygame.Vector2()
+
+    force = pygame.Vector2()
+    junction_center = pygame.Vector2(center_x, center_y)
+    for branch in BRANCHES:
+        if branch == active_branch:
+            continue
+        entrance = get_branch_entrance(branch)
+        distance = robot.position.distance_to(entrance)
+        if distance >= VIRTUAL_VALVE_RADIUS:
+            continue
+        inward = junction_center - entrance
+        if inward.length_squared() <= EPSILON:
+            continue
+        ratio = 1.0 - distance / VIRTUAL_VALVE_RADIUS
+        force += inward.normalize() * VIRTUAL_VALVE_GAIN * ratio**2
+    return force
+
 def get_branch_ordering_robots(robots) -> list["Robot"]:
     """Return mobile Base-connected mass used by the branch-ordering layer."""
     eligible = [
@@ -1914,6 +2244,491 @@ def compute_congestion_cost(
     return clamp(raw / max(CONGESTION_EXCESS_NORMALIZER, EPSILON), 0.0, 1.0)
 
 
+
+@dataclass
+class RolloutParticle:
+    """Lightweight copy used only by candidate-specific virtual SPH rollout."""
+
+    robot_id: int
+    position: pygame.Vector2
+    velocity: pygame.Vector2
+    initial_velocity: pygame.Vector2
+    initial_density: float
+    density: float = 0.0
+    pressure: float = 0.0
+
+
+def get_flow_rollout_robots(robots) -> list["Robot"]:
+    """Use the Base-connected mobile mass nearest the active Junction."""
+    eligible = get_branch_ordering_robots(robots)
+    junction_center = pygame.Vector2(center_x, center_y)
+    eligible.sort(
+        key=lambda robot: (
+            robot.position.distance_squared_to(junction_center),
+            robot.robot_id,
+        )
+    )
+    return eligible[:FLOW_ROLLOUT_MAX_ROBOTS]
+
+
+def rollout_region_allowed(position: pygame.Vector2, branch: str) -> bool:
+    return get_robot_region(position) in {"BOTTOM", "JUNCTION", branch}
+
+
+def is_rollout_walkable(
+    position: pygame.Vector2,
+    radius: float,
+    branch: str,
+) -> bool:
+    """Candidate-specific map check independent of the real active_branch."""
+    x = int(round(position.x))
+    y = int(round(position.y))
+    diagonal = int(round(radius / math.sqrt(2.0)))
+    test_points = [
+        (x, y),
+        (x + radius, y),
+        (x - radius, y),
+        (x, y + radius),
+        (x, y - radius),
+        (x + diagonal, y + diagonal),
+        (x + diagonal, y - diagonal),
+        (x - diagonal, y + diagonal),
+        (x - diagonal, y - diagonal),
+    ]
+    for px, py in test_points:
+        px = int(round(px))
+        py = int(round(py))
+        if not (0 <= px < SCREEN_WIDTH and 0 <= py < SCREEN_HEIGHT):
+            return False
+        if walkable_mask.get_at((px, py)) == 0:
+            return False
+    return rollout_region_allowed(position, branch)
+
+
+def rollout_edf_direction(
+    position: pygame.Vector2,
+    branch: str,
+) -> pygame.Vector2:
+    """Analytic geodesic EDF direction for a candidate Branch rollout."""
+    region = get_robot_region(position)
+    if region == branch:
+        target = branch_point_at_depth(
+            branch,
+            min(BRANCH_LENGTHS[branch], FLOW_ROLLOUT_TARGET_DEPTH),
+        )
+        return normalized_direction_toward(position, target)
+    if region == "JUNCTION":
+        return normalized_direction_toward(position, get_branch_entrance(branch))
+    current_entrance = get_region_entrance(region)
+    if current_entrance is not None:
+        return normalized_direction_toward(position, current_entrance)
+    return normalized_direction_toward(position, pygame.Vector2(center_x, center_y))
+
+
+def rollout_virtual_valve_force(
+    position: pygame.Vector2,
+    open_branch: str,
+) -> pygame.Vector2:
+    if get_robot_region(position) != "JUNCTION":
+        return pygame.Vector2()
+    force = pygame.Vector2()
+    junction_center = pygame.Vector2(center_x, center_y)
+    for closed_branch in BRANCHES:
+        if closed_branch == open_branch:
+            continue
+        entrance = get_branch_entrance(closed_branch)
+        distance = position.distance_to(entrance)
+        if distance >= VIRTUAL_VALVE_RADIUS:
+            continue
+        inward = junction_center - entrance
+        if inward.length_squared() <= EPSILON:
+            continue
+        ratio = 1.0 - distance / VIRTUAL_VALVE_RADIUS
+        force += inward.normalize() * FLOW_ROLLOUT_VALVE_GAIN * ratio**2
+    return force
+
+
+def compute_rollout_densities(particles: list[RolloutParticle]) -> None:
+    self_density = spiky_kernel(0.0, SMOOTHING_LENGTH)
+    densities = [self_density for _ in particles]
+    h_squared = SMOOTHING_LENGTH**2
+    for i in range(len(particles)):
+        for j in range(i + 1, len(particles)):
+            delta = particles[i].position - particles[j].position
+            distance_squared = delta.length_squared()
+            if distance_squared > h_squared:
+                continue
+            value = spiky_kernel(math.sqrt(max(distance_squared, 0.0)), SMOOTHING_LENGTH)
+            densities[i] += value
+            densities[j] += value
+    for particle, density in zip(particles, densities):
+        particle.density = max(density, EPSILON)
+
+
+def compute_rollout_pressures(
+    particles: list[RolloutParticle],
+    reference_density: float,
+    stiffness_exponent: float,
+) -> None:
+    for particle in particles:
+        ratio = particle.density / max(reference_density, EPSILON)
+        particle.pressure = (
+            PRESSURE_GAIN
+            * particle.density
+            * (ratio**stiffness_exponent - 1.0)
+        )
+
+
+def rollout_stiffness_for_branch(
+    branch: str,
+    incoming_direction: pygame.Vector2,
+) -> tuple[float, float]:
+    """Return temporary lambda and normalized material-mode transition cost."""
+    turn_ratio = angle_between(
+        incoming_direction,
+        BRANCH_DIRECTIONS[branch],
+    ) / math.pi
+    mode_cost = clamp(turn_ratio, 0.0, 1.0)
+    stiffness = (
+        STIFFNESS_EXPONENT_RIGID
+        - (STIFFNESS_EXPONENT_RIGID - STIFFNESS_EXPONENT_SOFT) * mode_cost
+    )
+    return stiffness, mode_cost
+
+
+def evaluate_rollout_communication_risk(
+    particles: list[RolloutParticle],
+    robots,
+) -> tuple[float, float, float]:
+    """Predict Base connectivity after the virtual candidate transition."""
+    if base_station is None:
+        return 1.0, 0.0, 0.0
+
+    fixed_positions = [base_station.position.copy()]
+    fixed_positions.extend(
+        relay.position.copy()
+        for relay in get_trunk_relays(robots)
+    )
+    if junction_anchor is not None:
+        fixed_positions.append(junction_anchor.position.copy())
+
+    positions = fixed_positions + [particle.position.copy() for particle in particles]
+    fixed_count = len(fixed_positions)
+    adjacency: list[list[tuple[int, float]]] = [[] for _ in positions]
+    range_squared = COMM_RANGE**2
+
+    for i in range(len(positions)):
+        for j in range(i + 1, len(positions)):
+            distance_squared = positions[i].distance_squared_to(positions[j])
+            if distance_squared > range_squared:
+                continue
+            if not has_line_of_sight(positions[i], positions[j]):
+                continue
+            distance = math.sqrt(max(distance_squared, 0.0))
+            margin = COMM_RANGE - distance
+            adjacency[i].append((j, margin))
+            adjacency[j].append((i, margin))
+
+    best_margin = [float("-inf") for _ in positions]
+    best_margin[0] = float("inf")
+    heap = [(-1.0e12, 0)]
+    while heap:
+        _, current = heapq.heappop(heap)
+        for neighbor, edge_margin in adjacency[current]:
+            candidate_margin = min(best_margin[current], edge_margin)
+            if candidate_margin <= best_margin[neighbor] + EPSILON:
+                continue
+            best_margin[neighbor] = candidate_margin
+            heapq.heappush(heap, (-candidate_margin, neighbor))
+
+    mobile_margins = best_margin[fixed_count:]
+    connected = [margin for margin in mobile_margins if math.isfinite(margin)]
+    connected_ratio = len(connected) / max(len(mobile_margins), 1)
+    robust_margin = min(connected) if connected else -COMM_RANGE
+    margin_quality = clamp(robust_margin / max(COMM_SAFE_DISTANCE, EPSILON), 0.0, 1.0)
+    risk = clamp(
+        0.75 * (1.0 - connected_ratio)
+        + 0.25 * (1.0 - margin_quality),
+        0.0,
+        1.0,
+    )
+    return risk, connected_ratio, robust_margin
+
+
+def evaluate_flow_preserving_rollout(
+    branch: str,
+    robots,
+    reference_density: float,
+    incoming_direction: pygame.Vector2,
+) -> dict:
+    """Run a short non-mutating SPH look-ahead for one candidate Branch.
+
+    The rollout directly estimates the quantity described by the proposed
+    Flow-Preserving SPH-Aware DFS policy: expected gate flux is rewarded while
+    changes in density and velocity, wall/collision exposure, Base-link risk,
+    and stiffness-mode transition are penalized.
+    """
+    source_robots = get_flow_rollout_robots(robots)
+    if not source_robots:
+        return {
+            "predicted_flow": 0.0,
+            "density_disturbance": 1.0,
+            "velocity_disturbance": 1.0,
+            "wall_risk": 1.0,
+            "collision_risk": 1.0,
+            "rollout_comm": 1.0,
+            "rollout_connected_ratio": 0.0,
+            "rollout_margin": -COMM_RANGE,
+            "stabilization": 1.0,
+            "lambda_mode": 1.0,
+            "rollout_lambda": STIFFNESS_EXPONENT_SOFT,
+            "predicted_entry_ratio": 0.0,
+            "rollout_robot_count": 0,
+        }
+
+    rollout_lambda, lambda_mode_cost = rollout_stiffness_for_branch(
+        branch,
+        incoming_direction,
+    )
+    particles = [
+        RolloutParticle(
+            robot_id=robot.robot_id,
+            position=robot.position.copy(),
+            velocity=robot.velocity.copy(),
+            initial_velocity=robot.velocity.copy(),
+            initial_density=max(robot.density, EPSILON),
+        )
+        for robot in source_robots
+    ]
+
+    density_disturbance_sum = 0.0
+    velocity_disturbance_sum = 0.0
+    wall_risk_sum = 0.0
+    collision_risk_sum = 0.0
+    density_samples = 0
+    velocity_samples = 0
+    collision_samples = 0
+    h_squared = SMOOTHING_LENGTH**2
+
+    for _ in range(FLOW_ROLLOUT_STEPS):
+        compute_rollout_densities(particles)
+        compute_rollout_pressures(
+            particles,
+            reference_density,
+            rollout_lambda,
+        )
+        accelerations = [pygame.Vector2() for _ in particles]
+
+        for i in range(len(particles)):
+            for j in range(i + 1, len(particles)):
+                particle_i = particles[i]
+                particle_j = particles[j]
+                r_ij = particle_i.position - particle_j.position
+                distance_squared = r_ij.length_squared()
+                if distance_squared <= EPSILON:
+                    collision_risk_sum += 1.0
+                    collision_samples += 1
+                    continue
+
+                distance = math.sqrt(distance_squared)
+                if distance < FLOW_ROLLOUT_COLLISION_DISTANCE:
+                    penetration = (
+                        FLOW_ROLLOUT_COLLISION_DISTANCE - distance
+                    ) / max(FLOW_ROLLOUT_COLLISION_DISTANCE, EPSILON)
+                    collision_risk_sum += penetration**2
+                    collision_samples += 1
+
+                if distance_squared > h_squared:
+                    continue
+
+                gradient = spiky_gradient(r_ij, SMOOTHING_LENGTH)
+                pressure_coefficient = (
+                    particle_i.pressure / max(particle_i.density**2, EPSILON)
+                    + particle_j.pressure / max(particle_j.density**2, EPSILON)
+                )
+                pressure_force = -pressure_coefficient * gradient
+                accelerations[i] += pressure_force
+                accelerations[j] -= pressure_force
+
+                v_ij = particle_i.velocity - particle_j.velocity
+                approach_value = v_ij.dot(r_ij)
+                if approach_value < 0.0:
+                    mu_ij = (
+                        SMOOTHING_LENGTH
+                        * approach_value
+                        / (distance_squared + 0.01 * SMOOTHING_LENGTH**2)
+                    )
+                    c_i_squared = (
+                        particle_i.pressure
+                        + PRESSURE_GAIN * particle_i.density
+                    ) / max(particle_i.density, EPSILON)
+                    c_j_squared = (
+                        particle_j.pressure
+                        + PRESSURE_GAIN * particle_j.density
+                    ) / max(particle_j.density, EPSILON)
+                    c_ij = 0.5 * (
+                        math.sqrt(max(c_i_squared, 0.0))
+                        + math.sqrt(max(c_j_squared, 0.0))
+                    )
+                    mean_density = 0.5 * (
+                        particle_i.density + particle_j.density
+                    )
+                    pi_ij = (
+                        -VISCOSITY_XI1 * c_ij * mu_ij
+                        + VISCOSITY_XI2 * mu_ij**2
+                    ) / max(mean_density, EPSILON)
+                    viscosity_force = -pi_ij * gradient
+                    accelerations[i] += viscosity_force
+                    accelerations[j] -= viscosity_force
+
+                if distance < SAFE_RADIUS:
+                    direction_away = r_ij / distance
+                    penetration_ratio = (SAFE_RADIUS - distance) / SAFE_RADIUS
+                    repulsion = (
+                        REPULSION_GAIN
+                        * penetration_ratio
+                        * direction_away
+                    )
+                    accelerations[i] += repulsion
+                    accelerations[j] -= repulsion
+
+        for index, particle in enumerate(particles):
+            region = get_robot_region(particle.position)
+            route_force = (
+                rollout_edf_direction(particle.position, branch)
+                * FLOW_ROLLOUT_ROUTE_GAIN
+            )
+            route_force += rollout_virtual_valve_force(
+                particle.position,
+                branch,
+            )
+            if region in {"UP", "BOTTOM"}:
+                route_force.x += CENTERING_GAIN * (center_x - particle.position.x)
+            elif region in {"LEFT", "RIGHT"}:
+                route_force.y += CENTERING_GAIN * (center_y - particle.position.y)
+
+            acceleration = (
+                accelerations[index]
+                + route_force
+                - DAMPING * particle.velocity
+            )
+            limit_vector(acceleration, FLOW_ROLLOUT_MAX_ACCELERATION)
+            particle.velocity += acceleration * FLOW_ROLLOUT_DT
+            limit_vector(particle.velocity, FLOW_ROLLOUT_MAX_SPEED)
+
+            proposed_x = pygame.Vector2(
+                particle.position.x + particle.velocity.x * FLOW_ROLLOUT_DT,
+                particle.position.y,
+            )
+            if is_rollout_walkable(proposed_x, ROBOT_RADIUS, branch):
+                particle.position.x = proposed_x.x
+            else:
+                wall_risk_sum += 1.0
+                particle.velocity.x = 0.0
+
+            proposed_y = pygame.Vector2(
+                particle.position.x,
+                particle.position.y + particle.velocity.y * FLOW_ROLLOUT_DT,
+            )
+            if is_rollout_walkable(proposed_y, ROBOT_RADIUS, branch):
+                particle.position.y = proposed_y.y
+            else:
+                wall_risk_sum += 1.0
+                particle.velocity.y = 0.0
+
+            if not is_rollout_walkable(
+                particle.position,
+                ROBOT_RADIUS + FLOW_ROLLOUT_WALL_CLEARANCE,
+                branch,
+            ):
+                wall_risk_sum += 0.35
+
+            relative_density_change = (
+                particle.density - particle.initial_density
+            ) / max(particle.initial_density, reference_density, EPSILON)
+            density_disturbance_sum += relative_density_change**2
+            density_samples += 1
+
+            velocity_change = particle.velocity - particle.initial_velocity
+            velocity_disturbance_sum += (
+                velocity_change.length()
+                / max(FLOW_ROLLOUT_VELOCITY_NORMALIZER, EPSILON)
+            ) ** 2
+            velocity_samples += 1
+
+    # Refresh final densities for final-state metrics.
+    compute_rollout_densities(particles)
+
+    entrance = get_branch_entrance(branch)
+    direction = BRANCH_DIRECTIONS[branch]
+    weighted_flux = 0.0
+    weight_sum = 0.0
+    entered = 0
+    for particle in particles:
+        distance = particle.position.distance_to(entrance)
+        weight = math.exp(
+            -(distance**2)
+            / max(2.0 * FLOW_ROLLOUT_GATE_SIGMA**2, EPSILON)
+        )
+        weighted_flux += weight * max(0.0, particle.velocity.dot(direction))
+        weight_sum += weight
+        if get_robot_region(particle.position) == branch:
+            entered += 1
+
+    predicted_flow = clamp(
+        weighted_flux
+        / max(weight_sum * FLOW_ROLLOUT_REFERENCE_SPEED, EPSILON),
+        0.0,
+        1.0,
+    )
+    density_disturbance = clamp(
+        (density_disturbance_sum / max(density_samples, 1))
+        / max(FLOW_ROLLOUT_DENSITY_NORMALIZER**2, EPSILON),
+        0.0,
+        1.0,
+    )
+    velocity_disturbance = clamp(
+        velocity_disturbance_sum / max(velocity_samples, 1),
+        0.0,
+        1.0,
+    )
+    wall_risk = clamp(
+        wall_risk_sum
+        / max(len(particles) * FLOW_ROLLOUT_STEPS * 2.35, 1.0),
+        0.0,
+        1.0,
+    )
+    collision_risk = clamp(
+        collision_risk_sum / max(collision_samples, 1),
+        0.0,
+        1.0,
+    ) if collision_samples else 0.0
+    rollout_comm, connected_ratio, robust_margin = evaluate_rollout_communication_risk(
+        particles,
+        robots,
+    )
+    stabilization = clamp(
+        0.5 * density_disturbance + 0.5 * velocity_disturbance,
+        0.0,
+        1.0,
+    )
+
+    return {
+        "predicted_flow": predicted_flow,
+        "density_disturbance": density_disturbance,
+        "velocity_disturbance": velocity_disturbance,
+        "wall_risk": wall_risk,
+        "collision_risk": collision_risk,
+        "rollout_comm": rollout_comm,
+        "rollout_connected_ratio": connected_ratio,
+        "rollout_margin": robust_margin,
+        "stabilization": stabilization,
+        "lambda_mode": lambda_mode_cost,
+        "rollout_lambda": rollout_lambda,
+        "predicted_entry_ratio": entered / max(len(particles), 1),
+        "rollout_robot_count": len(particles),
+    }
+
 def branch_efficiency_cost(
     branch: str,
     robots,
@@ -1921,11 +2736,21 @@ def branch_efficiency_cost(
     reference_density: float,
     principal_axis: pygame.Vector2,
     shape_confidence: float,
+    proxy_mass_stats: dict[str, dict],
 ):
     ordering_robots = get_branch_ordering_robots(robots)
+    rollout = evaluate_flow_preserving_rollout(
+        branch,
+        robots,
+        reference_density,
+        incoming_direction,
+    )
+
+    # Low-weight decision priors retained from the previous implementation.
     transport = compute_transport_cost(branch, ordering_robots)
+    proxy_mass = proxy_mass_stats.get(branch, {}).get("mass_deficit_cost", 1.0)
     shape = compute_shape_cost(branch, principal_axis, shape_confidence)
-    flow = compute_flow_cost(branch, ordering_robots)
+    flow_prior = compute_flow_cost(branch, ordering_robots)
     congestion = compute_congestion_cost(
         branch,
         ordering_robots,
@@ -1944,7 +2769,6 @@ def branch_efficiency_cost(
         ),
     )
     relay = relay_count / max_relays
-    comm = clamp(estimate_branch_comm_risk(branch), 0.0, 1.0)
     backtrack = BRANCH_LENGTHS[branch] / max(BRANCH_LENGTHS.values())
     switch = angle_between(
         incoming_direction,
@@ -1952,30 +2776,42 @@ def branch_efficiency_cost(
     ) / math.pi
 
     total = (
-        BRANCH_COST_TRANSPORT_WEIGHT * transport
-        + BRANCH_COST_SHAPE_WEIGHT * shape
-        + BRANCH_COST_FLOW_WEIGHT * flow
-        + BRANCH_COST_CONGESTION_WEIGHT * congestion
+        -BRANCH_COST_PREDICTED_FLOW_REWARD * rollout["predicted_flow"]
+        + BRANCH_COST_DENSITY_DISTURBANCE_WEIGHT * rollout["density_disturbance"]
+        + BRANCH_COST_VELOCITY_DISTURBANCE_WEIGHT * rollout["velocity_disturbance"]
+        + BRANCH_COST_WALL_RISK_WEIGHT * rollout["wall_risk"]
+        + BRANCH_COST_COLLISION_RISK_WEIGHT * rollout["collision_risk"]
+        + BRANCH_COST_ROLLOUT_COMM_WEIGHT * rollout["rollout_comm"]
         + BRANCH_COST_RELAY_WEIGHT * relay
-        + BRANCH_COST_COMM_WEIGHT * comm
+        + BRANCH_COST_LAMBDA_MODE_WEIGHT * rollout["lambda_mode"]
+        + BRANCH_COST_STABILIZATION_WEIGHT * rollout["stabilization"]
+        + BRANCH_COST_TRANSPORT_WEIGHT * transport
+        + BRANCH_COST_PROXY_MASS_WEIGHT * proxy_mass
+        + BRANCH_COST_SHAPE_WEIGHT * shape
+        + BRANCH_COST_FLOW_PRIOR_WEIGHT * flow_prior
+        + BRANCH_COST_CONGESTION_WEIGHT * congestion
         + BRANCH_COST_BACKTRACK_WEIGHT * backtrack
         + BRANCH_COST_SWITCH_WEIGHT * switch
     )
 
-    return total, {
+    components = {
+        **rollout,
         "transport": transport,
+        "proxy_mass": proxy_mass,
+        "proxy_quota": proxy_mass_stats.get(branch, {}).get("quota_fraction", 0.0),
+        "proxy_actual_mass": proxy_mass_stats.get(branch, {}).get("actual_mass_fraction", 0.0),
+        "proxy_robot_count": proxy_mass_stats.get(branch, {}).get("robot_count", 0),
         "shape": shape,
         "shape_confidence": shape_confidence,
-        "flow": flow,
+        "flow_prior": flow_prior,
         "congestion": congestion,
         "relay": relay,
-        "comm": comm,
         "backtrack": backtrack,
         "switch": switch,
         "structural_loss": structural_loss(branch),
         "ordering_robot_count": len(ordering_robots),
     }
-
+    return total, components
 
 def branch_is_feasible(branch: str, robots) -> bool:
     """Check deterministic resource/connectivity feasibility before scoring."""
@@ -1993,15 +2829,23 @@ def branch_is_feasible(branch: str, robots) -> bool:
 
 
 def choose_next_branch(anchor, robots, reference_density: float):
-    """Select one DFS child using hierarchical loss priority and SPH cost.
+    """Online/receding-horizon Flow-Preserving SPH DFS child selection.
 
     1. Keep only UNVISITED and resource-feasible branches.
-    2. Preserve complete exploration priority by retaining branches with the
-       maximum structural loss if their entrance edge were removed.
-    3. Among that priority set, minimize current SPH mass-transport, shape,
-       flow, congestion, relay, communication, backtracking, and turn cost.
+    2. Preserve complete-exploration priority lexicographically through
+       structural loss.
+    3. Clone the current mobile swarm state and briefly open each candidate
+       valve in a non-mutating SPH rollout.
+    4. Select the branch with the highest predicted natural flux and the
+       smallest density/velocity disturbance, wall/collision exposure,
+       communication risk, relay demand, and lambda-mode transition cost.
+    5. Repeat this evaluation whenever the swarm returns to the Junction.
     """
     global active_branch, previous_branch_direction, branch_order_plan
+    global last_proxy_partition, last_proxy_cell_centers
+    global last_proxy_mass_stats, last_proxy_candidates
+    global last_flow_rollout_scores
+    global selected_branch_entry_lambda, branch_entry_timer
 
     if anchor is None or anchor.local_branch_states is None:
         return None
@@ -2015,21 +2859,47 @@ def choose_next_branch(anchor, robots, reference_density: float):
         anchor.selected_branch = None
         return None
 
-    feasible = [branch for branch in unvisited if branch_is_feasible(branch, robots)]
+    feasible = [
+        branch for branch in unvisited
+        if branch_is_feasible(branch, robots)
+    ]
     candidates = feasible if feasible else unvisited
     if not feasible:
-        print("[DFS] warning: no branch passed resource feasibility; using UNVISITED fallback")
+        print(
+            "[DFS] warning: no branch passed resource feasibility; "
+            "using UNVISITED fallback"
+        )
 
     losses = {branch: structural_loss(branch) for branch in candidates}
     maximum_loss = max(losses.values())
     priority_candidates = [
-        branch for branch in candidates if losses[branch] == maximum_loss
+        branch
+        for branch in candidates
+        if losses[branch] == maximum_loss
     ]
 
     ordering_robots = get_branch_ordering_robots(robots)
-    principal_axis, shape_confidence = compute_swarm_principal_axis(ordering_robots)
+    principal_axis, shape_confidence = compute_swarm_principal_axis(
+        ordering_robots
+    )
+    partition, cell_centers, quotas = build_capacity_constrained_proxy_partition(
+        priority_candidates
+    )
+    proxy_stats, _ = compute_proxy_mass_statistics(
+        ordering_robots,
+        priority_candidates,
+        partition,
+        cell_centers,
+        quotas,
+        reference_density,
+    )
+    last_proxy_partition = partition
+    last_proxy_cell_centers = cell_centers
+    last_proxy_mass_stats = proxy_stats
+    last_proxy_candidates = tuple(priority_candidates)
 
     scored = []
+    candidate_score_map: dict[str, dict] = {}
     for branch in priority_candidates:
         cost, components = branch_efficiency_cost(
             branch,
@@ -2038,20 +2908,34 @@ def choose_next_branch(anchor, robots, reference_density: float):
             reference_density,
             principal_axis,
             shape_confidence,
+            proxy_stats,
         )
         scored.append((cost, branch, components))
+        candidate_score_map[branch] = {
+            "cost": cost,
+            "components": components,
+        }
         print(
-            f"[DFS Cost] branch={branch}, loss={losses[branch]}, "
-            f"cost={cost:.4f}, components={components}"
+            f"[Flow Rollout] branch={branch}, loss={losses[branch]}, "
+            f"cost={cost:.4f}, Q={components['predicted_flow']:.3f}, "
+            f"dRho={components['density_disturbance']:.3f}, "
+            f"dV={components['velocity_disturbance']:.3f}, "
+            f"wall={components['wall_risk']:.3f}, "
+            f"collision={components['collision_risk']:.3f}, "
+            f"comm={components['rollout_comm']:.3f}, "
+            f"lambda={components['rollout_lambda']:.3f}"
         )
 
     scored.sort(key=lambda item: (item[0], item[1]))
     cost, selected, components = scored[0]
+    last_flow_rollout_scores = candidate_score_map
 
     anchor.local_branch_states[selected] = "ACTIVE"
     anchor.selected_branch = selected
     active_branch = selected
     branch_order_plan.append(selected)
+    selected_branch_entry_lambda = components["rollout_lambda"]
+    branch_entry_timer = 0.0
     initialize_relay_plan(selected)
 
     metrics.branch_selection_events.append({
@@ -2060,11 +2944,14 @@ def choose_next_branch(anchor, robots, reference_density: float):
         "cost": cost,
         "max_structural_loss": maximum_loss,
         "components": components,
+        "candidate_scores": candidate_score_map,
     })
 
     print(
         f"[DFS] selected={selected}, cost={cost:.4f}, "
-        f"max_loss={maximum_loss}, components={components}"
+        f"Q={components['predicted_flow']:.3f}, "
+        f"entry_lambda={selected_branch_entry_lambda:.3f}, "
+        f"max_loss={maximum_loss}"
     )
     return selected
 
@@ -2105,6 +2992,82 @@ def begin_final_return(anchor, robots):
     release_trunk_relays_for_return(robots)
     phase = SimulationPhase.RETURN_TO_BASE
     print("[DFS] return to base")
+
+# =========================================================
+# 12-1. Junction stability consensus
+# =========================================================
+
+
+@dataclass
+class JunctionConsensusTracker:
+    dwell: float = 0.0
+    elapsed: float = 0.0
+    candidate_count: int = 0
+    stable_ratio: float = 0.0
+    mean_speed: float = 0.0
+    mean_density_delta_ratio: float = 0.0
+    ready: bool = False
+    previous_density: dict[int, float] = field(default_factory=dict)
+
+    def reset(self):
+        self.dwell = 0.0
+        self.elapsed = 0.0
+        self.candidate_count = 0
+        self.stable_ratio = 0.0
+        self.mean_speed = 0.0
+        self.mean_density_delta_ratio = 0.0
+        self.ready = False
+        self.previous_density.clear()
+
+    def update(self, robots, dt: float, reference_density: float) -> bool:
+        self.elapsed += dt
+        candidates = [
+            robot
+            for robot in robots
+            if robot.role == "NORMAL"
+            and get_robot_region(robot.position) == "JUNCTION"
+        ]
+        self.candidate_count = len(candidates)
+        if not candidates:
+            self.stable_ratio = 0.0
+            self.mean_speed = 0.0
+            self.mean_density_delta_ratio = float("inf")
+            self.dwell = 0.0
+            self.ready = False
+            return False
+
+        stable_count = 0
+        density_deltas = []
+        speeds = []
+        for robot in candidates:
+            speed = robot.velocity.length()
+            previous = self.previous_density.get(robot.robot_id, robot.density)
+            density_delta_ratio = abs(robot.density - previous) / max(reference_density, EPSILON)
+            self.previous_density[robot.robot_id] = robot.density
+            speeds.append(speed)
+            density_deltas.append(density_delta_ratio)
+            if (
+                robot.connected_to_base
+                and speed <= JUNCTION_CONSENSUS_SPEED_THRESHOLD
+                and density_delta_ratio <= JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO
+            ):
+                stable_count += 1
+
+        self.stable_ratio = stable_count / len(candidates)
+        self.mean_speed = sum(speeds) / len(speeds)
+        self.mean_density_delta_ratio = sum(density_deltas) / len(density_deltas)
+        conditions = (
+            self.candidate_count >= JUNCTION_CONSENSUS_MIN_COUNT
+            and self.stable_ratio >= JUNCTION_CONSENSUS_STABLE_RATIO
+            and self.mean_speed <= JUNCTION_CONSENSUS_SPEED_THRESHOLD
+            and self.mean_density_delta_ratio <= JUNCTION_CONSENSUS_DENSITY_DELTA_RATIO
+        )
+        self.dwell = self.dwell + dt if conditions else 0.0
+        self.ready = self.dwell >= JUNCTION_CONSENSUS_DWELL_TIME
+        return self.ready
+
+
+junction_consensus_tracker = JunctionConsensusTracker()
 
 # =========================================================
 # 13. Saturation detector
@@ -2415,10 +3378,39 @@ def compute_densities(robots, grid):
         robot_i.density = max(density, EPSILON)
 
 
+def get_effective_stiffness_exponent() -> float:
+    """Adaptive lambda schedule for real branch switching and pressure push."""
+    if phase == SimulationPhase.PRESSURE_PUSH:
+        return STIFFNESS_EXPONENT_PRESSURE_PUSH
+    if phase == SimulationPhase.JUNCTION_SWITCH:
+        return STIFFNESS_EXPONENT_SOFT
+    if phase in {
+        SimulationPhase.EXPLORE_BRANCH,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+    }:
+        recovery = clamp(
+            branch_entry_timer / max(BRANCH_STIFFNESS_RECOVERY_TIME, EPSILON),
+            0.0,
+            1.0,
+        )
+        return (
+            selected_branch_entry_lambda
+            + (STIFFNESS_EXPONENT_RIGID - selected_branch_entry_lambda)
+            * recovery
+        )
+    return STIFFNESS_EXPONENT_RIGID
+
+
 def compute_pressures(robots, reference_density):
+    effective_lambda = get_effective_stiffness_exponent()
     for robot in robots:
         ratio = robot.density / max(reference_density, EPSILON)
-        robot.pressure = PRESSURE_GAIN * robot.density * (ratio**STIFFNESS_EXPONENT - 1.0)
+        robot.pressure = (
+            PRESSURE_GAIN
+            * robot.density
+            * (ratio**effective_lambda - 1.0)
+        )
         if phase == SimulationPhase.PRESSURE_PUSH and robot.role == "SHEPHERD":
             ramp = min(1.0, 0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON))
             robot.pressure += PRESSURE_GAIN * robot.density * SHEPHERD_PRESSURE_FACTOR * ramp
@@ -2456,9 +3448,11 @@ def compute_route_force(robot):
         lane_error = robot.ingress_lane_x - robot.position.x
         force.x = clamp(INITIAL_INGRESS_LANE_GAIN * lane_error, -INITIAL_INGRESS_LANE_MAX_FORCE, INITIAL_INGRESS_LANE_MAX_FORCE)
     elif phase == SimulationPhase.EXPLORE_BRANCH:
-        force = normalized_direction_toward(
-            robot.position, get_branch_tip_target(active_branch)
-        ) * ROUTE_FORCE * relay_motion_scale
+        force = (
+            geodesic_edf_direction(robot.position, active_branch)
+            * ROUTE_FORCE
+            * relay_motion_scale
+        )
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
         if robot.role == "SHEPHERD":
             force = pygame.Vector2()
@@ -2475,15 +3469,24 @@ def compute_route_force(robot):
         if robot.role == "SHEPHERD":
             force = pygame.Vector2()
         elif region == active_branch:
-            force = normalized_direction_toward(
-                robot.position,
-                get_shepherd_fill_target(active_branch),
-            ) * ROUTE_FORCE * relay_motion_scale
+            force = (
+                geodesic_edf_direction(
+                    robot.position,
+                    active_branch,
+                    get_shepherd_fill_target(active_branch),
+                )
+                * ROUTE_FORCE
+                * relay_motion_scale
+            )
         else:
-            force = normalized_direction_toward(
-                robot.position,
-                JUNCTION_STAGING_POSITION,
-            ) * OUTLET_FORCE
+            force = (
+                geodesic_edf_direction(
+                    robot.position,
+                    active_branch,
+                    get_shepherd_fill_target(active_branch),
+                )
+                * OUTLET_FORCE
+            )
     elif phase == SimulationPhase.PRESSURE_PUSH:
         if robot.role == "NORMAL" and region == active_branch:
             force = get_backtrack_direction(active_branch) * PRESSURE_BACKTRACK_BODY_FORCE
@@ -2500,6 +3503,8 @@ def compute_route_force(robot):
     elif phase == SimulationPhase.RETURN_TO_BASE:
         target = junction_target if region in BRANCHES else get_bottom_hold_point()
         force = normalized_direction_toward(robot.position, target) * OUTLET_FORCE
+
+    force += compute_virtual_valve_force(robot)
 
     if region in {"UP", "BOTTOM"}:
         force.x += CENTERING_GAIN * (center_x - robot.position.x)
@@ -2637,7 +3642,15 @@ def update_metrics_per_frame(robots, dt):
 
 def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
-    global junction_switch_timer, final_gather_timer
+    global junction_switch_timer, final_gather_timer, branch_entry_timer
+
+    if phase in {
+        SimulationPhase.EXPLORE_BRANCH,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+    }:
+        branch_entry_timer += dt
+
     anchor = elect_junction_anchor(robots)
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
@@ -2646,16 +3659,23 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             get_robot_region(robot.position) == "JUNCTION" and robot.role != "ANCHOR"
             for robot in robots
         )
+        consensus_ready = junction_consensus_tracker.update(
+            robots,
+            dt,
+            reference_density,
+        )
         if (
             anchor is not None
             and anchor_deployment_ready(anchor, robots)
             and robots_in_junction >= JUNCTION_ENTRY_COUNT
+            and consensus_ready
         ):
             selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
                 saturation_tracker.reset(selected)
+                junction_consensus_tracker.reset()
                 phase = SimulationPhase.EXPLORE_BRANCH
                 metrics.branch_events.append({"branch": selected, "started_at": simulation_time})
 
@@ -2744,15 +3764,25 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             complete_active_branch(anchor, active_branch)
             phase = SimulationPhase.JUNCTION_SWITCH
             junction_switch_timer = 0.0
+            junction_consensus_tracker.reset()
 
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
-        if junction_switch_timer >= JUNCTION_SWITCH_DWELL_TIME:
+        consensus_ready = junction_consensus_tracker.update(
+            robots,
+            dt,
+            reference_density,
+        )
+        fallback_ready = junction_switch_timer >= JUNCTION_CONSENSUS_FALLBACK_TIME
+        if consensus_ready or fallback_ready:
+            if fallback_ready and not consensus_ready:
+                print("[Consensus] fallback selection after stabilization timeout")
             selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
                 saturation_tracker.reset(selected)
+                junction_consensus_tracker.reset()
                 phase = SimulationPhase.EXPLORE_BRANCH
                 metrics.branch_events.append({"branch": selected, "started_at": simulation_time})
 
@@ -2777,6 +3807,28 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             print(f"[DFS] done, robots={in_bottom}/{len(robots)}")
             save_experiment_logs(robots, "DONE")
 
+def draw_proxy_partition(surface):
+    """Draw the last decision-time temporary HydroSwarm proxy subregions."""
+    if not last_proxy_partition or not last_proxy_cell_centers:
+        return
+    branch_colors = {
+        "UP": (126, 166, 211),
+        "LEFT": (177, 151, 205),
+        "RIGHT": (221, 166, 111),
+    }
+    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    for key, branch in last_proxy_partition.items():
+        center = last_proxy_cell_centers[key]
+        rect = pygame.Rect(
+            int(center.x - PROXY_CELL_SIZE / 2),
+            int(center.y - PROXY_CELL_SIZE / 2),
+            PROXY_CELL_SIZE,
+            PROXY_CELL_SIZE,
+        )
+        pygame.draw.rect(overlay, (*branch_colors[branch], 35), rect)
+    surface.blit(overlay, (0, 0))
+
+
 # =========================================================
 # 17. Initialization
 # =========================================================
@@ -2790,6 +3842,10 @@ def reset_dfs_state():
     global last_message_signature, relay_slots, relay_deploy_cooldown
     global relay_retract_cooldown, relay_retract_clear_timer, relay_motion_scale
     global trunk_relay_slots, trunk_relay_deploy_cooldown, base_station
+    global last_proxy_partition, last_proxy_cell_centers
+    global last_proxy_mass_stats, last_proxy_candidates
+    global last_flow_rollout_scores
+    global selected_branch_entry_lambda, branch_entry_timer
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
@@ -2808,8 +3864,16 @@ def reset_dfs_state():
     trunk_relay_slots = []
     trunk_relay_deploy_cooldown = 0.0
     base_station = BaseStation(BASE_POSITION)
+    last_proxy_partition = {}
+    last_proxy_cell_centers = {}
+    last_proxy_mass_stats = {}
+    last_proxy_candidates = ()
+    last_flow_rollout_scores = {}
+    selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
+    branch_entry_timer = 0.0
     initialize_trunk_relay_plan()
     saturation_tracker.reset()
+    junction_consensus_tracker.reset()
     metrics = ExperimentMetrics()
 
 
@@ -2895,6 +3959,7 @@ while running:
     pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=5)
 
     if show_regions:
+        draw_proxy_partition(screen)
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
         pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
         pygame.draw.circle(screen, ANCHOR_COLOR, ANCHOR_PARK_POSITION, 4, width=1)
@@ -2935,7 +4000,7 @@ while running:
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
     hud_lines = [
-        "Base-rooted SPH DFS: trunk + adaptive Shepherd + saturation piston",
+        "Base-rooted DFS: Flow-Preserving SPH rollout + proxy/EDF",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
         f"Anchor={junction_anchor.robot_id if junction_anchor else '-'} | score={junction_anchor.anchor_election_score:.3f}" if junction_anchor else "Anchor=-",
         f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
@@ -2943,13 +4008,43 @@ while running:
         (
             "Last branch cost: "
             + (
-                f"T={metrics.branch_selection_events[-1]['components']['transport']:.2f} "
-                f"S={metrics.branch_selection_events[-1]['components']['shape']:.2f} "
-                f"F={metrics.branch_selection_events[-1]['components']['flow']:.2f} "
-                f"C={metrics.branch_selection_events[-1]['components']['congestion']:.2f}"
+                f"Q={metrics.branch_selection_events[-1]['components']['predicted_flow']:.2f} "
+                f"dRho={metrics.branch_selection_events[-1]['components']['density_disturbance']:.2f} "
+                f"dV={metrics.branch_selection_events[-1]['components']['velocity_disturbance']:.2f} "
+                f"Comm={metrics.branch_selection_events[-1]['components']['rollout_comm']:.2f}"
                 if metrics.branch_selection_events
                 else "-"
             )
+        ),
+        (
+            "Proxy mass: "
+            + " | ".join(
+                f"{branch} q={last_proxy_mass_stats.get(branch, {}).get('quota_fraction', 0.0):.2f} "
+                f"m={last_proxy_mass_stats.get(branch, {}).get('actual_mass_fraction', 0.0):.2f}"
+                for branch in last_proxy_candidates
+            )
+            if last_proxy_candidates
+            else "Proxy mass: -"
+        ),
+        (
+            "Rollout candidates: "
+            + " | ".join(
+                f"{branch}:J={data['cost']:.2f},Q={data['components']['predicted_flow']:.2f}"
+                for branch, data in sorted(last_flow_rollout_scores.items())
+            )
+            if last_flow_rollout_scores
+            else "Rollout candidates: -"
+        ),
+        (
+            f"Adaptive lambda={get_effective_stiffness_exponent():.3f} "
+            f"entry={selected_branch_entry_lambda:.3f} "
+            f"recovery={branch_entry_timer:.2f}/{BRANCH_STIFFNESS_RECOVERY_TIME:.2f}"
+        ),
+        (
+            f"Junction consensus: n={junction_consensus_tracker.candidate_count} "
+            f"stable={junction_consensus_tracker.stable_ratio:.2f} "
+            f"dv={junction_consensus_tracker.mean_density_delta_ratio:.3f} "
+            f"dwell={junction_consensus_tracker.dwell:.2f}"
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
