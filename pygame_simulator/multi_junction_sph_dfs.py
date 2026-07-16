@@ -947,6 +947,33 @@ def validate_topology():
 
 validate_topology()
 
+def set_branch_visit_state(
+    branch: str,
+    visit_state: VisitState,
+):
+    """Synchronize legacy branch state with topology edge state."""
+
+    if branch not in BRANCH_TO_EDGE:
+        raise ValueError(f"Unknown branch: {branch}")
+
+    edge_id = BRANCH_TO_EDGE[branch]
+
+    branch_states[branch] = visit_state.name
+    topology_edges[edge_id].visit_state = visit_state
+
+
+def reset_topology_visit_states():
+    """Reset the current single-junction topology states."""
+
+    for branch, edge_id in BRANCH_TO_EDGE.items():
+        branch_states[branch] = VisitState.UNVISITED.name
+        topology_edges[edge_id].visit_state = VisitState.UNVISITED
+
+    topology_nodes["BASE"].visit_state = VisitState.VISITED
+    topology_nodes["J0"].visit_state = VisitState.UNVISITED
+    topology_edges["E_BASE_J0"].visit_state = VisitState.VISITED
+
+
 def get_backtrack_direction(branch: str):
     return -BRANCH_DIRECTIONS[branch]
 
@@ -3491,9 +3518,12 @@ def choose_next_branch(anchor, robots, reference_density: float):
 
     scored.sort(key=lambda item: (item[0], item[1]))
     cost, selected, components = scored[0]
-    last_flow_rollout_scores = candidate_score_map
 
-    anchor.local_branch_states[selected] = "ACTIVE"
+    set_branch_visit_state(
+        selected,
+        VisitState.ACTIVE,
+    )
+
     anchor.selected_branch = selected
     active_branch = selected
     branch_order_plan.append(selected)
@@ -3522,7 +3552,12 @@ def complete_active_branch(anchor, branch):
     global previous_branch_direction
     if anchor is None or anchor.local_branch_states is None:
         return
-    anchor.local_branch_states[branch] = "VISITED"
+    
+    set_branch_visit_state(
+    branch,
+    VisitState.VISITED,
+    )
+
     anchor.selected_branch = None
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
@@ -4662,7 +4697,9 @@ def reset_dfs_state():
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
+
     branch_states = {branch: "UNVISITED" for branch in BRANCHES}
+    reset_topology_visit_states()
     branch_order_plan = []
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
     junction_anchor = None
