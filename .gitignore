@@ -11,3 +11,4 @@ robot_ws/log/
 *.pyo
 *.save
 *follower_node_backup.py
+pygame_simulator/sph_dfs_experiment_summary.csv
