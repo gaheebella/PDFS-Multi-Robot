@@ -819,6 +819,18 @@ def get_branch_tip_target(branch: str):
 def build_initial_topology():
     """Represent the current single-junction map as a topology graph."""
 
+    j1_position = get_branch_tip_target("RIGHT")
+
+    j1_up_room_position = pygame.Vector2(
+        j1_position.x,
+        j1_position.y - half_width - normal_length + 18,
+    )
+
+    j1_down_room_position = pygame.Vector2(
+        j1_position.x,
+        j1_position.y + half_width + normal_length - 18,
+    )
+
     nodes = {
         "BASE": TopologyNode(
             node_id="BASE",
@@ -850,11 +862,27 @@ def build_initial_topology():
             position=get_branch_tip_target("LEFT"),
             parent_edge_id="E_J0_LEFT",
         ),
-        "RIGHT_ROOM": TopologyNode(
-            node_id="RIGHT_ROOM",
-            node_type=NodeType.ROOM,
-            position=get_branch_tip_target("RIGHT"),
+        "J1": TopologyNode(
+            node_id="J1",
+            node_type=NodeType.JUNCTION,
+            position=j1_position.copy(),
             parent_edge_id="E_J0_RIGHT",
+            child_edge_ids=[
+                "E_J1_UP",
+                "E_J1_DOWN",
+            ],
+        ),
+        "J1_UP_ROOM": TopologyNode(
+            node_id="J1_UP_ROOM",
+            node_type=NodeType.ROOM,
+            position=j1_up_room_position,
+            parent_edge_id="E_J1_UP",
+        ),
+        "J1_DOWN_ROOM": TopologyNode(
+            node_id="J1_DOWN_ROOM",
+            node_type=NodeType.ROOM,
+            position=j1_down_room_position,
+            parent_edge_id="E_J1_DOWN",
         ),
     }
 
@@ -887,10 +915,26 @@ def build_initial_topology():
         "E_J0_RIGHT": TopologyEdge(
             edge_id="E_J0_RIGHT",
             start_node_id="J0",
-            end_node_id="RIGHT_ROOM",
+            end_node_id="J1",
             length=float(right_length),
             width=float(corridor_width),
             direction=pygame.Vector2(1.0, 0.0),
+        ),
+        "E_J1_UP": TopologyEdge(
+            edge_id="E_J1_UP",
+            start_node_id="J1",
+            end_node_id="J1_UP_ROOM",
+            length=float(normal_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(0.0, -1.0),
+        ),
+        "E_J1_DOWN": TopologyEdge(
+            edge_id="E_J1_DOWN",
+            start_node_id="J1",
+            end_node_id="J1_DOWN_ROOM",
+            length=float(normal_length),
+            width=float(corridor_width),
+            direction=pygame.Vector2(0.0, 1.0),
         ),
     }
 
@@ -1133,14 +1177,18 @@ def set_topology_cursor_at_junction(junction_id: str):
 
 
 def reset_topology_visit_states():
-    """Reset the current single-junction topology states."""
+    """Reset all topology nodes, edges, and the DFS stack."""
 
-    for branch, edge_id in BRANCH_TO_EDGE.items():
+    for node in topology_nodes.values():
+        node.visit_state = VisitState.UNVISITED
+
+    for edge in topology_edges.values():
+        edge.visit_state = VisitState.UNVISITED
+
+    for branch in BRANCHES:
         branch_states[branch] = VisitState.UNVISITED.name
-        topology_edges[edge_id].visit_state = VisitState.UNVISITED
 
     topology_nodes["BASE"].visit_state = VisitState.VISITED
-    topology_nodes["J0"].visit_state = VisitState.UNVISITED
     topology_edges["E_BASE_J0"].visit_state = VisitState.VISITED
 
     initialize_dfs_stack()
