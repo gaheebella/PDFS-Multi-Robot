@@ -959,6 +959,9 @@ EDGE_TO_BRANCH = {
 
 ROOT_JUNCTION_ID = "J0"
 
+CHILD_JUNCTION_ARRIVAL_RADIUS = 32.0
+CHILD_JUNCTION_ARRIVAL_COUNT = 18
+
 dfs_stack: list[DFSFrame] = []
 
 def push_junction_frame(
@@ -1174,7 +1177,103 @@ def set_topology_cursor_at_junction(junction_id: str):
         f"edge={current_edge_id}"
     )
 
+def get_current_topology_edge() -> Optional[TopologyEdge]:
+    """Return the edge currently being traversed."""
 
+    if current_edge_id is None:
+        return None
+
+    return topology_edges.get(current_edge_id)
+
+
+def get_current_edge_destination_node() -> Optional[TopologyNode]:
+    """Return the destination node of the current edge."""
+
+    edge = get_current_topology_edge()
+
+    if edge is None:
+        return None
+
+    return topology_nodes.get(edge.end_node_id)
+
+
+def current_edge_leads_to_junction() -> bool:
+    """Check whether the current edge ends at another junction."""
+
+    destination = get_current_edge_destination_node()
+
+    return (
+        destination is not None
+        and destination.node_type == NodeType.JUNCTION
+    )
+
+
+def child_junction_arrival_ready(
+    robots,
+    junction_id: str,
+) -> bool:
+    """Check whether enough mobile robots have arrived at a child junction."""
+
+    if junction_id not in topology_nodes:
+        return False
+
+    junction_position = topology_nodes[junction_id].position
+
+    arrived_count = sum(
+        robot.role not in {
+            "ANCHOR",
+            "TRUNK_RELAY",
+            "RELAY",
+        }
+        and robot.connected_to_base
+        and robot.position.distance_to(junction_position)
+        <= CHILD_JUNCTION_ARRIVAL_RADIUS
+        for robot in robots
+    )
+
+    if arrived_count >= CHILD_JUNCTION_ARRIVAL_COUNT:
+        print(
+            f"[Junction Arrival] "
+            f"junction={junction_id}, "
+            f"robots={arrived_count}"
+        )
+        return True
+
+    return False
+
+def enter_child_junction(junction_id: str):
+    """Enter a newly reached child junction and push its DFS frame."""
+
+    global phase
+
+    if junction_id not in topology_nodes:
+        raise ValueError(f"Unknown junction: {junction_id}")
+
+    arrival_edge_id = current_edge_id
+
+    if arrival_edge_id is None:
+        raise RuntimeError(
+            "Cannot enter child junction without an active edge"
+        )
+
+    push_junction_frame(
+        junction_id,
+        parent_edge_id=arrival_edge_id,
+    )
+
+    topology_nodes[junction_id].visit_state = VisitState.ACTIVE
+
+    set_topology_cursor_at_junction(junction_id)
+
+    print(
+        f"[Multi-Junction Test] "
+        f"arrived={junction_id}, "
+        f"stack={[frame.junction_id for frame in dfs_stack]}"
+    )
+
+    # 이번 단계에서는 J1 도착과 Stack push까지만 검증한다.
+    # 다음 단계에서 J1 Anchor 선출과 자식 Edge 선택으로 교체한다.
+    phase = SimulationPhase.DONE
 
 def reset_topology_visit_states():
     """Reset all topology nodes, edges, and the DFS stack."""
@@ -4545,6 +4644,23 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
+
+        destination_node = get_current_edge_destination_node()
+
+        if (
+            current_edge_leads_to_junction()
+            and destination_node is not None
+            and child_junction_arrival_ready(
+                robots,
+                destination_node.node_id,
+            )
+        ):
+            enter_child_junction(destination_node.node_id)
+            return
+
+        # Dead-end 또는 Room으로 이어지는 Edge에서만
+        # Shepherd를 선출하고 압력 Backtracking을 시작한다.
+
 
         # Preserve the original timing: wait until the leading robots enter the
         # dead-end capture region. Only the required count is now width-adaptive.
