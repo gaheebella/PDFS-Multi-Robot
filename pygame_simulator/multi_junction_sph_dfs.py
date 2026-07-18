@@ -913,22 +913,71 @@ EDGE_TO_BRANCH = {
     for branch, edge_id in BRANCH_TO_EDGE.items()
 }
 
+ROOT_JUNCTION_ID = "J0"
+
 dfs_stack: list[DFSFrame] = []
 
+def push_junction_frame(
+    junction_id: str,
+    parent_edge_id: Optional[str] = None,
+) -> DFSFrame:
+    """Push a junction onto the DFS traversal stack."""
+
+    if junction_id not in topology_nodes:
+        raise ValueError(f"Unknown junction: {junction_id}")
+
+    junction = topology_nodes[junction_id]
+
+    if junction.node_type != NodeType.JUNCTION:
+        raise ValueError(
+            f"Node {junction_id} is not a junction: "
+            f"{junction.node_type.name}"
+        )
+
+    resolved_parent_edge_id = (
+        parent_edge_id
+        if parent_edge_id is not None
+        else junction.parent_edge_id
+    )
+
+    frame = DFSFrame(
+        junction_id=junction.node_id,
+        parent_edge_id=resolved_parent_edge_id,
+        child_edge_ids=list(junction.child_edge_ids),
+    )
+
+    dfs_stack.append(frame)
+
+    print(
+        f"[DFS Stack] push junction={frame.junction_id}, "
+        f"parent={frame.parent_edge_id}, "
+        f"depth={len(dfs_stack)}"
+    )
+
+    return frame
+
+
+def pop_current_junction_frame() -> Optional[DFSFrame]:
+    """Pop the completed junction from the DFS stack."""
+
+    if not dfs_stack:
+        return None
+
+    frame = dfs_stack.pop()
+
+    print(
+        f"[DFS Stack] pop junction={frame.junction_id}, "
+        f"depth={len(dfs_stack)}"
+    )
+
+    return frame
+
+
 def initialize_dfs_stack():
-    """Initialize the DFS stack with the root junction J0."""
+    """Initialize DFS traversal from the root junction."""
 
     dfs_stack.clear()
-
-    root_junction = topology_nodes["J0"]
-
-    dfs_stack.append(
-        DFSFrame(
-            junction_id=root_junction.node_id,
-            parent_edge_id=root_junction.parent_edge_id,
-            child_edge_ids=list(root_junction.child_edge_ids),
-        )
-    )
+    push_junction_frame(ROOT_JUNCTION_ID)
 
 
 def get_current_dfs_frame() -> Optional[DFSFrame]:
@@ -938,6 +987,17 @@ def get_current_dfs_frame() -> Optional[DFSFrame]:
         return None
 
     return dfs_stack[-1]
+
+
+def resolve_current_junction_id() -> Optional[str]:
+    """Resolve the active junction from the top DFS frame."""
+
+    frame = get_current_dfs_frame()
+
+    if frame is not None:
+        return frame.junction_id
+
+    return current_junction_id
 
 
 def update_current_dfs_frame(
@@ -1010,8 +1070,6 @@ def validate_topology():
 
 
 validate_topology()
-
-initialize_dfs_stack()
 
 def set_branch_visit_state(
     branch: str,
@@ -3672,6 +3730,13 @@ def complete_active_branch(anchor, branch):
     branch,
     VisitState.VISITED,
     )
+
+    junction_id = resolve_current_junction_id()
+
+    if junction_id is None:
+        raise RuntimeError(
+            "Cannot complete branch without an active junction"
+        )
 
     set_topology_cursor_at_junction("J0")
 
