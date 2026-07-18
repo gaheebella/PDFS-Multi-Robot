@@ -234,6 +234,7 @@ early_capture_regions = {
 
 class SimulationPhase(Enum):
     MOVE_TO_JUNCTION = auto()
+    STABILIZE_JUNCTION = auto()
     EXPLORE_BRANCH = auto()
     FORM_SHEPHERD_BOUNDARY = auto()
     FILL_BEHIND_SHEPHERD = auto()
@@ -286,6 +287,14 @@ class DFSFrame:
     child_edge_ids: list[str] = field(default_factory=list)
     active_edge_id: Optional[str] = None
     completed_edge_ids: set[str] = field(default_factory=set)
+
+@dataclass
+class JunctionContext:
+    junction_id: str
+    anchor_robot_id: Optional[int] = None
+    arrival_edge_id: Optional[str] = None
+    selected_edge_id: Optional[str] = None
+    stable_timer: float = 0.0
 
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
@@ -964,6 +973,11 @@ CHILD_JUNCTION_ARRIVAL_COUNT = 18
 
 dfs_stack: list[DFSFrame] = []
 
+junction_contexts: dict[str, JunctionContext] = {}
+
+CHILD_JUNCTION_ANCHOR_RADIUS = 36.0
+CHILD_JUNCTION_ANCHOR_MIN_CANDIDATES = 4
+
 def push_junction_frame(
     junction_id: str,
     parent_edge_id: Optional[str] = None,
@@ -1249,6 +1263,8 @@ def enter_child_junction(junction_id: str):
     if junction_id not in topology_nodes:
         raise ValueError(f"Unknown junction: {junction_id}")
 
+    # set_topology_cursor_at_junction()을 호출하면
+    # current_edge_id가 None이 되므로 먼저 저장한다.
     arrival_edge_id = current_edge_id
 
     if arrival_edge_id is None:
@@ -1265,15 +1281,28 @@ def enter_child_junction(junction_id: str):
 
     set_topology_cursor_at_junction(junction_id)
 
+    # 도착한 정션의 상태를 정션별 Context에 저장한다.
+    context = junction_contexts.setdefault(
+        junction_id,
+        JunctionContext(
+            junction_id=junction_id,
+            arrival_edge_id=arrival_edge_id,
+        ),
+    )
+
+    context.arrival_edge_id = arrival_edge_id
+    context.selected_edge_id = None
+    context.stable_timer = 0.0
+
     print(
         f"[Multi-Junction Test] "
         f"arrived={junction_id}, "
         f"stack={[frame.junction_id for frame in dfs_stack]}"
     )
 
-    # 이번 단계에서는 J1 도착과 Stack push까지만 검증한다.
-    # 다음 단계에서 J1 Anchor 선출과 자식 Edge 선택으로 교체한다.
-    phase = SimulationPhase.DONE
+    # J1 주변 군집 안정화와 Anchor 선출 단계로 이동한다.
+    phase = SimulationPhase.STABILIZE_JUNCTION
+
 
 def reset_topology_visit_states():
     """Reset all topology nodes, edges, and the DFS stack."""
@@ -1291,7 +1320,6 @@ def reset_topology_visit_states():
     topology_edges["E_BASE_J0"].visit_state = VisitState.VISITED
 
     initialize_dfs_stack()
-
 
 def get_backtrack_direction(branch: str):
     return -BRANCH_DIRECTIONS[branch]
@@ -2526,11 +2554,118 @@ def elect_junction_anchor(robots):
     junction_anchor.anchor_position = ANCHOR_PARK_POSITION.copy()
     junction_anchor.local_branch_states = branch_states
     junction_anchor.selected_branch = None
+
+    root_context = junction_contexts.setdefault(
+        ROOT_JUNCTION_ID,
+        JunctionContext(
+            junction_id=ROOT_JUNCTION_ID,
+            arrival_edge_id="E_BASE_J0",
+        ),
+    )
+
+    root_context.anchor_robot_id = junction_anchor.robot_id
+
     print(
         f"[Anchor] robot={junction_anchor.robot_id}, score={junction_anchor.anchor_election_score:.3f}, "
         f"entry={junction_anchor.anchor_region_entry_time:.3f}"
     )
     return junction_anchor
+
+
+def elect_child_junction_anchor(
+    robots,
+    junction_id: str,
+):
+    """Elect an anchor near a newly reached child junction."""
+
+    if junction_id not in topology_nodes:
+        raise ValueError(f"Unknown junction: {junction_id}")
+
+    context = junction_contexts.setdefault(
+        junction_id,
+        JunctionContext(junction_id=junction_id),
+    )
+
+    if context.anchor_robot_id is not None:
+        for robot in robots:
+            if robot.robot_id == context.anchor_robot_id:
+                return robot
+
+        context.anchor_robot_id = None
+
+    junction_position = topology_nodes[junction_id].position
+
+    candidates = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_base
+        and robot.position.distance_to(junction_position)
+        <= CHILD_JUNCTION_ANCHOR_RADIUS
+    ]
+
+    if len(candidates) < CHILD_JUNCTION_ANCHOR_MIN_CANDIDATES:
+        return None
+
+    scored_candidates = []
+
+    for candidate in candidates:
+        distance = candidate.position.distance_to(junction_position)
+
+        distance_score = 1.0 - min(
+            distance / CHILD_JUNCTION_ANCHOR_RADIUS,
+            1.0,
+        )
+
+        speed_score = 1.0 - min(
+            candidate.velocity.length() / max(MAX_SPEED, EPSILON),
+            1.0,
+        )
+
+        neighbor_count, _ = local_visible_neighbor_count(
+            candidate,
+            robots,
+        )
+
+        communication_score = min(
+            neighbor_count / 8.0,
+            1.0,
+        )
+
+        score = (
+            0.55 * distance_score
+            + 0.25 * communication_score
+            + 0.20 * speed_score
+        )
+
+        scored_candidates.append((score, candidate))
+
+    score, selected = max(
+        scored_candidates,
+        key=lambda item: (
+            item[0],
+            -item[1].robot_id,
+        ),
+    )
+
+    selected.role = "ANCHOR"
+    selected.anchor_position = junction_position.copy()
+    selected.anchor_election_score = score
+    selected.local_branch_states = {}
+    selected.selected_branch = None
+    selected.velocity.update(0.0, 0.0)
+
+    context.anchor_robot_id = selected.robot_id
+    context.stable_timer = 0.0
+
+    print(
+        f"[Junction Anchor] "
+        f"junction={junction_id}, "
+        f"robot={selected.robot_id}, "
+        f"score={score:.3f}"
+    )
+
+    return selected
 
 
 def reachable_nodes_without_branch(branch: str) -> set[str]:
@@ -4642,6 +4777,42 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 phase = SimulationPhase.EXPLORE_BRANCH
                 metrics.branch_events.append({"branch": selected, "started_at": simulation_time})
 
+    elif phase == SimulationPhase.STABILIZE_JUNCTION:
+        junction_id = resolve_current_junction_id()
+
+        if junction_id is None:
+            raise RuntimeError(
+                "STABILIZE_JUNCTION requires an active junction"
+            )
+
+        context = junction_contexts.setdefault(
+            junction_id,
+            JunctionContext(junction_id=junction_id),
+        )
+
+        context.stable_timer += dt
+
+        child_anchor = elect_child_junction_anchor(
+            robots,
+            junction_id,
+        )
+
+        if child_anchor is not None:
+            anchors = {
+                context_id: junction_context.anchor_robot_id
+                for context_id, junction_context
+                in junction_contexts.items()
+                if junction_context.anchor_robot_id is not None
+            }
+
+            print(
+                f"[Multi-Junction Test] "
+                f"anchors={anchors}"
+            )
+
+            # 이번 단계에서는 J0와 J1 Anchor 동시 유지까지만 확인한다.
+            phase = SimulationPhase.DONE
+
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
 
@@ -5044,6 +5215,7 @@ def reset_dfs_state():
     global current_node_id
     global current_junction_id
     global current_edge_id
+    global junction_contexts
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
 
@@ -5057,6 +5229,7 @@ def reset_dfs_state():
     branch_order_plan = []
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
     junction_anchor = None
+    junction_contexts = {}
     simulation_time = 0.0
     junction_switch_timer = final_gather_timer = shepherd_form_timer = 0.0
     pressure_push_timer = flow_establish_timer = 0.0
