@@ -406,6 +406,7 @@ j1_early_capture_regions = {
 class SimulationPhase(Enum):
     MOVE_TO_JUNCTION = auto()
     STABILIZE_JUNCTION = auto()
+    EXPLORE_NESTED_EDGE = auto()
     EXPLORE_BRANCH = auto()
     FORM_SHEPHERD_BOUNDARY = auto()
     FILL_BEHIND_SHEPHERD = auto()
@@ -964,7 +965,10 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
 
         return region in allowed_regions
 
-    if phase == SimulationPhase.STABILIZE_JUNCTION:
+    if phase in {
+        SimulationPhase.STABILIZE_JUNCTION,
+        SimulationPhase.EXPLORE_NESTED_EDGE,
+    }:
         junction_id = resolve_current_junction_id()
 
         if junction_id == "J1":
@@ -1301,6 +1305,9 @@ CHILD_JUNCTION_ARRIVAL_COUNT = 18
 
 NESTED_EDGE_ENTRY_COUNT = 18
 NESTED_EDGE_MOUTH_OFFSET = 12.0
+
+NESTED_EDGE_TARGET_COUNT = 18
+NESTED_EDGE_TERMINAL_DEPTH = 80.0
 
 dfs_stack: list[DFSFrame] = []
 
@@ -1839,6 +1846,28 @@ def nested_edge_route_direction(
     # 이번 시험에서는 J0와 다른 Branch에 있는 후방 로봇까지
     # 모두 끌어오지 않는다.
     return pygame.Vector2()
+
+def nested_edge_terminal_reached(
+    position: pygame.Vector2,
+    profile: EdgeTraversalProfile,
+) -> bool:
+    """Return True when a robot reaches the terminal section of a nested edge."""
+
+    if (
+        get_robot_region(position)
+        != profile.physical_region
+    ):
+        return False
+
+    remaining_distance = (
+        profile.target_position
+        - position
+    ).dot(profile.direction)
+
+    return (
+        remaining_distance
+        <= NESTED_EDGE_TERMINAL_DEPTH
+    )
 
 def reset_topology_visit_states():
     """Reset all topology nodes, edges, and the DFS stack."""
@@ -5079,7 +5108,10 @@ def compute_route_force(robot):
             force.y = -INITIAL_INGRESS_FORCE * scale
         lane_error = robot.ingress_lane_x - robot.position.x
         force.x = clamp(INITIAL_INGRESS_LANE_GAIN * lane_error, -INITIAL_INGRESS_LANE_MAX_FORCE, INITIAL_INGRESS_LANE_MAX_FORCE)
-    elif phase == SimulationPhase.STABILIZE_JUNCTION:
+    elif phase in {
+        SimulationPhase.STABILIZE_JUNCTION,
+        SimulationPhase.EXPLORE_NESTED_EDGE,
+    }:
         junction_id = resolve_current_junction_id()
 
         context = (
@@ -5446,34 +5478,66 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     f"[Nested Edge Traverse] "
                     f"started edge={selected_edge_id}"
                 )
+                phase = SimulationPhase.EXPLORE_NESTED_EDGE
+    elif phase == SimulationPhase.EXPLORE_NESTED_EDGE:
+        junction_id = resolve_current_junction_id()
 
-        if context.selected_edge_id is not None:
-            profile = get_edge_traversal_profile(
-                context.selected_edge_id,
+        if junction_id is None:
+            raise RuntimeError(
+                "EXPLORE_NESTED_EDGE requires "
+                "an active junction"
             )
 
-            entered_count = sum(
-                1
-                for robot in robots
-                if (
-                    robot.role == "NORMAL"
-                    and get_robot_region(
-                        robot.position,
-                    )
-                    == profile.physical_region
-                )
+        context = junction_contexts.get(
+            junction_id,
+        )
+
+        if (
+            context is None
+            or context.selected_edge_id is None
+        ):
+            raise RuntimeError(
+                f"No selected nested edge "
+                f"for junction={junction_id}"
             )
 
-            if entered_count >= NESTED_EDGE_ENTRY_COUNT:
-                print(
-                    f"[Nested Edge Traverse] "
-                    f"completed edge={profile.edge_id}, "
-                    f"region={profile.physical_region}, "
-                    f"robots={entered_count}"
+        profile = get_edge_traversal_profile(
+            context.selected_edge_id,
+        )
+
+        target_count = sum(
+            1
+            for robot in robots
+            if (
+                robot.role == "NORMAL"
+                and nested_edge_terminal_reached(
+                    robot.position,
+                    profile,
                 )
+            )
+        )
 
-                phase = SimulationPhase.DONE
+        if int(simulation_time * 2) != int(
+            (simulation_time - dt) * 2
+        ):
+            print(
+                f"[Nested Edge Progress] "
+                f"edge={profile.edge_id}, "
+                f"terminal={target_count}/"
+                f"{NESTED_EDGE_TARGET_COUNT}"
+            )
 
+        if target_count >= NESTED_EDGE_TARGET_COUNT:
+            print(
+                f"[Nested Edge Target] "
+                f"reached edge={profile.edge_id}, "
+                f"target=("
+                f"{profile.target_position.x:.1f},"
+                f"{profile.target_position.y:.1f}), "
+                f"robots={target_count}"
+            )
+
+            phase = SimulationPhase.DONE
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
 
