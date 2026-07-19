@@ -1693,6 +1693,7 @@ def get_unvisited_child_edge_ids(
 
 def activate_next_child_edge_for_current_junction(
     junction_id: str,
+    preferred_edge_id: Optional[str] = None,
 ) -> Optional[str]:
     """Select and activate the next unvisited child edge."""
 
@@ -1743,8 +1744,27 @@ def activate_next_child_edge_for_current_junction(
 
         return None
 
-    # 현재 단계에서는 DFSFrame에 저장된 순서대로 첫 Edge를 선택한다.
-    selected_edge_id = candidate_edge_ids[0]
+    if preferred_edge_id is None:
+        selected_edge_id = (
+            candidate_edge_ids[0]
+        )
+    else:
+        if (
+            preferred_edge_id
+            not in candidate_edge_ids
+        ):
+            raise RuntimeError(
+                f"Preferred edge="
+                f"{preferred_edge_id} "
+                f"is not an available child "
+                f"of junction={junction_id}; "
+                f"candidates="
+                f"{candidate_edge_ids}"
+            )
+
+        selected_edge_id = (
+            preferred_edge_id
+        )
 
     current_frame.active_edge_id = selected_edge_id
     topology_edges[selected_edge_id].visit_state = VisitState.ACTIVE
@@ -4572,6 +4592,444 @@ def rollout_virtual_valve_force(
         force += inward.normalize() * FLOW_ROLLOUT_VALVE_GAIN * ratio**2
     return force
 
+def get_nested_proxy_region_rollout_robots(
+    robots,
+    junction_id: str,
+    edge_id: str,
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> tuple[list["Robot"], set[int], set[int]]:
+    """Select one nested proxy region plus nearby SPH boundary context."""
+
+    eligible = get_nested_proxy_robots(
+        robots,
+        junction_id,
+    )
+
+    primary = [
+        robot
+        for robot in eligible
+        if robot_assignment.get(robot.robot_id)
+        == edge_id
+    ]
+
+    entrance = get_nested_edge_entrance(
+        edge_id,
+    )
+
+    # 대리영역에 할당된 로봇이 너무 적으면
+    # 해당 Edge 입구와 가까운 로봇을 보충한다.
+    if len(primary) < PROXY_ROLLOUT_MIN_PRIMARY:
+        already_selected = {
+            robot.robot_id
+            for robot in primary
+        }
+
+        supplements = sorted(
+            (
+                robot
+                for robot in eligible
+                if robot.robot_id
+                not in already_selected
+            ),
+            key=lambda robot: (
+                robot.position.distance_to(
+                    entrance,
+                ),
+                robot.robot_id,
+            ),
+        )
+
+        required_count = (
+            PROXY_ROLLOUT_MIN_PRIMARY
+            - len(primary)
+        )
+
+        primary.extend(
+            supplements[:required_count]
+        )
+
+    # Rollout 최대 로봇 수를 초과하면
+    # Edge 입구에 가까운 Primary부터 유지한다.
+    if len(primary) > FLOW_ROLLOUT_MAX_ROBOTS:
+        primary.sort(
+            key=lambda robot: (
+                robot.position.distance_to(
+                    entrance,
+                ),
+                robot.robot_id,
+            )
+        )
+
+        primary = primary[
+            :FLOW_ROLLOUT_MAX_ROBOTS
+        ]
+
+    primary_ids = {
+        robot.robot_id
+        for robot in primary
+    }
+
+    boundary_centers = (
+        get_proxy_boundary_centers(
+            edge_id,
+            partition,
+            centers,
+        )
+    )
+
+    if not boundary_centers:
+        boundary_centers = [
+            entrance,
+        ]
+
+    context_candidates = []
+
+    for robot in eligible:
+        if robot.robot_id in primary_ids:
+            continue
+
+        proxy_point = (
+            project_robot_to_nested_proxy(
+                robot.position,
+                junction_id,
+            )
+        )
+
+        distance = min(
+            proxy_point.distance_to(center)
+            for center in boundary_centers
+        )
+
+        if (
+            distance
+            <= PROXY_ROLLOUT_CONTEXT_DISTANCE
+        ):
+            context_candidates.append(
+                (
+                    distance,
+                    robot.robot_id,
+                    robot,
+                )
+            )
+
+    context_candidates.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
+    )
+
+    remaining_capacity = max(
+        0,
+        FLOW_ROLLOUT_MAX_ROBOTS
+        - len(primary),
+    )
+
+    context = [
+        item[2]
+        for item in context_candidates[
+            :remaining_capacity
+        ]
+    ]
+
+    context_ids = {
+        robot.robot_id
+        for robot in context
+    }
+
+    return (
+        primary + context,
+        primary_ids,
+        context_ids,
+    )
+
+
+def nested_rollout_region_allowed(
+    position: pygame.Vector2,
+    edge_id: str,
+) -> bool:
+    """Check whether a virtual particle stays on the route to a child edge."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    region = get_robot_region(
+        position,
+    )
+
+    allowed_regions = {
+        "RIGHT",
+        "J1_JUNCTION",
+        profile.physical_region,
+    }
+
+    return region in allowed_regions
+
+
+def is_nested_rollout_walkable(
+    position: pygame.Vector2,
+    radius: float,
+    edge_id: str,
+) -> bool:
+    """Candidate-specific map check for a nested child Edge."""
+
+    x = int(round(position.x))
+    y = int(round(position.y))
+
+    diagonal = int(
+        round(
+            radius
+            / math.sqrt(2.0)
+        )
+    )
+
+    test_points = [
+        (x, y),
+        (x + radius, y),
+        (x - radius, y),
+        (x, y + radius),
+        (x, y - radius),
+        (x + diagonal, y + diagonal),
+        (x + diagonal, y - diagonal),
+        (x - diagonal, y + diagonal),
+        (x - diagonal, y - diagonal),
+    ]
+
+    for px, py in test_points:
+        px = int(round(px))
+        py = int(round(py))
+
+        if not (
+            0 <= px < SCREEN_WIDTH
+            and 0 <= py < SCREEN_HEIGHT
+        ):
+            return False
+
+        if walkable_mask.get_at(
+            (px, py)
+        ) == 0:
+            return False
+
+    return nested_rollout_region_allowed(
+        position,
+        edge_id,
+    )
+
+
+def nested_rollout_edf_direction(
+    position: pygame.Vector2,
+    edge_id: str,
+) -> pygame.Vector2:
+    """Return the virtual EDF direction toward a nested child Edge."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    region = get_robot_region(
+        position,
+    )
+
+    entrance = get_nested_edge_entrance(
+        edge_id,
+    )
+
+    if region == profile.physical_region:
+        maximum_depth = (
+            profile.target_position
+            - entrance
+        ).length()
+
+        rollout_depth = min(
+            maximum_depth,
+            FLOW_ROLLOUT_TARGET_DEPTH,
+        )
+
+        rollout_target = (
+            entrance
+            + profile.direction
+            * rollout_depth
+        )
+
+        return normalized_direction_toward(
+            position,
+            rollout_target,
+        )
+
+    if region == "J1_JUNCTION":
+        return normalized_direction_toward(
+            position,
+            entrance,
+        )
+
+    if region == "RIGHT":
+        return normalized_direction_toward(
+            position,
+            J1_CENTER,
+        )
+
+    return normalized_direction_toward(
+        position,
+        J1_CENTER,
+    )
+
+
+def nested_rollout_virtual_valve_force(
+    position: pygame.Vector2,
+    junction_id: str,
+    open_edge_id: str,
+    candidate_edge_ids: list[str],
+) -> pygame.Vector2:
+    """Virtually close every unselected child Edge during one rollout."""
+
+    if (
+        get_robot_region(position)
+        != "J1_JUNCTION"
+    ):
+        return pygame.Vector2()
+
+    force = pygame.Vector2()
+
+    junction_center = (
+        get_physical_junction_center(
+            junction_id,
+        )
+    )
+
+    for closed_edge_id in candidate_edge_ids:
+        if closed_edge_id == open_edge_id:
+            continue
+
+        entrance = get_nested_edge_entrance(
+            closed_edge_id,
+        )
+
+        distance = position.distance_to(
+            entrance,
+        )
+
+        if distance >= VIRTUAL_VALVE_RADIUS:
+            continue
+
+        inward = (
+            junction_center
+            - entrance
+        )
+
+        if inward.length_squared() <= EPSILON:
+            continue
+
+        ratio = (
+            1.0
+            - distance
+            / VIRTUAL_VALVE_RADIUS
+        )
+
+        force += (
+            inward.normalize()
+            * FLOW_ROLLOUT_VALVE_GAIN
+            * ratio**2
+        )
+
+    return force
+
+
+def rollout_stiffness_for_edge(
+    edge_id: str,
+    incoming_direction: pygame.Vector2,
+) -> tuple[float, float]:
+    """Return rollout lambda from the turn angle of a topology Edge."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    turn_ratio = (
+        angle_between(
+            incoming_direction,
+            profile.direction,
+        )
+        / math.pi
+    )
+
+    mode_cost = clamp(
+        turn_ratio,
+        0.0,
+        1.0,
+    )
+
+    stiffness = (
+        STIFFNESS_EXPONENT_RIGID
+        - (
+            STIFFNESS_EXPONENT_RIGID
+            - STIFFNESS_EXPONENT_SOFT
+        )
+        * mode_cost
+    )
+
+    return stiffness, mode_cost
+
+
+def get_junction_incoming_direction(
+    junction_id: str,
+) -> pygame.Vector2:
+    """Return the direction in which the swarm entered a DFS junction."""
+
+    if not dfs_stack:
+        raise RuntimeError(
+            "Cannot resolve incoming direction "
+            "because the DFS stack is empty"
+        )
+
+    current_frame = dfs_stack[-1]
+
+    if current_frame.junction_id != junction_id:
+        raise RuntimeError(
+            f"Requested junction={junction_id}, "
+            f"but stack top="
+            f"{current_frame.junction_id}"
+        )
+
+    parent_edge_id = (
+        current_frame.parent_edge_id
+    )
+
+    if parent_edge_id is None:
+        return pygame.Vector2(
+            0.0,
+            -1.0,
+        )
+
+    parent_edge = topology_edges[
+        parent_edge_id
+    ]
+
+    incoming_direction = (
+        parent_edge.direction.copy()
+    )
+
+    # Edge 방향이 현재 Junction을 빠져나가는 방향으로
+    # 저장된 경우에는 반대로 뒤집는다.
+    if (
+        parent_edge.end_node_id
+        != junction_id
+    ):
+        incoming_direction *= -1.0
+
+    if (
+        incoming_direction.length_squared()
+        <= EPSILON
+    ):
+        return pygame.Vector2(
+            0.0,
+            -1.0,
+        )
+
+    return incoming_direction.normalize()
+
 
 def compute_rollout_densities(particles: list[RolloutParticle]) -> None:
     self_density = spiky_kernel(0.0, SMOOTHING_LENGTH)
@@ -4999,6 +5457,931 @@ def evaluate_flow_preserving_rollout(
         "proxy_primary_count": primary_count,
         "proxy_context_count": len(context_ids),
     }
+
+def evaluate_nested_edge_rollout(
+    junction_id: str,
+    edge_id: str,
+    candidate_edge_ids: list[str],
+    robots,
+    reference_density: float,
+    incoming_direction: pygame.Vector2,
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> dict:
+    """Run a non-mutating SPH rollout for one nested child Edge."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    source_robots, primary_ids, context_ids = (
+        get_nested_proxy_region_rollout_robots(
+            robots,
+            junction_id,
+            edge_id,
+            robot_assignment,
+            partition,
+            centers,
+        )
+    )
+
+    if not source_robots or not primary_ids:
+        return {
+            "predicted_flow": 0.0,
+            "density_disturbance": 1.0,
+            "velocity_disturbance": 1.0,
+            "wall_risk": 1.0,
+            "collision_risk": 1.0,
+            "rollout_comm": 1.0,
+            "rollout_connected_ratio": 0.0,
+            "rollout_margin": -COMM_RANGE,
+            "stabilization": 1.0,
+            "lambda_mode": 1.0,
+            "rollout_lambda": STIFFNESS_EXPONENT_SOFT,
+            "predicted_entry_ratio": 0.0,
+            "rollout_robot_count": 0,
+            "proxy_primary_count": 0,
+            "proxy_context_count": 0,
+        }
+
+    rollout_lambda, lambda_mode_cost = (
+        rollout_stiffness_for_edge(
+            edge_id,
+            incoming_direction,
+        )
+    )
+
+    particles = [
+        RolloutParticle(
+            robot_id=robot.robot_id,
+            position=robot.position.copy(),
+            velocity=robot.velocity.copy(),
+            initial_position=robot.position.copy(),
+            initial_velocity=robot.velocity.copy(),
+            initial_density=max(
+                robot.density,
+                EPSILON,
+            ),
+            is_primary=(
+                robot.robot_id
+                in primary_ids
+            ),
+        )
+        for robot in source_robots
+    ]
+
+    density_disturbance_sum = 0.0
+    velocity_disturbance_sum = 0.0
+    wall_risk_sum = 0.0
+    collision_risk_sum = 0.0
+
+    density_samples = 0
+    velocity_samples = 0
+    collision_samples = 0
+
+    primary_count = sum(
+        particle.is_primary
+        for particle in particles
+    )
+
+    h_squared = (
+        SMOOTHING_LENGTH**2
+    )
+
+    for _ in range(
+        FLOW_ROLLOUT_STEPS
+    ):
+        compute_rollout_densities(
+            particles,
+        )
+
+        compute_rollout_pressures(
+            particles,
+            reference_density,
+            rollout_lambda,
+        )
+
+        accelerations = [
+            pygame.Vector2()
+            for _ in particles
+        ]
+
+        for i in range(
+            len(particles)
+        ):
+            for j in range(
+                i + 1,
+                len(particles),
+            ):
+                particle_i = particles[i]
+                particle_j = particles[j]
+
+                r_ij = (
+                    particle_i.position
+                    - particle_j.position
+                )
+
+                distance_squared = (
+                    r_ij.length_squared()
+                )
+
+                pair_is_relevant = (
+                    particle_i.is_primary
+                    or particle_j.is_primary
+                )
+
+                if distance_squared <= EPSILON:
+                    if pair_is_relevant:
+                        collision_risk_sum += 1.0
+                        collision_samples += 1
+
+                    continue
+
+                distance = math.sqrt(
+                    distance_squared,
+                )
+
+                if (
+                    pair_is_relevant
+                    and distance
+                    < FLOW_ROLLOUT_COLLISION_DISTANCE
+                ):
+                    penetration = (
+                        FLOW_ROLLOUT_COLLISION_DISTANCE
+                        - distance
+                    ) / max(
+                        FLOW_ROLLOUT_COLLISION_DISTANCE,
+                        EPSILON,
+                    )
+
+                    collision_risk_sum += (
+                        penetration**2
+                    )
+
+                    collision_samples += 1
+
+                if (
+                    distance_squared
+                    > h_squared
+                ):
+                    continue
+
+                gradient = spiky_gradient(
+                    r_ij,
+                    SMOOTHING_LENGTH,
+                )
+
+                pressure_coefficient = (
+                    particle_i.pressure
+                    / max(
+                        particle_i.density**2,
+                        EPSILON,
+                    )
+                    + particle_j.pressure
+                    / max(
+                        particle_j.density**2,
+                        EPSILON,
+                    )
+                )
+
+                pressure_force = (
+                    -pressure_coefficient
+                    * gradient
+                )
+
+                accelerations[i] += (
+                    pressure_force
+                )
+
+                accelerations[j] -= (
+                    pressure_force
+                )
+
+                v_ij = (
+                    particle_i.velocity
+                    - particle_j.velocity
+                )
+
+                approach_value = (
+                    v_ij.dot(r_ij)
+                )
+
+                if approach_value < 0.0:
+                    mu_ij = (
+                        SMOOTHING_LENGTH
+                        * approach_value
+                        / (
+                            distance_squared
+                            + 0.01
+                            * SMOOTHING_LENGTH**2
+                        )
+                    )
+
+                    c_i_squared = (
+                        particle_i.pressure
+                        + PRESSURE_GAIN
+                        * particle_i.density
+                    ) / max(
+                        particle_i.density,
+                        EPSILON,
+                    )
+
+                    c_j_squared = (
+                        particle_j.pressure
+                        + PRESSURE_GAIN
+                        * particle_j.density
+                    ) / max(
+                        particle_j.density,
+                        EPSILON,
+                    )
+
+                    c_ij = 0.5 * (
+                        math.sqrt(
+                            max(
+                                c_i_squared,
+                                0.0,
+                            )
+                        )
+                        + math.sqrt(
+                            max(
+                                c_j_squared,
+                                0.0,
+                            )
+                        )
+                    )
+
+                    mean_density = 0.5 * (
+                        particle_i.density
+                        + particle_j.density
+                    )
+
+                    pi_ij = (
+                        -VISCOSITY_XI1
+                        * c_ij
+                        * mu_ij
+                        + VISCOSITY_XI2
+                        * mu_ij**2
+                    ) / max(
+                        mean_density,
+                        EPSILON,
+                    )
+
+                    viscosity_force = (
+                        -pi_ij
+                        * gradient
+                    )
+
+                    accelerations[i] += (
+                        viscosity_force
+                    )
+
+                    accelerations[j] -= (
+                        viscosity_force
+                    )
+
+                if distance < SAFE_RADIUS:
+                    direction_away = (
+                        r_ij / distance
+                    )
+
+                    penetration_ratio = (
+                        SAFE_RADIUS
+                        - distance
+                    ) / SAFE_RADIUS
+
+                    repulsion = (
+                        REPULSION_GAIN
+                        * penetration_ratio
+                        * direction_away
+                    )
+
+                    accelerations[i] += (
+                        repulsion
+                    )
+
+                    accelerations[j] -= (
+                        repulsion
+                    )
+
+        for index, particle in enumerate(
+            particles,
+        ):
+            region = get_robot_region(
+                particle.position,
+            )
+
+            if particle.is_primary:
+                route_force = (
+                    nested_rollout_edf_direction(
+                        particle.position,
+                        edge_id,
+                    )
+                    * FLOW_ROLLOUT_ROUTE_GAIN
+                )
+
+                route_force += (
+                    nested_rollout_virtual_valve_force(
+                        particle.position,
+                        junction_id,
+                        edge_id,
+                        candidate_edge_ids,
+                    )
+                )
+
+            else:
+                route_force = (
+                    particle.initial_position
+                    - particle.position
+                ) * PROXY_CONTEXT_HOLD_GAIN
+
+            if region in {
+                "J1_UP",
+                "J1_DOWN",
+            }:
+                route_force.x += (
+                    CENTERING_GAIN
+                    * (
+                        J1_CENTER.x
+                        - particle.position.x
+                    )
+                )
+
+            elif region == "RIGHT":
+                route_force.y += (
+                    CENTERING_GAIN
+                    * (
+                        J1_CENTER.y
+                        - particle.position.y
+                    )
+                )
+
+            acceleration = (
+                accelerations[index]
+                + route_force
+                - DAMPING
+                * particle.velocity
+            )
+
+            limit_vector(
+                acceleration,
+                FLOW_ROLLOUT_MAX_ACCELERATION,
+            )
+
+            particle.velocity += (
+                acceleration
+                * FLOW_ROLLOUT_DT
+            )
+
+            speed_limit = (
+                FLOW_ROLLOUT_MAX_SPEED
+                if particle.is_primary
+                else (
+                    FLOW_ROLLOUT_MAX_SPEED
+                    * PROXY_CONTEXT_MAX_SPEED_SCALE
+                )
+            )
+
+            limit_vector(
+                particle.velocity,
+                speed_limit,
+            )
+
+            proposed_x = pygame.Vector2(
+                particle.position.x
+                + particle.velocity.x
+                * FLOW_ROLLOUT_DT,
+                particle.position.y,
+            )
+
+            if is_nested_rollout_walkable(
+                proposed_x,
+                ROBOT_RADIUS,
+                edge_id,
+            ):
+                particle.position.x = (
+                    proposed_x.x
+                )
+
+            else:
+                if particle.is_primary:
+                    wall_risk_sum += 1.0
+
+                particle.velocity.x = 0.0
+
+            proposed_y = pygame.Vector2(
+                particle.position.x,
+                particle.position.y
+                + particle.velocity.y
+                * FLOW_ROLLOUT_DT,
+            )
+
+            if is_nested_rollout_walkable(
+                proposed_y,
+                ROBOT_RADIUS,
+                edge_id,
+            ):
+                particle.position.y = (
+                    proposed_y.y
+                )
+
+            else:
+                if particle.is_primary:
+                    wall_risk_sum += 1.0
+
+                particle.velocity.y = 0.0
+
+            if (
+                particle.is_primary
+                and not is_nested_rollout_walkable(
+                    particle.position,
+                    ROBOT_RADIUS
+                    + FLOW_ROLLOUT_WALL_CLEARANCE,
+                    edge_id,
+                )
+            ):
+                wall_risk_sum += 0.35
+
+            if particle.is_primary:
+                relative_density_change = (
+                    particle.density
+                    - particle.initial_density
+                ) / max(
+                    particle.initial_density,
+                    reference_density,
+                    EPSILON,
+                )
+
+                density_disturbance_sum += (
+                    relative_density_change**2
+                )
+
+                density_samples += 1
+
+                velocity_change = (
+                    particle.velocity
+                    - particle.initial_velocity
+                )
+
+                velocity_disturbance_sum += (
+                    velocity_change.length()
+                    / max(
+                        FLOW_ROLLOUT_VELOCITY_NORMALIZER,
+                        EPSILON,
+                    )
+                ) ** 2
+
+                velocity_samples += 1
+
+    compute_rollout_densities(
+        particles,
+    )
+
+    entrance = get_nested_edge_entrance(
+        edge_id,
+    )
+
+    direction = profile.direction
+
+    weighted_flux = 0.0
+    weight_sum = 0.0
+    entered = 0
+
+    for particle in particles:
+        if not particle.is_primary:
+            continue
+
+        distance = (
+            particle.position.distance_to(
+                entrance,
+            )
+        )
+
+        weight = math.exp(
+            -(distance**2)
+            / max(
+                2.0
+                * FLOW_ROLLOUT_GATE_SIGMA**2,
+                EPSILON,
+            )
+        )
+
+        weighted_flux += (
+            weight
+            * max(
+                0.0,
+                particle.velocity.dot(
+                    direction,
+                ),
+            )
+        )
+
+        weight_sum += weight
+
+        if (
+            get_robot_region(
+                particle.position,
+            )
+            == profile.physical_region
+        ):
+            entered += 1
+
+    predicted_flow = clamp(
+        weighted_flux
+        / max(
+            weight_sum
+            * FLOW_ROLLOUT_REFERENCE_SPEED,
+            EPSILON,
+        ),
+        0.0,
+        1.0,
+    )
+
+    density_disturbance = clamp(
+        (
+            density_disturbance_sum
+            / max(
+                density_samples,
+                1,
+            )
+        )
+        / max(
+            FLOW_ROLLOUT_DENSITY_NORMALIZER**2,
+            EPSILON,
+        ),
+        0.0,
+        1.0,
+    )
+
+    velocity_disturbance = clamp(
+        velocity_disturbance_sum
+        / max(
+            velocity_samples,
+            1,
+        ),
+        0.0,
+        1.0,
+    )
+
+    wall_risk = clamp(
+        wall_risk_sum
+        / max(
+            primary_count
+            * FLOW_ROLLOUT_STEPS
+            * 2.35,
+            1.0,
+        ),
+        0.0,
+        1.0,
+    )
+
+    collision_risk = (
+        clamp(
+            collision_risk_sum
+            / max(
+                collision_samples,
+                1,
+            ),
+            0.0,
+            1.0,
+        )
+        if collision_samples
+        else 0.0
+    )
+
+    (
+        rollout_comm,
+        connected_ratio,
+        robust_margin,
+    ) = evaluate_rollout_communication_risk(
+        particles,
+        robots,
+    )
+
+    stabilization = clamp(
+        0.5
+        * density_disturbance
+        + 0.5
+        * velocity_disturbance,
+        0.0,
+        1.0,
+    )
+
+    return {
+        "predicted_flow": predicted_flow,
+        "density_disturbance": density_disturbance,
+        "velocity_disturbance": velocity_disturbance,
+        "wall_risk": wall_risk,
+        "collision_risk": collision_risk,
+        "rollout_comm": rollout_comm,
+        "rollout_connected_ratio": connected_ratio,
+        "rollout_margin": robust_margin,
+        "stabilization": stabilization,
+        "lambda_mode": lambda_mode_cost,
+        "rollout_lambda": rollout_lambda,
+        "predicted_entry_ratio": (
+            entered
+            / max(
+                primary_count,
+                1,
+            )
+        ),
+        "rollout_robot_count": len(
+            particles,
+        ),
+        "proxy_primary_count": (
+            primary_count
+        ),
+        "proxy_context_count": len(
+            context_ids,
+        ),
+    }
+
+def nested_edge_efficiency_cost(
+    junction_id: str,
+    edge_id: str,
+    candidate_edge_ids: list[str],
+    robots,
+    reference_density: float,
+    incoming_direction: pygame.Vector2,
+    proxy_mass_stats: dict[str, dict],
+    robot_assignment: dict[int, str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[tuple[int, int], pygame.Vector2],
+) -> tuple[float, dict]:
+    """Compute the SPH rollout cost of one nested child Edge."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    rollout = evaluate_nested_edge_rollout(
+        junction_id,
+        edge_id,
+        candidate_edge_ids,
+        robots,
+        reference_density,
+        incoming_direction,
+        robot_assignment,
+        partition,
+        centers,
+    )
+
+    edge_length = max(
+        topology_edges[edge_id].length,
+        EPSILON,
+    )
+
+    maximum_edge_length = max(
+        (
+            topology_edges[
+                candidate_edge_id
+            ].length
+            for candidate_edge_id
+            in candidate_edge_ids
+        ),
+        default=edge_length,
+    )
+
+    required_relays = max(
+        0,
+        math.ceil(
+            edge_length
+            / max(
+                RELAY_SPACING,
+                EPSILON,
+            )
+        )
+        - 1,
+    )
+
+    maximum_required_relays = max(
+        1,
+        max(
+            (
+                max(
+                    0,
+                    math.ceil(
+                        topology_edges[
+                            candidate_edge_id
+                        ].length
+                        / max(
+                            RELAY_SPACING,
+                            EPSILON,
+                        )
+                    )
+                    - 1,
+                )
+                for candidate_edge_id
+                in candidate_edge_ids
+            ),
+            default=1,
+        ),
+    )
+
+    relay_cost = (
+        required_relays
+        / maximum_required_relays
+    )
+
+    backtrack_cost = (
+        edge_length
+        / max(
+            maximum_edge_length,
+            EPSILON,
+        )
+    )
+
+    switch_cost = clamp(
+        angle_between(
+            incoming_direction,
+            profile.direction,
+        )
+        / math.pi,
+        0.0,
+        1.0,
+    )
+
+    proxy_mass_cost = (
+        proxy_mass_stats.get(
+            edge_id,
+            {},
+        ).get(
+            "mass_deficit_cost",
+            1.0,
+        )
+    )
+
+    total_cost = (
+        -BRANCH_COST_PREDICTED_FLOW_REWARD
+        * rollout["predicted_flow"]
+
+        + BRANCH_COST_DENSITY_DISTURBANCE_WEIGHT
+        * rollout["density_disturbance"]
+
+        + BRANCH_COST_VELOCITY_DISTURBANCE_WEIGHT
+        * rollout["velocity_disturbance"]
+
+        + BRANCH_COST_WALL_RISK_WEIGHT
+        * rollout["wall_risk"]
+
+        + BRANCH_COST_COLLISION_RISK_WEIGHT
+        * rollout["collision_risk"]
+
+        + BRANCH_COST_ROLLOUT_COMM_WEIGHT
+        * rollout["rollout_comm"]
+
+        + BRANCH_COST_RELAY_WEIGHT
+        * relay_cost
+
+        + BRANCH_COST_LAMBDA_MODE_WEIGHT
+        * rollout["lambda_mode"]
+
+        + BRANCH_COST_STABILIZATION_WEIGHT
+        * rollout["stabilization"]
+
+        + BRANCH_COST_PROXY_MASS_WEIGHT
+        * proxy_mass_cost
+
+        + BRANCH_COST_BACKTRACK_WEIGHT
+        * backtrack_cost
+
+        + BRANCH_COST_SWITCH_WEIGHT
+        * switch_cost
+    )
+
+    components = {
+        **rollout,
+        "proxy_mass": proxy_mass_cost,
+        "relay": relay_cost,
+        "backtrack": backtrack_cost,
+        "switch": switch_cost,
+        "edge_length": edge_length,
+        "required_relays": required_relays,
+    }
+
+    return total_cost, components
+
+
+def choose_next_nested_edge_by_proxy(
+    junction_id: str,
+    robots,
+    reference_density: float,
+) -> Optional[str]:
+    """Select one child Edge using nested proxy SPH rollout costs."""
+
+    preview_nested_proxy_partition(
+        junction_id,
+        robots,
+        reference_density,
+    )
+
+    if (
+        last_nested_proxy_junction_id
+        != junction_id
+    ):
+        raise RuntimeError(
+            f"Nested proxy state belongs to "
+            f"junction="
+            f"{last_nested_proxy_junction_id}, "
+            f"not junction={junction_id}"
+        )
+
+    candidate_edge_ids = list(
+        last_nested_proxy_candidates,
+    )
+
+    if not candidate_edge_ids:
+        return None
+
+    incoming_direction = (
+        get_junction_incoming_direction(
+            junction_id,
+        )
+    )
+
+    scored: list[
+        tuple[float, str, dict]
+    ] = []
+
+    for edge_id in candidate_edge_ids:
+        cost, components = (
+            nested_edge_efficiency_cost(
+                junction_id,
+                edge_id,
+                candidate_edge_ids,
+                robots,
+                reference_density,
+                incoming_direction,
+                last_nested_proxy_mass_stats,
+                last_nested_proxy_robot_assignment,
+                last_nested_proxy_partition,
+                last_nested_proxy_cell_centers,
+            )
+        )
+
+        scored.append(
+            (
+                cost,
+                edge_id,
+                components,
+            )
+        )
+
+        print(
+            f"[Nested Proxy Rollout] "
+            f"edge={edge_id}, "
+            f"cost={cost:.4f}, "
+            f"Q="
+            f"{components['predicted_flow']:.3f}, "
+            f"dRho="
+            f"{components['density_disturbance']:.3f}, "
+            f"dV="
+            f"{components['velocity_disturbance']:.3f}, "
+            f"wall="
+            f"{components['wall_risk']:.3f}, "
+            f"collision="
+            f"{components['collision_risk']:.3f}, "
+            f"comm="
+            f"{components['rollout_comm']:.3f}, "
+            f"lambda="
+            f"{components['rollout_lambda']:.3f}, "
+            f"mass="
+            f"{components['proxy_mass']:.3f}, "
+            f"relay="
+            f"{components['relay']:.3f}, "
+            f"switch="
+            f"{components['switch']:.3f}, "
+            f"primary="
+            f"{components['proxy_primary_count']}, "
+            f"context="
+            f"{components['proxy_context_count']}"
+        )
+
+    scored.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
+    )
+
+    (
+        selected_cost,
+        selected_edge_id,
+        selected_components,
+    ) = scored[0]
+
+    print(
+        f"[Nested Edge Selection] "
+        f"junction={junction_id}, "
+        f"selected={selected_edge_id}, "
+        f"cost={selected_cost:.4f}, "
+        f"Q="
+        f"{selected_components['predicted_flow']:.3f}"
+    )
+
+    return selected_edge_id
+
 
 
 def branch_efficiency_cost(
@@ -6123,14 +7506,18 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"[Multi-Junction Test] "
                 f"anchors={anchors}"
             )
-            preview_nested_proxy_partition(
-                junction_id,
-                robots,
-                reference_density,
+            preferred_edge_id = (
+                choose_next_nested_edge_by_proxy(
+                    junction_id,
+                    robots,
+                    reference_density,
+                )
             )
+
             selected_edge_id = (
                 activate_next_child_edge_for_current_junction(
                     junction_id,
+                    preferred_edge_id,
                 )
             )
 
