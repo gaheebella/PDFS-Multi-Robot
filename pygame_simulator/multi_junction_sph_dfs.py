@@ -1517,6 +1517,94 @@ def enter_child_junction(junction_id: str):
     # J1 주변 군집 안정화와 Anchor 선출 단계로 이동한다.
     phase = SimulationPhase.STABILIZE_JUNCTION
 
+def activate_next_child_edge_for_current_junction(
+    junction_id: str,
+) -> Optional[str]:
+    """Select and activate the next unvisited child edge."""
+
+    global current_node_id
+    global current_junction_id
+    global current_edge_id
+
+    if junction_id not in topology_nodes:
+        raise ValueError(
+            f"Unknown junction: {junction_id}"
+        )
+
+    if not dfs_stack:
+        raise RuntimeError(
+            "Cannot select a child edge because the DFS stack is empty"
+        )
+
+    current_frame = dfs_stack[-1]
+
+    if current_frame.junction_id != junction_id:
+        raise RuntimeError(
+            f"DFS frame mismatch: "
+            f"requested={junction_id}, "
+            f"stack_top={current_frame.junction_id}"
+        )
+
+    candidate_edge_ids = [
+        edge_id
+        for edge_id in current_frame.child_edge_ids
+        if (
+            edge_id not in current_frame.completed_edge_ids
+            and topology_edges[edge_id].visit_state
+            == VisitState.UNVISITED
+        )
+    ]
+
+    print(
+        f"[Child Edge Selection] "
+        f"junction={junction_id}, "
+        f"candidates={candidate_edge_ids}"
+    )
+
+    if not candidate_edge_ids:
+        current_frame.active_edge_id = None
+        current_edge_id = None
+
+        print(
+            f"[Child Edge Selection] "
+            f"junction={junction_id}, "
+            f"selected=None"
+        )
+
+        return None
+
+    # 현재 단계에서는 DFSFrame에 저장된 순서대로 첫 Edge를 선택한다.
+    selected_edge_id = candidate_edge_ids[0]
+
+    current_frame.active_edge_id = selected_edge_id
+    topology_edges[selected_edge_id].visit_state = VisitState.ACTIVE
+
+    # Topology Cursor를 선택된 Edge로 이동한다.
+    current_node_id = junction_id
+    current_junction_id = junction_id
+    current_edge_id = selected_edge_id
+
+    print(
+        f"[Child Edge Selection] "
+        f"junction={junction_id}, "
+        f"selected={selected_edge_id}"
+    )
+
+    print(
+        f"[DFS Stack] "
+        f"junction={current_frame.junction_id}, "
+        f"active={current_frame.active_edge_id}, "
+        f"completed={current_frame.completed_edge_ids}"
+    )
+
+    print(
+        f"[Topology Cursor] "
+        f"junction={current_junction_id}, "
+        f"edge={current_edge_id}"
+    )
+
+    return selected_edge_id
+
 
 def reset_topology_visit_states():
     """Reset all topology nodes, edges, and the DFS stack."""
@@ -5033,7 +5121,30 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"anchors={anchors}"
             )
 
-            # 이번 단계에서는 J0와 J1 Anchor 동시 유지까지만 확인한다.
+            selected_edge_id = (
+                activate_next_child_edge_for_current_junction(
+                    junction_id,
+                )
+            )
+
+            if selected_edge_id is None:
+                print(
+                    f"[Multi-Junction Test] "
+                    f"junction={junction_id}, "
+                    f"no_unvisited_child=True"
+                )
+
+            else:
+                context.selected_edge_id = selected_edge_id
+
+                print(
+                    f"[Multi-Junction Test] "
+                    f"junction={junction_id}, "
+                    f"selected_child={selected_edge_id}"
+                )
+
+            # 이번 단계에서는 J1 자식 Edge 선택까지만 검증한다.
+            # 실제 J1_UP/J1_DOWN 이동은 다음 단계에서 연결한다.
             phase = SimulationPhase.DONE
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
@@ -5613,6 +5724,9 @@ while running:
         update_communication_system(robots, spatial_grid)
         update_simulation_state(robots, frame_dt, reference_density, spatial_grid)
         update_metrics_per_frame(robots, frame_dt)
+        if phase == SimulationPhase.DONE:
+            running = False
+            break
     else:
         update_communication_system(robots, spatial_grid)
         compute_densities(robots, spatial_grid)
