@@ -225,6 +225,101 @@ J1_ANCHOR_PARK_POSITION = pygame.Vector2(
     J1_CENTER.y - 25,
 )
 
+@dataclass
+class EdgeTraversalProfile:
+    """Physical traversal information corresponding to one topology edge."""
+
+    edge_id: str
+    source_junction_id: str
+    destination_node_id: str
+
+    physical_region: str
+
+    direction: pygame.Vector2
+    target_position: pygame.Vector2
+    corridor_rect: pygame.Rect
+
+    enters_child_junction: bool = False
+
+
+
+# =========================================================
+# Topology Edge -> Physical Traversal Profile
+# =========================================================
+
+EDGE_TRAVERSAL_PROFILES: dict[
+    str,
+    EdgeTraversalProfile,
+] = {
+    "E_J0_UP": EdgeTraversalProfile(
+        edge_id="E_J0_UP",
+        source_junction_id="J0",
+        destination_node_id="UP_ROOM",
+        physical_region="UP",
+        direction=pygame.Vector2(0.0, -1.0),
+        target_position=pygame.Vector2(
+            center_x,
+            up_rect.top + 18,
+        ),
+        corridor_rect=up_rect.copy(),
+        enters_child_junction=False,
+    ),
+
+    "E_J0_LEFT": EdgeTraversalProfile(
+        edge_id="E_J0_LEFT",
+        source_junction_id="J0",
+        destination_node_id="LEFT_ROOM",
+        physical_region="LEFT",
+        direction=pygame.Vector2(-1.0, 0.0),
+        target_position=pygame.Vector2(
+            left_rect.left + 18,
+            center_y,
+        ),
+        corridor_rect=left_rect.copy(),
+        enters_child_junction=False,
+    ),
+
+    "E_J0_RIGHT": EdgeTraversalProfile(
+        edge_id="E_J0_RIGHT",
+        source_junction_id="J0",
+        destination_node_id="J1",
+        physical_region="RIGHT",
+        direction=pygame.Vector2(1.0, 0.0),
+        target_position=J1_CENTER.copy(),
+        corridor_rect=right_rect.copy(),
+        enters_child_junction=True,
+    ),
+
+    "E_J1_UP": EdgeTraversalProfile(
+        edge_id="E_J1_UP",
+        source_junction_id="J1",
+        destination_node_id="J1_UP_ROOM",
+        physical_region="J1_UP",
+        direction=pygame.Vector2(0.0, -1.0),
+        target_position=pygame.Vector2(
+            J1_CENTER.x,
+            J1_UP_RECT.top + 18,
+        ),
+        corridor_rect=J1_UP_RECT.copy(),
+        enters_child_junction=False,
+    ),
+
+    "E_J1_DOWN": EdgeTraversalProfile(
+        edge_id="E_J1_DOWN",
+        source_junction_id="J1",
+        destination_node_id="J1_DOWN_ROOM",
+        physical_region="J1_DOWN",
+        direction=pygame.Vector2(0.0, 1.0),
+        target_position=pygame.Vector2(
+            J1_CENTER.x,
+            J1_DOWN_RECT.bottom - 18,
+        ),
+        corridor_rect=J1_DOWN_RECT.copy(),
+        enters_child_junction=False,
+    ),
+}
+
+
 END_REGION_DEPTH = 48
 
 dead_end_regions = {
@@ -371,6 +466,7 @@ class JunctionContext:
     arrival_edge_id: Optional[str] = None
     selected_edge_id: Optional[str] = None
     stable_timer: float = 0.0
+
 
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
@@ -1604,6 +1700,47 @@ def activate_next_child_edge_for_current_junction(
     )
 
     return selected_edge_id
+
+def get_edge_traversal_profile(
+    edge_id: str,
+) -> EdgeTraversalProfile:
+    """Return the physical traversal profile of a topology edge."""
+
+    if edge_id not in topology_edges:
+        raise ValueError(
+            f"Unknown topology edge: {edge_id}"
+        )
+
+    profile = EDGE_TRAVERSAL_PROFILES.get(edge_id)
+
+    if profile is None:
+        raise RuntimeError(
+            f"No physical traversal profile registered "
+            f"for edge={edge_id}"
+        )
+
+    return profile
+
+
+def print_edge_traversal_profile(
+    edge_id: str,
+):
+    """Print the selected edge's physical traversal information."""
+
+    profile = get_edge_traversal_profile(edge_id)
+
+    print(
+        f"[Traversal Profile] "
+        f"edge={profile.edge_id}, "
+        f"source={profile.source_junction_id}, "
+        f"destination={profile.destination_node_id}, "
+        f"region={profile.physical_region}, "
+        f"direction=({profile.direction.x:.1f},"
+        f"{profile.direction.y:.1f}), "
+        f"target=({profile.target_position.x:.1f},"
+        f"{profile.target_position.y:.1f}), "
+        f"child_junction={profile.enters_child_junction}"
+    )
 
 
 def reset_topology_visit_states():
@@ -5143,8 +5280,14 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     f"selected_child={selected_edge_id}"
                 )
 
-            # 이번 단계에서는 J1 자식 Edge 선택까지만 검증한다.
-            # 실제 J1_UP/J1_DOWN 이동은 다음 단계에서 연결한다.
+                # 선택된 Topology Edge가 어떤 실제 복도와
+                # 방향·목표점에 연결되는지 검증한다.
+                print_edge_traversal_profile(
+                    selected_edge_id,
+                )
+
+            # 이번 단계에서는 Edge와 물리 복도 정보의
+            # 연결까지만 검증한다.
             phase = SimulationPhase.DONE
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
