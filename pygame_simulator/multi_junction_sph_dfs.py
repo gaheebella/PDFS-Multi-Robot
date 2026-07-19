@@ -531,6 +531,24 @@ last_proxy_cell_centers: dict[tuple[int, int], pygame.Vector2] = {}
 last_proxy_mass_stats: dict[str, dict] = {}
 last_proxy_robot_assignment: dict[int, str] = {}
 last_proxy_candidates: tuple[str, ...] = ()
+last_nested_proxy_junction_id: Optional[str] = None
+last_nested_proxy_partition: dict[
+    tuple[int, int],
+    str,
+] = {}
+last_nested_proxy_cell_centers: dict[
+    tuple[int, int],
+    pygame.Vector2,
+] = {}
+last_nested_proxy_mass_stats: dict[
+    str,
+    dict,
+] = {}
+last_nested_proxy_robot_assignment: dict[
+    int,
+    str,
+] = {}
+last_nested_proxy_candidates: tuple[str, ...] = ()
 # Candidate-by-candidate virtual SPH rollout results from the latest Junction
 # decision.  They are display/logging data only and never alter real robots.
 last_flow_rollout_scores: dict[str, dict] = {}
@@ -1641,6 +1659,38 @@ def enter_child_junction(junction_id: str):
     # J1 주변 군집 안정화와 Anchor 선출 단계로 이동한다.
     phase = SimulationPhase.STABILIZE_JUNCTION
 
+def get_unvisited_child_edge_ids(
+    junction_id: str,
+) -> list[str]:
+    """Return the unvisited child edges of the current DFS junction."""
+
+    if not dfs_stack:
+        raise RuntimeError(
+            "Cannot query child edges because "
+            "the DFS stack is empty"
+        )
+
+    current_frame = dfs_stack[-1]
+
+    if current_frame.junction_id != junction_id:
+        raise RuntimeError(
+            f"Requested junction={junction_id}, "
+            f"but DFS stack top="
+            f"{current_frame.junction_id}"
+        )
+
+    return [
+        edge_id
+        for edge_id in current_frame.child_edge_ids
+        if (
+            edge_id
+            not in current_frame.completed_edge_ids
+            and topology_edges[edge_id].visit_state
+            == VisitState.UNVISITED
+        )
+    ]
+
+
 def activate_next_child_edge_for_current_junction(
     junction_id: str,
 ) -> Optional[str]:
@@ -1669,15 +1719,11 @@ def activate_next_child_edge_for_current_junction(
             f"stack_top={current_frame.junction_id}"
         )
 
-    candidate_edge_ids = [
-        edge_id
-        for edge_id in current_frame.child_edge_ids
-        if (
-            edge_id not in current_frame.completed_edge_ids
-            and topology_edges[edge_id].visit_state
-            == VisitState.UNVISITED
+    candidate_edge_ids = (
+        get_unvisited_child_edge_ids(
+            junction_id,
         )
-    ]
+    )
 
     print(
         f"[Child Edge Selection] "
@@ -3516,6 +3562,638 @@ def compute_proxy_mass_statistics(
         )
     return stats, robot_assignment
 
+def get_junction_proxy_rect(
+    junction_id: str,
+) -> pygame.Rect:
+    """Return the physical proxy rectangle of a junction."""
+
+    if junction_id == "J0":
+        return junction_rect
+
+    if junction_id == "J1":
+        return J1_JUNCTION_RECT
+
+    raise ValueError(
+        f"No proxy rectangle registered "
+        f"for junction={junction_id}"
+    )
+
+
+def get_nested_edge_entrance(
+    edge_id: str,
+) -> pygame.Vector2:
+    """Return the child-edge mouth located on its source junction."""
+
+    profile = get_edge_traversal_profile(
+        edge_id,
+    )
+
+    junction_center = (
+        get_physical_junction_center(
+            profile.source_junction_id,
+        )
+    )
+
+    return (
+        junction_center
+        + profile.direction * half_width
+    )
+
+
+def estimate_nested_edge_robot_demand(
+    edge_id: str,
+) -> float:
+    """Estimate relative swarm demand from topology edge length."""
+
+    edge = topology_edges[edge_id]
+
+    relay_demand = max(
+        0,
+        math.ceil(
+            edge.length
+            / max(RELAY_SPACING, EPSILON)
+        )
+        - 1,
+    )
+
+    return max(
+        1.0,
+        adaptive_shepherd_count()
+        + relay_demand,
+    )
+
+
+def nested_proxy_cell_grid(
+    junction_id: str,
+) -> tuple[
+    dict[tuple[int, int], pygame.Vector2],
+    int,
+    int,
+]:
+    """Create proxy cells inside one physical junction."""
+
+    proxy_rect = get_junction_proxy_rect(
+        junction_id,
+    )
+
+    cols = max(
+        1,
+        int(
+            math.ceil(
+                proxy_rect.width
+                / PROXY_CELL_SIZE
+            )
+        ),
+    )
+
+    rows = max(
+        1,
+        int(
+            math.ceil(
+                proxy_rect.height
+                / PROXY_CELL_SIZE
+            )
+        ),
+    )
+
+    centers: dict[
+        tuple[int, int],
+        pygame.Vector2,
+    ] = {}
+
+    for row in range(rows):
+        for col in range(cols):
+            x = min(
+                proxy_rect.right - 0.5,
+                proxy_rect.left
+                + (col + 0.5)
+                * PROXY_CELL_SIZE,
+            )
+
+            y = min(
+                proxy_rect.bottom - 0.5,
+                proxy_rect.top
+                + (row + 0.5)
+                * PROXY_CELL_SIZE,
+            )
+
+            centers[(col, row)] = (
+                pygame.Vector2(x, y)
+            )
+
+    return centers, cols, rows
+
+
+def build_nested_proxy_partition(
+    junction_id: str,
+    candidate_edge_ids: list[str],
+) -> tuple[
+    dict[tuple[int, int], str],
+    dict[tuple[int, int], pygame.Vector2],
+    dict[str, float],
+]:
+    """Partition a nested junction by child-edge mouth proximity."""
+
+    candidate_edge_ids = sorted(
+        candidate_edge_ids,
+    )
+
+    centers, _, _ = nested_proxy_cell_grid(
+        junction_id,
+    )
+
+    if not candidate_edge_ids:
+        return {}, centers, {}
+
+    if len(candidate_edge_ids) == 1:
+        edge_id = candidate_edge_ids[0]
+
+        return (
+            {
+                key: edge_id
+                for key in centers
+            },
+            centers,
+            {
+                edge_id: 1.0,
+            },
+        )
+
+    demands = {
+        edge_id: (
+            estimate_nested_edge_robot_demand(
+                edge_id,
+            )
+        )
+        for edge_id in candidate_edge_ids
+    }
+
+    total_demand = max(
+        sum(demands.values()),
+        EPSILON,
+    )
+
+    quotas = {
+        edge_id: (
+            demands[edge_id]
+            / total_demand
+        )
+        for edge_id in candidate_edge_ids
+    }
+
+    biases = {
+        edge_id: 0.0
+        for edge_id in candidate_edge_ids
+    }
+
+    proxy_rect = get_junction_proxy_rect(
+        junction_id,
+    )
+
+    diagonal = max(
+        math.hypot(
+            proxy_rect.width,
+            proxy_rect.height,
+        ),
+        EPSILON,
+    )
+
+    partition: dict[
+        tuple[int, int],
+        str,
+    ] = {}
+
+    for _ in range(
+        PROXY_PARTITION_ITERATIONS
+    ):
+        counts = {
+            edge_id: 0
+            for edge_id
+            in candidate_edge_ids
+        }
+
+        partition = {}
+
+        for key, center in centers.items():
+            selected_edge_id = min(
+                candidate_edge_ids,
+                key=lambda edge_id: (
+                    center.distance_to(
+                        get_nested_edge_entrance(
+                            edge_id,
+                        )
+                    )
+                    / diagonal
+                    + biases[edge_id],
+                    edge_id,
+                ),
+            )
+
+            partition[key] = (
+                selected_edge_id
+            )
+
+            counts[selected_edge_id] += 1
+
+        total_cells = max(
+            len(centers),
+            1,
+        )
+
+        maximum_error = 0.0
+
+        for edge_id in candidate_edge_ids:
+            actual = (
+                counts[edge_id]
+                / total_cells
+            )
+
+            error = (
+                actual
+                - quotas[edge_id]
+            )
+
+            maximum_error = max(
+                maximum_error,
+                abs(error),
+            )
+
+            biases[edge_id] += (
+                PROXY_BIAS_LEARNING_RATE
+                * error
+            )
+
+        if (
+            maximum_error
+            <= 1.0 / total_cells
+        ):
+            break
+
+    return partition, centers, quotas
+
+
+def get_nested_proxy_robots(
+    robots,
+    junction_id: str,
+) -> list["Robot"]:
+    """Return connected mobile robots relevant to one nested junction."""
+
+    if junction_id == "J1":
+        allowed_regions = {
+            "RIGHT",
+            "J1_JUNCTION",
+            "J1_UP",
+            "J1_DOWN",
+        }
+
+    else:
+        allowed_regions = {
+            "JUNCTION",
+            "UP",
+            "LEFT",
+            "RIGHT",
+            "BOTTOM",
+        }
+
+    return [
+        robot
+        for robot in robots
+        if (
+            robot.role == "NORMAL"
+            and robot.connected_to_base
+            and get_robot_region(
+                robot.position,
+            )
+            in allowed_regions
+        )
+    ]
+
+
+def project_robot_to_nested_proxy(
+    position: pygame.Vector2,
+    junction_id: str,
+) -> pygame.Vector2:
+    """Project a robot onto one nested junction proxy."""
+
+    proxy_rect = get_junction_proxy_rect(
+        junction_id,
+    )
+
+    region = get_robot_region(
+        position,
+    )
+
+    margin = 1.0
+
+    if junction_id == "J1":
+        if region == "J1_JUNCTION":
+            return pygame.Vector2(
+                clamp(
+                    position.x,
+                    proxy_rect.left + margin,
+                    proxy_rect.right - margin,
+                ),
+                clamp(
+                    position.y,
+                    proxy_rect.top + margin,
+                    proxy_rect.bottom - margin,
+                ),
+            )
+
+        if region == "RIGHT":
+            return pygame.Vector2(
+                proxy_rect.left + margin,
+                clamp(
+                    position.y,
+                    proxy_rect.top + margin,
+                    proxy_rect.bottom - margin,
+                ),
+            )
+
+        if region == "J1_UP":
+            return pygame.Vector2(
+                clamp(
+                    position.x,
+                    proxy_rect.left + margin,
+                    proxy_rect.right - margin,
+                ),
+                proxy_rect.top + margin,
+            )
+
+        if region == "J1_DOWN":
+            return pygame.Vector2(
+                clamp(
+                    position.x,
+                    proxy_rect.left + margin,
+                    proxy_rect.right - margin,
+                ),
+                proxy_rect.bottom - margin,
+            )
+
+    return pygame.Vector2(
+        clamp(
+            position.x,
+            proxy_rect.left + margin,
+            proxy_rect.right - margin,
+        ),
+        clamp(
+            position.y,
+            proxy_rect.top + margin,
+            proxy_rect.bottom - margin,
+        ),
+    )
+
+
+def nearest_nested_proxy_cell(
+    point: pygame.Vector2,
+    junction_id: str,
+    centers: dict[
+        tuple[int, int],
+        pygame.Vector2,
+    ],
+) -> Optional[tuple[int, int]]:
+    """Return the nearest cell key inside a nested proxy."""
+
+    if not centers:
+        return None
+
+    proxy_rect = get_junction_proxy_rect(
+        junction_id,
+    )
+
+    col = int(
+        (
+            point.x
+            - proxy_rect.left
+        )
+        // PROXY_CELL_SIZE
+    )
+
+    row = int(
+        (
+            point.y
+            - proxy_rect.top
+        )
+        // PROXY_CELL_SIZE
+    )
+
+    key = (col, row)
+
+    if key in centers:
+        return key
+
+    return min(
+        centers,
+        key=lambda candidate: (
+            centers[candidate]
+            .distance_squared_to(point)
+        ),
+    )
+
+
+def compute_nested_proxy_mass_statistics(
+    robots,
+    junction_id: str,
+    candidate_edge_ids: list[str],
+    partition: dict[tuple[int, int], str],
+    centers: dict[
+        tuple[int, int],
+        pygame.Vector2,
+    ],
+    quotas: dict[str, float],
+    reference_density: float,
+) -> tuple[
+    dict[str, dict],
+    dict[int, str],
+]:
+    """Measure robot and density mass assigned to each child edge."""
+
+    stats = {
+        edge_id: {
+            "quota_fraction": quotas.get(
+                edge_id,
+                0.0,
+            ),
+            "cell_count": sum(
+                value == edge_id
+                for value
+                in partition.values()
+            ),
+            "robot_count": 0,
+            "density_mass": 0.0,
+            "actual_mass_fraction": 0.0,
+            "mass_deficit_cost": 1.0,
+        }
+        for edge_id
+        in candidate_edge_ids
+    }
+
+    robot_assignment: dict[
+        int,
+        str,
+    ] = {}
+
+    total_mass = 0.0
+
+    for robot in robots:
+        proxy_point = (
+            project_robot_to_nested_proxy(
+                robot.position,
+                junction_id,
+            )
+        )
+
+        cell = nearest_nested_proxy_cell(
+            proxy_point,
+            junction_id,
+            centers,
+        )
+
+        if (
+            cell is None
+            or cell not in partition
+        ):
+            continue
+
+        edge_id = partition[cell]
+
+        density_mass = clamp(
+            robot.density
+            / max(
+                reference_density,
+                EPSILON,
+            ),
+            PROXY_DENSITY_MASS_MIN,
+            PROXY_DENSITY_MASS_MAX,
+        )
+
+        stats[edge_id]["robot_count"] += 1
+        stats[edge_id]["density_mass"] += (
+            density_mass
+        )
+
+        robot_assignment[
+            robot.robot_id
+        ] = edge_id
+
+        total_mass += density_mass
+
+    for edge_id in candidate_edge_ids:
+        quota = stats[
+            edge_id
+        ]["quota_fraction"]
+
+        actual = (
+            stats[edge_id][
+                "density_mass"
+            ]
+            / max(total_mass, EPSILON)
+        )
+
+        stats[edge_id][
+            "actual_mass_fraction"
+        ] = actual
+
+        stats[edge_id][
+            "mass_deficit_cost"
+        ] = clamp(
+            max(
+                0.0,
+                quota - actual,
+            )
+            / max(quota, EPSILON),
+            0.0,
+            1.0,
+        )
+
+    return stats, robot_assignment
+
+
+def preview_nested_proxy_partition(
+    junction_id: str,
+    robots,
+    reference_density: float,
+) -> None:
+    """Build and log the proxy partition before selecting a child edge."""
+
+    global last_nested_proxy_junction_id
+    global last_nested_proxy_partition
+    global last_nested_proxy_cell_centers
+    global last_nested_proxy_mass_stats
+    global last_nested_proxy_robot_assignment
+    global last_nested_proxy_candidates
+
+    candidate_edge_ids = (
+        get_unvisited_child_edge_ids(
+            junction_id,
+        )
+    )
+
+    if not candidate_edge_ids:
+        return
+
+    partition, centers, quotas = (
+        build_nested_proxy_partition(
+            junction_id,
+            candidate_edge_ids,
+        )
+    )
+
+    ordering_robots = (
+        get_nested_proxy_robots(
+            robots,
+            junction_id,
+        )
+    )
+
+    stats, robot_assignment = (
+        compute_nested_proxy_mass_statistics(
+            ordering_robots,
+            junction_id,
+            candidate_edge_ids,
+            partition,
+            centers,
+            quotas,
+            reference_density,
+        )
+    )
+
+    last_nested_proxy_junction_id = (
+        junction_id
+    )
+    last_nested_proxy_partition = partition
+    last_nested_proxy_cell_centers = centers
+    last_nested_proxy_mass_stats = stats
+    last_nested_proxy_robot_assignment = (
+        robot_assignment
+    )
+    last_nested_proxy_candidates = tuple(
+        candidate_edge_ids
+    )
+
+    print(
+        f"[Nested Proxy Partition] "
+        f"junction={junction_id}, "
+        f"candidates={candidate_edge_ids}, "
+        f"robots={len(ordering_robots)}, "
+        f"cells={len(centers)}"
+    )
+
+    for edge_id in candidate_edge_ids:
+        edge_stats = stats[edge_id]
+
+        print(
+            f"[Nested Proxy Region] "
+            f"edge={edge_id}, "
+            f"quota="
+            f"{edge_stats['quota_fraction']:.3f}, "
+            f"cells={edge_stats['cell_count']}, "
+            f"robots={edge_stats['robot_count']}, "
+            f"mass="
+            f"{edge_stats['actual_mass_fraction']:.3f}, "
+            f"deficit="
+            f"{edge_stats['mass_deficit_cost']:.3f}"
+        )
 
 def geodesic_edf_direction(
     position: pygame.Vector2,
@@ -5445,7 +6123,11 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"[Multi-Junction Test] "
                 f"anchors={anchors}"
             )
-
+            preview_nested_proxy_partition(
+                junction_id,
+                robots,
+                reference_density,
+            )
             selected_edge_id = (
                 activate_next_child_edge_for_current_junction(
                     junction_id,
@@ -5933,6 +6615,14 @@ def reset_dfs_state():
     global last_proxy_partition, last_proxy_cell_centers
     global last_proxy_mass_stats, last_proxy_robot_assignment
     global last_proxy_candidates
+
+    global last_nested_proxy_junction_id
+    global last_nested_proxy_partition
+    global last_nested_proxy_cell_centers
+    global last_nested_proxy_mass_stats
+    global last_nested_proxy_robot_assignment
+    global last_nested_proxy_candidates
+
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
     global return_trunk_release_pending, return_trunk_retract_timer
@@ -5971,6 +6661,14 @@ def reset_dfs_state():
     last_proxy_mass_stats = {}
     last_proxy_robot_assignment = {}
     last_proxy_candidates = ()
+
+    last_nested_proxy_junction_id = None
+    last_nested_proxy_partition = {}
+    last_nested_proxy_cell_centers = {}
+    last_nested_proxy_mass_stats = {}
+    last_nested_proxy_robot_assignment = {}
+    last_nested_proxy_candidates = ()
+
     last_flow_rollout_scores = {}
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
     branch_entry_timer = 0.0
