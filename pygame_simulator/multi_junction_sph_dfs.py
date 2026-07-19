@@ -968,12 +968,30 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
         junction_id = resolve_current_junction_id()
 
         if junction_id == "J1":
-            return region in {
+            allowed_regions = {
                 "BOTTOM",
                 "JUNCTION",
                 "RIGHT",
                 "J1_JUNCTION",
             }
+
+            context = junction_contexts.get(
+                junction_id,
+            )
+
+            if (
+                context is not None
+                and context.selected_edge_id is not None
+            ):
+                profile = get_edge_traversal_profile(
+                    context.selected_edge_id,
+                )
+
+                allowed_regions.add(
+                    profile.physical_region,
+                )
+
+            return region in allowed_regions
 
         return region in {
             "BOTTOM",
@@ -1280,6 +1298,9 @@ ROOT_JUNCTION_ID = "J0"
 
 CHILD_JUNCTION_ARRIVAL_RADIUS = 32.0
 CHILD_JUNCTION_ARRIVAL_COUNT = 18
+
+NESTED_EDGE_ENTRY_COUNT = 18
+NESTED_EDGE_MOUTH_OFFSET = 12.0
 
 dfs_stack: list[DFSFrame] = []
 
@@ -1742,6 +1763,82 @@ def print_edge_traversal_profile(
         f"child_junction={profile.enters_child_junction}"
     )
 
+def get_physical_junction_center(
+    junction_id: str,
+) -> pygame.Vector2:
+    """Return the physical center of a topology junction."""
+
+    if junction_id == "J0":
+        return pygame.Vector2(
+            center_x,
+            center_y,
+        )
+
+    if junction_id == "J1":
+        return J1_CENTER.copy()
+
+    raise ValueError(
+        f"No physical center registered for junction={junction_id}"
+    )
+
+
+def nested_edge_route_direction(
+    position: pygame.Vector2,
+    profile: EdgeTraversalProfile,
+) -> pygame.Vector2:
+    """Guide the front subchain from a nested junction into its child edge."""
+
+    region = get_robot_region(position)
+
+    source_center = get_physical_junction_center(
+        profile.source_junction_id,
+    )
+
+    source_region = (
+        "JUNCTION"
+        if profile.source_junction_id == "J0"
+        else f"{profile.source_junction_id}_JUNCTION"
+    )
+
+    # 이미 선택된 자식 복도 안에 들어온 로봇은
+    # 해당 복도의 끝 목표점으로 이동한다.
+    if region == profile.physical_region:
+        return normalized_direction_toward(
+            position,
+            profile.target_position,
+        )
+
+    # 현재 Junction 안의 로봇은 Branch 입구보다 약간 안쪽을
+    # 목표로 삼아 실제 자식 복도 영역까지 진입하게 한다.
+    if region == source_region:
+        mouth_target = (
+            source_center
+            + profile.direction
+            * (
+                half_width
+                + NESTED_EDGE_MOUTH_OFFSET
+            )
+        )
+
+        return normalized_direction_toward(
+            position,
+            mouth_target,
+        )
+
+    # J1으로 이어지는 RIGHT 복도에 남아 있는 전방 로봇은
+    # 먼저 J1 중심까지 이동한다.
+    if (
+        profile.source_junction_id == "J1"
+        and region == "RIGHT"
+    ):
+        return normalized_direction_toward(
+            position,
+            J1_CENTER,
+        )
+
+    # 이번 시험에서는 J0와 다른 Branch에 있는 후방 로봇까지
+    # 모두 끌어오지 않는다.
+    return pygame.Vector2()
 
 def reset_topology_visit_states():
     """Reset all topology nodes, edges, and the DFS stack."""
@@ -4982,6 +5079,31 @@ def compute_route_force(robot):
             force.y = -INITIAL_INGRESS_FORCE * scale
         lane_error = robot.ingress_lane_x - robot.position.x
         force.x = clamp(INITIAL_INGRESS_LANE_GAIN * lane_error, -INITIAL_INGRESS_LANE_MAX_FORCE, INITIAL_INGRESS_LANE_MAX_FORCE)
+    elif phase == SimulationPhase.STABILIZE_JUNCTION:
+        junction_id = resolve_current_junction_id()
+
+        context = (
+            junction_contexts.get(junction_id)
+            if junction_id is not None
+            else None
+        )
+
+        if (
+            context is not None
+            and context.selected_edge_id is not None
+        ):
+            profile = get_edge_traversal_profile(
+                context.selected_edge_id,
+            )
+
+            force = (
+                nested_edge_route_direction(
+                    robot.position,
+                    profile,
+                )
+                * ROUTE_FORCE
+                * relay_motion_scale
+            )
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         force = (
             geodesic_edf_direction(robot.position, active_branch)
@@ -5049,10 +5171,33 @@ def compute_route_force(robot):
 
     force += compute_virtual_valve_force(robot)
 
-    if region in {"UP", "BOTTOM"}:
-        force.x += CENTERING_GAIN * (center_x - robot.position.x)
-    elif region in {"LEFT", "RIGHT"}:
-        force.y += CENTERING_GAIN * (center_y - robot.position.y)
+    if region in {
+        "UP",
+        "BOTTOM",
+    }:
+        force.x += CENTERING_GAIN * (
+            center_x
+            - robot.position.x
+        )
+
+    elif region in {
+        "J1_UP",
+        "J1_DOWN",
+    }:
+        force.x += CENTERING_GAIN * (
+            J1_CENTER.x
+            - robot.position.x
+        )
+
+    elif region in {
+        "LEFT",
+        "RIGHT",
+    }:
+        force.y += CENTERING_GAIN * (
+            center_y
+            - robot.position.y
+        )
+
     return force
 
 
@@ -5230,12 +5375,15 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
         if junction_id is None:
             raise RuntimeError(
-                "STABILIZE_JUNCTION requires an active junction"
+                "STABILIZE_JUNCTION requires "
+                "an active junction"
             )
 
         context = junction_contexts.setdefault(
             junction_id,
-            JunctionContext(junction_id=junction_id),
+            JunctionContext(
+                junction_id=junction_id,
+            ),
         )
 
         context.stable_timer += dt
@@ -5245,12 +5393,20 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             junction_id,
         )
 
-        if child_anchor is not None:
+        if (
+            child_anchor is not None
+            and context.selected_edge_id is None
+        ):
             anchors = {
                 context_id: junction_context.anchor_robot_id
-                for context_id, junction_context
-                in junction_contexts.items()
-                if junction_context.anchor_robot_id is not None
+                for (
+                    context_id,
+                    junction_context,
+                ) in junction_contexts.items()
+                if (
+                    junction_context.anchor_robot_id
+                    is not None
+                )
             }
 
             print(
@@ -5271,6 +5427,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     f"no_unvisited_child=True"
                 )
 
+                phase = SimulationPhase.DONE
+
             else:
                 context.selected_edge_id = selected_edge_id
 
@@ -5280,15 +5438,41 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     f"selected_child={selected_edge_id}"
                 )
 
-                # 선택된 Topology Edge가 어떤 실제 복도와
-                # 방향·목표점에 연결되는지 검증한다.
                 print_edge_traversal_profile(
                     selected_edge_id,
                 )
 
-            # 이번 단계에서는 Edge와 물리 복도 정보의
-            # 연결까지만 검증한다.
-            phase = SimulationPhase.DONE
+                print(
+                    f"[Nested Edge Traverse] "
+                    f"started edge={selected_edge_id}"
+                )
+
+        if context.selected_edge_id is not None:
+            profile = get_edge_traversal_profile(
+                context.selected_edge_id,
+            )
+
+            entered_count = sum(
+                1
+                for robot in robots
+                if (
+                    robot.role == "NORMAL"
+                    and get_robot_region(
+                        robot.position,
+                    )
+                    == profile.physical_region
+                )
+            )
+
+            if entered_count >= NESTED_EDGE_ENTRY_COUNT:
+                print(
+                    f"[Nested Edge Traverse] "
+                    f"completed edge={profile.edge_id}, "
+                    f"region={profile.physical_region}, "
+                    f"robots={entered_count}"
+                )
+
+                phase = SimulationPhase.DONE
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
