@@ -179,6 +179,52 @@ bottom_rect = pygame.Rect(
     normal_length,
 )
 
+# =========================================================
+# Second physical junction J1
+# =========================================================
+
+# J0의 RIGHT 복도 끝부분을 J1 중심으로 사용한다.
+# Topology Graph의 J1 좌표와 반드시 동일해야 한다.
+J1_CENTER = pygame.Vector2(
+    center_x + right_length,
+    center_y,
+)
+
+J1_JUNCTION_RECT = pygame.Rect(
+    int(J1_CENTER.x - half_width),
+    int(J1_CENTER.y - half_width),
+    corridor_width,
+    corridor_width,
+)
+
+J1_UP_RECT = pygame.Rect(
+    int(J1_CENTER.x - half_width),
+    int(J1_CENTER.y - half_width - normal_length),
+    corridor_width,
+    normal_length,
+)
+
+J1_DOWN_RECT = pygame.Rect(
+    int(J1_CENTER.x - half_width),
+    int(J1_CENTER.y + half_width),
+    corridor_width,
+    normal_length,
+)
+
+J1_ANCHOR_REGION_SIZE = 70
+
+J1_ANCHOR_ELECTION_RECT = pygame.Rect(
+    int(J1_CENTER.x - J1_ANCHOR_REGION_SIZE / 2),
+    int(J1_CENTER.y - J1_ANCHOR_REGION_SIZE / 2),
+    J1_ANCHOR_REGION_SIZE,
+    J1_ANCHOR_REGION_SIZE,
+)
+
+J1_ANCHOR_PARK_POSITION = pygame.Vector2(
+    J1_CENTER.x - 25,
+    J1_CENTER.y - 25,
+)
+
 END_REGION_DEPTH = 48
 
 dead_end_regions = {
@@ -199,6 +245,21 @@ dead_end_regions = {
         center_y - half_width,
         END_REGION_DEPTH,
         corridor_width,
+    ),
+}
+
+j1_dead_end_regions = {
+    "UP": pygame.Rect(
+        J1_UP_RECT.left,
+        J1_UP_RECT.top,
+        J1_UP_RECT.width,
+        END_REGION_DEPTH,
+    ),
+    "DOWN": pygame.Rect(
+        J1_DOWN_RECT.left,
+        J1_DOWN_RECT.bottom - END_REGION_DEPTH,
+        J1_DOWN_RECT.width,
+        END_REGION_DEPTH,
     ),
 }
 
@@ -224,6 +285,21 @@ early_capture_regions = {
         center_y - half_width,
         EARLY_CAPTURE_DEPTH,
         corridor_width,
+    ),
+}
+
+j1_early_capture_regions = {
+    "UP": pygame.Rect(
+        J1_UP_RECT.left,
+        J1_UP_RECT.top,
+        J1_UP_RECT.width,
+        EARLY_CAPTURE_DEPTH,
+    ),
+    "DOWN": pygame.Rect(
+        J1_DOWN_RECT.left,
+        J1_DOWN_RECT.bottom - EARLY_CAPTURE_DEPTH,
+        J1_DOWN_RECT.width,
+        EARLY_CAPTURE_DEPTH,
     ),
 }
 
@@ -646,31 +722,132 @@ CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 # 5. Map mask and region checks
 # =========================================================
 
-floor_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+floor_surface = pygame.Surface(
+    (SCREEN_WIDTH, SCREEN_HEIGHT),
+    pygame.SRCALPHA,
+)
 floor_surface.fill((0, 0, 0, 0))
-pygame.draw.polygon(floor_surface, (255, 255, 255, 255), cross_points)
+
+# 기존 J0 십자가 영역
+pygame.draw.polygon(
+    floor_surface,
+    (255, 255, 255, 255),
+    cross_points,
+)
+
+# 두 번째 정션 J1과 J1의 위·아래 복도
+pygame.draw.rect(
+    floor_surface,
+    (255, 255, 255, 255),
+    J1_JUNCTION_RECT,
+)
+pygame.draw.rect(
+    floor_surface,
+    (255, 255, 255, 255),
+    J1_UP_RECT,
+)
+pygame.draw.rect(
+    floor_surface,
+    (255, 255, 255, 255),
+    J1_DOWN_RECT,
+)
+
 walkable_mask = pygame.mask.from_surface(floor_surface)
+
+# 연결된 전체 물리 영역의 외곽선이다.
+# 개별 사각형 테두리를 그리지 않으므로 복도 연결부에 가짜 벽이 생기지 않는다.
+walkable_outline = walkable_mask.outline()
 
 
 def get_robot_region(position: pygame.Vector2) -> str:
-    point = (int(position.x), int(position.y))
+    """Return the physical map region containing the position."""
+
+    point = (
+        int(position.x),
+        int(position.y),
+    )
+
+    # J1은 기존 RIGHT 복도 끝과 겹친다.
+    if J1_JUNCTION_RECT.collidepoint(point):
+
+        # J0에서 E_J0_RIGHT를 따라 J1으로 이동하는 동안에는
+        # 기존 RIGHT Branch 제어력을 계속 받도록 한다.
+        if (
+            current_edge_id == "E_J0_RIGHT"
+            and phase
+            in {
+                SimulationPhase.EXPLORE_BRANCH,
+                SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+                SimulationPhase.FILL_BEHIND_SHEPHERD,
+                SimulationPhase.PRESSURE_PUSH,
+                SimulationPhase.FLOW_BACKTRACK,
+            }
+        ):
+            return "RIGHT"
+
+        # J1 도착 처리가 끝난 이후에는
+        # 독립적인 Junction 영역으로 판정한다.
+        return "J1_JUNCTION"
+
+    # 기존 중앙 정션 J0
     if junction_rect.collidepoint(point):
         return "JUNCTION"
+
+    # J1의 자식 Branch
+    if J1_UP_RECT.collidepoint(point):
+        return "J1_UP"
+
+    if J1_DOWN_RECT.collidepoint(point):
+        return "J1_DOWN"
+
+    # J0의 기존 Branch
     if up_rect.collidepoint(point):
         return "UP"
+
     if left_rect.collidepoint(point):
         return "LEFT"
+
     if right_rect.collidepoint(point):
         return "RIGHT"
+
     if bottom_rect.collidepoint(point):
         return "BOTTOM"
+
     return "OUTSIDE"
+
+def get_branch_path_regions(
+    branch: str,
+    include_bottom: bool = False,
+) -> set[str]:
+    """Return physical regions belonging to a branch traversal path."""
+
+    regions = {
+        "JUNCTION",
+        branch,
+    }
+
+    if include_bottom:
+        regions.add("BOTTOM")
+
+    # J0의 RIGHT Edge는 J1 정션 내부까지 이어진다.
+    if branch == "RIGHT":
+        regions.add("J1_JUNCTION")
+
+    return regions
+
 
 
 def is_region_allowed(position: pygame.Vector2) -> bool:
+    """Check whether the current phase allows the robot in this region."""
+
     region = get_robot_region(position)
+
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        return region in {"BOTTOM", "JUNCTION"}
+        return region in {
+            "BOTTOM",
+            "JUNCTION",
+        }
+
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -679,16 +856,53 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
         SimulationPhase.FLOW_BACKTRACK,
         SimulationPhase.JUNCTION_SWITCH,
     }:
-        return region in {"BOTTOM", "JUNCTION", active_branch}
+        allowed_regions = {
+            "BOTTOM",
+            "JUNCTION",
+            active_branch,
+        }
+
+        # J0 RIGHT 탐색은 J1 정션까지 이어진다.
+        if active_branch == "RIGHT":
+            allowed_regions.add("J1_JUNCTION")
+
+        return region in allowed_regions
+
+    if phase == SimulationPhase.STABILIZE_JUNCTION:
+        junction_id = resolve_current_junction_id()
+
+        if junction_id == "J1":
+            return region in {
+                "BOTTOM",
+                "JUNCTION",
+                "RIGHT",
+                "J1_JUNCTION",
+            }
+
+        return region in {
+            "BOTTOM",
+            "JUNCTION",
+        }
+
     if phase in {
         SimulationPhase.FINAL_JUNCTION_GATHER,
         SimulationPhase.RETURN_TO_BASE,
     }:
-        return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
-    if phase == SimulationPhase.DONE:
-        return region in {"BOTTOM", "JUNCTION"}
-    return region != "OUTSIDE"
+        return region in {
+            "BOTTOM",
+            "JUNCTION",
+            "UP",
+            "LEFT",
+            "RIGHT",
+            "J1_JUNCTION",
+            "J1_UP",
+            "J1_DOWN",
+        }
 
+    if phase == SimulationPhase.DONE:
+        return region != "OUTSIDE"
+
+    return region != "OUTSIDE"
 
 def is_walkable(position: pygame.Vector2, radius: float) -> bool:
     x = int(round(position.x))
@@ -828,7 +1042,7 @@ def get_branch_tip_target(branch: str):
 def build_initial_topology():
     """Represent the current single-junction map as a topology graph."""
 
-    j1_position = get_branch_tip_target("RIGHT")
+    j1_position = J1_CENTER.copy()
 
     j1_up_room_position = pygame.Vector2(
         j1_position.x,
@@ -2328,8 +2542,9 @@ def get_exploration_front_progress(robots, branch):
     candidates = [
         robot
         for robot in robots
-        if robot.role in {"NORMAL", "SHEPHERD"}
-        and get_robot_region(robot.position) in {"JUNCTION", branch}
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position)
+        in get_branch_path_regions(branch)
     ]
     return max((relay_path_progress(robot.position, branch) for robot in candidates), default=0.0)
 
@@ -2345,7 +2560,8 @@ def select_relay_candidate(robots, slot):
         for robot in robots
         if robot.role == "NORMAL"
         and robot.connected_to_base
-        and get_robot_region(robot.position) in {"JUNCTION", active_branch}
+        and get_robot_region(robot.position)
+        in get_branch_path_regions(active_branch)
         and robot.position.distance_to(slot["position"]) <= RELAY_SELECTION_RADIUS
     ]
     return min(
@@ -2449,7 +2665,8 @@ def update_relay_retraction(robots, dt):
         robot
         for robot in robots
         if robot.role in {"NORMAL", "SHEPHERD"}
-        and get_robot_region(robot.position) in {active_branch, "JUNCTION"}
+        and get_robot_region(robot.position)
+        in get_branch_path_regions(active_branch)
     ]
     beyond = [
         robot
@@ -3245,7 +3462,13 @@ def get_proxy_region_rollout_robots(
 
 
 def rollout_region_allowed(position: pygame.Vector2, branch: str) -> bool:
-    return get_robot_region(position) in {"BOTTOM", "JUNCTION", branch}
+    return (
+    get_robot_region(position)
+    in get_branch_path_regions(
+        branch,
+        include_bottom=True,
+    )
+)
 
 
 def is_rollout_walkable(
@@ -5396,36 +5619,119 @@ while running:
         compute_pressures(robots, reference_density)
 
     screen.fill(BACKGROUND_COLOR)
-    pygame.draw.polygon(screen, FLOOR_COLOR, cross_points)
+
+    # 기존 J0 십자가 바닥
+    pygame.draw.polygon(
+        screen,
+        FLOOR_COLOR,
+        cross_points,
+    )
+
+    # 실제 J1 정션 및 위·아래 복도 바닥
+    pygame.draw.rect(
+        screen,
+        FLOOR_COLOR,
+        J1_JUNCTION_RECT,
+    )
+    pygame.draw.rect(
+        screen,
+        FLOOR_COLOR,
+        J1_UP_RECT,
+    )
+    pygame.draw.rect(
+        screen,
+        FLOOR_COLOR,
+        J1_DOWN_RECT,
+    )
+
     draw_branch_colour_fields(screen)
-    pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=5)
+
+    # 개별 Rect 테두리를 그리면 복도 연결부에 가짜 벽이 생긴다.
+    # Walkable Mask의 외곽선만 그려 전체 연결 맵의 실제 벽을 표현한다.
+    if len(walkable_outline) >= 3:
+        pygame.draw.lines(
+            screen,
+            WALL_COLOR,
+            True,
+            walkable_outline,
+            width=5,
+        )
+        
 
     if show_regions:
         draw_proxy_partition(screen)
         draw_proxy_robot_assignments(screen, robots)
+
+        # J0
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
         pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
+
+        # J1
+        pygame.draw.rect(
+            screen,
+            JUNCTION_COLOR,
+            J1_JUNCTION_RECT,
+            width=2,
+        )
+        pygame.draw.rect(
+            screen,
+            ANCHOR_COLOR,
+            J1_ANCHOR_ELECTION_RECT,
+            width=1,
+        )
+        pygame.draw.circle(
+            screen,
+            ANCHOR_COLOR,
+            J1_ANCHOR_PARK_POSITION,
+            4,
+            width=1,
+        )
+
+        pygame.draw.rect(
+            screen,
+            JUNCTION_COLOR,
+            J1_UP_RECT,
+            width=1,
+        )
+        pygame.draw.rect(
+            screen,
+            JUNCTION_COLOR,
+            J1_DOWN_RECT,
+            width=1,
+        )
+
         pygame.draw.circle(screen, ANCHOR_COLOR, ANCHOR_PARK_POSITION, 4, width=1)
         pygame.draw.circle(screen, BASE_COLOR, BASE_POSITION, 7, width=2)
-        pygame.draw.rect(
-            screen,
-            BRANCH_COLORS[active_branch],
-            early_capture_regions[active_branch],
-            width=2,
-        )
-        pygame.draw.rect(
-            screen,
-            BRANCH_COLORS[active_branch],
-            get_saturation_rect(active_branch),
-            width=2,
-        )
+        # J0의 UP/LEFT만 실제 막다른 Branch다.
+        # RIGHT는 J1으로 연결되는 Edge이므로 dead-end 표시를 하지 않는다.
+        if active_branch in {"UP", "LEFT"}:
+            pygame.draw.rect(
+                screen,
+                BRANCH_COLORS[active_branch],
+                early_capture_regions[active_branch],
+                width=2,
+            )
+            pygame.draw.rect(
+                screen,
+                BRANCH_COLORS[active_branch],
+                get_saturation_rect(active_branch),
+                width=2,
+            )
+        
         for branch, rect in dead_end_regions.items():
+            # J0 RIGHT는 더 이상 막다른 방이 아니라 J1 연결 Edge다.
+            if branch == "RIGHT":
+                continue
+
             pygame.draw.rect(
                 screen,
                 BRANCH_COLORS[branch],
                 rect,
                 width=3 if branch == active_branch else 2,
             )
+
+
+
         for robot in get_shepherds(robots):
             if robot.shepherd_anchor is not None:
                 pygame.draw.circle(
