@@ -287,6 +287,8 @@ BRANCH_TARGET_NODE = {
 phase = SimulationPhase.MOVE_TO_JUNCTION
 active_branch = "UP"
 pending_branch: Optional[str] = None
+transition_pressure_plan: dict = {}
+stored_compression_density_ratio = 0.0
 branch_states = {branch: "UNVISITED" for branch in BRANCHES}
 branch_order_plan: list[str] = []
 previous_branch_direction = pygame.Vector2(0.0, -1.0)  # incoming from BASE
@@ -419,9 +421,34 @@ BASE_RESERVOIR_REQUIREMENT = max(
     JUNCTION_ENTRY_COUNT,
     2 * (math.floor((corridor_width - 2 * ROBOT_RADIUS) / GRID_SPACING) + 1),
 )
+# A transition pressure wave must contain enough mobile mass to span the
+# longest dead-end -> Junction -> next-dead-end route.  Five effective flow
+# lanes are obtained from 55% of the corridor width at the verified
+# equilibrium gap.  On the current map this raises 220 robots only to the
+# geometry-derived minimum instead of applying an arbitrary large increase.
+PRESSURE_FLOW_WIDTH_FRACTION = 0.55
+PRESSURE_FLOW_LANES = max(
+    3,
+    math.ceil(
+        corridor_width
+        * PRESSURE_FLOW_WIDTH_FRACTION
+        / TARGET_EQUILIBRIUM_DISTANCE
+    ),
+)
+MAX_BRANCH_TRANSITION_DISTANCE = max(
+    BRANCH_LENGTHS[source] + corridor_width + BRANCH_LENGTHS[target]
+    for source in BRANCHES
+    for target in BRANCHES
+    if source != target
+)
+PRESSURE_FLOW_LAYERS = math.ceil(
+    MAX_BRANCH_TRANSITION_DISTANCE / TARGET_EQUILIBRIUM_DISTANCE
+)
+PRESSURE_MASS_REQUIREMENT = PRESSURE_FLOW_LANES * PRESSURE_FLOW_LAYERS
 MOBILE_FLUID_REQUIREMENT = max(
     2 * JUNCTION_ENTRY_COUNT,
     4 * math.ceil(corridor_width / TARGET_EQUILIBRIUM_DISTANCE),
+    PRESSURE_MASS_REQUIREMENT,
 )
 ROLE_RESERVE_REQUIREMENT = 14
 MINIMUM_CONTINUOUS_SWARM_COUNT = (
@@ -502,6 +529,19 @@ VIRTUAL_PRESSURE_RADIUS = 60.0
 VIRTUAL_PRESSURE_FORCE = 135.0
 PRESSURE_RAMP_TIME = 0.8
 
+# Branch-specific stored-pressure planning.  The estimate treats robot mass as
+# unit mass and balances target acceleration plus linear damping over the
+# dead-end -> Junction -> next-dead-end travel distance.  It is a controller
+# budget, not a claim of exact fluid energy conservation.
+PRESSURE_TRANSFER_HORIZON = 12.0
+PRESSURE_TARGET_SPEED_MIN = 12.0
+PRESSURE_TARGET_SPEED_MAX = 32.0
+PRESSURE_PLAN_MAX_SCALE = 2.20
+PRESSURE_BASE_COMPRESSION_DENSITY_RATIO = 1.18
+PRESSURE_MAX_COMPRESSION_DENSITY_RATIO = 1.32
+PRESSURE_MIN_PLUG_LAYERS = 4
+PRESSURE_EXPANSION_RELEASE_RATIO = 0.96
+
 SHEPHERD_LOCAL_FLOW_DEPTH = 58.0
 SHEPHERD_LOCAL_FLOW_FORWARD_ALLOWANCE = 6.0
 SHEPHERD_MIN_PUSH_TIME = 0.20
@@ -530,7 +570,7 @@ ANCHOR_READY_DIRECT_NEIGHBORS = 1
 # passed them.  There is no precomputed slot plan and no robot moves ahead of
 # the swarm to become a relay.
 BREADCRUMB_SPACING = TARGET_EQUILIBRIUM_DISTANCE
-BREADCRUMB_TRIGGER_SPAN = BREADCRUMB_SPACING * 1.85
+BREADCRUMB_DROP_TRIGGER = COMM_SAFE_DISTANCE * 0.82
 BREADCRUMB_SELECTION_TOLERANCE = max(4.0, BREADCRUMB_SPACING * 0.30)
 BREADCRUMB_DEPLOY_COOLDOWN = 0.12
 BREADCRUMB_ANCHOR_KP = 12.0
@@ -552,9 +592,10 @@ CONTINUOUS_CHAIN_REQUIRED_CONNECTED_RATIO = 0.90
 DISTRIBUTED_VOTE_ROUNDS = 5
 DISTRIBUTED_VOTE_MIN_ROBOTS = 6
 DISTRIBUTED_VOTE_QUORUM = 0.55
-DISTRIBUTED_VOTE_DISTANCE_WEIGHT = 0.45
-DISTRIBUTED_VOTE_FLOW_WEIGHT = 0.35
-DISTRIBUTED_VOTE_CONGESTION_WEIGHT = 0.20
+DISTRIBUTED_VOTE_DISTANCE_WEIGHT = 0.39
+DISTRIBUTED_VOTE_FLOW_WEIGHT = 0.31
+DISTRIBUTED_VOTE_CONGESTION_WEIGHT = 0.18
+DISTRIBUTED_VOTE_PRESSURE_WEIGHT = 0.12
 PENDING_BRANCH_PREOPEN_DEPTH = TARGET_EQUILIBRIUM_DISTANCE
 
 # Proxy-Region-Based Flow-Preserving SPH-Aware DFS ordering.
@@ -570,6 +611,7 @@ BRANCH_COST_WALL_RISK_WEIGHT = 0.07
 BRANCH_COST_COLLISION_RISK_WEIGHT = 0.07
 BRANCH_COST_ROLLOUT_COMM_WEIGHT = 0.09
 BRANCH_COST_CONTINUOUS_CHAIN_WEIGHT = 0.07
+BRANCH_COST_PRESSURE_BUDGET_WEIGHT = 0.06
 BRANCH_COST_LAMBDA_MODE_WEIGHT = 0.04
 BRANCH_COST_STABILIZATION_WEIGHT = 0.04
 
@@ -1170,6 +1212,9 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         writer.writerow(["equilibrium_distance", f"{EQUILIBRIUM_DISTANCE:.6f}"])
         writer.writerow(["communication_safe_distance", f"{COMM_SAFE_DISTANCE:.6f}"])
         writer.writerow(["minimum_continuous_swarm_count", MINIMUM_CONTINUOUS_SWARM_COUNT])
+        writer.writerow(["pressure_mass_requirement", PRESSURE_MASS_REQUIREMENT])
+        writer.writerow(["pressure_flow_lanes", PRESSURE_FLOW_LANES])
+        writer.writerow(["pressure_flow_layers", PRESSURE_FLOW_LAYERS])
         writer.writerow(["drive_mode", DRIVE_MODE])
         writer.writerow(["base_reserve_required", BASE_RESERVE_MIN_COUNT])
         writer.writerow(["base_reserve_min_observed", metrics.base_reserve_min_observed])
@@ -1243,6 +1288,18 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
                 ])
         writer.writerow(["saturation_event_count", len(metrics.saturation_events)])
         writer.writerow(["pressure_event_count", len(metrics.pressure_events)])
+        for index, event in enumerate(metrics.pressure_events, start=1):
+            plan = event.get("pressure_plan", {})
+            writer.writerow([
+                f"pressure_event_{index}",
+                (
+                    f"branch={event.get('branch')}; "
+                    f"target={event.get('target_branch')}; "
+                    f"stored_density={event.get('stored_density_ratio', 0.0):.6f}; "
+                    f"scale={plan.get('pressure_scale', 1.0):.6f}; "
+                    f"distance={plan.get('distance', 0.0):.6f}"
+                ),
+            ])
         writer.writerow(["distributed_vote_event_count", len(metrics.distributed_vote_events)])
         for index, event in enumerate(metrics.distributed_vote_events, start=1):
             writer.writerow([
@@ -1857,8 +1914,13 @@ def base_breadcrumb_is_settled(robot):
     )
 
 
-def select_base_breadcrumb_candidate(robots, parent, desired_progress):
-    """Select a passed tail robot and freeze it at its current position."""
+def get_moving_swarm_tail(robots, parent=None):
+    """Return the rearmost mobile Normal robot ahead of the current endpoint."""
+    parent_progress = (
+        base_corridor_progress(parent.position)
+        if parent is not None
+        else -EPSILON
+    )
     candidates = [
         robot
         for robot in robots
@@ -1866,15 +1928,12 @@ def select_base_breadcrumb_candidate(robots, parent, desired_progress):
         and not robot.base_reserve_member
         and robot.connected_to_base
         and get_robot_region(robot.position) in {"BOTTOM", "JUNCTION"}
-        and robot.position.distance_to(parent.position) <= COMM_SAFE_DISTANCE
-        and abs(base_corridor_progress(robot.position) - desired_progress)
-        <= BREADCRUMB_SELECTION_TOLERANCE
-        and has_line_of_sight(parent.position, robot.position)
+        and base_corridor_progress(robot.position) > parent_progress + EPSILON
     ]
     return min(
         candidates,
         key=lambda robot: (
-            abs(base_corridor_progress(robot.position) - desired_progress),
+            base_corridor_progress(robot.position),
             robot.velocity.length_squared(),
             robot.robot_id,
         ),
@@ -1890,32 +1949,22 @@ def update_base_breadcrumb_deployment(robots, dt):
     )
     if phase != SimulationPhase.MOVE_TO_JUNCTION:
         return
-    mobile = [
-        robot
-        for robot in robots
-        if robot.role == "NORMAL"
-        and get_robot_region(robot.position) in {"BOTTOM", "JUNCTION"}
-    ]
-    if not mobile:
-        return
-    front_progress = max(base_corridor_progress(robot.position) for robot in mobile)
     breadcrumbs = get_base_breadcrumbs(robots)
     parent = breadcrumbs[-1] if breadcrumbs else base_station
     if parent is None:
         return
-    parent_progress = base_corridor_progress(parent.position)
-    if front_progress - parent_progress < BREADCRUMB_TRIGGER_SPAN:
+    tail = get_moving_swarm_tail(robots, parent)
+    if tail is None:
         return
-    if base_breadcrumb_deploy_cooldown > 0.0:
+    gap = tail.position.distance_to(parent.position)
+    if (
+        gap < BREADCRUMB_DROP_TRIGGER
+        or gap > COMM_SAFE_DISTANCE
+        or not has_line_of_sight(parent.position, tail.position)
+        or base_breadcrumb_deploy_cooldown > 0.0
+    ):
         return
-    desired_progress = parent_progress + BREADCRUMB_SPACING
-    candidate = select_base_breadcrumb_candidate(
-        robots,
-        parent,
-        desired_progress,
-    )
-    if candidate is None:
-        return
+    candidate = tail
     candidate.role = "BREADCRUMB"
     candidate.breadcrumb_anchor = candidate.position.copy()
     candidate.breadcrumb_index = len(base_breadcrumb_records)
@@ -1930,17 +1979,21 @@ def update_base_breadcrumb_deployment(robots, dt):
     print(
         f"[Breadcrumb] dropped robot={candidate.robot_id}, "
         f"index={candidate.breadcrumb_index}, "
-        f"gap={candidate.position.distance_to(parent.position):.2f}"
+        f"tail_gap={gap:.2f}"
     )
 
 
 def base_breadcrumb_backbone_ready(robots):
+    breadcrumbs = get_base_breadcrumbs(robots)
+    if not all(base_breadcrumb_is_settled(robot) for robot in breadcrumbs):
+        return False
+    endpoint = breadcrumbs[-1] if breadcrumbs else base_station
+    tail = get_moving_swarm_tail(robots, endpoint)
+    if endpoint is None or tail is None:
+        return False
     return (
-        all(
-            base_breadcrumb_is_settled(robot)
-            for robot in get_base_breadcrumbs(robots)
-        )
-        and (junction_anchor is None or junction_anchor.connected_to_base)
+        endpoint.position.distance_to(tail.position) <= COMM_RANGE
+        and has_line_of_sight(endpoint.position, tail.position)
     )
 
 
@@ -1950,7 +2003,7 @@ def release_next_base_breadcrumb_for_return(robots):
     Sequential release prevents the fixed Breadcrumb chain from becoming a
     permanent deadlock while preserving Base-rooted communication during the
     final return.  The released robot becomes NORMAL and must reach BOTTOM and
-    reconnect before the next Trunk Relay is released.
+    reconnect before the next Base Breadcrumb is released.
     """
     breadcrumbs = sorted(
         (robot for robot in robots if robot.role == "BREADCRUMB"),
@@ -1994,8 +2047,15 @@ def release_all_base_breadcrumbs_for_return(robots):
 def draw_base_breadcrumb_backbone(surface, robots):
     nodes = [base_station] if base_station is not None else []
     nodes.extend(get_base_breadcrumbs(robots))
-    if junction_anchor is not None:
-        nodes.append(junction_anchor)
+    endpoint = nodes[-1] if nodes else None
+    tail = get_moving_swarm_tail(robots, endpoint)
+    if (
+        endpoint is not None
+        and tail is not None
+        and endpoint.position.distance_to(tail.position) <= COMM_RANGE
+        and has_line_of_sight(endpoint.position, tail.position)
+    ):
+        nodes.append(tail)
     for first, second in zip(nodes, nodes[1:]):
         pygame.draw.line(surface, BREADCRUMB_COLOR, first.position, second.position, width=2)
 
@@ -2083,6 +2143,139 @@ def get_front_communication_status(robots, branch):
             or robust_margin < CONTINUOUS_CHAIN_MARGIN
         ),
     }
+
+
+def transition_route_distance(
+    source_branch: Optional[str],
+    target_branch: Optional[str],
+) -> float:
+    """Geodesic pressure-transfer distance through the Junction."""
+    if source_branch is None and target_branch is None:
+        return 0.0
+    if source_branch is None:
+        junction_center = pygame.Vector2(center_x, center_y)
+        return (
+            BASE_POSITION.distance_to(junction_center)
+            + half_width
+            + BRANCH_LENGTHS[target_branch]
+        )
+    if target_branch is None:
+        return BRANCH_LENGTHS[source_branch] + half_width
+    return (
+        BRANCH_LENGTHS[source_branch]
+        + corridor_width
+        + BRANCH_LENGTHS[target_branch]
+    )
+
+
+def transition_turn_fraction(
+    source_branch: Optional[str],
+    target_branch: Optional[str],
+) -> float:
+    """0 for straight transfer and 1 for a complete reversal."""
+    if target_branch is None:
+        return 0.0
+    incoming = (
+        pygame.Vector2(0.0, -1.0)
+        if source_branch is None
+        else get_backtrack_direction(source_branch)
+    )
+    outgoing = BRANCH_DIRECTIONS[target_branch]
+    if incoming.length_squared() <= EPSILON or outgoing.length_squared() <= EPSILON:
+        return 0.0
+    cosine = clamp(incoming.normalize().dot(outgoing.normalize()), -1.0, 1.0)
+    return math.acos(cosine) / math.pi
+
+
+def build_transition_pressure_plan(
+    source_branch: Optional[str],
+    target_branch: Optional[str],
+) -> dict:
+    """Calculate the minimum stored-pressure controller budget before release.
+
+    The unit-mass estimate uses ``a + DAMPING * v`` over the full transition
+    route.  The resulting scale controls Shepherd pressure, virtual piston
+    force, the required compressed density, and the release threshold.
+    """
+    distance = transition_route_distance(source_branch, target_branch)
+    target_speed = clamp(
+        distance / max(PRESSURE_TRANSFER_HORIZON, EPSILON),
+        PRESSURE_TARGET_SPEED_MIN,
+        PRESSURE_TARGET_SPEED_MAX,
+    )
+    required_acceleration = (
+        2.0 * distance / max(PRESSURE_TRANSFER_HORIZON**2, EPSILON)
+    )
+    required_force = required_acceleration + DAMPING * target_speed
+
+    reference_distance = min(BRANCH_LENGTHS.values())
+    reference_speed = clamp(
+        reference_distance / max(PRESSURE_TRANSFER_HORIZON, EPSILON),
+        PRESSURE_TARGET_SPEED_MIN,
+        PRESSURE_TARGET_SPEED_MAX,
+    )
+    reference_force = (
+        2.0
+        * reference_distance
+        / max(PRESSURE_TRANSFER_HORIZON**2, EPSILON)
+        + DAMPING * reference_speed
+    )
+    turn_fraction = transition_turn_fraction(source_branch, target_branch)
+    pressure_scale = clamp(
+        required_force
+        / max(reference_force, EPSILON)
+        * (1.0 + 0.20 * turn_fraction),
+        1.0,
+        PRESSURE_PLAN_MAX_SCALE,
+    )
+
+    base_term = PRESSURE_BASE_COMPRESSION_DENSITY_RATIO**(
+        STIFFNESS_EXPONENT_PRESSURE_PUSH
+    ) - 1.0
+    target_density_ratio = (
+        1.0 + pressure_scale * base_term
+    ) ** (1.0 / STIFFNESS_EXPONENT_PRESSURE_PUSH)
+    target_density_ratio = clamp(
+        target_density_ratio,
+        PRESSURE_BASE_COMPRESSION_DENSITY_RATIO,
+        PRESSURE_MAX_COMPRESSION_DENSITY_RATIO,
+    )
+    required_tip_robots = max(
+        SATURATION_MIN_TIP_ROBOTS,
+        PRESSURE_FLOW_LANES * PRESSURE_MIN_PLUG_LAYERS,
+    )
+    return {
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "distance": distance,
+        "turn_fraction": turn_fraction,
+        "target_speed": target_speed,
+        "required_force": required_force,
+        "pressure_scale": pressure_scale,
+        "target_density_ratio": target_density_ratio,
+        "required_tip_robots": required_tip_robots,
+        "required_occupancy_ratio": SATURATION_OCCUPANCY_RATIO,
+        "pressure_budget_cost": (
+            (pressure_scale - 1.0)
+            / max(PRESSURE_PLAN_MAX_SCALE - 1.0, EPSILON)
+        ),
+    }
+
+
+def pressure_selection_source_branch() -> Optional[str]:
+    if (
+        active_branch in BRANCHES
+        and branch_states.get(active_branch) == "ACTIVE"
+        and phase
+        in {
+            SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+            SimulationPhase.FILL_BEHIND_SHEPHERD,
+            SimulationPhase.PRESSURE_PUSH,
+            SimulationPhase.FLOW_BACKTRACK,
+        }
+    ):
+        return active_branch
+    return None
 
 # =========================================================
 # 12. Anchor election and cost-guided branch ordering
@@ -3330,6 +3523,11 @@ def branch_efficiency_cost(
         required_continuous_chain_robots(branch)
         / max(required_continuous_chain_robots(candidate) for candidate in BRANCHES)
     )
+    pressure_plan = build_transition_pressure_plan(
+        pressure_selection_source_branch(),
+        branch,
+    )
+    pressure_budget = pressure_plan["pressure_budget_cost"]
     backtrack = BRANCH_LENGTHS[branch] / max(BRANCH_LENGTHS.values())
     switch = angle_between(
         incoming_direction,
@@ -3344,6 +3542,7 @@ def branch_efficiency_cost(
         + BRANCH_COST_COLLISION_RISK_WEIGHT * rollout["collision_risk"]
         + BRANCH_COST_ROLLOUT_COMM_WEIGHT * rollout["rollout_comm"]
         + BRANCH_COST_CONTINUOUS_CHAIN_WEIGHT * continuous_chain
+        + BRANCH_COST_PRESSURE_BUDGET_WEIGHT * pressure_budget
         + BRANCH_COST_LAMBDA_MODE_WEIGHT * rollout["lambda_mode"]
         + BRANCH_COST_STABILIZATION_WEIGHT * rollout["stabilization"]
         + BRANCH_COST_TRANSPORT_WEIGHT * transport
@@ -3367,6 +3566,11 @@ def branch_efficiency_cost(
         "flow_prior": flow_prior,
         "congestion": congestion,
         "continuous_chain": continuous_chain,
+        "pressure_budget": pressure_budget,
+        "planned_pressure_scale": pressure_plan["pressure_scale"],
+        "planned_density_ratio": pressure_plan["target_density_ratio"],
+        "planned_transition_distance": pressure_plan["distance"],
+        "planned_required_tip_robots": pressure_plan["required_tip_robots"],
         "backtrack": backtrack,
         "switch": switch,
         "structural_loss": structural_loss(branch),
@@ -3420,10 +3624,15 @@ def local_branch_vote_cost(robot, branch: str) -> float:
         for neighbor in visible
     )
     congestion_cost = congested / max(len(visible), 1)
+    pressure_cost = build_transition_pressure_plan(
+        pressure_selection_source_branch(),
+        branch,
+    )["pressure_budget_cost"]
     return (
         DISTRIBUTED_VOTE_DISTANCE_WEIGHT * distance_cost
         + DISTRIBUTED_VOTE_FLOW_WEIGHT * flow_cost
         + DISTRIBUTED_VOTE_CONGESTION_WEIGHT * congestion_cost
+        + DISTRIBUTED_VOTE_PRESSURE_WEIGHT * pressure_cost
     )
 
 
@@ -3536,6 +3745,7 @@ def choose_next_branch(
     global last_proxy_candidates
     global last_flow_rollout_scores, last_distributed_vote
     global selected_branch_entry_lambda, branch_entry_timer
+    global transition_pressure_plan
 
     if anchor is None or anchor.local_branch_states is None:
         return None
@@ -3548,8 +3758,13 @@ def choose_next_branch(
     if not unvisited:
         if activate:
             anchor.selected_branch = None
+            transition_pressure_plan = {}
         else:
             anchor.pending_branch = None
+            transition_pressure_plan = build_transition_pressure_plan(
+                active_branch,
+                None,
+            )
         return None
 
     feasible = [
@@ -3651,8 +3866,16 @@ def choose_next_branch(
         branch_order_plan.append(selected)
         selected_branch_entry_lambda = components["rollout_lambda"]
         branch_entry_timer = 0.0
+        transition_pressure_plan = build_transition_pressure_plan(
+            pressure_selection_source_branch(),
+            selected,
+        )
     else:
         anchor.pending_branch = selected
+        transition_pressure_plan = build_transition_pressure_plan(
+            active_branch,
+            selected,
+        )
 
     metrics.branch_selection_events.append({
         "time": simulation_time,
@@ -3670,6 +3893,8 @@ def choose_next_branch(
         f"cost={cost:.4f}, "
         f"Q={components['predicted_flow']:.3f}, "
         f"entry_lambda={selected_branch_entry_lambda:.3f}, "
+        f"pressure_scale={transition_pressure_plan.get('pressure_scale', 1.0):.2f}, "
+        f"rho_target={transition_pressure_plan.get('target_density_ratio', SATURATION_DENSITY_RATIO):.2f}, "
         f"max_loss={maximum_loss}"
     )
     return selected
@@ -3855,6 +4080,9 @@ class SaturationTracker:
     occupancy_ratio: float = 0.0
     front_delta: float = float("inf")
     tip_count: int = 0
+    required_tip_count: int = SATURATION_MIN_TIP_ROBOTS
+    required_density_ratio: float = SATURATION_DENSITY_RATIO
+    required_occupancy_ratio: float = SATURATION_OCCUPANCY_RATIO
     saturated: bool = False
 
     def reset(self, branch: Optional[str] = None):
@@ -3866,6 +4094,9 @@ class SaturationTracker:
         self.occupancy_ratio = 0.0
         self.front_delta = float("inf")
         self.tip_count = 0
+        self.required_tip_count = SATURATION_MIN_TIP_ROBOTS
+        self.required_density_ratio = SATURATION_DENSITY_RATIO
+        self.required_occupancy_ratio = SATURATION_OCCUPANCY_RATIO
         self.saturated = False
 
 
@@ -3901,6 +4132,27 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
     tracker = saturation_tracker
     if tracker.branch != branch:
         tracker.reset(branch)
+    plan = transition_pressure_plan or build_transition_pressure_plan(
+        branch,
+        None,
+    )
+    tracker.required_tip_count = max(
+        SATURATION_MIN_TIP_ROBOTS,
+        int(plan.get("required_tip_robots", SATURATION_MIN_TIP_ROBOTS)),
+    )
+    tracker.required_density_ratio = max(
+        SATURATION_DENSITY_RATIO,
+        float(plan.get("target_density_ratio", SATURATION_DENSITY_RATIO)),
+    )
+    tracker.required_occupancy_ratio = max(
+        SATURATION_OCCUPANCY_RATIO,
+        float(
+            plan.get(
+                "required_occupancy_ratio",
+                SATURATION_OCCUPANCY_RATIO,
+            )
+        ),
+    )
     tip = tip_robots(robots, branch)
     tracker.tip_count = len(tip)
     if tip:
@@ -3925,10 +4177,10 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
         tracker.front_delta = float("inf")
 
     conditions = (
-        tracker.tip_count >= SATURATION_MIN_TIP_ROBOTS
+        tracker.tip_count >= tracker.required_tip_count
         and tracker.low_speed_ratio >= SATURATION_LOW_SPEED_RATIO
-        and tracker.average_density_ratio >= SATURATION_DENSITY_RATIO
-        and tracker.occupancy_ratio >= SATURATION_OCCUPANCY_RATIO
+        and tracker.average_density_ratio >= tracker.required_density_ratio
+        and tracker.occupancy_ratio >= tracker.required_occupancy_ratio
         and tracker.front_delta <= SATURATION_FRONT_PROGRESS_EPSILON
     )
     tracker.dwell = tracker.dwell + dt if conditions else 0.0
@@ -3940,7 +4192,10 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
             "tip_count": tracker.tip_count,
             "low_speed_ratio": tracker.low_speed_ratio,
             "density_ratio": tracker.average_density_ratio,
+            "required_density_ratio": tracker.required_density_ratio,
             "occupancy": tracker.occupancy_ratio,
+            "required_occupancy": tracker.required_occupancy_ratio,
+            "required_tip_count": tracker.required_tip_count,
             "front_delta": tracker.front_delta,
         })
     return tracker.saturated
@@ -4113,11 +4368,32 @@ def normal_backtracking_metrics(robots, branch):
     return moving_ratio, average_speed, len(normals)
 
 
+def local_compression_density_ratio(robots, branch, reference_density):
+    normals = get_local_pressure_front_normals(robots, branch)
+    if not normals:
+        return 0.0
+    return (
+        sum(robot.density for robot in normals)
+        / len(normals)
+        / max(reference_density, EPSILON)
+    )
+
+
+def planned_pressure_scale() -> float:
+    return float(transition_pressure_plan.get("pressure_scale", 1.0))
+
+
 def release_shepherds_into_flow(robots):
     direction = get_backtrack_direction(active_branch)
     local = get_local_pressure_front_normals(robots, active_branch)
     positive = [max(0.0, robot.velocity.dot(direction)) for robot in local]
-    speed = max(SHEPHERD_RELEASE_SPEED, (sum(positive) / len(positive) * 1.15) if positive else 0.0)
+    release_speed = SHEPHERD_RELEASE_SPEED * math.sqrt(
+        planned_pressure_scale()
+    )
+    speed = max(
+        release_speed,
+        (sum(positive) / len(positive) * 1.15) if positive else 0.0,
+    )
     speed = min(speed, MAX_SPEED * 0.45)
     released = 0
     for robot in robots:
@@ -4184,7 +4460,13 @@ def compute_pressures(robots, reference_density):
         )
         if phase == SimulationPhase.PRESSURE_PUSH and robot.role == "SHEPHERD":
             ramp = min(1.0, 0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON))
-            robot.pressure += PRESSURE_GAIN * robot.density * SHEPHERD_PRESSURE_FACTOR * ramp
+            robot.pressure += (
+                PRESSURE_GAIN
+                * robot.density
+                * SHEPHERD_PRESSURE_FACTOR
+                * planned_pressure_scale()
+                * ramp
+            )
 
 
 def compute_route_force(robot):
@@ -4267,7 +4549,11 @@ def compute_route_force(robot):
             )
     elif phase == SimulationPhase.PRESSURE_PUSH:
         if robot.role == "NORMAL" and region == active_branch:
-            force = get_backtrack_direction(active_branch) * PRESSURE_BACKTRACK_BODY_FORCE
+            force = (
+                get_backtrack_direction(active_branch)
+                * PRESSURE_BACKTRACK_BODY_FORCE
+                * planned_pressure_scale()
+            )
         elif (
             robot.role != "SHEPHERD"
             and pending_branch is not None
@@ -4387,7 +4673,13 @@ def compute_sph_forces(robots, grid):
                 distance = math.sqrt(max(distance_sq, EPSILON))
                 ratio = max(0.0, 1.0 - distance / VIRTUAL_PRESSURE_RADIUS)
                 ramp = min(1.0, 0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON))
-                virtual_force += backtrack_direction * VIRTUAL_PRESSURE_FORCE * ratio**2 * ramp
+                virtual_force += (
+                    backtrack_direction
+                    * VIRTUAL_PRESSURE_FORCE
+                    * planned_pressure_scale()
+                    * ratio**2
+                    * ramp
+                )
 
             if distance_sq <= EPSILON or distance_sq > h_sq:
                 continue
@@ -4523,6 +4815,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global junction_switch_timer, final_gather_timer, branch_entry_timer
     global pending_branch
+    global stored_compression_density_ratio
     global return_base_breadcrumb_release_pending
     global return_base_breadcrumb_retract_timer
     global return_base_breadcrumb_last_released_id
@@ -4587,9 +4880,21 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
         shepherd_form_timer += dt
         if shepherd_boundary_formed(robots):
+            # Select and size the next transition before compression.  The
+            # selected entrance stays physically closed until PRESSURE_PUSH.
+            pending_branch = choose_next_branch(
+                anchor,
+                robots,
+                reference_density,
+                activate=False,
+            )
             phase = SimulationPhase.FILL_BEHIND_SHEPHERD
             saturation_tracker.reset(active_branch)
-            print("[Shepherd] boundary formed; ordinary robots now fill behind it")
+            print(
+                "[Shepherd] boundary formed; ordinary robots now compress "
+                f"to rho={transition_pressure_plan.get('target_density_ratio', SATURATION_DENSITY_RATIO):.2f}, "
+                f"pressure_scale={planned_pressure_scale():.2f}"
+            )
         elif shepherd_form_timer >= SHEPHERD_FORM_TIMEOUT:
             # Do not start pressure with an incomplete boundary. Return selected
             # robots to NORMAL and retry when the capture region is ready.
@@ -4602,22 +4907,25 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             robots, active_branch, reference_density, dt
         )
         if saturated:
-            pending_branch = choose_next_branch(
-                anchor,
+            stored_compression_density_ratio = local_compression_density_ratio(
                 robots,
+                active_branch,
                 reference_density,
-                activate=False,
             )
             phase = SimulationPhase.PRESSURE_PUSH
             pressure_push_timer = 0.0
             flow_establish_timer = 0.0
             metrics.pressure_events.append({
                 "branch": active_branch,
+                "target_branch": pending_branch,
                 "started_at": simulation_time,
+                "stored_density_ratio": stored_compression_density_ratio,
+                "pressure_plan": dict(transition_pressure_plan),
             })
             print(
                 f"[Saturation] robots packed behind Shepherd boundary: "
-                f"branch={active_branch}, count={saturation_tracker.tip_count}"
+                f"branch={active_branch}, count={saturation_tracker.tip_count}, "
+                f"rho={stored_compression_density_ratio:.2f}"
             )
             print("[Pressure] piston push started")
             if pending_branch is not None:
@@ -4629,6 +4937,25 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     elif phase == SimulationPhase.PRESSURE_PUSH:
         pressure_push_timer += dt
         moving_ratio, average_speed, normal_count = normal_backtracking_metrics(robots, active_branch)
+        current_density_ratio = local_compression_density_ratio(
+            robots,
+            active_branch,
+            reference_density,
+        )
+        target_density_ratio = float(
+            transition_pressure_plan.get(
+                "target_density_ratio",
+                SATURATION_DENSITY_RATIO,
+            )
+        )
+        compression_ready = (
+            stored_compression_density_ratio >= target_density_ratio
+        )
+        expansion_started = (
+            current_density_ratio
+            <= stored_compression_density_ratio
+            * PRESSURE_EXPANSION_RELEASE_RATIO
+        )
         established = (
             pressure_push_timer >= SHEPHERD_MIN_PUSH_TIME
             and normal_count >= FLOW_MIN_NORMAL_COUNT
@@ -4636,17 +4963,28 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             and average_speed >= FLOW_AVERAGE_SPEED_THRESHOLD
         )
         flow_establish_timer = flow_establish_timer + dt if established else 0.0
-        if (
-            flow_establish_timer >= FLOW_ESTABLISH_DWELL_TIME
-            or pressure_push_timer >= FLOW_FALLBACK_TIME
-            or normal_count == 0
-        ):
+        release_on_flow = (
+            compression_ready
+            and expansion_started
+            and flow_establish_timer >= FLOW_ESTABLISH_DWELL_TIME
+        )
+        release_on_timeout = (
+            compression_ready
+            and pressure_push_timer >= FLOW_FALLBACK_TIME
+        )
+        if release_on_flow or release_on_timeout or normal_count == 0:
             release_shepherds_into_flow(robots)
             phase = SimulationPhase.FLOW_BACKTRACK
             if metrics.pressure_events:
                 metrics.pressure_events[-1]["flow_at"] = simulation_time
                 metrics.pressure_events[-1]["latency"] = pressure_push_timer
-            print(f"[Pressure] flow ratio={moving_ratio:.2f}, avg={average_speed:.2f}")
+            print(
+                f"[Pressure] flow ratio={moving_ratio:.2f}, "
+                f"avg={average_speed:.2f}, "
+                f"rho={stored_compression_density_ratio:.2f}"
+                f"->{current_density_ratio:.2f}, "
+                f"scale={planned_pressure_scale():.2f}"
+            )
 
     elif phase == SimulationPhase.FLOW_BACKTRACK:
         remaining = sum(get_robot_region(robot.position) == active_branch for robot in robots)
@@ -4951,6 +5289,7 @@ def draw_shepherd_curtain(surface):
 def reset_dfs_state():
     global phase, active_branch, branch_states, branch_order_plan
     global pending_branch
+    global transition_pressure_plan, stored_compression_density_ratio
     global previous_branch_direction, junction_anchor, simulation_time
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
     global pressure_push_timer, flow_establish_timer, communication_sequence
@@ -4971,6 +5310,8 @@ def reset_dfs_state():
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = "UP"
     pending_branch = None
+    transition_pressure_plan = {}
+    stored_compression_density_ratio = 0.0
     branch_states = {branch: "UNVISITED" for branch in BRANCHES}
     branch_order_plan = []
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
@@ -5033,7 +5374,9 @@ def initialize_simulation():
         )
     print(
         f"[Swarm Budget] requested={REQUESTED_ROBOT_COUNT}, "
-        f"minimum={MINIMUM_CONTINUOUS_SWARM_COUNT}, using={ROBOT_COUNT}"
+        f"minimum={MINIMUM_CONTINUOUS_SWARM_COUNT}, using={ROBOT_COUNT}, "
+        f"pressure_mass={PRESSURE_MASS_REQUIREMENT} "
+        f"({PRESSURE_FLOW_LANES}x{PRESSURE_FLOW_LAYERS})"
     )
     print(
         f"[Equilibrium] d*={EQUILIBRIUM_DISTANCE:.4f}, "
@@ -5226,6 +5569,16 @@ while running:
     normal_count, shepherd_count = count_branch_roles(robots, active_branch)
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
+    base_breadcrumbs = get_base_breadcrumbs(robots)
+    breadcrumb_endpoint = (
+        base_breadcrumbs[-1]
+        if base_breadcrumbs
+        else base_station
+    )
+    moving_swarm_tail = get_moving_swarm_tail(
+        robots,
+        breadcrumb_endpoint,
+    )
     hud_lines = [
         "Base-rooted DFS: Proxy-Region Flow-Preserving SPH + EDF",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
@@ -5280,14 +5633,16 @@ while running:
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
-        f"Base direct={communication_stats['direct']} | Anchor linked={communication_stats['anchor_connected']} | Base Breadcrumbs={len(get_base_breadcrumbs(robots))}",
+        f"Base direct={communication_stats['direct']} | Anchor linked={communication_stats['anchor_connected']} | Base Breadcrumbs={len(base_breadcrumbs)}",
+        f"Breadcrumb endpoint -> swarm tail={moving_swarm_tail.robot_id if moving_swarm_tail else '-'} (never Anchor)",
         f"Front comm ratio={front_comm['connected_ratio']:.2f} | continuous chain risk={front_comm['chain_at_risk']}",
         "Branch relay deployment=disabled",
         f"Branch robots normal={normal_count} shepherd={shepherd_count}",
-        f"Saturation: tip={saturation_tracker.tip_count} slow={saturation_tracker.low_speed_ratio:.2f}",
-        f"density={saturation_tracker.average_density_ratio:.2f} occupancy={saturation_tracker.occupancy_ratio:.2f}",
+        f"Saturation: tip={saturation_tracker.tip_count}/{saturation_tracker.required_tip_count} slow={saturation_tracker.low_speed_ratio:.2f}",
+        f"density={saturation_tracker.average_density_ratio:.2f}/{saturation_tracker.required_density_ratio:.2f} occupancy={saturation_tracker.occupancy_ratio:.2f}/{saturation_tracker.required_occupancy_ratio:.2f}",
         f"front_delta={saturation_tracker.front_delta:.2f} dwell={saturation_tracker.dwell:.2f} saturated={saturation_tracker.saturated}",
         f"Shepherd target={adaptive_shepherd_count()} | formed={shepherd_boundary_formed(robots)} | pressure t={pressure_push_timer:.2f}",
+        f"Pressure plan: {transition_pressure_plan.get('source_branch', '-')}->{transition_pressure_plan.get('target_branch', '-')} d={transition_pressure_plan.get('distance', 0.0):.0f} scale={planned_pressure_scale():.2f}",
         f"Distance total={sum(robot.total_distance for robot in robots):.0f} | disconnect robot-s={metrics.disconnected_robot_seconds:.1f}",
         (
             f"Mean forces P={metrics.pressure_force_sum / max(metrics.force_samples, 1):.1f} "
