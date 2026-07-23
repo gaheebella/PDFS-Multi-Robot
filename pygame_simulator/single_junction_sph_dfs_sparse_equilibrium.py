@@ -3,8 +3,8 @@
 Implemented research components
 -------------------------------
 1. Multi-criteria Junction Anchor election.
-2. Proxy-region-based Flow-Preserving SPH short-rollout, EDF, and
-   continuous-chain-aware DFS child-branch ordering.
+2. Fixed Physical DFS order: RIGHT -> UP -> LEFT. Branch ordering, proxy
+   rollout, and Junction voting do not participate in control.
 3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
 4. Width-adaptive Shepherd count, scored candidate election, and
@@ -21,8 +21,9 @@ Implemented research components
     participating in SPH.
 11. Compliant Breadcrumb particles transmit SPH forces instead of acting as
     force-free fixed markers.
-12. Normal robots exchange local branch votes; the Anchor records the result.
-13. The next Branch is preopened while the current Branch backtracks, so the
+12. The first Branch is open before Junction arrival, so the swarm flows
+    directly into RIGHT without a Junction waiting stage.
+13. The next fixed Branch is preopened while the current Branch backtracks, so the
     robots already near the Junction naturally become the new leading front.
 14. Branch Relay deployment is completely disabled.  Breadcrumbs are dropped
     only once, behind the swarm during its initial Base-corridor traversal,
@@ -30,8 +31,8 @@ Implemented research components
 
 Scope limitation
 ----------------
-The map contains one T/cross junction. The code therefore implements DFS
-child ordering at one junction, not recursive multi-junction DFS-tree repair.
+The map contains one T/cross junction. The code therefore implements a fixed
+single-junction Physical DFS sequence, not recursive multi-junction DFS-tree repair.
 The data structures are intentionally separated so they can be extended to a
 multi-junction topological graph later.
 """
@@ -71,7 +72,7 @@ SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base SPH DFS | Proxy Regions + Separate HUD Panel"
+    "Base SPH DFS | Fixed RIGHT-UP-LEFT"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
@@ -257,6 +258,7 @@ class SimulationPhase(Enum):
 
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
+FIXED_BRANCH_ORDER = ("RIGHT", "UP", "LEFT")
 BRANCH_DIRECTIONS = {
     "UP": pygame.Vector2(0.0, -1.0),
     "LEFT": pygame.Vector2(-1.0, 0.0),
@@ -285,12 +287,15 @@ BRANCH_TARGET_NODE = {
 }
 
 phase = SimulationPhase.MOVE_TO_JUNCTION
-active_branch = "UP"
+active_branch = FIXED_BRANCH_ORDER[0]
 pending_branch: Optional[str] = None
 transition_pressure_plan: dict = {}
 stored_compression_density_ratio = 0.0
-branch_states = {branch: "UNVISITED" for branch in BRANCHES}
-branch_order_plan: list[str] = []
+branch_states = {
+    branch: ("ACTIVE" if branch == FIXED_BRANCH_ORDER[0] else "UNVISITED")
+    for branch in BRANCHES
+}
+branch_order_plan: list[str] = [FIXED_BRANCH_ORDER[0]]
 previous_branch_direction = pygame.Vector2(0.0, -1.0)  # incoming from BASE
 
 junction_anchor: Optional["Robot"] = None
@@ -739,7 +744,7 @@ def get_robot_region(position: pygame.Vector2) -> str:
 def is_region_allowed(position: pygame.Vector2) -> bool:
     region = get_robot_region(position)
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        return region in {"BOTTOM", "JUNCTION"}
+        return region in {"BOTTOM", "JUNCTION", FIXED_BRANCH_ORDER[0]}
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -1947,7 +1952,16 @@ def update_base_breadcrumb_deployment(robots, dt):
         0.0,
         base_breadcrumb_deploy_cooldown - dt,
     )
-    if phase != SimulationPhase.MOVE_TO_JUNCTION:
+    if (
+        any(state == "VISITED" for state in branch_states.values())
+        or phase
+        not in {
+            SimulationPhase.MOVE_TO_JUNCTION,
+            SimulationPhase.EXPLORE_BRANCH,
+            SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+            SimulationPhase.FILL_BEHIND_SHEPHERD,
+        }
+    ):
         return
     breadcrumbs = get_base_breadcrumbs(robots)
     parent = breadcrumbs[-1] if breadcrumbs else base_station
@@ -2688,6 +2702,7 @@ def geodesic_edf_direction(
 def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
     """Smooth virtual-particle barrier at every unselected branch mouth."""
     if phase not in {
+        SimulationPhase.MOVE_TO_JUNCTION,
         SimulationPhase.EXPLORE_BRANCH,
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
         SimulationPhase.FILL_BEHIND_SHEPHERD,
@@ -3900,12 +3915,39 @@ def choose_next_branch(
     return selected
 
 
+def next_fixed_branch() -> Optional[str]:
+    """Return the next UNVISITED Branch in RIGHT -> UP -> LEFT order."""
+    for branch in FIXED_BRANCH_ORDER:
+        if branch_states[branch] == "UNVISITED":
+            return branch
+    return None
+
+
+def prepare_fixed_transition(anchor) -> Optional[str]:
+    """Preopen the next fixed Branch and calculate its pressure budget."""
+    global transition_pressure_plan
+    selected = next_fixed_branch()
+    if anchor is not None:
+        anchor.pending_branch = selected
+    transition_pressure_plan = build_transition_pressure_plan(
+        active_branch,
+        selected,
+    )
+    print(
+        f"[Fixed DFS] next={selected or 'BASE'}, "
+        f"pressure_scale={transition_pressure_plan['pressure_scale']:.2f}, "
+        f"rho_target={transition_pressure_plan['target_density_ratio']:.2f}"
+    )
+    return selected
+
+
 def activate_pending_branch(anchor) -> Optional[str]:
     """Commit the branch already opened during the previous Backtracking."""
     global active_branch, pending_branch, selected_branch_entry_lambda
     global branch_entry_timer
     if anchor is None or pending_branch is None:
         return None
+    source = active_branch
     selected = pending_branch
     anchor.local_branch_states[selected] = "ACTIVE"
     anchor.selected_branch = selected
@@ -3914,10 +3956,14 @@ def activate_pending_branch(anchor) -> Optional[str]:
     pending_branch = None
     if selected not in branch_order_plan:
         branch_order_plan.append(selected)
-    components = last_flow_rollout_scores.get(selected, {}).get("components", {})
-    selected_branch_entry_lambda = components.get(
-        "rollout_lambda",
-        STIFFNESS_EXPONENT_SOFT,
+    turn_fraction = transition_turn_fraction(
+        source,
+        selected,
+    )
+    selected_branch_entry_lambda = (
+        STIFFNESS_EXPONENT_SOFT
+        if turn_fraction > 0.25
+        else STIFFNESS_EXPONENT_RIGID
     )
     branch_entry_timer = 0.0
     print(f"[DFS] activated preopened branch={selected}")
@@ -4503,12 +4549,11 @@ def compute_route_force(robot):
             return force
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
-        if y_distance > 0.0:
-            scale = max(INITIAL_INGRESS_MIN_FORCE_SCALE, min(1.0, y_distance / INITIAL_INGRESS_BRAKE_DISTANCE))
-            force.y = -INITIAL_INGRESS_FORCE * scale
-        lane_error = robot.ingress_lane_x - robot.position.x
-        force.x = clamp(INITIAL_INGRESS_LANE_GAIN * lane_error, -INITIAL_INGRESS_LANE_MAX_FORCE, INITIAL_INGRESS_LANE_MAX_FORCE)
+        # RIGHT is open before Junction arrival, so there is no staging stop.
+        force = (
+            geodesic_edf_direction(robot.position, FIXED_BRANCH_ORDER[0])
+            * INITIAL_INGRESS_FORCE
+        )
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         force = (
             geodesic_edf_direction(robot.position, active_branch)
@@ -4829,32 +4874,22 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         branch_entry_timer += dt
 
     anchor = elect_junction_anchor(robots)
+    if not any(state == "VISITED" for state in branch_states.values()):
+        update_base_breadcrumb_deployment(robots, dt)
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        update_base_breadcrumb_deployment(robots, dt)
-        robots_in_junction = sum(
-            get_robot_region(robot.position) == "JUNCTION" and robot.role != "ANCHOR"
-            for robot in robots
-        )
-        consensus_ready = junction_consensus_tracker.update(
-            robots,
-            dt,
-            reference_density,
-        )
-        if (
-            anchor is not None
-            and anchor_deployment_ready(anchor, robots)
-            and robots_in_junction >= JUNCTION_ENTRY_COUNT
-            and consensus_ready
-        ):
-            selected = choose_next_branch(anchor, robots, reference_density)
-            if selected is None:
-                begin_final_gather()
-            else:
-                saturation_tracker.reset(selected)
-                junction_consensus_tracker.reset()
-                phase = SimulationPhase.EXPLORE_BRANCH
-                metrics.branch_events.append({"branch": selected, "started_at": simulation_time})
+        # The swarm is already flowing into RIGHT. Anchor election and parking
+        # run asynchronously and do not create a Junction waiting stage.
+        if anchor is not None:
+            anchor.selected_branch = FIXED_BRANCH_ORDER[0]
+            saturation_tracker.reset(FIXED_BRANCH_ORDER[0])
+            phase = SimulationPhase.EXPLORE_BRANCH
+            metrics.branch_events.append({
+                "branch": FIXED_BRANCH_ORDER[0],
+                "started_at": simulation_time,
+                "direct_entry": True,
+            })
+            print("[Fixed DFS] direct entry RIGHT; no Junction stop")
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         # Preserve the original timing: wait until the leading robots enter the
@@ -4882,12 +4917,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         if shepherd_boundary_formed(robots):
             # Select and size the next transition before compression.  The
             # selected entrance stays physically closed until PRESSURE_PUSH.
-            pending_branch = choose_next_branch(
-                anchor,
-                robots,
-                reference_density,
-                activate=False,
-            )
+            pending_branch = prepare_fixed_transition(anchor)
             phase = SimulationPhase.FILL_BEHIND_SHEPHERD
             saturation_tracker.reset(active_branch)
             print(
@@ -5032,10 +5062,14 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     "[Consensus] relaxed fallback selection after "
                     f"{junction_switch_timer:.2f}s"
                 )
-            selected = choose_next_branch(anchor, robots, reference_density)
+            selected = next_fixed_branch()
             if selected is None:
                 begin_final_gather()
             else:
+                pending_branch = selected
+                if anchor is not None:
+                    anchor.pending_branch = selected
+                selected = activate_pending_branch(anchor)
                 saturation_tracker.reset(selected)
                 junction_consensus_tracker.reset()
                 phase = SimulationPhase.EXPLORE_BRANCH
@@ -5308,12 +5342,15 @@ def reset_dfs_state():
     global return_base_breadcrumb_force_timer
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
-    active_branch = "UP"
+    active_branch = FIXED_BRANCH_ORDER[0]
     pending_branch = None
     transition_pressure_plan = {}
     stored_compression_density_ratio = 0.0
-    branch_states = {branch: "UNVISITED" for branch in BRANCHES}
-    branch_order_plan = []
+    branch_states = {
+        branch: ("ACTIVE" if branch == FIXED_BRANCH_ORDER[0] else "UNVISITED")
+        for branch in BRANCHES
+    }
+    branch_order_plan = [FIXED_BRANCH_ORDER[0]]
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
     junction_anchor = None
     simulation_time = 0.0
@@ -5521,8 +5558,6 @@ while running:
     pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=5)
 
     if show_regions:
-        draw_proxy_partition(screen)
-        draw_proxy_robot_assignments(screen, robots)
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
         pygame.draw.rect(screen, BASE_COLOR, base_reserve_rect, width=2)
         pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
@@ -5580,56 +5615,15 @@ while running:
         breadcrumb_endpoint,
     )
     hud_lines = [
-        "Base-rooted DFS: Proxy-Region Flow-Preserving SPH + EDF",
+        "Base-rooted DFS: Fixed RIGHT -> UP -> LEFT + SPH",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
         f"Drive={DRIVE_MODE} | d*={EQUILIBRIUM_DISTANCE:.1f} | Base reserve={count_base_reserve_members(robots)}/{BASE_RESERVE_MIN_COUNT}",
         f"Anchor={junction_anchor.robot_id if junction_anchor else '-'} | score={junction_anchor.anchor_election_score:.3f}" if junction_anchor else "Anchor=-",
-        f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
-        f"Pending branch={pending_branch or '-'} | vote={last_distributed_vote.get('selected', '-')} quorum={last_distributed_vote.get('quorum', 0.0):.2f}",
-        f"Order={' > '.join(branch_order_plan) if branch_order_plan else '-'}",
-        (
-            "Last branch cost: "
-            + (
-                f"Q={metrics.branch_selection_events[-1]['components']['predicted_flow']:.2f} "
-                f"dRho={metrics.branch_selection_events[-1]['components']['density_disturbance']:.2f} "
-                f"dV={metrics.branch_selection_events[-1]['components']['velocity_disturbance']:.2f} "
-                f"Comm={metrics.branch_selection_events[-1]['components']['rollout_comm']:.2f}"
-                if metrics.branch_selection_events
-                else "-"
-            )
-        ),
-        (
-            "Proxy mass: "
-            + " | ".join(
-                f"{branch} q={last_proxy_mass_stats.get(branch, {}).get('quota_fraction', 0.0):.2f} "
-                f"m={last_proxy_mass_stats.get(branch, {}).get('actual_mass_fraction', 0.0):.2f}"
-                for branch in last_proxy_candidates
-            )
-            if last_proxy_candidates
-            else "Proxy mass: -"
-        ),
-        (
-            "Proxy rollout candidates: "
-            + " | ".join(
-                f"{branch}:J={data['cost']:.2f},Q={data['components']['predicted_flow']:.2f},"
-                f"n={data['components']['proxy_primary_count']}+{data['components']['proxy_context_count']}"
-                for branch, data in sorted(last_flow_rollout_scores.items())
-            )
-            if last_flow_rollout_scores
-            else "Proxy rollout candidates: -"
-        ),
+        f"Branch={active_branch} | pending={pending_branch or '-'} | fixed order={' > '.join(FIXED_BRANCH_ORDER)}",
         (
             f"Adaptive lambda={get_effective_stiffness_exponent():.3f} "
             f"entry={selected_branch_entry_lambda:.3f} "
             f"recovery={branch_entry_timer:.2f}/{BRANCH_STIFFNESS_RECOVERY_TIME:.2f}"
-        ),
-        (
-            f"Junction consensus: n={junction_consensus_tracker.candidate_count} "
-            f"stable={junction_consensus_tracker.stable_ratio:.2f} "
-            f"dv={junction_consensus_tracker.mean_density_delta_ratio:.3f} "
-            f"dwell={junction_consensus_tracker.dwell:.2f} "
-            f"fast={junction_consensus_tracker.fast_dwell:.2f} "
-            f"mode={junction_consensus_tracker.ready_mode}"
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
