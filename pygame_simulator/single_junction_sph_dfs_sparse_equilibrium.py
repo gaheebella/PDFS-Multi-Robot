@@ -344,7 +344,7 @@ GRID_ROW_SPACING = 5.25 * MAP_SCALE
 SMOOTHING_LENGTH = 28.0 * MAP_SCALE
 PRESSURE_GAIN = 2800.0
 SPH_MOTION_PRESSURE_BOOST = 2.20
-SHEPHERD_PACKED_PRESSURE_BOOST = 4.00
+SHEPHERD_PACKED_PRESSURE_BOOST = 5.00
 STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1 = 0.9
 VISCOSITY_XI2 = 1.2
@@ -357,7 +357,7 @@ NORMAL_EQUILIBRIUM_SCALE = 1.20
 # while high-frequency SPH reversals and corridor-crossing zigzags are damped.
 ACCELERATION_FILTER_ALPHA = 0.18
 CORRIDOR_LATERAL_VELOCITY_DAMPING = 12.0
-SPH_PRESSURE_FORCE_LIMIT = 140.0 * MOTION_SPEED_MULTIPLIER
+SPH_PRESSURE_FORCE_LIMIT = 200.0 * MOTION_SPEED_MULTIPLIER
 SPH_VISCOSITY_FORCE_LIMIT = 90.0 * MOTION_SPEED_MULTIPLIER
 VISCOELASTIC_LINK_RADIUS = SAFE_RADIUS * 1.45
 VISCOELASTIC_REST_MIN = ROBOT_RADIUS * 2.20
@@ -369,6 +369,14 @@ VISCOELASTIC_EQUILIBRIUM_ADAPTATION = 4.0
 VISCOELASTIC_VELOCITY_CONSENSUS_GAIN = 6.0
 VISCOELASTIC_FORCE_LIMIT = 75.0 * MOTION_SPEED_MULTIPLIER
 VISCOELASTIC_LINK_STALE_STEPS = 3
+COMPRESSION_RELEASE_DENSITY_RATIO = 1.20
+COMPRESSION_RELEASE_RADIUS = (
+    SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE * 1.15
+)
+COMPRESSION_RELEASE_GAIN = 120.0
+COMPRESSION_RELEASE_FORCE_LIMIT = 180.0 * MOTION_SPEED_MULTIPLIER
+COMPRESSION_RELEASE_RAMP_TIME = 0.35
+PRESSURE_POLICY_VERSION = "SPH_SELF_EXPANSION_V1"
 VISCOELASTIC_MODEL_VERSION = "KELVIN_VOIGT_SPH_V2_SPACED"
 MOTION_POLICY_VERSION = "FAST_STABLE_COMMAND_V3"
 
@@ -376,11 +384,13 @@ ROUTE_FORCE = 22.0 * MOTION_SPEED_MULTIPLIER
 OUTLET_FORCE = 24.0 * MOTION_SPEED_MULTIPLIER
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
-PRESSURE_BACKTRACK_BODY_FORCE = 28.0 * MOTION_SPEED_MULTIPLIER
+PRESSURE_BACKTRACK_BODY_FORCE = 8.0 * MOTION_SPEED_MULTIPLIER
 CENTERING_GAIN = 1.2
 
 MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
 MAX_ACCELERATION = 300.0 * MOTION_SPEED_MULTIPLIER
+PRESSURE_PUSH_MAX_SPEED = 42.0 * MOTION_SPEED_MULTIPLIER
+FLOW_BACKTRACK_MAX_SPEED = 52.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
 INITIAL_INGRESS_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
@@ -471,7 +481,7 @@ SHEPHERD_MAX_COUNT = 14
 SHEPHERD_EDGE_MARGIN = 12.0 * MAP_SCALE
 SHEPHERD_TARGET_SLOT_SPACING = 12.5 * MAP_SCALE
 
-SHEPHERD_FORM_SPEED = 110.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_FORM_SPEED = 50.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_RELEASE_SPEED = 32.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_FORM_TOLERANCE = 3.0 * MAP_SCALE
 SHEPHERD_FORM_TIMEOUT = 1.25
@@ -482,25 +492,28 @@ SHEPHERD_FORM_TIMEOUT = 1.25
 # Shepherds so ordinary robots cannot leak toward the dead-end wall.
 SHEPHERD_CURTAIN_CLEARANCE = max(ROBOT_RADIUS * 2.5, 6.0 * MAP_SCALE)
 SHEPHERD_CURTAIN_INTERACTION_DEPTH = 24.0 * MAP_SCALE
-SHEPHERD_CURTAIN_FORCE = 860.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_CURTAIN_VELOCITY_DAMPING = 18.0
-SHEPHERD_CURTAIN_RECOVERY_SPEED = 10.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_CURTAIN_FORCE = 180.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_CURTAIN_MAX_FORCE = 220.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_CURTAIN_VELOCITY_DAMPING = 12.0
+SHEPHERD_CURTAIN_RECOVERY_SPEED = 6.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_CURTAIN_DRAW_HALF_WIDTH = 3
 
 # Piston motion: Shepherd boundary advances toward the parent junction.
-SHEPHERD_PISTON_SPEED = 22.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_PISTON_SPEED = 8.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_PISTON_MAX_TRAVEL = 42.0 * MAP_SCALE
-SHEPHERD_LINE_BACKTRACK_SPEED = 30.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_LINE_BACKTRACK_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_SPEED_RAMP_TIME = 0.55
 SHEPHERD_JUNCTION_DEPTH_TOLERANCE = max(ROBOT_RADIUS, 0.75)
 SHEPHERD_JUNCTION_RELEASE_INSET = max(
     ROBOT_RADIUS * 2.5,
     2.0 * MAP_SCALE,
 )
 SHEPHERD_JUNCTION_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_POLICY_VERSION = "RIGID_CURTAIN_RELEASE_V2"
-SHEPHERD_PRESSURE_FACTOR = 12.0
+SHEPHERD_POLICY_VERSION = "DENSITY_RELEASE_CURTAIN_V3"
+SHEPHERD_PRESSURE_FACTOR = 4.0
 VIRTUAL_PRESSURE_RADIUS = 60.0 * MAP_SCALE
-VIRTUAL_PRESSURE_FORCE = 440.0
+VIRTUAL_PRESSURE_FORCE = 110.0
+SHEPHERD_VIRTUAL_FORCE_LIMIT = 140.0 * MOTION_SPEED_MULTIPLIER
 PRESSURE_RAMP_TIME = 0.8
 
 SHEPHERD_LOCAL_FLOW_DEPTH = 58.0 * MAP_SCALE
@@ -829,6 +842,20 @@ def smoothstep01(value: float) -> float:
     return value * value * (3.0 - 2.0 * value)
 
 
+def ramped_travel(
+    elapsed: float,
+    target_speed: float,
+    ramp_time: float,
+) -> float:
+    """Distance under a bounded linear acceleration into target speed."""
+    elapsed = max(0.0, elapsed)
+    ramp_time = max(ramp_time, EPSILON)
+    if elapsed < ramp_time:
+        acceleration = target_speed / ramp_time
+        return 0.5 * acceleration * elapsed**2
+    return target_speed * (elapsed - 0.5 * ramp_time)
+
+
 def limit_vector(vector: pygame.Vector2, maximum_length: float) -> pygame.Vector2:
     if vector.length_squared() > maximum_length * maximum_length:
         vector.scale_to_length(maximum_length)
@@ -992,13 +1019,21 @@ def get_shepherd_curtain_depth(branch: str) -> float:
     if phase == SimulationPhase.PRESSURE_PUSH:
         travel = min(
             SHEPHERD_PISTON_MAX_TRAVEL,
-            pressure_push_timer * SHEPHERD_PISTON_SPEED,
+            ramped_travel(
+                pressure_push_timer,
+                SHEPHERD_PISTON_SPEED,
+                SHEPHERD_SPEED_RAMP_TIME,
+            ),
         )
         depth -= travel
     elif phase == SimulationPhase.FLOW_BACKTRACK:
         depth = (
             shepherd_flow_start_depth
-            - shepherd_flow_timer * SHEPHERD_LINE_BACKTRACK_SPEED
+            - ramped_travel(
+                shepherd_flow_timer,
+                SHEPHERD_LINE_BACKTRACK_SPEED,
+                SHEPHERD_SPEED_RAMP_TIME,
+            )
         )
     return max(0.0, depth)
 
@@ -1049,9 +1084,13 @@ def compute_shepherd_curtain_force(robot: "Robot") -> pygame.Vector2:
         0.0,
         robot.velocity.dot(BRANCH_DIRECTIONS[active_branch]),
     )
-    magnitude = (
-        SHEPHERD_CURTAIN_FORCE * ratio**2
-        + SHEPHERD_CURTAIN_VELOCITY_DAMPING * forward_speed
+    magnitude = min(
+        SHEPHERD_CURTAIN_MAX_FORCE,
+        (
+            SHEPHERD_CURTAIN_FORCE * ratio**2
+            + SHEPHERD_CURTAIN_VELOCITY_DAMPING
+            * forward_speed
+        ),
     )
     return get_backtrack_direction(active_branch) * magnitude
 
@@ -1221,7 +1260,11 @@ class Robot:
         self.filtered_acceleration = pygame.Vector2()
         self.radius = ROBOT_RADIUS
         self.density = 0.0
+        self.density_ratio = 1.0
         self.pressure = 0.0
+        self.last_sph_pressure_force = 0.0
+        self.last_compression_release_force = 0.0
+        self.last_shepherd_force = 0.0
         self.role = "NORMAL"
 
         self.shepherd_anchor: Optional[pygame.Vector2] = None
@@ -1369,6 +1412,10 @@ class Robot:
                 if get_robot_region(self.position) == "JUNCTION"
                 else INITIAL_SAFE_MAX_SPEED
             )
+        elif phase == SimulationPhase.PRESSURE_PUSH:
+            speed_limit = PRESSURE_PUSH_MAX_SPEED
+        elif phase == SimulationPhase.FLOW_BACKTRACK:
+            speed_limit = FLOW_BACKTRACK_MAX_SPEED
         limit_vector(self.velocity, speed_limit)
         x_position = pygame.Vector2(self.position.x + self.velocity.x * dt, self.position.y)
         if is_walkable(x_position, self.radius):
@@ -4607,6 +4654,7 @@ def compute_pressures(robots, reference_density):
     effective_lambda = get_effective_stiffness_exponent()
     for robot in robots:
         ratio = robot.density / max(reference_density, EPSILON)
+        robot.density_ratio = ratio
         raw_pressure = (
             PRESSURE_GAIN
             * robot.density
@@ -4646,11 +4694,9 @@ def compute_pressures(robots, reference_density):
             ramp = (
                 1.0
                 if phase == SimulationPhase.FLOW_BACKTRACK
-                else min(
-                    1.0,
-                    0.25
-                    + pressure_push_timer
-                    / max(PRESSURE_RAMP_TIME, EPSILON),
+                else smoothstep01(
+                    pressure_push_timer
+                    / max(PRESSURE_RAMP_TIME, EPSILON)
                 )
             )
             robot.pressure += PRESSURE_GAIN * robot.density * SHEPHERD_PRESSURE_FACTOR * ramp
@@ -4887,6 +4933,9 @@ def compute_sph_forces(
     for robot_i in robots:
         if robot_i.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}:
             robot_i.acceleration.update(0.0, 0.0)
+            robot_i.last_sph_pressure_force = 0.0
+            robot_i.last_compression_release_force = 0.0
+            robot_i.last_shepherd_force = 0.0
             continue
         if robot_i.role == "SHEPHERD" and phase in {
             SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -4896,11 +4945,15 @@ def compute_sph_forces(
         }:
             robot_i.acceleration.update(0.0, 0.0)
             robot_i.filtered_acceleration.update(0.0, 0.0)
+            robot_i.last_sph_pressure_force = 0.0
+            robot_i.last_compression_release_force = 0.0
+            robot_i.last_shepherd_force = 0.0
             continue
 
         pressure_force = pygame.Vector2()
         viscosity_force = pygame.Vector2()
         viscoelastic_force = pygame.Vector2()
+        compression_release_force = pygame.Vector2()
         repulsion_force = pygame.Vector2()
         virtual_force = pygame.Vector2()
         cohesion_force = pygame.Vector2()
@@ -4932,11 +4985,9 @@ def compute_sph_forces(
                 ramp = (
                     1.0
                     if phase == SimulationPhase.FLOW_BACKTRACK
-                    else min(
-                        1.0,
-                        0.25
-                        + pressure_push_timer
-                        / max(PRESSURE_RAMP_TIME, EPSILON),
+                    else smoothstep01(
+                        pressure_push_timer
+                        / max(PRESSURE_RAMP_TIME, EPSILON)
                     )
                 )
                 virtual_force += (
@@ -4964,6 +5015,7 @@ def compute_sph_forces(
             neighbor_count += 1
             neighbor_center += robot_j.position
             distance = math.sqrt(distance_sq)
+            direction_away = r_ij / distance
             gradient = spiky_gradient(r_ij, SMOOTHING_LENGTH)
             coefficient = (
                 robot_i.pressure / max(robot_i.density**2, EPSILON)
@@ -5036,13 +5088,62 @@ def compute_sph_forces(
                     viscoelastic_last_seen[pair] = viscoelastic_step
 
                 rest_length = viscoelastic_rest_lengths[pair]
-                direction_away = r_ij / distance
                 extension = distance - rest_length
                 radial_relative_speed = v_ij.dot(direction_away)
                 viscoelastic_force += direction_away * (
                     -VISCOELASTIC_ELASTIC_GAIN * extension
                     -VISCOELASTIC_DASHPOT_GAIN
                     * radial_relative_speed
+                )
+
+            if (
+                phase in {
+                    SimulationPhase.PRESSURE_PUSH,
+                    SimulationPhase.FLOW_BACKTRACK,
+                }
+                and robot_i.role == "NORMAL"
+                and robot_j.role == "NORMAL"
+                and distance < COMPRESSION_RELEASE_RADIUS
+            ):
+                average_density_ratio = 0.5 * (
+                    robot_i.density_ratio
+                    + robot_j.density_ratio
+                )
+                density_excess = max(
+                    0.0,
+                    average_density_ratio
+                    - COMPRESSION_RELEASE_DENSITY_RATIO,
+                )
+                spacing_compression = max(
+                    0.0,
+                    1.0
+                    - distance
+                    / max(pair_equilibrium_radius, EPSILON),
+                )
+                release_intensity = max(
+                    density_excess,
+                    spacing_compression * 2.0,
+                )
+                release_weight = (
+                    1.0
+                    - distance / COMPRESSION_RELEASE_RADIUS
+                ) ** 2
+                release_ramp = (
+                    1.0
+                    if phase == SimulationPhase.FLOW_BACKTRACK
+                    else smoothstep01(
+                        pressure_push_timer
+                        / max(
+                            COMPRESSION_RELEASE_RAMP_TIME,
+                            EPSILON,
+                        )
+                    )
+                )
+                compression_release_force += direction_away * (
+                    COMPRESSION_RELEASE_GAIN
+                    * release_intensity
+                    * release_weight
+                    * release_ramp
                 )
 
             approach = v_ij.dot(r_ij)
@@ -5067,6 +5168,14 @@ def compute_sph_forces(
         limit_vector(pressure_force, SPH_PRESSURE_FORCE_LIMIT)
         limit_vector(viscosity_force, SPH_VISCOSITY_FORCE_LIMIT)
         limit_vector(viscoelastic_force, VISCOELASTIC_FORCE_LIMIT)
+        limit_vector(
+            compression_release_force,
+            COMPRESSION_RELEASE_FORCE_LIMIT,
+        )
+        limit_vector(
+            virtual_force,
+            SHEPHERD_VIRTUAL_FORCE_LIMIT,
+        )
         route_force = compute_route_force(robot_i)
         connectivity_force = compute_connectivity_force(
             robot_i,
@@ -5076,6 +5185,13 @@ def compute_sph_forces(
         initial_junction_wall_force = (
             compute_initial_junction_soft_wall_force(robot_i)
         )
+        robot_i.last_sph_pressure_force = pressure_force.length()
+        robot_i.last_compression_release_force = (
+            compression_release_force.length()
+        )
+        robot_i.last_shepherd_force = (
+            virtual_force + shepherd_curtain_force
+        ).length()
         pressure_phase_normal = (
             phase == SimulationPhase.PRESSURE_PUSH
             and robot_i.role == "NORMAL"
@@ -5094,6 +5210,7 @@ def compute_sph_forces(
             pressure_force
             + viscosity_force
             + viscoelastic_force
+            + compression_release_force
             + repulsion_force
             + virtual_force
             + cohesion_force
@@ -5948,6 +6065,25 @@ while running:
         ),
         default=0.0,
     )
+    force_samples = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == active_branch
+    ]
+    force_sample_count = max(1, len(force_samples))
+    average_sph_pressure_force = sum(
+        robot.last_sph_pressure_force
+        for robot in force_samples
+    ) / force_sample_count
+    average_compression_release_force = sum(
+        robot.last_compression_release_force
+        for robot in force_samples
+    ) / force_sample_count
+    average_shepherd_force = sum(
+        robot.last_shepherd_force
+        for robot in force_samples
+    ) / force_sample_count
     hud_lines = [
         "Pressure-driven SPH | Distributed NORMAL consensus | Breadcrumb relay",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
@@ -6072,6 +6208,12 @@ while running:
             f"Viscoelastic={VISCOELASTIC_MODEL_VERSION} | "
             f"active links={len(viscoelastic_rest_lengths)}"
         ),
+        (
+            f"Force avg: SPH={average_sph_pressure_force:.1f} | "
+            f"self-expand={average_compression_release_force:.1f} | "
+            f"Shepherd={average_shepherd_force:.1f}"
+        ),
+        f"Pressure policy={PRESSURE_POLICY_VERSION}",
         (
             f"Shepherd line depth={get_shepherd_curtain_depth(active_branch):.1f} "
             f"| max slot error={shepherd_line_error:.2f}"
