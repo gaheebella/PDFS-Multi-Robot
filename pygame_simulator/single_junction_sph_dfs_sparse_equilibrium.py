@@ -2,18 +2,17 @@
 
 Implemented research components
 -------------------------------
-1. Multi-criteria Junction Anchor election.
-2. Proxy-region-based Flow-Preserving SPH short-rollout, EDF, and relay-aware DFS child-branch ordering.
+1. NORMAL-to-NORMAL local voting for distributed Junction decisions.
+2. Fixed RIGHT -> UP -> LEFT priority agreed through peer consensus.
 3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
-4. Width-adaptive Shepherd count, scored candidate election, and
-   minimum-cost candidate-to-slot assignment.
-5. Moving piston-style Shepherd boundary plus weak directional body force.
-6. Fixed Base-rooted LOS communication with permanent trunk relays.
+4. Width-adaptive Shepherd count and peer-auction role self-election.
+5. Pressure-dominant SPH motion with only a weak directional bias.
+6. Fixed Base-rooted LOS communication with reactive tail Breadcrumb relays.
 7. The original dead-end first-arrival Shepherd selection timing is retained,
    but the Shepherd count is computed from corridor width.
 8. Pressure starts only after the ordinary robots saturate behind the formed
-   Shepherd boundary; branch relays, release logic, and final gathering remain.
+   Shepherd boundary; Breadcrumb release logic and final gathering remain.
 
 Scope limitation
 ----------------
@@ -58,7 +57,7 @@ SUBSTEPS = 1
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(
-    "Base SPH DFS | Proxy Regions + Separate HUD Panel"
+    "Pressure-Driven SPH | Distributed Decisions + Breadcrumb Relays"
 )
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
@@ -89,6 +88,8 @@ COMM_LINK_SAFE_COLOR = (132, 190, 158)
 COMM_LINK_WARNING_COLOR = (226, 177, 96)
 COMM_LINK_DANGER_COLOR = (214, 103, 103)
 DISCONNECTED_COLOR = (205, 96, 96)
+ARTIFICIAL_WALL_COLOR = (220, 62, 62)
+ARTIFICIAL_WALL_WIDTH = 8
 
 # Branch colour identity is shared by the physical branch, its proxy subregion,
 # projected proxy particles, branch labels, and branch boundaries.  The same
@@ -278,6 +279,8 @@ phase = SimulationPhase.MOVE_TO_JUNCTION
 active_branch = FIXED_BRANCH_ORDER[0]
 branch_states = {branch: "UNVISITED" for branch in BRANCHES}
 branch_order_plan: list[str] = []
+branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+distributed_consensus_branch: Optional[str] = None
 previous_branch_direction = pygame.Vector2(0.0, -1.0)  # incoming from BASE
 
 junction_anchor: Optional["Robot"] = None
@@ -315,13 +318,14 @@ last_flow_rollout_scores: dict[str, dict] = {}
 # 4. Physics and control parameters
 # =========================================================
 
-ROBOT_COUNT = 220
+ROBOT_COUNT = 352
 SPAWN_MODE = "grid"
 ROBOT_RADIUS = 2
-GRID_SPACING = 7
+GRID_SPACING = 6.0
 
 SMOOTHING_LENGTH = 28.0
-PRESSURE_GAIN = 1650.0
+PRESSURE_GAIN = 2800.0
+SPH_MOTION_PRESSURE_BOOST = 1.60
 STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1 = 0.9
 VISCOSITY_XI2 = 1.2
@@ -330,8 +334,8 @@ DAMPING = 2.3
 SAFE_RADIUS = 7.5
 REPULSION_GAIN = 260.0
 
-ROUTE_FORCE = 52.0 * MOTION_SPEED_MULTIPLIER
-OUTLET_FORCE = 44.0 * MOTION_SPEED_MULTIPLIER
+ROUTE_FORCE = 12.0 * MOTION_SPEED_MULTIPLIER
+OUTLET_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
 PRESSURE_BACKTRACK_BODY_FORCE = 12.0 * MOTION_SPEED_MULTIPLIER
@@ -341,7 +345,7 @@ MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
 MAX_ACCELERATION = 520.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
-INITIAL_INGRESS_FORCE = 44.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_INGRESS_FORCE = 10.0 * MOTION_SPEED_MULTIPLIER
 INITIAL_INGRESS_LANE_GAIN = 1.0
 INITIAL_INGRESS_LANE_MAX_FORCE = 20.0
 INITIAL_INGRESS_TARGET_Y = center_y + 10.0
@@ -445,7 +449,7 @@ COMM_LOS_CLEARANCE = 0.0
 COMM_SAFE_DISTANCE = 34.0
 COMM_BARRIER_START = COMM_RANGE * 0.84
 COMM_RECOVERY_RANGE = 84.0
-COMM_RECOVERY_GAIN = 2.2
+COMM_RECOVERY_GAIN = 0.65
 SHOW_COMM_LINKS_DEFAULT = True
 COMM_UPDATE_INTERVAL_FRAMES = 3
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
@@ -458,6 +462,15 @@ TRUNK_RELAY_SPACING = 30.0
 TRUNK_RELAY_SELECTION_RADIUS = 50.0
 TRUNK_RELAY_DEPLOY_LOOKAHEAD = 12.0
 TRUNK_RELAY_DEPLOY_COOLDOWN = 0.08
+
+# Reactive Breadcrumb relays. No slot is planned in advance. Once the moving
+# NORMAL tail has passed the latest breadcrumb far enough to threaten its
+# communication margin, that tail robot stops exactly where it is.
+BREADCRUMB_SPACING = COMM_BARRIER_START
+BREADCRUMB_DEPLOY_DISTANCE = COMM_BARRIER_START
+BREADCRUMB_FRONT_CLEARANCE = 18.0
+BREADCRUMB_MIN_TRAVEL = 12.0
+BREADCRUMB_DEPLOY_COOLDOWN = 0.18
 
 # Branch relay
 RELAY_SPACING = 30.0
@@ -478,6 +491,11 @@ RELAY_DEPLOY_MARGIN = 5.0
 RELAY_FRONT_FRACTION = 0.20
 RELAY_FRONT_MIN_COUNT = 10
 RELAY_FRONT_REQUIRED_CONNECTED_RATIO = 0.90
+
+# Peer-to-peer branch consensus among NORMAL robots near the Junction.
+DISTRIBUTED_VOTE_MIN_ROBOTS = 8
+DISTRIBUTED_VOTE_QUORUM_RATIO = 0.60
+DISTRIBUTED_VOTE_NEIGHBOR_RANGE = COMM_RANGE
 
 # Proxy-Region-Based Flow-Preserving SPH-Aware DFS ordering.
 # Structural complete-exploration loss is handled lexicographically first.
@@ -628,7 +646,10 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
         SimulationPhase.FLOW_BACKTRACK,
         SimulationPhase.JUNCTION_SWITCH,
     }:
-        return region in {"BOTTOM", "JUNCTION", active_branch}
+        return (
+            region in {"BOTTOM", "JUNCTION"}
+            or branch_gate_states.get(region) == "OPEN"
+        )
     if phase in {
         SimulationPhase.FINAL_JUNCTION_GATHER,
         SimulationPhase.RETURN_TO_BASE,
@@ -1057,6 +1078,7 @@ class BaseStation:
         self.comm_path_margin = float("inf")
         self.received_branch = None
         self.received_command = None
+        self.received_gate_states = None
         self.received_sequence = -1
 
 
@@ -1078,8 +1100,12 @@ class Robot:
         self.relay_anchor: Optional[pygame.Vector2] = None
         self.relay_index = -1
         self.anchor_position: Optional[pygame.Vector2] = None
-        self.local_branch_states = None
+        self.local_branch_states = branch_states.copy()
         self.selected_branch = None
+        self.branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+        self.branch_vote: Optional[str] = None
+        self.branch_vote_confidence = 0.0
+        self.distributed_branch_decision: Optional[str] = None
         self.parent_branch = "BOTTOM"
 
         self.anchor_region_entry_time: Optional[float] = None
@@ -1093,6 +1119,7 @@ class Robot:
         self.comm_path_margin = float("-inf")
         self.received_branch = None
         self.received_command = None
+        self.received_gate_states = None
         self.received_sequence = -1
 
         self.total_distance = 0.0
@@ -1376,16 +1403,30 @@ def anchor_deployment_ready(anchor, robots):
 
 
 def get_anchor_message(anchor):
-    if anchor is None or not anchor.connected_to_base:
-        return None, "WAIT_FOR_BASE_LINK"
-    return anchor.selected_branch, phase.name
+    if anchor is None:
+        return (
+            distributed_consensus_branch,
+            (
+                f"DISTRIBUTED_{phase.name}"
+                if distributed_consensus_branch is not None
+                else "DISTRIBUTED_VOTING"
+            ),
+            branch_gate_states.copy(),
+        )
+    if not anchor.connected_to_base:
+        return None, "WAIT_FOR_BASE_LINK", None
+    return (
+        anchor.selected_branch,
+        phase.name,
+        anchor.branch_gate_states.copy(),
+    )
 
 
 def propagate_base_message(robots, anchor):
-    """Compute widest paths from the fixed Base, then distribute Anchor's command.
+    """Compute Base-rooted paths and mirror the NORMAL peer-consensus state.
 
-    Connectivity is rooted at Base. The Anchor only supplies the DFS command; the
-    command is accepted and propagated when the Anchor itself has a Base path.
+    The Base is only a communication root/observer. It does not select a
+    branch, assign roles, or issue motion commands.
     """
     global communication_sequence, last_message_signature
     if base_station is None:
@@ -1398,6 +1439,7 @@ def propagate_base_message(robots, anchor):
         robot.comm_path_margin = float("-inf")
         robot.received_branch = None
         robot.received_command = None
+        robot.received_gate_states = None
         robot.received_sequence = -1
 
     base_station.connected_to_base = True
@@ -1419,24 +1461,56 @@ def propagate_base_message(robots, anchor):
             neighbor.comm_path_margin = candidate_margin
             heapq.heappush(heap, (-candidate_margin, neighbor.robot_id, neighbor))
 
-    selected_branch, command = get_anchor_message(anchor)
-    signature = (selected_branch, command)
+    selected_branch, command, gate_states = get_anchor_message(anchor)
+    gate_signature = (
+        tuple(sorted(gate_states.items()))
+        if gate_states is not None
+        else None
+    )
+    signature = (selected_branch, command, gate_signature)
     if signature != last_message_signature:
         communication_sequence += 1
         last_message_signature = signature
+        gate_text = (
+            ", ".join(
+                f"{branch}={gate_states[branch]}"
+                for branch in BRANCHES
+            )
+            if gate_states is not None
+            else "-"
+        )
         print(
-            f"[Base Communication] seq={communication_sequence}, "
-            f"command={command}, branch={selected_branch}"
+            f"[Communication Observer] seq={communication_sequence}, "
+            f"command={command}, branch={selected_branch}, gates={gate_text}"
         )
 
     base_station.received_branch = selected_branch
     base_station.received_command = command
+    base_station.received_gate_states = (
+        gate_states.copy() if gate_states is not None else None
+    )
     base_station.received_sequence = communication_sequence
     for robot in robots:
         if not robot.connected_to_base:
             continue
-        robot.received_branch = selected_branch
-        robot.received_command = command
+        if anchor is None:
+            robot.received_branch = robot.distributed_branch_decision
+            robot.received_command = (
+                "PEER_CONSENSUS"
+                if robot.distributed_branch_decision is not None
+                else "LOCAL_VOTING"
+            )
+            robot.received_gate_states = (
+                branch_gate_states.copy()
+                if robot.distributed_branch_decision is not None
+                else None
+            )
+        else:
+            robot.received_branch = selected_branch
+            robot.received_command = command
+            robot.received_gate_states = (
+                gate_states.copy() if gate_states is not None else None
+            )
         robot.received_sequence = communication_sequence
 
 
@@ -1529,30 +1603,17 @@ def draw_communication_links(surface, robots):
         pygame.draw.line(surface, color, robot.position, parent.position, width=1)
 
 # =========================================================
-# 11. Permanent Base trunk and adaptive branch relays
+# 11. Reactive tail Breadcrumb communication trail
 # =========================================================
 
 
 def initialize_trunk_relay_plan():
     global trunk_relay_slots, trunk_relay_deploy_cooldown
-    vector = ANCHOR_PARK_POSITION - BASE_POSITION
-    length = vector.length()
+    # Deliberately keep this empty: trunk positions must never be precomputed.
+    # The active controller uses update_relay_deployment(), which freezes an
+    # actual tail robot at its current, already-traversed position.
     trunk_relay_slots = []
     trunk_relay_deploy_cooldown = 0.0
-    if length <= EPSILON:
-        return
-    direction = vector / length
-    distance = TRUNK_RELAY_SPACING
-    index = 0
-    while distance < length - COMM_SAFE_DISTANCE * 0.35:
-        trunk_relay_slots.append({
-            "index": index,
-            "position": BASE_POSITION + direction * distance,
-            "path_distance": distance,
-        })
-        index += 1
-        distance += TRUNK_RELAY_SPACING
-    print(f"[Base Trunk] slots={len(trunk_relay_slots)}")
 
 
 def trunk_path_progress(position):
@@ -1727,36 +1788,43 @@ def get_relay_path_endpoint(branch):
 def initialize_relay_plan(branch):
     global relay_slots, relay_deploy_cooldown, relay_retract_cooldown
     global relay_retract_clear_timer, relay_motion_scale
-    start = ANCHOR_PARK_POSITION.copy()
-    end = get_relay_path_endpoint(branch)
-    vector = end - start
-    length = vector.length()
     relay_slots = []
     relay_deploy_cooldown = relay_retract_cooldown = relay_retract_clear_timer = 0.0
     relay_motion_scale = 1.0
-    if length <= EPSILON:
-        return
-    direction = vector / length
-    distance = RELAY_SPACING
-    index = 0
-    while distance <= length:
-        relay_slots.append({
-            "index": index,
-            "position": start + direction * distance,
-            "path_distance": distance,
-        })
-        index += 1
-        distance += RELAY_SPACING
-    print(f"[Relay] plan branch={branch}, slots={len(relay_slots)}")
+    print(f"[Breadcrumb] reactive deployment enabled for branch={branch}")
 
 
 def relay_path_progress(position, branch):
-    start = ANCHOR_PARK_POSITION
-    vector = get_relay_path_endpoint(branch) - start
-    length = vector.length()
-    if length <= EPSILON:
-        return 0.0
-    return clamp((position - start).dot(vector / length), 0.0, length)
+    """Piecewise progress along the path already traversed by the swarm."""
+    junction_center = pygame.Vector2(center_x, center_y)
+    base_vector = junction_center - BASE_POSITION
+    base_length = base_vector.length()
+    region = get_robot_region(position)
+    if region == "BOTTOM":
+        return clamp(
+            (position - BASE_POSITION).dot(base_vector.normalize()),
+            0.0,
+            base_length,
+        )
+    branch_direction = BRANCH_DIRECTIONS[branch]
+    if region == "JUNCTION":
+        junction_approach = base_length - clamp(
+            position.y - center_y,
+            0.0,
+            float(half_width),
+        )
+        return junction_approach + clamp(
+            (position - junction_center).dot(branch_direction),
+            0.0,
+            float(half_width),
+        )
+    if region == branch:
+        return (
+            base_length
+            + half_width
+            + branch_depth_from_junction(position, branch)
+        )
+    return 0.0
 
 
 def get_relays(robots):
@@ -1860,22 +1928,69 @@ def update_relay_deployment(robots, dt):
     global relay_deploy_cooldown, relay_motion_scale
     relay_deploy_cooldown = max(0.0, relay_deploy_cooldown - dt)
     relay_motion_scale = 1.0
-    if phase not in {SimulationPhase.EXPLORE_BRANCH, SimulationPhase.FORM_SHEPHERD_BOUNDARY, SimulationPhase.FILL_BEHIND_SHEPHERD} or junction_anchor is None:
+    if phase not in {
+        SimulationPhase.MOVE_TO_JUNCTION,
+        SimulationPhase.EXPLORE_BRANCH,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+    }:
         return
-    front_progress = get_exploration_front_progress(robots, active_branch)
-    status = get_front_communication_status(robots, active_branch)
-    next_slot = get_next_undeployed_slot(robots)
-    if status["needs_relay"]:
-        relay_motion_scale = RELAY_WAIT_SPEED_SCALE
-        if next_slot is not None:
-            reached = front_progress >= next_slot["path_distance"] - RELAY_DEPLOY_LOOKAHEAD
-            if reached and relay_deploy_cooldown <= 0.0 and deploy_relay_for_slot(robots, next_slot):
-                relay_deploy_cooldown = RELAY_DEPLOY_COOLDOWN
-                relay_motion_scale = RELAY_FORMING_SPEED_SCALE
-    if any(not relay_at_slot_is_settled(relay) for relay in get_active_branch_relays(robots)):
-        relay_motion_scale = min(relay_motion_scale, RELAY_FORMING_SPEED_SCALE)
-    if status["connected_ratio"] < 0.55:
-        relay_motion_scale = 0.0
+    if relay_deploy_cooldown > 0.0 or base_station is None:
+        return
+
+    breadcrumbs = get_active_branch_relays(robots)
+    last_node = breadcrumbs[-1] if breadcrumbs else base_station
+    last_progress = (
+        relay_path_progress(last_node.relay_anchor, active_branch)
+        if breadcrumbs and last_node.relay_anchor is not None
+        else 0.0
+    )
+    mobile = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_base
+        and get_robot_region(robot.position)
+        in {"BOTTOM", "JUNCTION", active_branch}
+    ]
+    ahead = [
+        (relay_path_progress(robot.position, active_branch), robot)
+        for robot in mobile
+        if relay_path_progress(robot.position, active_branch)
+        > last_progress + EPSILON
+    ]
+    if not ahead:
+        return
+
+    ahead.sort(key=lambda item: (item[0], item[1].robot_id))
+    tail_progress, tail_robot = ahead[0]
+    front_progress = ahead[-1][0]
+    if tail_progress - last_progress < BREADCRUMB_SPACING:
+        return
+    if front_progress - tail_progress < BREADCRUMB_FRONT_CLEARANCE:
+        return
+    if tail_robot.total_distance < BREADCRUMB_MIN_TRAVEL:
+        return
+    if tail_robot.position.distance_to(last_node.position) < BREADCRUMB_DEPLOY_DISTANCE:
+        return
+
+    tail_robot.role = "RELAY"
+    tail_robot.relay_anchor = tail_robot.position.copy()
+    tail_robot.relay_index = (
+        breadcrumbs[-1].relay_index + 1 if breadcrumbs else 0
+    )
+    tail_robot.velocity.update(0.0, 0.0)
+    tail_robot.acceleration.update(0.0, 0.0)
+    relay_slots.append({
+        "index": tail_robot.relay_index,
+        "position": tail_robot.relay_anchor.copy(),
+        "path_distance": tail_progress,
+    })
+    relay_deploy_cooldown = BREADCRUMB_DEPLOY_COOLDOWN
+    print(
+        f"[Breadcrumb] tail robot={tail_robot.robot_id}, "
+        f"index={tail_robot.relay_index}, progress={tail_progress:.1f}"
+    )
 
 
 def release_relay_into_backtracking(robot):
@@ -1920,9 +2035,7 @@ def update_relay_retraction(robots, dt):
 
 
 def draw_relay_plan(surface, robots):
-    for slot in relay_slots:
-        pygame.draw.circle(surface, RELAY_SLOT_COLOR, slot["position"], 3, width=1)
-    nodes = ([junction_anchor] if junction_anchor is not None else []) + get_active_branch_relays(robots)
+    nodes = ([base_station] if base_station is not None else []) + get_active_branch_relays(robots)
     for first, second in zip(nodes, nodes[1:]):
         pygame.draw.line(surface, RELAY_COLOR, first.position, second.position, width=2)
 
@@ -2008,6 +2121,7 @@ def elect_junction_anchor(robots):
     junction_anchor.anchor_position = ANCHOR_PARK_POSITION.copy()
     junction_anchor.local_branch_states = branch_states
     junction_anchor.selected_branch = None
+    junction_anchor.branch_gate_states = branch_gate_states.copy()
     print(
         f"[Anchor] robot={junction_anchor.robot_id}, score={junction_anchor.anchor_election_score:.3f}, "
         f"entry={junction_anchor.anchor_region_entry_time:.3f}"
@@ -2336,7 +2450,7 @@ def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
     force = pygame.Vector2()
     junction_center = pygame.Vector2(center_x, center_y)
     for branch in BRANCHES:
-        if branch == active_branch:
+        if branch_gate_states.get(branch) != "CLOSED":
             continue
         entrance = get_branch_entrance(branch)
         distance = robot.position.distance_to(entrance)
@@ -3215,6 +3329,108 @@ def branch_is_feasible(branch: str, robots) -> bool:
     return len(connected_normals) >= required_mobile_roles
 
 
+def update_distributed_branch_consensus(robots) -> Optional[str]:
+    """Run a local NORMAL-to-NORMAL vote without an Anchor decision maker."""
+    global distributed_consensus_branch
+    voters = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_base
+        and get_robot_region(robot.position) == "JUNCTION"
+    ]
+    if len(voters) < DISTRIBUTED_VOTE_MIN_ROBOTS:
+        return None
+
+    for robot in voters:
+        preferred = next(
+            (
+                branch
+                for branch in FIXED_BRANCH_ORDER
+                if robot.local_branch_states.get(branch) == "UNVISITED"
+            ),
+            None,
+        )
+        local_peers = [
+            peer
+            for peer in robot.comm_neighbors
+            if getattr(peer, "role", None) == "NORMAL"
+            and get_robot_region(peer.position) == "JUNCTION"
+            and robot.position.distance_to(peer.position)
+            <= DISTRIBUTED_VOTE_NEIGHBOR_RANGE
+        ]
+        peer_votes = [
+            peer.branch_vote
+            for peer in local_peers
+            if peer.branch_vote in FIXED_BRANCH_ORDER
+            and peer.local_branch_states.get(peer.branch_vote) == "UNVISITED"
+        ]
+        counts = {
+            branch: peer_votes.count(branch)
+            for branch in FIXED_BRANCH_ORDER
+            if robot.local_branch_states.get(branch) == "UNVISITED"
+        }
+        if preferred is not None:
+            counts[preferred] = counts.get(preferred, 0) + 1
+        if counts:
+            robot.branch_vote = max(
+                counts,
+                key=lambda branch: (
+                    counts[branch],
+                    -FIXED_BRANCH_ORDER.index(branch),
+                ),
+            )
+            robot.branch_vote_confidence = (
+                counts[robot.branch_vote] / max(sum(counts.values()), 1)
+            )
+
+    vote_counts = {
+        branch: sum(robot.branch_vote == branch for robot in voters)
+        for branch in FIXED_BRANCH_ORDER
+    }
+    selected = max(
+        FIXED_BRANCH_ORDER,
+        key=lambda branch: (
+            vote_counts[branch],
+            -FIXED_BRANCH_ORDER.index(branch),
+        ),
+    )
+    quorum = max(
+        DISTRIBUTED_VOTE_MIN_ROBOTS,
+        math.ceil(len(voters) * DISTRIBUTED_VOTE_QUORUM_RATIO),
+    )
+    if vote_counts[selected] < quorum:
+        return None
+
+    distributed_consensus_branch = selected
+    for robot in voters:
+        robot.distributed_branch_decision = selected
+    print(
+        f"[Distributed Consensus] branch={selected}, "
+        f"votes={vote_counts[selected]}/{len(voters)}"
+    )
+    return selected
+
+
+def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
+    """Apply the branch-mouth state agreed by the NORMAL peer consensus."""
+    global branch_gate_states
+    if open_branch is None:
+        branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+    else:
+        branch_gate_states = {
+            branch: "OPEN" if branch == open_branch else "CLOSED"
+            for branch in BRANCHES
+        }
+    print(
+        "[Distributed Gate Consensus] "
+        + ", ".join(
+            f"{branch}={branch_gate_states[branch]}"
+            for branch in BRANCHES
+        )
+    )
+
+
 def choose_next_branch(anchor, robots, reference_density: float):
     """Select the next unvisited branch using the fixed DFS route.
 
@@ -3229,19 +3445,10 @@ def choose_next_branch(anchor, robots, reference_density: float):
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
 
-    if anchor is None or anchor.local_branch_states is None:
-        return None
-
-    selected = next(
-        (
-            branch
-            for branch in FIXED_BRANCH_ORDER
-            if anchor.local_branch_states[branch] == "UNVISITED"
-        ),
-        None,
-    )
-    if selected is None:
-        anchor.selected_branch = None
+    selected = distributed_consensus_branch
+    if selected is None or branch_states.get(selected) != "UNVISITED":
+        if anchor is not None:
+            anchor.selected_branch = None
         return None
 
     if not branch_is_feasible(selected, robots):
@@ -3259,8 +3466,15 @@ def choose_next_branch(anchor, robots, reference_density: float):
     last_proxy_candidates = ()
     last_flow_rollout_scores = {}
 
-    anchor.local_branch_states[selected] = "ACTIVE"
-    anchor.selected_branch = selected
+    branch_states[selected] = "ACTIVE"
+    for robot in robots:
+        robot.local_branch_states[selected] = "ACTIVE"
+        if robot.role == "NORMAL":
+            robot.distributed_branch_decision = selected
+    if anchor is not None:
+        anchor.local_branch_states[selected] = "ACTIVE"
+        anchor.selected_branch = selected
+    apply_consensus_branch_gates(selected)
     active_branch = selected
     branch_order_plan.append(selected)
     selected_branch_entry_lambda, _ = rollout_stiffness_for_branch(
@@ -3276,12 +3490,18 @@ def choose_next_branch(anchor, robots, reference_density: float):
     )
     return selected
 
-def complete_active_branch(anchor, branch):
-    global previous_branch_direction
-    if anchor is None or anchor.local_branch_states is None:
-        return
-    anchor.local_branch_states[branch] = "VISITED"
-    anchor.selected_branch = None
+def complete_active_branch(anchor, branch, robots):
+    global previous_branch_direction, distributed_consensus_branch
+    branch_states[branch] = "VISITED"
+    distributed_consensus_branch = None
+    for robot in robots:
+        robot.local_branch_states[branch] = "VISITED"
+        robot.branch_vote = None
+        robot.branch_vote_confidence = 0.0
+        robot.distributed_branch_decision = None
+    if anchor is not None:
+        anchor.local_branch_states[branch] = "VISITED"
+        anchor.selected_branch = None
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
     print(f"[DFS] completed={branch}")
@@ -3301,6 +3521,7 @@ def begin_final_gather():
     relay_slots = []
     relay_motion_scale = 1.0
     final_gather_timer = 0.0
+    apply_consensus_branch_gates(None)
     phase = SimulationPhase.FINAL_JUNCTION_GATHER
     print("[DFS] final gather")
 
@@ -3601,22 +3822,47 @@ def capture_region_ready_for_shepherd(robots, branch):
 
 
 def assign_shepherd_slots(candidates, slots):
-    """Assign the first-arrival candidates to the nearest remaining slots."""
+    """Peer-auction Shepherd self-election using only local slot bids.
+
+    Every NORMAL candidate proposes its nearest unclaimed slot. Conflicts are
+    resolved deterministically by distance and robot id, equivalent to a local
+    winner announcement among nearby peers.
+    """
     if len(candidates) < len(slots):
         return []
 
-    unused = list(candidates[: len(slots)])
+    unassigned = list(candidates)
+    open_slots = set(range(len(slots)))
     assignment = []
-    for slot in slots:
-        chosen = min(
-            unused,
-            key=lambda robot: (
-                robot.position.distance_squared_to(slot),
-                robot.robot_id,
-            ),
-        )
-        unused.remove(chosen)
-        assignment.append((chosen, slot, 0.0))
+    while open_slots and unassigned:
+        proposals: dict[int, list["Robot"]] = {}
+        for robot in unassigned:
+            slot_index = min(
+                open_slots,
+                key=lambda index: (
+                    robot.position.distance_squared_to(slots[index]),
+                    index,
+                ),
+            )
+            proposals.setdefault(slot_index, []).append(robot)
+
+        winners = []
+        for slot_index, bidders in proposals.items():
+            winner = min(
+                bidders,
+                key=lambda robot: (
+                    robot.position.distance_squared_to(slots[slot_index]),
+                    robot.robot_id,
+                ),
+            )
+            score = winner.position.distance_to(slots[slot_index])
+            assignment.append((winner, slots[slot_index], score))
+            winners.append(winner)
+            open_slots.remove(slot_index)
+        unassigned = [
+            robot for robot in unassigned
+            if robot not in winners
+        ]
     return assignment
 
 
@@ -3757,6 +4003,14 @@ def compute_pressures(robots, reference_density):
             * robot.density
             * (ratio**effective_lambda - 1.0)
         )
+        if (
+            phase in {
+                SimulationPhase.MOVE_TO_JUNCTION,
+                SimulationPhase.EXPLORE_BRANCH,
+            }
+            and robot.role == "NORMAL"
+        ):
+            robot.pressure *= SPH_MOTION_PRESSURE_BOOST
         if phase == SimulationPhase.PRESSURE_PUSH and robot.role == "SHEPHERD":
             ramp = min(1.0, 0.25 + pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON))
             robot.pressure += PRESSURE_GAIN * robot.density * SHEPHERD_PRESSURE_FACTOR * ramp
@@ -3783,8 +4037,14 @@ def compute_route_force(robot):
             SimulationPhase.FILL_BEHIND_SHEPHERD,
             SimulationPhase.PRESSURE_PUSH,
             SimulationPhase.FLOW_BACKTRACK,
-        } and robot.received_branch != active_branch:
-            return force
+        }:
+            if robot.received_branch != active_branch:
+                return force
+            if (
+                robot.received_gate_states is None
+                or robot.received_gate_states.get(active_branch) != "OPEN"
+            ):
+                return force
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
@@ -4008,26 +4268,23 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     }:
         branch_entry_timer += dt
 
-    anchor = elect_junction_anchor(robots)
+    # No control Anchor is elected. NORMAL robots make branch decisions by
+    # exchanging local votes; the Base only remains the communication root.
+    anchor = None
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        update_trunk_relay_deployment(robots, dt)
+        update_relay_deployment(robots, dt)
         robots_in_junction = sum(
-            get_robot_region(robot.position) == "JUNCTION" and robot.role != "ANCHOR"
+            get_robot_region(robot.position) == "JUNCTION"
+            and robot.role == "NORMAL"
             for robot in robots
         )
-        consensus_ready = junction_consensus_tracker.update(
-            robots,
-            dt,
-            reference_density,
-        )
+        voted_branch = update_distributed_branch_consensus(robots)
         if (
-            anchor is not None
-            and anchor_deployment_ready(anchor, robots)
-            and robots_in_junction >= JUNCTION_ENTRY_COUNT
-            and consensus_ready
+            robots_in_junction >= DISTRIBUTED_VOTE_MIN_ROBOTS
+            and voted_branch is not None
         ):
-            selected = choose_next_branch(anchor, robots, reference_density)
+            selected = choose_next_branch(None, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -4122,40 +4379,19 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             for robot in robots
         )
         if remaining <= BRANCH_CLEAR_LIMIT and in_junction >= JUNCTION_SWITCH_COUNT and not get_active_branch_relays(robots):
-            complete_active_branch(anchor, active_branch)
+            complete_active_branch(anchor, active_branch, robots)
             phase = SimulationPhase.JUNCTION_SWITCH
             junction_switch_timer = 0.0
             junction_consensus_tracker.reset()
 
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
-        consensus_ready = junction_consensus_tracker.update(
-            robots,
-            dt,
-            reference_density,
-        )
-        fallback_ready = (
-            junction_switch_timer >= JUNCTION_CONSENSUS_FALLBACK_TIME
-            and junction_consensus_tracker.candidate_count
-            >= JUNCTION_FALLBACK_MIN_COUNT
-            and junction_consensus_tracker.stable_ratio
-            >= JUNCTION_FALLBACK_STABLE_RATIO
-            and junction_consensus_tracker.mean_speed
-            <= JUNCTION_FALLBACK_SPEED_THRESHOLD
-        )
-        if consensus_ready or fallback_ready:
-            if consensus_ready:
-                print(
-                    "[Consensus] Junction ready via "
-                    f"{junction_consensus_tracker.ready_mode.lower()} path "
-                    f"after {junction_switch_timer:.2f}s"
-                )
-            else:
-                print(
-                    "[Consensus] relaxed fallback selection after "
-                    f"{junction_switch_timer:.2f}s"
-                )
-            selected = choose_next_branch(anchor, robots, reference_density)
+        if not any(state == "UNVISITED" for state in branch_states.values()):
+            begin_final_gather()
+            return
+        voted_branch = update_distributed_branch_consensus(robots)
+        if voted_branch is not None:
+            selected = choose_next_branch(None, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -4263,6 +4499,48 @@ def draw_branch_colour_fields(surface):
             border_radius=6,
         )
         surface.blit(label, label.get_rect(center=position))
+
+
+def draw_branch_gates(surface):
+    """Draw the Anchor-commanded artificial walls at closed branch mouths."""
+    gate_lines = {
+        "UP": (
+            (center_x - half_width + 3, center_y - half_width),
+            (center_x + half_width - 3, center_y - half_width),
+        ),
+        "LEFT": (
+            (center_x - half_width, center_y - half_width + 3),
+            (center_x - half_width, center_y + half_width - 3),
+        ),
+        "RIGHT": (
+            (center_x + half_width, center_y - half_width + 3),
+            (center_x + half_width, center_y + half_width - 3),
+        ),
+    }
+    for branch, state in branch_gate_states.items():
+        if state != "CLOSED":
+            continue
+        start, end = gate_lines[branch]
+        pygame.draw.line(
+            surface,
+            ARTIFICIAL_WALL_COLOR,
+            start,
+            end,
+            ARTIFICIAL_WALL_WIDTH,
+        )
+        midpoint = (
+            round((start[0] + end[0]) / 2),
+            round((start[1] + end[1]) / 2),
+        )
+        label = hud_font.render("CLOSED", True, (255, 255, 255))
+        badge = label.get_rect(center=midpoint).inflate(8, 4)
+        pygame.draw.rect(
+            surface,
+            ARTIFICIAL_WALL_COLOR,
+            badge,
+            border_radius=4,
+        )
+        surface.blit(label, label.get_rect(center=midpoint))
 
 
 def draw_proxy_partition(surface):
@@ -4405,6 +4683,7 @@ def draw_shepherd_curtain(surface):
 
 def reset_dfs_state():
     global phase, active_branch, branch_states, branch_order_plan
+    global branch_gate_states, distributed_consensus_branch
     global previous_branch_direction, junction_anchor, simulation_time
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
     global pressure_push_timer, flow_establish_timer, communication_sequence
@@ -4422,6 +4701,8 @@ def reset_dfs_state():
     active_branch = FIXED_BRANCH_ORDER[0]
     branch_states = {branch: "UNVISITED" for branch in BRANCHES}
     branch_order_plan = []
+    branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+    distributed_consensus_branch = None
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
     junction_anchor = None
     simulation_time = 0.0
@@ -4447,7 +4728,6 @@ def reset_dfs_state():
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
     return_trunk_force_timer = 0.0
-    initialize_trunk_relay_plan()
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
     metrics = ExperimentMetrics()
@@ -4461,7 +4741,7 @@ def initialize_simulation():
     grid = build_spatial_grid(robots)
     compute_densities(robots, grid)
     mean_density = sum(robot.density for robot in robots) / len(robots)
-    reference_density = mean_density * 0.70
+    reference_density = mean_density * 0.62
     color_reference_density = mean_density * 0.68
     update_communication_system(robots, grid)
     print(f"robots={len(robots)}, mean_density={mean_density:.6f}, rho0={reference_density:.6f}")
@@ -4578,8 +4858,8 @@ while running:
             compute_sph_forces(robots, spatial_grid)
             for robot in robots:
                 robot.update(substep_dt)
-        update_anchor_entry_records(robots, simulation_time)
-        # Rebuild immediately after role changes such as Anchor or Relay election.
+        # Rebuild immediately after distributed role changes such as a
+        # Breadcrumb or Shepherd self-election.
         spatial_grid = build_spatial_grid(robots)
         update_communication_system(robots, spatial_grid)
         update_simulation_state(robots, frame_dt, reference_density, spatial_grid)
@@ -4593,13 +4873,12 @@ while running:
     pygame.draw.polygon(screen, FLOOR_COLOR, cross_points)
     draw_branch_colour_fields(screen)
     pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=5)
+    draw_branch_gates(screen)
 
     if show_regions:
         draw_proxy_partition(screen)
         draw_proxy_robot_assignments(screen, robots)
         pygame.draw.rect(screen, JUNCTION_COLOR, junction_rect, width=2)
-        pygame.draw.rect(screen, ANCHOR_COLOR, anchor_election_rect, width=1)
-        pygame.draw.circle(screen, ANCHOR_COLOR, ANCHOR_PARK_POSITION, 4, width=1)
         pygame.draw.circle(screen, BASE_COLOR, BASE_POSITION, 7, width=2)
         pygame.draw.rect(
             screen,
@@ -4630,7 +4909,6 @@ while running:
                     width=2,
                 )
         draw_shepherd_curtain(screen)
-        draw_trunk_relay_plan(screen, robots)
         draw_relay_plan(screen, robots)
 
     pygame.draw.circle(screen, JUNCTION_COLOR, (center_x, center_y), 5)
@@ -4644,10 +4922,22 @@ while running:
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
     hud_lines = [
-        "Base-rooted DFS: Proxy-Region Flow-Preserving SPH + EDF",
+        "Pressure-driven SPH | Distributed NORMAL consensus | Breadcrumb relay",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
-        f"Anchor={junction_anchor.robot_id if junction_anchor else '-'} | score={junction_anchor.anchor_election_score:.3f}" if junction_anchor else "Anchor=-",
+        (
+            "Decision=NORMAL peer consensus | "
+            f"Junction voters={sum(robot.role == 'NORMAL' and get_robot_region(robot.position) == 'JUNCTION' for robot in robots)}"
+        ),
         f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
+        (
+            f"Distributed decision=MOVE_{distributed_consensus_branch}"
+            if distributed_consensus_branch
+            else "Distributed decision=VOTING"
+        ),
+        "Gates: " + " | ".join(
+            f"{branch}={branch_gate_states[branch]}"
+            for branch in BRANCHES
+        ),
         f"Order={' > '.join(branch_order_plan) if branch_order_plan else '-'}",
         (
             "Last branch cost: "
@@ -4695,9 +4985,9 @@ while running:
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
-        f"Base direct={communication_stats['direct']} | Anchor linked={communication_stats['anchor_connected']} | trunk={len(get_trunk_relays(robots))}/{len(trunk_relay_slots)}",
+        f"Base direct={communication_stats['direct']} | Breadcrumbs={len(get_active_branch_relays(robots))}",
         f"Front comm ratio={front_comm['connected_ratio']:.2f} | relay need={front_comm['needs_relay']}",
-        f"Relays={len(get_relays(robots))} | motion scale={relay_motion_scale:.2f}",
+        f"Reactive relays={len(get_relays(robots))} | preplanned slots=0",
         f"Branch robots normal={normal_count} relay={relay_count} shepherd={shepherd_count}",
         f"Saturation: tip={saturation_tracker.tip_count} slow={saturation_tracker.low_speed_ratio:.2f}",
         f"density={saturation_tracker.average_density_ratio:.2f} occupancy={saturation_tracker.occupancy_ratio:.2f}",
