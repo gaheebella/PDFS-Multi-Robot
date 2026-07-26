@@ -112,7 +112,7 @@ BRANCH_BOUNDARY_WIDTH = 1
 
 center_x = 400
 center_y = 350
-MAP_SCALE = 0.55
+MAP_SCALE = 0.70
 corridor_width = round(120 * MAP_SCALE)
 half_width = corridor_width // 2
 normal_length = round(180 * MAP_SCALE)
@@ -158,7 +158,10 @@ BASE_POSITION = pygame.Vector2(
     center_x - 25 * MAP_SCALE,
     center_y + half_width + base_length - 14 * MAP_SCALE,
 )
-BASE_COMPRESSION_CENTER = pygame.Vector2(center_x, BASE_POSITION.y)
+BASE_COMPRESSION_CENTER = pygame.Vector2(
+    center_x,
+    center_y + half_width + base_length * 0.60,
+)
 JUNCTION_STAGING_POSITION = pygame.Vector2(
     center_x + 10 * MAP_SCALE,
     center_y + 10 * MAP_SCALE,
@@ -215,13 +218,15 @@ dead_end_regions = {
 # Keep the original Shepherd election timing: Shepherds are selected only after
 # enough leading NORMAL robots enter this dead-end capture region.
 EARLY_CAPTURE_DEPTH = round(34 * MAP_SCALE)
+UP_EARLY_CAPTURE_DEPTH = round(64 * MAP_SCALE)
+SHEPHERD_ELECTION_POLICY_VERSION = "BRANCH_SCALED_CAPTURE_V1"
 
 early_capture_regions = {
     "UP": pygame.Rect(
         center_x - half_width,
         center_y - half_width - normal_length,
         corridor_width,
-        EARLY_CAPTURE_DEPTH,
+        UP_EARLY_CAPTURE_DEPTH,
     ),
     "LEFT": pygame.Rect(
         center_x - half_width - normal_length,
@@ -288,7 +293,7 @@ phase = SimulationPhase.MOVE_TO_JUNCTION
 active_branch = FIXED_BRANCH_ORDER[0]
 branch_states = {branch: "UNVISITED" for branch in BRANCHES}
 branch_order_plan: list[str] = []
-branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
 distributed_consensus_branch: Optional[str] = None
 transfer_branch: Optional[str] = None
 final_base_transfer_active = False
@@ -303,6 +308,7 @@ pressure_push_timer = 0.0
 flow_establish_timer = 0.0
 shepherd_flow_timer = 0.0
 shepherd_flow_start_depth = 0.0
+pre_shepherd_branch: Optional[str] = None
 viscoelastic_step = 0
 viscoelastic_rest_lengths: dict[tuple[int, int], float] = {}
 viscoelastic_last_seen: dict[tuple[int, int], int] = {}
@@ -334,22 +340,23 @@ last_flow_rollout_scores: dict[str, dict] = {}
 # 4. Physics and control parameters
 # =========================================================
 
-ROBOT_COUNT = 352
+FLUID_BODY_POLICY_VERSION = "CONTINUOUS_SPH_BODY_680_LARGE_MAP_V2"
+ROBOT_COUNT = 680
 BASE_RESERVE_HOLD_GAIN = 42.0
 SPAWN_MODE = "grid"
-ROBOT_RADIUS = 2.0 * MAP_SCALE
-GRID_SPACING = 5.75 * MAP_SCALE
-GRID_ROW_SPACING = 5.25 * MAP_SCALE
+ROBOT_RADIUS = 1.60 * MAP_SCALE
+GRID_SPACING = 4.00 * MAP_SCALE
+GRID_ROW_SPACING = 3.80 * MAP_SCALE
 
-SMOOTHING_LENGTH = 28.0 * MAP_SCALE
+SMOOTHING_LENGTH = 22.0 * MAP_SCALE
 PRESSURE_GAIN = 2800.0
-SPH_MOTION_PRESSURE_BOOST = 2.20
+SPH_MOTION_PRESSURE_BOOST = 3.00
 SHEPHERD_PACKED_PRESSURE_BOOST = 5.00
 STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1 = 0.9
 VISCOSITY_XI2 = 1.2
 MOTION_SPEED_MULTIPLIER = 3.0
-DAMPING = 3.0
+DAMPING = 4.0
 SAFE_RADIUS = 7.5 * MAP_SCALE
 REPULSION_GAIN = 260.0
 NORMAL_EQUILIBRIUM_SCALE = 1.20
@@ -357,10 +364,10 @@ NORMAL_EQUILIBRIUM_SCALE = 1.20
 # while high-frequency SPH reversals and corridor-crossing zigzags are damped.
 ACCELERATION_FILTER_ALPHA = 0.18
 CORRIDOR_LATERAL_VELOCITY_DAMPING = 12.0
-SPH_PRESSURE_FORCE_LIMIT = 200.0 * MOTION_SPEED_MULTIPLIER
-SPH_VISCOSITY_FORCE_LIMIT = 90.0 * MOTION_SPEED_MULTIPLIER
+SPH_PRESSURE_FORCE_LIMIT = 420.0 * MOTION_SPEED_MULTIPLIER
+SPH_VISCOSITY_FORCE_LIMIT = 150.0 * MOTION_SPEED_MULTIPLIER
 VISCOELASTIC_LINK_RADIUS = SAFE_RADIUS * 1.45
-VISCOELASTIC_REST_MIN = ROBOT_RADIUS * 2.20
+VISCOELASTIC_REST_MIN = ROBOT_RADIUS * 2.05
 VISCOELASTIC_REST_MAX = SAFE_RADIUS * 1.65
 VISCOELASTIC_ELASTIC_GAIN = 42.0
 VISCOELASTIC_DASHPOT_GAIN = 8.0
@@ -381,6 +388,7 @@ VISCOELASTIC_MODEL_VERSION = "KELVIN_VOIGT_SPH_V2_SPACED"
 MOTION_POLICY_VERSION = "FAST_STABLE_COMMAND_V3"
 
 ROUTE_FORCE = 22.0 * MOTION_SPEED_MULTIPLIER
+WEAK_BRANCH_BIAS_FORCE = 2.5 * MOTION_SPEED_MULTIPLIER
 OUTLET_FORCE = 24.0 * MOTION_SPEED_MULTIPLIER
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
@@ -393,26 +401,37 @@ PRESSURE_PUSH_MAX_SPEED = 42.0 * MOTION_SPEED_MULTIPLIER
 FLOW_BACKTRACK_MAX_SPEED = 52.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
-INITIAL_INGRESS_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
-BASE_COMPRESSION_DURATION = 0.90
-BASE_EXPANSION_BOOST_DURATION = 1.60
-BASE_COMPRESSION_FORCE = 90.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_INGRESS_FORCE = 2.5 * MOTION_SPEED_MULTIPLIER
+BASE_COMPRESSION_DURATION = 1.10
+BASE_EXPANSION_BOOST_DURATION = 5.00
+BASE_COMPRESSION_FORCE = 75.0 * MOTION_SPEED_MULTIPLIER
 BASE_COMPRESSION_PRESSURE_SCALE = 0.35
-BASE_EXPANSION_PRESSURE_SCALE = 2.80
-BASE_EXPANSION_RAMP_FRACTION = 0.35
-INITIAL_INGRESS_LANE_GAIN = 1.0
-INITIAL_INGRESS_LANE_MAX_FORCE = 20.0
+BASE_EXPANSION_PRESSURE_SCALE = 7.50
+BASE_EXPANSION_RAMP_FRACTION = 0.14
+BASE_PACKED_EQUILIBRIUM_SCALE = 0.60
+BASE_STORED_PRESSURE_FLOOR = 0.85
+BASE_STORED_PRESSURE_DECAY_START = 4.50
+BASE_STORED_PRESSURE_DURATION = 9.00
+BASE_STORED_PRESSURE_RISE_TIME = 0.12
+BASE_PISTON_REACTION_GAIN = 360.0 * MOTION_SPEED_MULTIPLIER
+BASE_PISTON_REACTION_FORCE_LIMIT = 340.0 * MOTION_SPEED_MULTIPLIER
+BASE_PISTON_REACTION_RISE_TIME = 0.12
+BASE_PISTON_REACTION_DURATION = 8.00
+BASE_PISTON_REACTION_DEPTH_START = 0.00
+INITIAL_INGRESS_LANE_GAIN = 0.25
+INITIAL_INGRESS_LANE_MAX_FORCE = 5.0
 INITIAL_INGRESS_TARGET_Y = center_y + 10.0 * MAP_SCALE
 INITIAL_INGRESS_BRAKE_DISTANCE = 52.0 * MAP_SCALE
-INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
+INITIAL_INGRESS_MIN_FORCE_SCALE = 0.10
 INITIAL_INGRESS_MAX_DT = 0.04
-INITIAL_SAFE_MAX_SPEED = 36.0 * MOTION_SPEED_MULTIPLIER
-INITIAL_JUNCTION_MAX_SPEED = 20.0 * MOTION_SPEED_MULTIPLIER
-INITIAL_SAFE_MAX_ACCELERATION = 170.0 * MOTION_SPEED_MULTIPLIER
-INITIAL_JUNCTION_SOFT_WALL_DEPTH = 18.0 * MAP_SCALE
-INITIAL_JUNCTION_SOFT_WALL_FORCE = 120.0 * MOTION_SPEED_MULTIPLIER
-INITIAL_JUNCTION_SOFT_WALL_DAMPING = 20.0
-INITIAL_IMPULSE_POLICY_VERSION = "SOFT_RAMP_BRAKE_V1"
+INITIAL_SAFE_MAX_SPEED = 46.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_MAX_SPEED = 34.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_SAFE_MAX_ACCELERATION = 280.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_SOFT_WALL_DEPTH = 10.0 * MAP_SCALE
+INITIAL_JUNCTION_SOFT_WALL_FORCE = 70.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_SOFT_WALL_DAMPING = 5.0
+INITIAL_WALL_RESTITUTION = 0.18
+INITIAL_IMPULSE_POLICY_VERSION = "STORED_COMPRESSION_RELEASE_V3"
 
 RETURN_EGRESS_FORCE = 42.0 * MOTION_SPEED_MULTIPLIER
 RETURN_LANE_GAIN = 1.15
@@ -510,6 +529,7 @@ SHEPHERD_JUNCTION_RELEASE_INSET = max(
 )
 SHEPHERD_JUNCTION_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_POLICY_VERSION = "DENSITY_RELEASE_CURTAIN_V3"
+SHEPHERD_PIPELINE_POLICY_VERSION = "OVERLAPPED_PRE_SHIELD_V1"
 SHEPHERD_PRESSURE_FACTOR = 4.0
 VIRTUAL_PRESSURE_RADIUS = 60.0 * MAP_SCALE
 VIRTUAL_PRESSURE_FORCE = 110.0
@@ -533,8 +553,16 @@ COMM_LOS_SAMPLE_SPACING = 6.0 * MAP_SCALE
 COMM_LOS_CLEARANCE = 0.0
 COMM_SAFE_DISTANCE = 40.0 * MAP_SCALE
 COMM_BARRIER_START = COMM_RANGE * 0.84
+COMM_CONTROL_POLICY_VERSION = "PREDICTIVE_PARENT_LEASH_V1"
+COMM_GUARD_START = COMM_SAFE_DISTANCE * 0.78
+COMM_GUARD_HARD_LIMIT = COMM_RANGE * 0.88
+COMM_PARENT_SPRING_GAIN = 45.0
+COMM_PARENT_DAMPING_GAIN = 14.0
+COMM_PARENT_VELOCITY_MATCH_GAIN = 5.0
+COMM_GUARD_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
 COMM_RECOVERY_RANGE = 84.0 * MAP_SCALE
-COMM_RECOVERY_GAIN = 0.65
+COMM_RECOVERY_GAIN = 12.0
+COMM_MAX_LOCAL_NEIGHBORS = 16
 SHOW_COMM_LINKS_DEFAULT = False
 COMM_UPDATE_INTERVAL_FRAMES = 1
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
@@ -556,8 +584,9 @@ BREADCRUMB_DEPLOY_DISTANCE = COMM_SAFE_DISTANCE * 0.50
 BREADCRUMB_FRONT_CLEARANCE = 10.0 * MAP_SCALE
 BREADCRUMB_MIN_TRAVEL = 12.0 * MAP_SCALE
 BREADCRUMB_DEPLOY_COOLDOWN = 0.08
-BREADCRUMB_GUARD_PER_RELAY = 4
-BREADCRUMB_GUARD_DEPTH = COMM_SAFE_DISTANCE * 0.85
+BREADCRUMB_GUARD_POLICY_VERSION = "NO_STATIC_GUARDS_FLUID_BODY_V1"
+BREADCRUMB_GUARD_PER_RELAY = 0
+BREADCRUMB_GUARD_DEPTH = COMM_SAFE_DISTANCE * 1.10
 
 # Branch relay
 RELAY_SPACING = 30.0 * MAP_SCALE
@@ -664,8 +693,16 @@ PROXY_CONTEXT_MAX_SPEED_SCALE = 0.28
 
 # Geodesic EDF guidance and smooth virtual valves at unselected branch mouths.
 EDF_FINITE_EPSILON = 1e-6
+EDF_PROPULSION_POLICY_VERSION = "STORED_PRESSURE_TRANSFER_EDF_V3"
+EDF_PRESSURE_COUPLING_GAIN = 36.0 * MOTION_SPEED_MULTIPLIER
+EDF_PRESSURE_FORCE_LIMIT = 48.0 * MOTION_SPEED_MULTIPLIER
+EDF_PRESSURE_RAMP_TIME = 0.25
+TRANSFER_PRESSURE_FLOOR = 0.65
+TRANSFER_EDF_FORCE_MULTIPLIER = 1.25
 VIRTUAL_VALVE_RADIUS = 46.0 * MAP_SCALE
 VIRTUAL_VALVE_GAIN = 92.0
+FINAL_RETURN_VALVE_GAIN_MULTIPLIER = 4.0
+FINAL_GATE_POLICY_VERSION = "ONE_WAY_RETURN_SEAL_V1"
 
 # Centralized sampled-data approximation of HydroSwarm's local stability
 # consensus. A dual-threshold readiness rule shortens Junction waiting while
@@ -794,6 +831,47 @@ def constrain_base_reserve_to_bottom(robot: "Robot") -> None:
         robot.velocity.x = 0.0
     if robot.position.y != old_y:
         robot.velocity.y = max(0.0, robot.velocity.y)
+
+
+def constrain_final_return_gate_crossing(
+    robot: "Robot",
+    old_position: pygame.Vector2,
+) -> None:
+    """One-way hard gate: branch stragglers may exit, nobody may re-enter."""
+    if phase not in {
+        SimulationPhase.FINAL_JUNCTION_GATHER,
+        SimulationPhase.RETURN_TO_BASE,
+    }:
+        return
+    old_region = get_robot_region(old_position)
+    new_region = get_robot_region(robot.position)
+    if (
+        old_region not in {"JUNCTION", "BOTTOM"}
+        or new_region not in BRANCHES
+        or branch_gate_states.get(new_region) != "CLOSED"
+    ):
+        return
+
+    robot.position = old_position.copy()
+    outward_direction = BRANCH_DIRECTIONS[new_region]
+    outward_speed = robot.velocity.dot(outward_direction)
+    if outward_speed > 0.0:
+        robot.velocity -= outward_direction * outward_speed
+    robot.acceleration.update(0.0, 0.0)
+    robot.filtered_acceleration.update(0.0, 0.0)
+
+
+def wall_collision_velocity(component: float) -> float:
+    """Apply a small, damped rebound during pressure-driven forward flow."""
+    if (
+        phase in {
+            SimulationPhase.MOVE_TO_JUNCTION,
+            SimulationPhase.EXPLORE_BRANCH,
+        }
+        and simulation_time >= BASE_COMPRESSION_DURATION
+    ):
+        return -component * INITIAL_WALL_RESTITUTION
+    return 0.0
 
 
 def is_mask_clear_at(position: pygame.Vector2, clearance: float = 0.0) -> bool:
@@ -1135,6 +1213,101 @@ def enforce_shepherd_curtain_for_swarm(robots) -> None:
     for robot in robots:
         constrain_normal_behind_shepherd_curtain(robot)
 
+
+def pre_shepherd_curtain_active() -> bool:
+    return (
+        pre_shepherd_branch is not None
+        and phase in {
+            SimulationPhase.PRESSURE_PUSH,
+            SimulationPhase.FLOW_BACKTRACK,
+            SimulationPhase.EXPLORE_BRANCH,
+        }
+    )
+
+
+def get_pre_shepherd_normal_limit_depth(branch: str) -> float:
+    return max(
+        0.0,
+        get_shepherd_boundary_depth(branch)
+        - SHEPHERD_CURTAIN_CLEARANCE,
+    )
+
+
+def compute_pre_shepherd_curtain_force(
+    robot: "Robot",
+) -> pygame.Vector2:
+    """Static full-width shield formed early in the transfer branch."""
+    branch = pre_shepherd_branch
+    if (
+        not pre_shepherd_curtain_active()
+        or branch is None
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != branch
+    ):
+        return pygame.Vector2()
+    limit_depth = get_pre_shepherd_normal_limit_depth(branch)
+    depth = branch_depth_from_junction(robot.position, branch)
+    activation_depth = (
+        limit_depth - SHEPHERD_CURTAIN_INTERACTION_DEPTH
+    )
+    if depth <= activation_depth:
+        return pygame.Vector2()
+    ratio = clamp(
+        (depth - activation_depth)
+        / max(SHEPHERD_CURTAIN_INTERACTION_DEPTH, EPSILON),
+        0.0,
+        1.5,
+    )
+    forward_speed = max(
+        0.0,
+        robot.velocity.dot(BRANCH_DIRECTIONS[branch]),
+    )
+    magnitude = min(
+        SHEPHERD_CURTAIN_MAX_FORCE,
+        SHEPHERD_CURTAIN_FORCE * ratio**2
+        + SHEPHERD_CURTAIN_VELOCITY_DAMPING * forward_speed,
+    )
+    return get_backtrack_direction(branch) * magnitude
+
+
+def constrain_normal_behind_pre_shepherd_curtain(
+    robot: "Robot",
+) -> None:
+    """Hard guard preventing normals from passing the prepared shield."""
+    branch = pre_shepherd_branch
+    if (
+        not pre_shepherd_curtain_active()
+        or branch is None
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != branch
+    ):
+        return
+    limit_depth = get_pre_shepherd_normal_limit_depth(branch)
+    depth = branch_depth_from_junction(robot.position, branch)
+    if depth <= limit_depth:
+        return
+    penetration = depth - limit_depth
+    if branch == "UP":
+        robot.position.y = center_y - half_width - limit_depth
+    elif branch == "LEFT":
+        robot.position.x = center_x - half_width - limit_depth
+    else:
+        robot.position.x = center_x + half_width + limit_depth
+    forward_direction = BRANCH_DIRECTIONS[branch]
+    forward_speed = robot.velocity.dot(forward_direction)
+    if forward_speed > 0.0:
+        robot.velocity -= forward_direction * forward_speed
+    robot.velocity += get_backtrack_direction(branch) * min(
+        SHEPHERD_CURTAIN_RECOVERY_SPEED,
+        penetration * 2.0,
+    )
+
+
+def enforce_pre_shepherd_curtain_for_swarm(robots) -> None:
+    for robot in robots:
+        constrain_normal_behind_pre_shepherd_curtain(robot)
+
+
 def angle_between(a: pygame.Vector2, b: pygame.Vector2) -> float:
     if a.length_squared() <= EPSILON or b.length_squared() <= EPSILON:
         return 0.0
@@ -1265,10 +1438,13 @@ class Robot:
         self.last_sph_pressure_force = 0.0
         self.last_compression_release_force = 0.0
         self.last_shepherd_force = 0.0
+        self.last_base_piston_force = 0.0
+        self.last_edf_force = 0.0
         self.role = "NORMAL"
 
         self.shepherd_anchor: Optional[pygame.Vector2] = None
         self.shepherd_origin: Optional[pygame.Vector2] = None
+        self.shepherd_branch: Optional[str] = None
         self.relay_anchor: Optional[pygame.Vector2] = None
         self.relay_index = -1
         self.anchor_position: Optional[pygame.Vector2] = None
@@ -1355,6 +1531,28 @@ class Robot:
             self._record_motion()
             return
 
+        if self.role == "PRE_SHEPHERD" and self.shepherd_anchor is not None:
+            error = self.shepherd_anchor - self.position
+            step = SHEPHERD_FORM_SPEED * dt
+            next_position = (
+                self.shepherd_anchor.copy()
+                if error.length() <= step
+                else self.position + error.normalize() * step
+            ) if error.length_squared() > EPSILON else self.position.copy()
+            next_position = limit_communication_proposed_position(
+                self,
+                next_position,
+                old_position,
+            )
+            if is_walkable(next_position, self.radius):
+                self.position = next_position
+            self.velocity.update(0.0, 0.0)
+            self.acceleration.update(0.0, 0.0)
+            self.filtered_acceleration.update(0.0, 0.0)
+            self.previous_position = old_position
+            self._record_motion()
+            return
+
         if self.role == "SHEPHERD" and self.shepherd_anchor is not None:
             if phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
                 target = self.shepherd_anchor
@@ -1374,8 +1572,8 @@ class Robot:
 
             if target is not None:
                 error = target - self.position
-                # A selected Shepherd moves independently to its locally
-                # claimed slot; distant Base connectivity is irrelevant.
+                # A selected Shepherd claims its local slot, but the proposed
+                # step is still bounded by its current Base-side parent link.
                 if phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
                     motion_scale = 1.0
                 else:
@@ -1386,6 +1584,11 @@ class Robot:
                     if error.length() <= step
                     else self.position + error.normalize() * step
                 ) if error.length_squared() > EPSILON and step > 0.0 else self.position.copy()
+                next_position = limit_communication_proposed_position(
+                    self,
+                    next_position,
+                    old_position,
+                )
                 if is_walkable(next_position, self.radius):
                     self.position = next_position
                 self.velocity.update(0.0, 0.0)
@@ -1417,22 +1620,26 @@ class Robot:
         elif phase == SimulationPhase.FLOW_BACKTRACK:
             speed_limit = FLOW_BACKTRACK_MAX_SPEED
         limit_vector(self.velocity, speed_limit)
+        apply_communication_velocity_guard(self, dt)
         x_position = pygame.Vector2(self.position.x + self.velocity.x * dt, self.position.y)
         if is_walkable(x_position, self.radius):
             self.position.x = x_position.x
         else:
-            self.velocity.x = 0.0
+            self.velocity.x = wall_collision_velocity(self.velocity.x)
         y_position = pygame.Vector2(self.position.x, self.position.y + self.velocity.y * dt)
         if is_walkable(y_position, self.radius):
             self.position.y = y_position.y
         else:
-            self.velocity.y = 0.0
+            self.velocity.y = wall_collision_velocity(self.velocity.y)
 
+        constrain_final_return_gate_crossing(self, old_position)
         # Smooth virtual pressure is backed by a hard one-step guard so a fast
         # ordinary robot cannot pass through a temporary gap while Shepherds
         # are still moving laterally into their slots.
         constrain_normal_behind_shepherd_curtain(self)
+        constrain_normal_behind_pre_shepherd_curtain(self)
         constrain_base_reserve_to_bottom(self)
+        constrain_communication_parent_separation(self, old_position)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
         self._record_motion()
@@ -1445,7 +1652,7 @@ class Robot:
             color = TRUNK_RELAY_COLOR
         elif self.role == "RELAY":
             color = RELAY_COLOR
-        elif self.role == "SHEPHERD":
+        elif self.role in {"SHEPHERD", "PRE_SHEPHERD"}:
             color = SHEPHERD_COLOR
         elif show_density_color:
             color = density_to_color(self.density, color_reference_density)
@@ -1463,7 +1670,7 @@ class Robot:
             pygame.draw.circle(surface, ring_color, (x, y), draw_radius + 2, width=1)
         elif self.role == "ANCHOR":
             pygame.draw.circle(surface, ANCHOR_COLOR, (x, y), draw_radius + 2, width=1)
-        elif self.role == "SHEPHERD":
+        elif self.role in {"SHEPHERD", "PRE_SHEPHERD"}:
             pygame.draw.circle(surface, SHEPHERD_COLOR, (x, y), draw_radius + 2, width=1)
         elif self.base_reserve:
             pygame.draw.circle(
@@ -1572,7 +1779,7 @@ def iter_physics_neighbor_candidates(robot, grid):
 
 
 def update_communication_neighbors(robots, grid):
-    """Build robot links and explicit Base-to-robot links with LOS checks."""
+    """Build a sparse local mesh and explicit Base links with LOS checks."""
     range_sq = COMM_RANGE**2
     for robot in robots:
         robot.comm_neighbors = []
@@ -1580,14 +1787,24 @@ def update_communication_neighbors(robots, grid):
         return
     base_station.comm_neighbors = []
 
+    linked_pairs = set()
     for robot in robots:
+        candidates = []
         for other in iter_neighbor_candidates(robot, grid):
-            if other.robot_id <= robot.robot_id:
+            if other is robot:
                 continue
-            if robot.position.distance_squared_to(other.position) > range_sq:
+            distance_sq = robot.position.distance_squared_to(other.position)
+            if distance_sq > range_sq:
+                continue
+            candidates.append((distance_sq, other.robot_id, other))
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        for _, _, other in candidates[:COMM_MAX_LOCAL_NEIGHBORS]:
+            pair = tuple(sorted((robot.robot_id, other.robot_id)))
+            if pair in linked_pairs:
                 continue
             if not has_line_of_sight(robot.position, other.position):
                 continue
+            linked_pairs.add(pair)
             robot.comm_neighbors.append(other)
             other.comm_neighbors.append(robot)
 
@@ -1781,21 +1998,153 @@ def find_nearest_connected_robot(robot, grid):
     return nearest
 
 
+def get_communication_parent_velocity(robot):
+    """Return the current velocity of the robot's Base-side parent."""
+    parent = robot.comm_parent
+    parent_velocity = getattr(parent, "velocity", None)
+    return (
+        parent_velocity.copy()
+        if parent_velocity is not None
+        else pygame.Vector2()
+    )
+
+
+def apply_communication_velocity_guard(robot, dt):
+    """Prevent a connected mobile robot from outrunning its parent link."""
+    parent = robot.comm_parent
+    if (
+        not robot.connected_to_base
+        or parent is None
+        or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}
+    ):
+        return
+    separation = robot.position - parent.position
+    distance = separation.length()
+    if distance <= EPSILON:
+        return
+    outward = separation / distance
+    relative_velocity = (
+        robot.velocity - get_communication_parent_velocity(robot)
+    )
+    relative_outward_speed = relative_velocity.dot(outward)
+    maximum_outward_speed = max(
+        0.0,
+        (COMM_GUARD_HARD_LIMIT - distance) / max(dt, EPSILON),
+    )
+    if relative_outward_speed > maximum_outward_speed:
+        robot.velocity -= outward * (
+            relative_outward_speed - maximum_outward_speed
+        )
+
+
+def limit_communication_proposed_position(robot, proposed_position, old_position):
+    """Clamp scripted motion to the hard Base-parent communication radius."""
+    parent = robot.comm_parent
+    if not robot.connected_to_base or parent is None:
+        return proposed_position
+    separation = proposed_position - parent.position
+    distance = separation.length()
+    if distance <= COMM_GUARD_HARD_LIMIT or distance <= EPSILON:
+        return proposed_position
+    bounded = (
+        parent.position
+        + separation * (COMM_GUARD_HARD_LIMIT / distance)
+    )
+    if is_walkable(bounded, robot.radius):
+        return bounded
+    return old_position.copy()
+
+
+def constrain_communication_parent_separation(robot, old_position):
+    """Final one-step guard against numerical overshoot of a parent link."""
+    parent = robot.comm_parent
+    if (
+        not robot.connected_to_base
+        or parent is None
+        or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}
+    ):
+        return
+    bounded = limit_communication_proposed_position(
+        robot,
+        robot.position,
+        old_position,
+    )
+    if bounded.distance_squared_to(robot.position) <= EPSILON:
+        return
+    robot.position = bounded
+    separation = robot.position - parent.position
+    distance = separation.length()
+    if distance <= EPSILON:
+        return
+    outward = separation / distance
+    parent_velocity = get_communication_parent_velocity(robot)
+    relative_outward_speed = (
+        robot.velocity - parent_velocity
+    ).dot(outward)
+    if relative_outward_speed > 0.0:
+        robot.velocity -= outward * relative_outward_speed
+
+
 def compute_connectivity_force(robot, grid):
     if base_station is None or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}:
         return pygame.Vector2()
     if robot.connected_to_base:
-        return pygame.Vector2()
+        parent = robot.comm_parent
+        if parent is None:
+            return pygame.Vector2()
+        delta = parent.position - robot.position
+        distance = delta.length()
+        if distance <= COMM_GUARD_START or distance <= EPSILON:
+            return pygame.Vector2()
+        toward_parent = delta / distance
+        barrier_ratio = smoothstep01(
+            (distance - COMM_GUARD_START)
+            / max(
+                COMM_GUARD_HARD_LIMIT - COMM_GUARD_START,
+                EPSILON,
+            )
+        )
+        parent_velocity = get_communication_parent_velocity(robot)
+        relative_velocity = robot.velocity - parent_velocity
+        outward_speed = max(
+            0.0,
+            -relative_velocity.dot(toward_parent),
+        )
+        spring_force = toward_parent * (
+            COMM_PARENT_SPRING_GAIN
+            * (distance - COMM_GUARD_START)
+            * barrier_ratio
+            + COMM_PARENT_DAMPING_GAIN
+            * outward_speed
+            * barrier_ratio
+        )
+        velocity_match_force = (
+            parent_velocity - robot.velocity
+        ) * (
+            COMM_PARENT_VELOCITY_MATCH_GAIN
+            * barrier_ratio
+        )
+        return limit_vector(
+            spring_force + velocity_match_force,
+            COMM_GUARD_FORCE_LIMIT,
+        )
     target = find_nearest_connected_robot(robot, grid)
     if target is None:
         return pygame.Vector2()
     delta = target.position - robot.position
     distance = delta.length()
-    return (
-        COMM_RECOVERY_GAIN * min(distance, COMM_RECOVERY_RANGE) * delta / distance
-        if distance > EPSILON
-        else pygame.Vector2()
+    if distance <= EPSILON:
+        return pygame.Vector2()
+    toward_target = delta / distance
+    target_velocity = getattr(target, "velocity", pygame.Vector2())
+    recovery_force = (
+        toward_target
+        * COMM_RECOVERY_GAIN
+        * min(distance, COMM_RECOVERY_RANGE)
+        + (target_velocity - robot.velocity)
+        * COMM_PARENT_VELOCITY_MATCH_GAIN
     )
+    return limit_vector(recovery_force, COMM_GUARD_FORCE_LIMIT)
 
 
 def get_communication_stats(robots):
@@ -2172,38 +2521,9 @@ def assign_breadcrumb_front_guards(
     breadcrumb: "Robot",
     breadcrumb_progress: float,
 ) -> list["Robot"]:
-    """Keep nearby NORMAL robots immediately ahead of a Base Breadcrumb."""
-    if get_robot_region(breadcrumb.position) != "BOTTOM":
-        return []
-    candidates = [
-        robot
-        for robot in robots
-        if robot.role == "NORMAL"
-        and not robot.base_reserve
-        and robot.connected_to_base
-        and get_robot_region(robot.position) == "BOTTOM"
-        and breadcrumb_progress + ROBOT_RADIUS
-        < relay_path_progress(robot.position, active_branch)
-        <= breadcrumb_progress + BREADCRUMB_GUARD_DEPTH
-        and robot.position.distance_to(breadcrumb.position) <= COMM_RANGE * 0.9
-    ]
-    candidates.sort(
-        key=lambda robot: (
-            relay_path_progress(robot.position, active_branch),
-            robot.position.distance_squared_to(breadcrumb.position),
-            robot.robot_id,
-        )
-    )
-    selected = candidates[:BREADCRUMB_GUARD_PER_RELAY]
-    for robot in selected:
-        robot.base_reserve = True
-        robot.base_hold_position = robot.position.copy()
-    if selected:
-        print(
-            f"[Breadcrumb Guards] relay={breadcrumb.robot_id}, "
-            f"normal_guards={[robot.robot_id for robot in selected]}"
-        )
-    return selected
+    """Breadcrumbs mark the trail; NORMAL robots remain mobile SPH mass."""
+    del robots, breadcrumb, breadcrumb_progress
+    return []
 
 
 def update_relay_deployment(robots, dt):
@@ -2304,7 +2624,7 @@ def update_relay_deployment(robots, dt):
     print(
         f"[Breadcrumb] tail robot={tail_robot.robot_id}, "
         f"index={tail_robot.relay_index}, progress={tail_progress:.1f}, "
-        f"front_guards={len(guards)}"
+        f"static_guards={len(guards)}"
     )
 
 
@@ -2751,6 +3071,64 @@ def geodesic_edf_direction(
     return normalized_direction_toward(position, pygame.Vector2(center_x, center_y))
 
 
+def compute_pressure_coupled_edf_force(
+    robot: "Robot",
+) -> pygame.Vector2:
+    """Project available SPH pressure along the selected branch EDF."""
+    if (
+        robot.role != "NORMAL"
+        or not robot.connected_to_base
+    ):
+        return pygame.Vector2()
+    region = get_robot_region(robot.position)
+    if (
+        phase == SimulationPhase.EXPLORE_BRANCH
+        and region in {"JUNCTION", active_branch}
+    ):
+        target_branch = active_branch
+        ramp = smoothstep01(
+            branch_entry_timer / max(EDF_PRESSURE_RAMP_TIME, EPSILON)
+        )
+        phase_multiplier = 1.0
+    elif (
+        phase in {
+            SimulationPhase.PRESSURE_PUSH,
+            SimulationPhase.FLOW_BACKTRACK,
+        }
+        and transfer_branch is not None
+        and robot.transfer_target == transfer_branch
+        and region in {"JUNCTION", transfer_branch}
+    ):
+        target_branch = transfer_branch
+        ramp = (
+            1.0
+            if phase == SimulationPhase.FLOW_BACKTRACK
+            else smoothstep01(
+                pressure_push_timer / max(PRESSURE_RAMP_TIME, EPSILON)
+            )
+        )
+        phase_multiplier = TRANSFER_EDF_FORCE_MULTIPLIER
+    else:
+        return pygame.Vector2()
+    normalized_pressure = max(
+        0.0,
+        robot.pressure
+        / max(PRESSURE_GAIN * robot.density, EPSILON),
+    )
+    magnitude = min(
+        EDF_PRESSURE_FORCE_LIMIT,
+        EDF_PRESSURE_COUPLING_GAIN
+        * normalized_pressure
+        * ramp
+        * phase_multiplier
+        * relay_motion_scale,
+    )
+    return (
+        geodesic_edf_direction(robot.position, target_branch)
+        * magnitude
+    )
+
+
 def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
     """Smooth virtual-particle barrier at every unselected branch mouth."""
     if phase not in {
@@ -2759,6 +3137,8 @@ def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
         SimulationPhase.FILL_BEHIND_SHEPHERD,
         SimulationPhase.PRESSURE_PUSH,
         SimulationPhase.FLOW_BACKTRACK,
+        SimulationPhase.FINAL_JUNCTION_GATHER,
+        SimulationPhase.RETURN_TO_BASE,
     }:
         return pygame.Vector2()
     if get_robot_region(robot.position) != "JUNCTION":
@@ -2777,7 +3157,15 @@ def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
         if inward.length_squared() <= EPSILON:
             continue
         ratio = 1.0 - distance / VIRTUAL_VALVE_RADIUS
-        force += inward.normalize() * VIRTUAL_VALVE_GAIN * ratio**2
+        gain = VIRTUAL_VALVE_GAIN * (
+            FINAL_RETURN_VALVE_GAIN_MULTIPLIER
+            if phase in {
+                SimulationPhase.FINAL_JUNCTION_GATHER,
+                SimulationPhase.RETURN_TO_BASE,
+            }
+            else 1.0
+        )
+        force += inward.normalize() * gain * ratio**2
     return force
 
 def get_branch_ordering_robots(robots) -> list["Robot"]:
@@ -3762,15 +4150,22 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
         for branch in BRANCHES
     }
     for robot in robots:
+        region = get_robot_region(robot.position)
         robot.transfer_target = (
             target
-            if get_robot_region(robot.position) == source
+            if region in {source, "JUNCTION"}
             and robot.role in {"NORMAL", "SHEPHERD"}
             else None
         )
+    junction_seed_count = sum(
+        robot.transfer_target == target
+        and get_robot_region(robot.position) == "JUNCTION"
+        for robot in robots
+    )
     print(
         f"[Cross-Branch Transfer] {source} -> {target}; "
-        f"{source}=OPEN, {target}=OPEN"
+        f"{source}=OPEN, {target}=OPEN, "
+        f"junction_seed={junction_seed_count}"
     )
 
 
@@ -4252,8 +4647,9 @@ def reset_shepherd_roles(robots):
         if robot.role == "SHEPHERD":
             robot.role = "NORMAL"
             robot.filtered_acceleration.update(0.0, 0.0)
-        robot.shepherd_anchor = None
-        robot.shepherd_origin = None
+            robot.shepherd_anchor = None
+            robot.shepherd_origin = None
+            robot.shepherd_branch = None
 
 
 
@@ -4356,12 +4752,113 @@ def select_adaptive_shepherds(robots, branch, grid):
         robot.role = "SHEPHERD"
         robot.shepherd_anchor = slot.copy()
         robot.shepherd_origin = slot.copy()
+        robot.shepherd_branch = branch
         robot.velocity.update(0.0, 0.0)
         robot.filtered_acceleration.update(0.0, 0.0)
         selected.append(robot)
         print(f"[Shepherd] robot={robot.robot_id}, score={score:.3f}")
     print(f"[Shepherd] adaptive count={required_count}")
     return selected
+
+
+def get_pre_shepherds(robots, branch: Optional[str] = None):
+    return [
+        robot
+        for robot in robots
+        if robot.role == "PRE_SHEPHERD"
+        and (
+            branch is None
+            or robot.shepherd_branch == branch
+        )
+    ]
+
+
+def pre_shepherd_boundary_formed(robots, branch: str) -> bool:
+    shepherds = get_pre_shepherds(robots, branch)
+    return (
+        len(shepherds) == adaptive_shepherd_count()
+        and all(
+            robot.shepherd_anchor is not None
+            and robot.position.distance_to(robot.shepherd_anchor)
+            <= SHEPHERD_FORM_TOLERANCE
+            for robot in shepherds
+        )
+    )
+
+
+def select_pre_shepherds(robots, branch: str, grid):
+    """Elect the next branch shield without disturbing active Shepherds."""
+    del grid
+    global pre_shepherd_branch
+    if get_pre_shepherds(robots):
+        return get_pre_shepherds(robots, branch)
+    required_count = adaptive_shepherd_count()
+    slots = build_shepherd_slots(branch, required_count)
+    candidates = shepherd_candidates(robots, branch, required_count)
+    assignment = assign_shepherd_slots(candidates, slots)
+    if len(assignment) != required_count:
+        return []
+    selected = []
+    pre_shepherd_branch = branch
+    for robot, slot, score in assignment:
+        robot.role = "PRE_SHEPHERD"
+        robot.shepherd_anchor = slot.copy()
+        robot.shepherd_origin = slot.copy()
+        robot.shepherd_branch = branch
+        robot.velocity.update(0.0, 0.0)
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+        selected.append(robot)
+        print(
+            f"[Pre-Shepherd] branch={branch}, "
+            f"robot={robot.robot_id}, score={score:.3f}"
+        )
+    enforce_pre_shepherd_curtain_for_swarm(robots)
+    print(
+        f"[Pre-Shepherd] shield elected: "
+        f"branch={branch}, count={len(selected)}"
+    )
+    return selected
+
+
+def promote_pre_shepherds(robots, branch: str) -> bool:
+    """Activate a prepared shield only after the prior line has returned."""
+    global pre_shepherd_branch
+    if not pre_shepherd_boundary_formed(robots, branch):
+        return False
+    for robot in get_pre_shepherds(robots, branch):
+        robot.role = "SHEPHERD"
+        robot.velocity.update(0.0, 0.0)
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+    pre_shepherd_branch = None
+    print(
+        f"[Pre-Shepherd] promoted after prior Junction return: "
+        f"branch={branch}"
+    )
+    return True
+
+
+def update_pre_shepherd_pipeline(robots, grid) -> None:
+    """Prepare the next branch shield while the current line backtracks."""
+    branch = transfer_branch
+    if (
+        phase not in {
+            SimulationPhase.PRESSURE_PUSH,
+            SimulationPhase.FLOW_BACKTRACK,
+        }
+        or branch is None
+        or branch == active_branch
+    ):
+        return
+    existing = get_pre_shepherds(robots, branch)
+    if not existing and capture_region_ready_for_shepherd(
+        robots,
+        branch,
+    ):
+        select_pre_shepherds(robots, branch, grid)
+    if get_pre_shepherds(robots, branch):
+        enforce_pre_shepherd_curtain_for_swarm(robots)
 
 
 def get_shepherds(robots):
@@ -4473,6 +4970,7 @@ def release_shepherd_line_at_junction(robots) -> int:
         robot.role = "NORMAL"
         robot.shepherd_anchor = None
         robot.shepherd_origin = None
+        robot.shepherd_branch = None
         robot.velocity = (
             direction * SHEPHERD_JUNCTION_RELEASE_SPEED
         )
@@ -4551,6 +5049,15 @@ def robot_is_in_shepherd_packing_zone(
 def adaptive_equilibrium_radius(robot: "Robot") -> float:
     """Phase-local equilibrium spacing used by pair repulsion."""
     if (
+        phase == SimulationPhase.MOVE_TO_JUNCTION
+        and simulation_time < BASE_COMPRESSION_DURATION
+        and robot.role == "NORMAL"
+    ):
+        return max(
+            ROBOT_RADIUS * 2.05,
+            SAFE_RADIUS * BASE_PACKED_EQUILIBRIUM_SCALE,
+        )
+    if (
         phase == SimulationPhase.FILL_BEHIND_SHEPHERD
         and robot.role == "NORMAL"
     ):
@@ -4611,10 +5118,97 @@ def get_base_compression_envelope() -> float:
     return math.sin(math.pi * progress) ** 2
 
 
+def get_stored_compression_pressure_envelope() -> float:
+    """Stored compression energy retained as a decaying SPH pressure floor."""
+    elapsed = simulation_time - BASE_COMPRESSION_DURATION
+    if elapsed <= 0.0 or elapsed >= BASE_STORED_PRESSURE_DURATION:
+        return 0.0
+    rise = smoothstep01(
+        elapsed / max(BASE_STORED_PRESSURE_RISE_TIME, EPSILON)
+    )
+    decay = 1.0 - smoothstep01(
+        (
+            elapsed - BASE_STORED_PRESSURE_DECAY_START
+        )
+        / max(
+            BASE_STORED_PRESSURE_DURATION
+            - BASE_STORED_PRESSURE_DECAY_START,
+            EPSILON,
+        )
+    )
+    return rise * decay
+
+
+def get_base_piston_reaction_envelope() -> float:
+    """Fast release followed by a bounded decay of the Base-wall reaction."""
+    elapsed = simulation_time - BASE_COMPRESSION_DURATION
+    if elapsed <= 0.0 or elapsed >= BASE_PISTON_REACTION_DURATION:
+        return 0.0
+    rise = smoothstep01(
+        elapsed / max(BASE_PISTON_REACTION_RISE_TIME, EPSILON)
+    )
+    decay = 1.0 - smoothstep01(
+        (
+            elapsed - BASE_PISTON_REACTION_RISE_TIME
+        )
+        / max(
+            BASE_PISTON_REACTION_DURATION
+            - BASE_PISTON_REACTION_RISE_TIME,
+            EPSILON,
+        )
+    )
+    return rise * decay
+
+
+def compute_base_piston_reaction_force(
+    robot: "Robot",
+) -> pygame.Vector2:
+    """Convert compressed SPH pressure at the Base wall into upward thrust."""
+    if (
+        phase not in {
+            SimulationPhase.MOVE_TO_JUNCTION,
+            SimulationPhase.EXPLORE_BRANCH,
+        }
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != "BOTTOM"
+    ):
+        return pygame.Vector2()
+    envelope = get_base_piston_reaction_envelope()
+    if envelope <= 0.0:
+        return pygame.Vector2()
+    depth_fraction = clamp(
+        (robot.position.y - bottom_rect.top)
+        / max(bottom_rect.height, EPSILON),
+        0.0,
+        1.0,
+    )
+    wall_weight = smoothstep01(
+        (
+            depth_fraction - BASE_PISTON_REACTION_DEPTH_START
+        )
+        / max(
+            1.0 - BASE_PISTON_REACTION_DEPTH_START,
+            EPSILON,
+        )
+    )
+    normalized_pressure = (
+        robot.pressure
+        / max(PRESSURE_GAIN * robot.density, EPSILON)
+    )
+    magnitude = min(
+        BASE_PISTON_REACTION_FORCE_LIMIT,
+        BASE_PISTON_REACTION_GAIN
+        * normalized_pressure
+        * wall_weight
+        * envelope,
+    )
+    return pygame.Vector2(0.0, -magnitude)
+
+
 def compute_initial_junction_soft_wall_force(
     robot: "Robot",
 ) -> pygame.Vector2:
-    """Brake before the three closed Junction faces instead of colliding."""
+    """Damped elastic pressure wall at the three initially closed faces."""
     if (
         phase != SimulationPhase.MOVE_TO_JUNCTION
         or robot.role != "NORMAL"
@@ -4668,7 +5262,13 @@ def compute_pressures(robots, reference_density):
             if phase == SimulationPhase.MOVE_TO_JUNCTION:
                 robot.pressure *= get_base_pressure_scale()
             elif phase == SimulationPhase.EXPLORE_BRANCH:
-                robot.pressure *= SPH_MOTION_PRESSURE_BOOST
+                robot.pressure *= (
+                    get_base_pressure_scale()
+                    if simulation_time
+                    < BASE_COMPRESSION_DURATION
+                    + BASE_EXPANSION_BOOST_DURATION
+                    else SPH_MOTION_PRESSURE_BOOST
+                )
             elif phase == SimulationPhase.FILL_BEHIND_SHEPHERD:
                 if robot_is_in_shepherd_packing_zone(
                     robot,
@@ -4684,6 +5284,48 @@ def compute_pressures(robots, reference_density):
                 SimulationPhase.FLOW_BACKTRACK,
             }:
                 robot.pressure *= SHEPHERD_PACKED_PRESSURE_BOOST
+            if phase in {
+                SimulationPhase.MOVE_TO_JUNCTION,
+                SimulationPhase.EXPLORE_BRANCH,
+            }:
+                stored_pressure_floor = (
+                    PRESSURE_GAIN
+                    * robot.density
+                    * BASE_STORED_PRESSURE_FLOOR
+                    * get_stored_compression_pressure_envelope()
+                )
+                robot.pressure = max(
+                    robot.pressure,
+                    stored_pressure_floor,
+                )
+            if (
+                phase in {
+                    SimulationPhase.PRESSURE_PUSH,
+                    SimulationPhase.FLOW_BACKTRACK,
+                }
+                and transfer_branch is not None
+                and robot.transfer_target == transfer_branch
+                and get_robot_region(robot.position)
+                in {"JUNCTION", transfer_branch}
+            ):
+                transfer_ramp = (
+                    1.0
+                    if phase == SimulationPhase.FLOW_BACKTRACK
+                    else smoothstep01(
+                        pressure_push_timer
+                        / max(PRESSURE_RAMP_TIME, EPSILON)
+                    )
+                )
+                transfer_pressure_floor = (
+                    PRESSURE_GAIN
+                    * robot.density
+                    * TRANSFER_PRESSURE_FLOOR
+                    * transfer_ramp
+                )
+                robot.pressure = max(
+                    robot.pressure,
+                    transfer_pressure_floor,
+                )
         if (
             phase in {
                 SimulationPhase.PRESSURE_PUSH,
@@ -4793,7 +5435,7 @@ def compute_route_force(robot):
         else:
             force = (
                 geodesic_edf_direction(robot.position, active_branch)
-                * ROUTE_FORCE
+                * WEAK_BRANCH_BIAS_FORCE
                 * relay_motion_scale
             )
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
@@ -4936,6 +5578,8 @@ def compute_sph_forces(
             robot_i.last_sph_pressure_force = 0.0
             robot_i.last_compression_release_force = 0.0
             robot_i.last_shepherd_force = 0.0
+            robot_i.last_base_piston_force = 0.0
+            robot_i.last_edf_force = 0.0
             continue
         if robot_i.role == "SHEPHERD" and phase in {
             SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -4948,6 +5592,8 @@ def compute_sph_forces(
             robot_i.last_sph_pressure_force = 0.0
             robot_i.last_compression_release_force = 0.0
             robot_i.last_shepherd_force = 0.0
+            robot_i.last_base_piston_force = 0.0
+            robot_i.last_edf_force = 0.0
             continue
 
         pressure_force = pygame.Vector2()
@@ -5182,16 +5828,25 @@ def compute_sph_forces(
             communication_grid,
         )
         shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
+        pre_shepherd_curtain_force = (
+            compute_pre_shepherd_curtain_force(robot_i)
+        )
         initial_junction_wall_force = (
             compute_initial_junction_soft_wall_force(robot_i)
         )
+        base_piston_force = compute_base_piston_reaction_force(robot_i)
+        edf_force = compute_pressure_coupled_edf_force(robot_i)
         robot_i.last_sph_pressure_force = pressure_force.length()
         robot_i.last_compression_release_force = (
             compression_release_force.length()
         )
         robot_i.last_shepherd_force = (
-            virtual_force + shepherd_curtain_force
+            virtual_force
+            + shepherd_curtain_force
+            + pre_shepherd_curtain_force
         ).length()
+        robot_i.last_base_piston_force = base_piston_force.length()
+        robot_i.last_edf_force = edf_force.length()
         pressure_phase_normal = (
             phase == SimulationPhase.PRESSURE_PUSH
             and robot_i.role == "NORMAL"
@@ -5217,7 +5872,10 @@ def compute_sph_forces(
             + route_force
             + connectivity_force
             + shepherd_curtain_force
+            + pre_shepherd_curtain_force
             + initial_junction_wall_force
+            + base_piston_force
+            + edf_force
             - DAMPING * robot_i.velocity
         )
         acceleration_limit = (
@@ -5313,6 +5971,23 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
+        if pre_shepherd_branch == active_branch:
+            if (
+                not get_shepherds(robots)
+                and promote_pre_shepherds(
+                    robots,
+                    active_branch,
+                )
+            ):
+                phase = SimulationPhase.FILL_BEHIND_SHEPHERD
+                saturation_tracker.reset(active_branch)
+                print(
+                    "[Pre-Shepherd] prior line cleared; "
+                    "prepared shield now waits for packed density"
+                )
+            else:
+                enforce_pre_shepherd_curtain_for_swarm(robots)
+            return
 
         # Preserve the original timing: wait until the leading robots enter the
         # dead-end capture region. Only the required count is now width-adaptive.
@@ -5390,6 +6065,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             print("[Pressure] piston push started")
 
     elif phase == SimulationPhase.PRESSURE_PUSH:
+        update_pre_shepherd_pipeline(robots, spatial_grid)
         pressure_push_timer += dt
         moving_ratio, average_speed, normal_count = normal_backtracking_metrics(robots, active_branch)
         established = (
@@ -5412,6 +6088,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             print(f"[Pressure] flow ratio={moving_ratio:.2f}, avg={average_speed:.2f}")
 
     elif phase == SimulationPhase.FLOW_BACKTRACK:
+        update_pre_shepherd_pipeline(robots, spatial_grid)
         shepherd_flow_timer += dt
         release_shepherd_line_at_junction(robots)
         update_relay_retraction(robots, dt)
@@ -5450,6 +6127,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         if (
             remaining <= BRANCH_CLEAR_LIMIT
             and not get_active_branch_relays(robots)
+            and not get_shepherds(robots)
             and (
                 transfer_ready
                 or base_transfer_ready
@@ -5477,7 +6155,20 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     reference_density,
                 )
                 saturation_tracker.reset(selected)
-                phase = SimulationPhase.EXPLORE_BRANCH
+                if (
+                    selected == pre_shepherd_branch
+                    and promote_pre_shepherds(
+                        robots,
+                        selected,
+                    )
+                ):
+                    phase = SimulationPhase.FILL_BEHIND_SHEPHERD
+                    print(
+                        "[Pre-Shepherd] branch switch completed; "
+                        "density fill gate is now active"
+                    )
+                else:
+                    phase = SimulationPhase.EXPLORE_BRANCH
                 metrics.branch_events.append({
                     "branch": selected,
                     "started_at": simulation_time,
@@ -5786,6 +6477,45 @@ def draw_shepherd_curtain(surface):
     surface.blit(overlay, (0, 0))
 
 
+def draw_pre_shepherd_curtain(surface):
+    """Visualize the prepared next-branch shield before activation."""
+    branch = pre_shepherd_branch
+    if not pre_shepherd_curtain_active() or branch is None:
+        return
+    depth = get_shepherd_boundary_depth(branch)
+    color = BRANCH_COLORS[branch]
+    overlay = pygame.Surface(
+        (SCREEN_WIDTH, SCREEN_HEIGHT),
+        pygame.SRCALPHA,
+    )
+    if branch == "UP":
+        y = round(center_y - half_width - depth)
+        endpoints = (
+            (center_x - half_width + 2, y),
+            (center_x + half_width - 2, y),
+        )
+    elif branch == "LEFT":
+        x = round(center_x - half_width - depth)
+        endpoints = (
+            (x, center_y - half_width + 2),
+            (x, center_y + half_width - 2),
+        )
+    else:
+        x = round(center_x + half_width + depth)
+        endpoints = (
+            (x, center_y - half_width + 2),
+            (x, center_y + half_width - 2),
+        )
+    pygame.draw.line(
+        overlay,
+        (*color, 170),
+        endpoints[0],
+        endpoints[1],
+        SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
+    )
+    surface.blit(overlay, (0, 0))
+
+
 # =========================================================
 # 17. Initialization
 # =========================================================
@@ -5799,6 +6529,7 @@ def reset_dfs_state():
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
     global pressure_push_timer, flow_establish_timer, communication_sequence
     global shepherd_flow_timer, shepherd_flow_start_depth
+    global pre_shepherd_branch
     global viscoelastic_step, viscoelastic_rest_lengths
     global viscoelastic_last_seen
     global last_message_signature, relay_slots, relay_deploy_cooldown
@@ -5815,7 +6546,7 @@ def reset_dfs_state():
     active_branch = FIXED_BRANCH_ORDER[0]
     branch_states = {branch: "UNVISITED" for branch in BRANCHES}
     branch_order_plan = []
-    branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+    branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
     distributed_consensus_branch = None
     transfer_branch = None
     final_base_transfer_active = False
@@ -5825,6 +6556,7 @@ def reset_dfs_state():
     junction_switch_timer = final_gather_timer = shepherd_form_timer = 0.0
     pressure_push_timer = flow_establish_timer = 0.0
     shepherd_flow_timer = shepherd_flow_start_depth = 0.0
+    pre_shepherd_branch = None
     viscoelastic_step = 0
     viscoelastic_rest_lengths = {}
     viscoelastic_last_seen = {}
@@ -6025,16 +6757,23 @@ while running:
                 rect,
                 width=3 if branch == active_branch else 2,
             )
-        for robot in get_shepherds(robots):
+        for robot in (
+            get_shepherds(robots)
+            + get_pre_shepherds(robots)
+        ):
             if robot.shepherd_anchor is not None:
                 pygame.draw.circle(
                     screen,
-                    BRANCH_COLORS[active_branch],
+                    BRANCH_COLORS[
+                        robot.shepherd_branch
+                        or active_branch
+                    ],
                     robot.shepherd_anchor,
                     4,
                     width=2,
                 )
         draw_shepherd_curtain(screen)
+        draw_pre_shepherd_curtain(screen)
         draw_relay_plan(screen, robots)
 
     pygame.draw.circle(screen, JUNCTION_COLOR, (center_x, center_y), 5)
@@ -6047,6 +6786,27 @@ while running:
     normal_count, shepherd_count, relay_count = count_branch_roles(robots, active_branch)
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
+    communication_parent_distances = [
+        robot.position.distance_to(robot.comm_parent.position)
+        for robot in robots
+        if robot.connected_to_base and robot.comm_parent is not None
+    ]
+    communication_guarded_count = sum(
+        distance > COMM_GUARD_START
+        for distance in communication_parent_distances
+    )
+    communication_max_parent_distance = max(
+        communication_parent_distances,
+        default=0.0,
+    )
+    fluid_body_region_counts = {
+        region: sum(
+            robot.role == "NORMAL"
+            and get_robot_region(robot.position) == region
+            for robot in robots
+        )
+        for region in ("BOTTOM", "JUNCTION", active_branch)
+    }
     shepherd_packing_count = sum(
         robot_is_in_shepherd_packing_zone(robot, active_branch)
         for robot in robots
@@ -6084,6 +6844,34 @@ while running:
         robot.last_shepherd_force
         for robot in force_samples
     ) / force_sample_count
+    average_edf_force = sum(
+        robot.last_edf_force
+        for robot in force_samples
+    ) / force_sample_count
+    base_piston_samples = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == "BOTTOM"
+    ]
+    average_base_piston_force = sum(
+        robot.last_base_piston_force
+        for robot in base_piston_samples
+    ) / max(1, len(base_piston_samples))
+    active_capture_rect = early_capture_regions[active_branch]
+    shepherd_candidate_count = sum(
+        robot.role == "NORMAL"
+        and get_robot_region(robot.position) == active_branch
+        and active_capture_rect.collidepoint(
+            robot.position.x,
+            robot.position.y,
+        )
+        for robot in robots
+    )
+    return_branch_robot_count = sum(
+        get_robot_region(robot.position) in BRANCHES
+        for robot in robots
+    )
     hud_lines = [
         "Pressure-driven SPH | Distributed NORMAL consensus | Breadcrumb relay",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
@@ -6103,12 +6891,23 @@ while running:
             f"pressure scale={get_base_pressure_scale():.2f}"
         ),
         (
+            f"Base pulse: compress={get_base_compression_envelope():.2f} | "
+            f"stored-SPH={get_stored_compression_pressure_envelope():.2f} | "
+            f"density-piston={get_base_piston_reaction_envelope():.2f}"
+        ),
+        (
             "Decision=NORMAL peer consensus | "
             f"Junction voters={sum(robot.role == 'NORMAL' and get_robot_region(robot.position) == 'JUNCTION' for robot in robots)}"
         ),
         (
-            f"Breadcrumb-front NORMAL guards={sum(robot.base_reserve and get_robot_region(robot.position) == 'BOTTOM' for robot in robots)}"
-            f"/{sum(robot.base_reserve for robot in robots)}"
+            f"Fluid body={FLUID_BODY_POLICY_VERSION} | "
+            f"B={fluid_body_region_counts['BOTTOM']} "
+            f"J={fluid_body_region_counts['JUNCTION']} "
+            f"{active_branch}={fluid_body_region_counts[active_branch]}"
+        ),
+        (
+            f"Breadcrumb policy={BREADCRUMB_GUARD_POLICY_VERSION} | "
+            "static NORMAL guards=0"
         ),
         f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
         (
@@ -6176,6 +6975,12 @@ while running:
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
+        (
+            f"Comm control={COMM_CONTROL_POLICY_VERSION} | "
+            f"guarded={communication_guarded_count} | "
+            f"max parent gap={communication_max_parent_distance:.1f}/"
+            f"{COMM_GUARD_HARD_LIMIT:.1f}"
+        ),
         f"Base direct={communication_stats['direct']} | Breadcrumbs={len(get_active_branch_relays(robots))}",
         f"Front comm ratio={front_comm['connected_ratio']:.2f} | relay need={front_comm['needs_relay']}",
         f"Reactive relays={len(get_relays(robots))} | preplanned slots=0",
@@ -6199,10 +7004,26 @@ while running:
             f"(n={shepherd_packing_count}) | Junction-tail={JUNCTION_TAIL_EQUILIBRIUM_SCALE:.2f}x"
         ),
         f"Shepherd target={adaptive_shepherd_count()} | formed={shepherd_boundary_formed(robots)} | pressure t={pressure_push_timer:.2f}",
-        f"Shepherd control=LOCAL_ONLY | active={len(get_shepherds(robots))}",
+        (
+            f"Election={SHEPHERD_ELECTION_POLICY_VERSION} | "
+            f"candidates={shepherd_candidate_count}/"
+            f"{adaptive_shepherd_count()}"
+        ),
+        (
+            f"Shepherd control=LOCAL_ONLY | "
+            f"active={len(get_shepherds(robots))} | "
+            f"pre={len(get_pre_shepherds(robots))} "
+            f"branch={pre_shepherd_branch or '-'}"
+        ),
         (
             f"Motion={MOTION_POLICY_VERSION} | "
             f"Shepherd={SHEPHERD_POLICY_VERSION}"
+        ),
+        f"Shepherd pipeline={SHEPHERD_PIPELINE_POLICY_VERSION}",
+        (
+            f"Propulsion={EDF_PROPULSION_POLICY_VERSION} | "
+            f"EDF avg={average_edf_force:.1f} | "
+            f"bias={WEAK_BRANCH_BIAS_FORCE:.1f}"
         ),
         (
             f"Viscoelastic={VISCOELASTIC_MODEL_VERSION} | "
@@ -6211,9 +7032,15 @@ while running:
         (
             f"Force avg: SPH={average_sph_pressure_force:.1f} | "
             f"self-expand={average_compression_release_force:.1f} | "
+            f"EDF={average_edf_force:.1f} | "
+            f"Base-piston={average_base_piston_force:.1f} | "
             f"Shepherd={average_shepherd_force:.1f}"
         ),
         f"Pressure policy={PRESSURE_POLICY_VERSION}",
+        (
+            f"Final gate={FINAL_GATE_POLICY_VERSION} | "
+            f"branch robots={return_branch_robot_count}"
+        ),
         (
             f"Shepherd line depth={get_shepherd_curtain_depth(active_branch):.1f} "
             f"| max slot error={shepherd_line_error:.2f}"
