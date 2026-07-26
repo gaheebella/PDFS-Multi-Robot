@@ -303,6 +303,9 @@ pressure_push_timer = 0.0
 flow_establish_timer = 0.0
 shepherd_flow_timer = 0.0
 shepherd_flow_start_depth = 0.0
+viscoelastic_step = 0
+viscoelastic_rest_lengths: dict[tuple[int, int], float] = {}
+viscoelastic_last_seen: dict[tuple[int, int], int] = {}
 
 communication_sequence = 0
 last_message_signature = None
@@ -346,40 +349,60 @@ STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1 = 0.9
 VISCOSITY_XI2 = 1.2
 MOTION_SPEED_MULTIPLIER = 3.0
-DAMPING = 2.3
+DAMPING = 3.0
 SAFE_RADIUS = 7.5 * MAP_SCALE
 REPULSION_GAIN = 260.0
+NORMAL_EQUILIBRIUM_SCALE = 1.20
 # Physical-robot command conditioning.  Longitudinal motion remains fast,
 # while high-frequency SPH reversals and corridor-crossing zigzags are damped.
-ACCELERATION_FILTER_ALPHA = 0.22
+ACCELERATION_FILTER_ALPHA = 0.18
 CORRIDOR_LATERAL_VELOCITY_DAMPING = 12.0
-SPH_PRESSURE_FORCE_LIMIT = 190.0 * MOTION_SPEED_MULTIPLIER
+SPH_PRESSURE_FORCE_LIMIT = 140.0 * MOTION_SPEED_MULTIPLIER
 SPH_VISCOSITY_FORCE_LIMIT = 90.0 * MOTION_SPEED_MULTIPLIER
-MOTION_POLICY_VERSION = "STABLE_COMMAND_V1"
+VISCOELASTIC_LINK_RADIUS = SAFE_RADIUS * 1.45
+VISCOELASTIC_REST_MIN = ROBOT_RADIUS * 2.20
+VISCOELASTIC_REST_MAX = SAFE_RADIUS * 1.65
+VISCOELASTIC_ELASTIC_GAIN = 42.0
+VISCOELASTIC_DASHPOT_GAIN = 8.0
+VISCOELASTIC_REST_RELAXATION = 0.85
+VISCOELASTIC_EQUILIBRIUM_ADAPTATION = 4.0
+VISCOELASTIC_VELOCITY_CONSENSUS_GAIN = 6.0
+VISCOELASTIC_FORCE_LIMIT = 75.0 * MOTION_SPEED_MULTIPLIER
+VISCOELASTIC_LINK_STALE_STEPS = 3
+VISCOELASTIC_MODEL_VERSION = "KELVIN_VOIGT_SPH_V2_SPACED"
+MOTION_POLICY_VERSION = "FAST_STABLE_COMMAND_V3"
 
-ROUTE_FORCE = 12.0 * MOTION_SPEED_MULTIPLIER
-OUTLET_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
+ROUTE_FORCE = 22.0 * MOTION_SPEED_MULTIPLIER
+OUTLET_FORCE = 24.0 * MOTION_SPEED_MULTIPLIER
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
 PRESSURE_BACKTRACK_BODY_FORCE = 28.0 * MOTION_SPEED_MULTIPLIER
 CENTERING_GAIN = 1.2
 
 MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
-MAX_ACCELERATION = 520.0 * MOTION_SPEED_MULTIPLIER
+MAX_ACCELERATION = 300.0 * MOTION_SPEED_MULTIPLIER
 EPSILON = 1e-8
 
-INITIAL_INGRESS_FORCE = 10.0 * MOTION_SPEED_MULTIPLIER
-BASE_COMPRESSION_DURATION = 0.60
-BASE_EXPANSION_BOOST_DURATION = 1.10
-BASE_COMPRESSION_FORCE = 150.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_INGRESS_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
+BASE_COMPRESSION_DURATION = 0.90
+BASE_EXPANSION_BOOST_DURATION = 1.60
+BASE_COMPRESSION_FORCE = 90.0 * MOTION_SPEED_MULTIPLIER
 BASE_COMPRESSION_PRESSURE_SCALE = 0.35
-BASE_EXPANSION_PRESSURE_SCALE = 4.20
+BASE_EXPANSION_PRESSURE_SCALE = 2.80
+BASE_EXPANSION_RAMP_FRACTION = 0.35
 INITIAL_INGRESS_LANE_GAIN = 1.0
 INITIAL_INGRESS_LANE_MAX_FORCE = 20.0
 INITIAL_INGRESS_TARGET_Y = center_y + 10.0 * MAP_SCALE
-INITIAL_INGRESS_BRAKE_DISTANCE = 34.0 * MAP_SCALE
+INITIAL_INGRESS_BRAKE_DISTANCE = 52.0 * MAP_SCALE
 INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
 INITIAL_INGRESS_MAX_DT = 0.04
+INITIAL_SAFE_MAX_SPEED = 36.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_MAX_SPEED = 20.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_SAFE_MAX_ACCELERATION = 170.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_SOFT_WALL_DEPTH = 18.0 * MAP_SCALE
+INITIAL_JUNCTION_SOFT_WALL_FORCE = 120.0 * MOTION_SPEED_MULTIPLIER
+INITIAL_JUNCTION_SOFT_WALL_DAMPING = 20.0
+INITIAL_IMPULSE_POLICY_VERSION = "SOFT_RAMP_BRAKE_V1"
 
 RETURN_EGRESS_FORCE = 42.0 * MOTION_SPEED_MULTIPLIER
 RETURN_LANE_GAIN = 1.15
@@ -499,7 +522,7 @@ COMM_SAFE_DISTANCE = 40.0 * MAP_SCALE
 COMM_BARRIER_START = COMM_RANGE * 0.84
 COMM_RECOVERY_RANGE = 84.0 * MAP_SCALE
 COMM_RECOVERY_GAIN = 0.65
-SHOW_COMM_LINKS_DEFAULT = True
+SHOW_COMM_LINKS_DEFAULT = False
 COMM_UPDATE_INTERVAL_FRAMES = 1
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
 ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
@@ -659,6 +682,7 @@ JUNCTION_FALLBACK_STABLE_RATIO = 0.35
 JUNCTION_FALLBACK_SPEED_THRESHOLD = 10.0
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
+SPH_CELL_SIZE = SMOOTHING_LENGTH
 
 # =========================================================
 # 5. Map mask and region checks
@@ -798,6 +822,11 @@ def has_line_of_sight(a: pygame.Vector2, b: pygame.Vector2) -> bool:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def smoothstep01(value: float) -> float:
+    value = clamp(value, 0.0, 1.0)
+    return value * value * (3.0 - 2.0 * value)
 
 
 def limit_vector(vector: pygame.Vector2, maximum_length: float) -> pygame.Vector2:
@@ -1333,7 +1362,14 @@ class Robot:
                 self.velocity.y *= lateral_decay
             elif region in {"UP", "BOTTOM"}:
                 self.velocity.x *= lateral_decay
-        limit_vector(self.velocity, MAX_SPEED)
+        speed_limit = MAX_SPEED
+        if phase == SimulationPhase.MOVE_TO_JUNCTION:
+            speed_limit = (
+                INITIAL_JUNCTION_MAX_SPEED
+                if get_robot_region(self.position) == "JUNCTION"
+                else INITIAL_SAFE_MAX_SPEED
+            )
+        limit_vector(self.velocity, speed_limit)
         x_position = pygame.Vector2(self.position.x + self.velocity.x * dt, self.position.y)
         if is_walkable(x_position, self.radius):
             self.position.x = x_position.x
@@ -1455,6 +1491,30 @@ def build_spatial_grid(robots):
 
 def iter_neighbor_candidates(robot, grid):
     cx, cy = cell_key(robot.position)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            yield from grid.get((cx + dx, cy + dy), [])
+
+
+def physics_cell_key(position):
+    return (
+        int(position.x // SPH_CELL_SIZE),
+        int(position.y // SPH_CELL_SIZE),
+    )
+
+
+def build_physics_grid(robots):
+    grid = {}
+    for robot in robots:
+        grid.setdefault(
+            physics_cell_key(robot.position),
+            [],
+        ).append(robot)
+    return grid
+
+
+def iter_physics_neighbor_candidates(robot, grid):
+    cx, cy = physics_cell_key(robot.position)
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             yield from grid.get((cx + dx, cy + dy), [])
@@ -4390,7 +4450,7 @@ def compute_densities(robots, grid):
     h_sq = SMOOTHING_LENGTH**2
     for robot_i in robots:
         density = self_contribution
-        for robot_j in iter_neighbor_candidates(robot_i, grid):
+        for robot_j in iter_physics_neighbor_candidates(robot_i, grid):
             if robot_i is robot_j:
                 continue
             distance_sq = robot_i.position.distance_squared_to(robot_j.position)
@@ -4448,32 +4508,117 @@ def adaptive_equilibrium_radius(robot: "Robot") -> float:
         and robot.role == "NORMAL"
     ):
         if robot_is_in_shepherd_packing_zone(robot, active_branch):
-            return SAFE_RADIUS * SHEPHERD_PACKED_EQUILIBRIUM_SCALE
+            return max(
+                ROBOT_RADIUS * 2.05,
+                SAFE_RADIUS * SHEPHERD_PACKED_EQUILIBRIUM_SCALE,
+            )
         if get_robot_region(robot.position) in {"JUNCTION", "BOTTOM"}:
             return SAFE_RADIUS * JUNCTION_TAIL_EQUILIBRIUM_SCALE
-    return SAFE_RADIUS
+    return SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE
+
+
+def get_base_pressure_scale() -> float:
+    """Continuous compression-release pulse suitable for physical robots."""
+    if simulation_time < BASE_COMPRESSION_DURATION:
+        return BASE_COMPRESSION_PRESSURE_SCALE
+
+    elapsed = simulation_time - BASE_COMPRESSION_DURATION
+    if elapsed >= BASE_EXPANSION_BOOST_DURATION:
+        return SPH_MOTION_PRESSURE_BOOST
+
+    progress = clamp(
+        elapsed / max(BASE_EXPANSION_BOOST_DURATION, EPSILON),
+        0.0,
+        1.0,
+    )
+    rise = smoothstep01(
+        progress / max(BASE_EXPANSION_RAMP_FRACTION, EPSILON)
+    )
+    fall = smoothstep01(
+        (
+            progress
+            - (1.0 - BASE_EXPANSION_RAMP_FRACTION)
+        )
+        / max(BASE_EXPANSION_RAMP_FRACTION, EPSILON)
+    )
+    pressure_scale = (
+        BASE_COMPRESSION_PRESSURE_SCALE
+        + (
+            BASE_EXPANSION_PRESSURE_SCALE
+            - BASE_COMPRESSION_PRESSURE_SCALE
+        )
+        * rise
+    )
+    return pressure_scale + (
+        SPH_MOTION_PRESSURE_BOOST - pressure_scale
+    ) * fall
+
+
+def get_base_compression_envelope() -> float:
+    """Zero-slope-style pulse: no step impulse at compression start/end."""
+    progress = clamp(
+        simulation_time / max(BASE_COMPRESSION_DURATION, EPSILON),
+        0.0,
+        1.0,
+    )
+    return math.sin(math.pi * progress) ** 2
+
+
+def compute_initial_junction_soft_wall_force(
+    robot: "Robot",
+) -> pygame.Vector2:
+    """Brake before the three closed Junction faces instead of colliding."""
+    if (
+        phase != SimulationPhase.MOVE_TO_JUNCTION
+        or robot.role != "NORMAL"
+        or get_robot_region(robot.position) != "JUNCTION"
+    ):
+        return pygame.Vector2()
+
+    depth = max(INITIAL_JUNCTION_SOFT_WALL_DEPTH, EPSILON)
+    force = pygame.Vector2()
+    faces = (
+        (
+            robot.position.x - junction_rect.left,
+            pygame.Vector2(1.0, 0.0),
+        ),
+        (
+            junction_rect.right - robot.position.x,
+            pygame.Vector2(-1.0, 0.0),
+        ),
+        (
+            robot.position.y - junction_rect.top,
+            pygame.Vector2(0.0, 1.0),
+        ),
+    )
+    for clearance, inward in faces:
+        if clearance >= depth:
+            continue
+        ratio = clamp(1.0 - clearance / depth, 0.0, 1.0)
+        outward_speed = max(0.0, -robot.velocity.dot(inward))
+        force += inward * (
+            INITIAL_JUNCTION_SOFT_WALL_FORCE * ratio**2
+            + INITIAL_JUNCTION_SOFT_WALL_DAMPING * outward_speed
+        )
+    return force
 
 
 def compute_pressures(robots, reference_density):
     effective_lambda = get_effective_stiffness_exponent()
     for robot in robots:
         ratio = robot.density / max(reference_density, EPSILON)
-        robot.pressure = (
+        raw_pressure = (
             PRESSURE_GAIN
             * robot.density
             * (ratio**effective_lambda - 1.0)
         )
+        # Negative pressure creates tensile clumping in particle methods.
+        # Cohesion is supplied by the explicit viscoelastic links, leaving
+        # this SPH channel compressive and numerically stable.
+        robot.pressure = max(0.0, raw_pressure)
         if robot.role == "NORMAL":
             if phase == SimulationPhase.MOVE_TO_JUNCTION:
-                if simulation_time < BASE_COMPRESSION_DURATION:
-                    robot.pressure *= BASE_COMPRESSION_PRESSURE_SCALE
-                elif simulation_time < (
-                    BASE_COMPRESSION_DURATION
-                    + BASE_EXPANSION_BOOST_DURATION
-                ):
-                    robot.pressure *= BASE_EXPANSION_PRESSURE_SCALE
-                else:
-                    robot.pressure *= SPH_MOTION_PRESSURE_BOOST
+                robot.pressure *= get_base_pressure_scale()
             elif phase == SimulationPhase.EXPLORE_BRANCH:
                 robot.pressure *= SPH_MOTION_PRESSURE_BOOST
             elif phase == SimulationPhase.FILL_BEHIND_SHEPHERD:
@@ -4572,6 +4717,7 @@ def compute_route_force(robot):
                     compression.normalize()
                     * BASE_COMPRESSION_FORCE
                     * compression_scale
+                    * get_base_compression_envelope()
                 )
         else:
             y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
@@ -4724,10 +4870,19 @@ def compute_route_force(robot):
     return force
 
 
-def compute_sph_forces(robots, grid):
+def compute_sph_forces(
+    robots,
+    grid,
+    communication_grid,
+    dt=1.0 / FPS,
+):
+    global viscoelastic_step
+    viscoelastic_step += 1
     h_sq = SMOOTHING_LENGTH**2
+    viscoelastic_link_sq = VISCOELASTIC_LINK_RADIUS**2
     virtual_sq = VIRTUAL_PRESSURE_RADIUS**2
     backtrack_direction = get_backtrack_direction(active_branch)
+    active_shepherds = get_shepherds(robots)
     checked_pairs = set()
     for robot_i in robots:
         if robot_i.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}:
@@ -4745,13 +4900,53 @@ def compute_sph_forces(robots, grid):
 
         pressure_force = pygame.Vector2()
         viscosity_force = pygame.Vector2()
+        viscoelastic_force = pygame.Vector2()
         repulsion_force = pygame.Vector2()
         virtual_force = pygame.Vector2()
         cohesion_force = pygame.Vector2()
         neighbor_count = 0
         neighbor_center = pygame.Vector2()
 
-        for robot_j in iter_neighbor_candidates(robot_i, grid):
+        if (
+            phase in {
+                SimulationPhase.PRESSURE_PUSH,
+                SimulationPhase.FLOW_BACKTRACK,
+            }
+            and robot_i.role == "NORMAL"
+        ):
+            for shepherd in active_shepherds:
+                distance_sq = robot_i.position.distance_squared_to(
+                    shepherd.position
+                )
+                if (
+                    distance_sq > virtual_sq
+                    or branch_progress(robot_i, active_branch)
+                    > branch_progress(shepherd, active_branch) + 2.0
+                ):
+                    continue
+                distance = math.sqrt(max(distance_sq, EPSILON))
+                ratio = max(
+                    0.0,
+                    1.0 - distance / VIRTUAL_PRESSURE_RADIUS,
+                )
+                ramp = (
+                    1.0
+                    if phase == SimulationPhase.FLOW_BACKTRACK
+                    else min(
+                        1.0,
+                        0.25
+                        + pressure_push_timer
+                        / max(PRESSURE_RAMP_TIME, EPSILON),
+                    )
+                )
+                virtual_force += (
+                    backtrack_direction
+                    * VIRTUAL_PRESSURE_FORCE
+                    * ratio**2
+                    * ramp
+                )
+
+        for robot_j in iter_physics_neighbor_candidates(robot_i, grid):
             if robot_i is robot_j:
                 continue
             pair = tuple(sorted((robot_i.robot_id, robot_j.robot_id)))
@@ -4764,30 +4959,6 @@ def compute_sph_forces(robots, grid):
                 if distance < ROBOT_RADIUS * 2.0:
                     metrics.safety_violations += 1
 
-            if (
-                phase in {
-                    SimulationPhase.PRESSURE_PUSH,
-                    SimulationPhase.FLOW_BACKTRACK,
-                }
-                and robot_i.role == "NORMAL"
-                and robot_j.role == "SHEPHERD"
-                and distance_sq <= virtual_sq
-                and branch_progress(robot_i, active_branch) <= branch_progress(robot_j, active_branch) + 2.0
-            ):
-                distance = math.sqrt(max(distance_sq, EPSILON))
-                ratio = max(0.0, 1.0 - distance / VIRTUAL_PRESSURE_RADIUS)
-                ramp = (
-                    1.0
-                    if phase == SimulationPhase.FLOW_BACKTRACK
-                    else min(
-                        1.0,
-                        0.25
-                        + pressure_push_timer
-                        / max(PRESSURE_RAMP_TIME, EPSILON),
-                    )
-                )
-                virtual_force += backtrack_direction * VIRTUAL_PRESSURE_FORCE * ratio**2 * ramp
-
             if distance_sq <= EPSILON or distance_sq > h_sq:
                 continue
             neighbor_count += 1
@@ -4799,7 +4970,81 @@ def compute_sph_forces(robots, grid):
                 + robot_j.pressure / max(robot_j.density**2, EPSILON)
             )
             pressure_force += -coefficient * gradient
+            pair_equilibrium_radius = 0.5 * (
+                adaptive_equilibrium_radius(robot_i)
+                + adaptive_equilibrium_radius(robot_j)
+            )
             v_ij = robot_i.velocity - robot_j.velocity
+            kernel_weight = (
+                spiky_kernel(distance, SMOOTHING_LENGTH)
+                / max(
+                    spiky_kernel(0.0, SMOOTHING_LENGTH),
+                    EPSILON,
+                )
+            )
+            # Physical viscosity acts for shear and separation as well as
+            # compression; nearby robots continuously reach velocity
+            # consensus instead of only damping head-on approaches.
+            viscosity_force += (
+                robot_j.velocity - robot_i.velocity
+            ) * (
+                VISCOELASTIC_VELOCITY_CONSENSUS_GAIN
+                * kernel_weight
+            )
+
+            viscoelastic_pair = (
+                robot_i.role == "NORMAL"
+                and robot_j.role == "NORMAL"
+                and not robot_i.base_reserve
+                and not robot_j.base_reserve
+                and distance_sq <= viscoelastic_link_sq
+            )
+            if viscoelastic_pair:
+                if pair not in viscoelastic_rest_lengths:
+                    viscoelastic_rest_lengths[pair] = clamp(
+                        pair_equilibrium_radius,
+                        VISCOELASTIC_REST_MIN,
+                        VISCOELASTIC_REST_MAX,
+                    )
+                if (
+                    viscoelastic_last_seen.get(pair)
+                    != viscoelastic_step
+                ):
+                    rest_length = viscoelastic_rest_lengths[pair]
+                    equilibrium_target = clamp(
+                        pair_equilibrium_radius,
+                        VISCOELASTIC_REST_MIN,
+                        VISCOELASTIC_REST_MAX,
+                    )
+                    equilibrium_adaptation = clamp(
+                        VISCOELASTIC_EQUILIBRIUM_ADAPTATION * dt,
+                        0.0,
+                        1.0,
+                    )
+                    rest_length += (
+                        equilibrium_target - rest_length
+                    ) * equilibrium_adaptation
+                    relaxation = clamp(
+                        VISCOELASTIC_REST_RELAXATION * dt,
+                        0.0,
+                        1.0,
+                    )
+                    viscoelastic_rest_lengths[pair] = (
+                        rest_length
+                        + (distance - rest_length) * relaxation
+                    )
+                    viscoelastic_last_seen[pair] = viscoelastic_step
+
+                rest_length = viscoelastic_rest_lengths[pair]
+                direction_away = r_ij / distance
+                extension = distance - rest_length
+                radial_relative_speed = v_ij.dot(direction_away)
+                viscoelastic_force += direction_away * (
+                    -VISCOELASTIC_ELASTIC_GAIN * extension
+                    -VISCOELASTIC_DASHPOT_GAIN
+                    * radial_relative_speed
+                )
+
             approach = v_ij.dot(r_ij)
             if approach < 0.0:
                 mu_ij = SMOOTHING_LENGTH * approach / (distance_sq + 0.01 * SMOOTHING_LENGTH**2)
@@ -4809,10 +5054,6 @@ def compute_sph_forces(robots, grid):
                 mean_density = 0.5 * (robot_i.density + robot_j.density)
                 pi_ij = (-VISCOSITY_XI1 * c_ij * mu_ij + VISCOSITY_XI2 * mu_ij**2) / max(mean_density, EPSILON)
                 viscosity_force += -pi_ij * gradient
-            pair_equilibrium_radius = 0.5 * (
-                adaptive_equilibrium_radius(robot_i)
-                + adaptive_equilibrium_radius(robot_j)
-            )
             if distance < pair_equilibrium_radius:
                 penetration_ratio = (
                     pair_equilibrium_radius - distance
@@ -4825,9 +5066,16 @@ def compute_sph_forces(robots, grid):
 
         limit_vector(pressure_force, SPH_PRESSURE_FORCE_LIMIT)
         limit_vector(viscosity_force, SPH_VISCOSITY_FORCE_LIMIT)
+        limit_vector(viscoelastic_force, VISCOELASTIC_FORCE_LIMIT)
         route_force = compute_route_force(robot_i)
-        connectivity_force = compute_connectivity_force(robot_i, grid)
+        connectivity_force = compute_connectivity_force(
+            robot_i,
+            communication_grid,
+        )
         shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
+        initial_junction_wall_force = (
+            compute_initial_junction_soft_wall_force(robot_i)
+        )
         pressure_phase_normal = (
             phase == SimulationPhase.PRESSURE_PUSH
             and robot_i.role == "NORMAL"
@@ -4845,21 +5093,41 @@ def compute_sph_forces(robots, grid):
         total = (
             pressure_force
             + viscosity_force
+            + viscoelastic_force
             + repulsion_force
             + virtual_force
             + cohesion_force
             + route_force
             + connectivity_force
             + shepherd_curtain_force
+            + initial_junction_wall_force
             - DAMPING * robot_i.velocity
         )
-        raw_acceleration = limit_vector(total, MAX_ACCELERATION)
+        acceleration_limit = (
+            INITIAL_SAFE_MAX_ACCELERATION
+            if phase == SimulationPhase.MOVE_TO_JUNCTION
+            else MAX_ACCELERATION
+        )
+        raw_acceleration = limit_vector(total, acceleration_limit)
         robot_i.filtered_acceleration = (
             robot_i.filtered_acceleration
             * (1.0 - ACCELERATION_FILTER_ALPHA)
             + raw_acceleration * ACCELERATION_FILTER_ALPHA
         )
         robot_i.acceleration = robot_i.filtered_acceleration.copy()
+
+    if viscoelastic_step % 5 == 0:
+        stale_pairs = [
+            pair
+            for pair, last_seen in viscoelastic_last_seen.items()
+            if (
+                viscoelastic_step - last_seen
+                > VISCOELASTIC_LINK_STALE_STEPS
+            )
+        ]
+        for pair in stale_pairs:
+            viscoelastic_last_seen.pop(pair, None)
+            viscoelastic_rest_lengths.pop(pair, None)
 
 # =========================================================
 # 16. State machine
@@ -5414,6 +5682,8 @@ def reset_dfs_state():
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
     global pressure_push_timer, flow_establish_timer, communication_sequence
     global shepherd_flow_timer, shepherd_flow_start_depth
+    global viscoelastic_step, viscoelastic_rest_lengths
+    global viscoelastic_last_seen
     global last_message_signature, relay_slots, relay_deploy_cooldown
     global relay_retract_cooldown, relay_retract_clear_timer, relay_motion_scale
     global trunk_relay_slots, trunk_relay_deploy_cooldown, base_station
@@ -5438,6 +5708,9 @@ def reset_dfs_state():
     junction_switch_timer = final_gather_timer = shepherd_form_timer = 0.0
     pressure_push_timer = flow_establish_timer = 0.0
     shepherd_flow_timer = shepherd_flow_start_depth = 0.0
+    viscoelastic_step = 0
+    viscoelastic_rest_lengths = {}
+    viscoelastic_last_seen = {}
     communication_sequence = 0
     last_message_signature = None
     relay_slots = []
@@ -5469,7 +5742,7 @@ def initialize_simulation():
     if not robots:
         raise RuntimeError("No robots were created.")
     grid = build_spatial_grid(robots)
-    compute_densities(robots, grid)
+    compute_densities(robots, build_physics_grid(robots))
     mean_density = sum(robot.density for robot in robots) / len(robots)
     reference_density = mean_density * 0.62
     color_reference_density = mean_density * 0.68
@@ -5581,14 +5854,17 @@ while running:
     if not paused:
         simulation_time += frame_dt
         communication_frame_counter += 1
-        if communication_frame_counter % COMM_UPDATE_INTERVAL_FRAMES == 0:
-            update_communication_system(robots, spatial_grid)
         substep_dt = frame_dt / SUBSTEPS
         for _ in range(SUBSTEPS):
-            spatial_grid = build_spatial_grid(robots)
-            compute_densities(robots, spatial_grid)
+            physics_grid = build_physics_grid(robots)
+            compute_densities(robots, physics_grid)
             compute_pressures(robots, reference_density)
-            compute_sph_forces(robots, spatial_grid)
+            compute_sph_forces(
+                robots,
+                physics_grid,
+                spatial_grid,
+                substep_dt,
+            )
             for robot in robots:
                 robot.update(substep_dt)
         # Rebuild immediately after distributed role changes such as a
@@ -5599,7 +5875,7 @@ while running:
         update_metrics_per_frame(robots, frame_dt)
     else:
         update_communication_system(robots, spatial_grid)
-        compute_densities(robots, spatial_grid)
+        compute_densities(robots, build_physics_grid(robots))
         compute_pressures(robots, reference_density)
 
     screen.fill(BACKGROUND_COLOR)
@@ -5685,6 +5961,10 @@ while running:
             and simulation_time
             < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION
             else "Base impulse=RELEASED"
+        ),
+        (
+            f"Initial safety={INITIAL_IMPULSE_POLICY_VERSION} | "
+            f"pressure scale={get_base_pressure_scale():.2f}"
         ),
         (
             "Decision=NORMAL peer consensus | "
@@ -5778,7 +6058,8 @@ while running:
             f"saturated={saturation_tracker.saturated}"
         ),
         (
-            f"Fill spacing: Shepherd-back={SHEPHERD_PACKED_EQUILIBRIUM_SCALE:.2f}x "
+            f"Spacing: Normal={NORMAL_EQUILIBRIUM_SCALE:.2f}x | "
+            f"Shepherd-back={SHEPHERD_PACKED_EQUILIBRIUM_SCALE:.2f}x "
             f"(n={shepherd_packing_count}) | Junction-tail={JUNCTION_TAIL_EQUILIBRIUM_SCALE:.2f}x"
         ),
         f"Shepherd target={adaptive_shepherd_count()} | formed={shepherd_boundary_formed(robots)} | pressure t={pressure_push_timer:.2f}",
@@ -5786,6 +6067,10 @@ while running:
         (
             f"Motion={MOTION_POLICY_VERSION} | "
             f"Shepherd={SHEPHERD_POLICY_VERSION}"
+        ),
+        (
+            f"Viscoelastic={VISCOELASTIC_MODEL_VERSION} | "
+            f"active links={len(viscoelastic_rest_lengths)}"
         ),
         (
             f"Shepherd line depth={get_shepherd_curtain_depth(active_branch):.1f} "
