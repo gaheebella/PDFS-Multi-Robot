@@ -309,6 +309,9 @@ flow_establish_timer = 0.0
 shepherd_flow_timer = 0.0
 shepherd_flow_start_depth = 0.0
 pre_shepherd_branch: Optional[str] = None
+pre_shepherd_pack_dwell = 0.0
+pre_shepherd_pack_ready = False
+draining_branch: Optional[str] = None
 viscoelastic_step = 0
 viscoelastic_rest_lengths: dict[tuple[int, int], float] = {}
 viscoelastic_last_seen: dict[tuple[int, int], int] = {}
@@ -529,7 +532,9 @@ SHEPHERD_JUNCTION_RELEASE_INSET = max(
 )
 SHEPHERD_JUNCTION_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_POLICY_VERSION = "DENSITY_RELEASE_CURTAIN_V3"
-SHEPHERD_PIPELINE_POLICY_VERSION = "OVERLAPPED_PRE_SHIELD_V1"
+SHEPHERD_PIPELINE_POLICY_VERSION = "PACK_READY_IMMEDIATE_HANDOFF_V3"
+PIPELINE_SOURCE_STRAGGLER_LIMIT = 6
+PRE_SHEPHERD_PACK_DWELL_TIME = 0.08
 SHEPHERD_PRESSURE_FACTOR = 4.0
 VIRTUAL_PRESSURE_RADIUS = 60.0 * MAP_SCALE
 VIRTUAL_PRESSURE_FORCE = 110.0
@@ -2428,6 +2433,15 @@ def get_active_branch_relays(robots):
     )
 
 
+def get_relays_inside_branch(robots, branch):
+    """Return only breadcrumbs physically blocking completion of *branch*."""
+    return [
+        robot
+        for robot in get_active_branch_relays(robots)
+        if get_robot_region(robot.position) == branch
+    ]
+
+
 def relay_at_slot_is_settled(robot):
     return (
         robot.role == "RELAY"
@@ -4144,7 +4158,11 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
     branch_gate_states = {
         branch: (
             "OPEN"
-            if branch in {source, target}
+            if branch in {
+                source,
+                target,
+                draining_branch,
+            }
             else "CLOSED"
         )
         for branch in BRANCHES
@@ -4153,7 +4171,11 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
         region = get_robot_region(robot.position)
         robot.transfer_target = (
             target
-            if region in {source, "JUNCTION"}
+            if region in {
+                source,
+                "JUNCTION",
+                draining_branch,
+            }
             and robot.role in {"NORMAL", "SHEPHERD"}
             else None
         )
@@ -4195,6 +4217,30 @@ def close_all_branch_gates() -> None:
     global branch_gate_states
     branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
     print("[Gate] UP=CLOSED, LEFT=CLOSED, RIGHT=CLOSED")
+
+
+def update_draining_branch_gate(robots) -> None:
+    """Keep a completed source mouth open only for a few late normals."""
+    global draining_branch
+    branch = draining_branch
+    if branch is None:
+        return
+    remaining = [
+        robot
+        for robot in robots
+        if get_robot_region(robot.position) == branch
+        and robot.role in {
+            "NORMAL",
+            "SHEPHERD",
+            "PRE_SHEPHERD",
+        }
+    ]
+    if remaining:
+        branch_gate_states[branch] = "OPEN"
+        return
+    branch_gate_states[branch] = "CLOSED"
+    draining_branch = None
+    print(f"[Pipeline Drain] source gate closed: {branch}")
 
 
 def direction_toward_base_path(position: pygame.Vector2) -> pygame.Vector2:
@@ -4790,6 +4836,7 @@ def select_pre_shepherds(robots, branch: str, grid):
     """Elect the next branch shield without disturbing active Shepherds."""
     del grid
     global pre_shepherd_branch
+    global pre_shepherd_pack_dwell, pre_shepherd_pack_ready
     if get_pre_shepherds(robots):
         return get_pre_shepherds(robots, branch)
     required_count = adaptive_shepherd_count()
@@ -4800,6 +4847,8 @@ def select_pre_shepherds(robots, branch: str, grid):
         return []
     selected = []
     pre_shepherd_branch = branch
+    pre_shepherd_pack_dwell = 0.0
+    pre_shepherd_pack_ready = False
     for robot, slot, score in assignment:
         robot.role = "PRE_SHEPHERD"
         robot.shepherd_anchor = slot.copy()
@@ -4821,10 +4870,56 @@ def select_pre_shepherds(robots, branch: str, grid):
     return selected
 
 
+def update_pre_shepherd_pack_readiness(
+    robots,
+    branch: str,
+    reference_density: float,
+    dt: float,
+) -> bool:
+    """Track packed mass behind the prepared next-branch curtain."""
+    global pre_shepherd_pack_dwell, pre_shepherd_pack_ready
+    tip = tip_robots(robots, branch)
+    required_count = max(
+        SATURATION_PACKED_MIN_TIP_ROBOTS,
+        math.ceil(
+            max(1, len(get_pre_shepherds(robots, branch)))
+            * SATURATION_PACKED_ROBOTS_PER_SHEPHERD
+        ),
+    )
+    average_density_ratio = (
+        sum(robot.density for robot in tip)
+        / max(len(tip), 1)
+        / max(reference_density, EPSILON)
+    )
+    occupancy = tip_occupancy_ratio(tip, branch)
+    packed = (
+        len(tip) >= SATURATION_PACKED_MIN_TIP_ROBOTS
+        and occupancy >= SATURATION_PACKED_OCCUPANCY_RATIO
+        and (
+            len(tip) >= required_count
+            or average_density_ratio
+            >= SATURATION_PACKED_DENSITY_RATIO
+        )
+    )
+    pre_shepherd_pack_dwell = (
+        pre_shepherd_pack_dwell + dt
+        if packed
+        else 0.0
+    )
+    pre_shepherd_pack_ready = (
+        pre_shepherd_pack_dwell
+        >= PRE_SHEPHERD_PACK_DWELL_TIME
+    )
+    return pre_shepherd_pack_ready
+
+
 def promote_pre_shepherds(robots, branch: str) -> bool:
     """Activate a prepared shield only after the prior line has returned."""
     global pre_shepherd_branch
-    if not pre_shepherd_boundary_formed(robots, branch):
+    if (
+        not pre_shepherd_boundary_formed(robots, branch)
+        or not pre_shepherd_pack_ready
+    ):
         return False
     for robot in get_pre_shepherds(robots, branch):
         robot.role = "SHEPHERD"
@@ -4839,7 +4934,12 @@ def promote_pre_shepherds(robots, branch: str) -> bool:
     return True
 
 
-def update_pre_shepherd_pipeline(robots, grid) -> None:
+def update_pre_shepherd_pipeline(
+    robots,
+    grid,
+    reference_density: float,
+    dt: float,
+) -> None:
     """Prepare the next branch shield while the current line backtracks."""
     branch = transfer_branch
     if (
@@ -4859,6 +4959,12 @@ def update_pre_shepherd_pipeline(robots, grid) -> None:
         select_pre_shepherds(robots, branch, grid)
     if get_pre_shepherds(robots, branch):
         enforce_pre_shepherd_curtain_for_swarm(robots)
+        update_pre_shepherd_pack_readiness(
+            robots,
+            branch,
+            reference_density,
+            dt,
+        )
 
 
 def get_shepherds(robots):
@@ -5507,7 +5613,7 @@ def compute_route_force(robot):
         elif (
             transfer_branch is not None
             and robot.transfer_target == transfer_branch
-            and region in {"JUNCTION", transfer_branch}
+            and region != active_branch
         ):
             force = (
                 geodesic_edf_direction(robot.position, transfer_branch)
@@ -5929,6 +6035,38 @@ def update_metrics_per_frame(robots, dt):
         metrics.disconnected_robot_seconds += disconnected * dt
 
 
+def start_shepherd_pressure_push(robots, branch):
+    """Start a prepared Shepherd piston without repeating the fill wait."""
+    global phase, pressure_push_timer, flow_establish_timer
+    global shepherd_flow_timer
+    next_branch = next_unvisited_transfer_branch(branch)
+    if next_branch is not None:
+        begin_cross_branch_transfer(
+            robots,
+            branch,
+            next_branch,
+        )
+    else:
+        begin_final_base_transfer(
+            robots,
+            branch,
+        )
+    phase = SimulationPhase.PRESSURE_PUSH
+    pressure_push_timer = 0.0
+    flow_establish_timer = 0.0
+    shepherd_flow_timer = 0.0
+    packed_count = len(tip_robots(robots, branch))
+    metrics.pressure_events.append({
+        "branch": branch,
+        "started_at": simulation_time,
+    })
+    print(
+        f"[Saturation] robots packed behind Shepherd boundary: "
+        f"branch={branch}, count={packed_count}"
+    )
+    print("[Pressure] piston push started")
+
+
 def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global shepherd_flow_timer
@@ -5936,6 +6074,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global distributed_consensus_branch, transfer_branch
     global final_base_transfer_active
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
+    global draining_branch
+
+    update_draining_branch_gate(robots)
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
@@ -5972,6 +6113,12 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
         if pre_shepherd_branch == active_branch:
+            update_pre_shepherd_pack_readiness(
+                robots,
+                active_branch,
+                reference_density,
+                dt,
+            )
             if (
                 not get_shepherds(robots)
                 and promote_pre_shepherds(
@@ -5979,11 +6126,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     active_branch,
                 )
             ):
-                phase = SimulationPhase.FILL_BEHIND_SHEPHERD
-                saturation_tracker.reset(active_branch)
+                start_shepherd_pressure_push(
+                    robots,
+                    active_branch,
+                )
                 print(
                     "[Pre-Shepherd] prior line cleared; "
-                    "prepared shield now waits for packed density"
+                    "packed shield starts piston push immediately"
                 )
             else:
                 enforce_pre_shepherd_curtain_for_swarm(robots)
@@ -6038,34 +6187,18 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             robots, active_branch, reference_density, dt
         )
         if saturated:
-            next_branch = next_unvisited_transfer_branch(active_branch)
-            if next_branch is not None:
-                begin_cross_branch_transfer(
-                    robots,
-                    active_branch,
-                    next_branch,
-                )
-            else:
-                begin_final_base_transfer(
-                    robots,
-                    active_branch,
-                )
-            phase = SimulationPhase.PRESSURE_PUSH
-            pressure_push_timer = 0.0
-            flow_establish_timer = 0.0
-            shepherd_flow_timer = 0.0
-            metrics.pressure_events.append({
-                "branch": active_branch,
-                "started_at": simulation_time,
-            })
-            print(
-                f"[Saturation] robots packed behind Shepherd boundary: "
-                f"branch={active_branch}, count={saturation_tracker.tip_count}"
+            start_shepherd_pressure_push(
+                robots,
+                active_branch,
             )
-            print("[Pressure] piston push started")
 
     elif phase == SimulationPhase.PRESSURE_PUSH:
-        update_pre_shepherd_pipeline(robots, spatial_grid)
+        update_pre_shepherd_pipeline(
+            robots,
+            spatial_grid,
+            reference_density,
+            dt,
+        )
         pressure_push_timer += dt
         moving_ratio, average_speed, normal_count = normal_backtracking_metrics(robots, active_branch)
         established = (
@@ -6088,7 +6221,12 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             print(f"[Pressure] flow ratio={moving_ratio:.2f}, avg={average_speed:.2f}")
 
     elif phase == SimulationPhase.FLOW_BACKTRACK:
-        update_pre_shepherd_pipeline(robots, spatial_grid)
+        update_pre_shepherd_pipeline(
+            robots,
+            spatial_grid,
+            reference_density,
+            dt,
+        )
         shepherd_flow_timer += dt
         release_shepherd_line_at_junction(robots)
         update_relay_retraction(robots, dt)
@@ -6124,9 +6262,27 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             and not final_base_transfer_active
             and in_junction >= JUNCTION_SWITCH_COUNT
         )
+        pipeline_switch_ready = (
+            transfer_branch is not None
+            and pre_shepherd_branch == transfer_branch
+            and pre_shepherd_boundary_formed(
+                robots,
+                transfer_branch,
+            )
+            and pre_shepherd_pack_ready
+            and not get_shepherds(robots)
+            and remaining <= PIPELINE_SOURCE_STRAGGLER_LIMIT
+        )
+        source_branch_relays = get_relays_inside_branch(
+            robots,
+            active_branch,
+        )
         if (
-            remaining <= BRANCH_CLEAR_LIMIT
-            and not get_active_branch_relays(robots)
+            (
+                remaining <= BRANCH_CLEAR_LIMIT
+                or pipeline_switch_ready
+            )
+            and not source_branch_relays
             and not get_shepherds(robots)
             and (
                 transfer_ready
@@ -6136,6 +6292,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         ):
             completed_branch = active_branch
             next_branch = transfer_branch
+            if pipeline_switch_ready and remaining > 0:
+                draining_branch = completed_branch
             complete_active_branch(anchor, completed_branch, robots)
             if final_base_transfer_active:
                 reset_shepherd_roles(robots)
@@ -6154,6 +6312,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     robots,
                     reference_density,
                 )
+                if draining_branch is not None:
+                    branch_gate_states[draining_branch] = "OPEN"
                 saturation_tracker.reset(selected)
                 if (
                     selected == pre_shepherd_branch
@@ -6162,10 +6322,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                         selected,
                     )
                 ):
-                    phase = SimulationPhase.FILL_BEHIND_SHEPHERD
+                    start_shepherd_pressure_push(
+                        robots,
+                        selected,
+                    )
                     print(
                         "[Pre-Shepherd] branch switch completed; "
-                        "density fill gate is now active"
+                        "packed piston push is active immediately"
                     )
                 else:
                     phase = SimulationPhase.EXPLORE_BRANCH
@@ -6530,6 +6693,8 @@ def reset_dfs_state():
     global pressure_push_timer, flow_establish_timer, communication_sequence
     global shepherd_flow_timer, shepherd_flow_start_depth
     global pre_shepherd_branch
+    global pre_shepherd_pack_dwell, pre_shepherd_pack_ready
+    global draining_branch
     global viscoelastic_step, viscoelastic_rest_lengths
     global viscoelastic_last_seen
     global last_message_signature, relay_slots, relay_deploy_cooldown
@@ -6557,6 +6722,9 @@ def reset_dfs_state():
     pressure_push_timer = flow_establish_timer = 0.0
     shepherd_flow_timer = shepherd_flow_start_depth = 0.0
     pre_shepherd_branch = None
+    pre_shepherd_pack_dwell = 0.0
+    pre_shepherd_pack_ready = False
+    draining_branch = None
     viscoelastic_step = 0
     viscoelastic_rest_lengths = {}
     viscoelastic_last_seen = {}
@@ -7013,7 +7181,10 @@ while running:
             f"Shepherd control=LOCAL_ONLY | "
             f"active={len(get_shepherds(robots))} | "
             f"pre={len(get_pre_shepherds(robots))} "
-            f"branch={pre_shepherd_branch or '-'}"
+            f"branch={pre_shepherd_branch or '-'} | "
+            f"pre-pack={pre_shepherd_pack_ready} "
+            f"dwell={pre_shepherd_pack_dwell:.2f} | "
+            f"drain={draining_branch or '-'}"
         ),
         (
             f"Motion={MOTION_POLICY_VERSION} | "
