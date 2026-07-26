@@ -68,13 +68,13 @@ BACKGROUND_COLOR = (248, 249, 252)
 FLOOR_COLOR = (235, 239, 246)
 WALL_COLOR = (96, 106, 124)
 TEXT_COLOR = (58, 67, 82)
-ROBOT_BASE_COLOR = (44, 92, 118)
+ROBOT_BASE_COLOR = (29, 74, 135)
 SHEPHERD_COLOR = (106, 70, 150)
 ANCHOR_COLOR = (48, 118, 82)
 BASE_COLOR = (44, 72, 120)
 TRUNK_RELAY_COLOR = (142, 82, 60)
 RELAY_COLOR = (168, 112, 44)
-ROBOT_OUTLINE_COLOR = (22, 42, 58)
+ROBOT_OUTLINE_COLOR = (12, 28, 52)
 DISCONNECTED_FILL_COLOR = (180, 92, 92)
 PROXY_POINT_COLORS = {
     "UP": (46, 76, 130),
@@ -84,9 +84,11 @@ PROXY_POINT_COLORS = {
 RELAY_SLOT_COLOR = (196, 129, 65)
 JUNCTION_COLOR = (153, 164, 181)
 END_REGION_COLOR = (224, 171, 115)
-COMM_LINK_SAFE_COLOR = (132, 190, 158)
+# Muted sage-mint stays lighter than the navy swarm without visual harshness.
+COMM_LINK_SAFE_COLOR = (96, 158, 138)
 COMM_LINK_WARNING_COLOR = (226, 177, 96)
 COMM_LINK_DANGER_COLOR = (214, 103, 103)
+COMM_LINK_WIDTH = 1
 DISCONNECTED_COLOR = (205, 96, 96)
 ARTIFICIAL_WALL_COLOR = (220, 62, 62)
 ARTIFICIAL_WALL_WIDTH = 3
@@ -568,7 +570,8 @@ COMM_GUARD_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
 COMM_RECOVERY_RANGE = 84.0 * MAP_SCALE
 COMM_RECOVERY_GAIN = 12.0
 COMM_MAX_LOCAL_NEIGHBORS = 16
-SHOW_COMM_LINKS_DEFAULT = False
+SHOW_COMM_LINKS_DEFAULT = True
+SHOW_DENSITY_COLOR_DEFAULT = True
 COMM_UPDATE_INTERVAL_FRAMES = 1
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
 ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
@@ -967,29 +970,29 @@ def interpolate_color(a, b, ratio):
 
 
 def density_to_color(density: float, reference_density: float):
-    """Blue-density palette for readability: sky blue -> blue -> navy."""
+    """Dark fluid-density palette: blue -> cobalt -> midnight navy."""
     ratio = density / max(reference_density, EPSILON)
     if ratio <= 0.85:
         return interpolate_color(
-            (158, 214, 255),
-            (102, 176, 255),
+            (44, 95, 135),
+            (31, 74, 119),
             ratio / 0.85,
         )
     if ratio <= 1.15:
         return interpolate_color(
-            (102, 176, 255),
-            (52, 118, 214),
+            (31, 74, 119),
+            (20, 53, 96),
             (ratio - 0.85) / 0.30,
         )
     if ratio <= 1.55:
         return interpolate_color(
-            (52, 118, 214),
-            (28, 74, 156),
+            (20, 53, 96),
+            (13, 36, 73),
             (ratio - 1.15) / 0.40,
         )
     return interpolate_color(
-        (28, 74, 156),
-        (16, 42, 96),
+        (13, 36, 73),
+        (6, 20, 48),
         min((ratio - 1.55) / 0.70, 1.0),
     )
 
@@ -1669,6 +1672,14 @@ class Robot:
 
         draw_radius = max(1, round(self.radius + 1))
         pygame.draw.circle(surface, color, (x, y), draw_radius)
+        if self.role == "NORMAL" and not show_density_color:
+            pygame.draw.circle(
+                surface,
+                ROBOT_OUTLINE_COLOR,
+                (x, y),
+                draw_radius,
+                width=1,
+            )
 
         if self.role in {"RELAY", "TRUNK_RELAY"}:
             ring_color = TRUNK_RELAY_COLOR if self.role == "TRUNK_RELAY" else RELAY_COLOR
@@ -2193,7 +2204,13 @@ def draw_communication_links(surface, robots):
             if distance <= COMM_BARRIER_START
             else COMM_LINK_DANGER_COLOR
         )
-        pygame.draw.line(surface, color, robot.position, parent.position, width=1)
+        pygame.draw.line(
+            surface,
+            color,
+            robot.position,
+            parent.position,
+            width=COMM_LINK_WIDTH,
+        )
 
 # =========================================================
 # 11. Reactive tail Breadcrumb communication trail
@@ -6838,7 +6855,7 @@ def draw_hud_panel(surface, lines):
         controls_y += line_height
 
 
-show_density_color = False
+show_density_color = SHOW_DENSITY_COLOR_DEFAULT
 show_regions = True
 show_comm_links = SHOW_COMM_LINKS_DEFAULT
 communication_frame_counter = 0
