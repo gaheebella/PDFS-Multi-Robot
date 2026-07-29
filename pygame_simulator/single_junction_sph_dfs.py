@@ -2302,7 +2302,7 @@ def geodesic_edf_direction(
 ) -> pygame.Vector2:
     """Negative gradient direction of a piecewise geodesic EDF.
 
-    For this rectilinear cross map the shortest free-space route is:
+    For this rectilinear cross map the exact shortest free-space route is:
     current corridor -> its Junction mouth -> selected mouth -> branch target.
     The returned unit vector is therefore the analytic counterpart of
     -∇phi/||∇phi|| used by HydroSwarm, without a raster distance-field lookup.
@@ -2893,7 +2893,6 @@ def evaluate_flow_preserving_rollout(
                     + particle_j.pressure / max(particle_j.density**2, EPSILON)
                 )
                 pressure_force = -pressure_coefficient * gradient
-
                 accelerations[i] += pressure_force
                 accelerations[j] -= pressure_force
 
@@ -3992,21 +3991,14 @@ def compute_sph_forces(robots, grid):
             neighbor_count += 1
             neighbor_center += robot_j.position
             distance = math.sqrt(distance_sq)
-
             gradient = spiky_gradient(r_ij, SMOOTHING_LENGTH)
-
-            # 압력력
             coefficient = (
                 robot_i.pressure / max(robot_i.density**2, EPSILON)
                 + robot_j.pressure / max(robot_j.density**2, EPSILON)
             )
             pressure_force += -coefficient * gradient
-
-            # 상대위치와 상대속도
             v_ij = robot_i.velocity - robot_j.velocity
             approach = v_ij.dot(r_ij)
-
-            # 인공점성: 접근 중일 때만 적용
             if approach < 0.0:
                 mu_ij = SMOOTHING_LENGTH * approach / (distance_sq + 0.01 * SMOOTHING_LENGTH**2)
                 c_i_sq = (robot_i.pressure + PRESSURE_GAIN * robot_i.density) / max(robot_i.density, EPSILON)

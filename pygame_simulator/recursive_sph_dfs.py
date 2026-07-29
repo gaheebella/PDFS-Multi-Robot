@@ -17,9 +17,10 @@ Implemented research components
 
 Scope limitation
 ----------------
-The map contains root Junction J0 and child Junction J1. J0 keeps the
-original single-junction control pipeline, while J1 reuses the terminal-edge
-Shepherd/pressure pipeline after local staging and proxy child-edge selection.
+The map contains one T/cross junction. The code therefore implements DFS
+child ordering at one junction, not recursive multi-junction DFS-tree repair.
+The data structures are intentionally separated so they can be extended to a
+multi-junction topological graph later.
 """
 
 from __future__ import annotations
@@ -743,33 +744,6 @@ INITIAL_INGRESS_BRAKE_DISTANCE = 34.0
 INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
 INITIAL_INGRESS_MAX_DT = 0.04
 
-# Generic junction staging controller.  It is used at J0, J1, and future
-# child junctions.  Unlike the original one-way ingress force, the
-# longitudinal PD term also brakes robots that have crossed the staging plane.
-JUNCTION_STAGING_LONGITUDINAL_KP = 7.0
-JUNCTION_STAGING_LONGITUDINAL_KD = 8.5
-JUNCTION_STAGING_LATERAL_KP = 1.4
-JUNCTION_STAGING_LATERAL_KD = 3.2
-JUNCTION_STAGING_MAX_LONGITUDINAL_FORCE = 430.0
-JUNCTION_STAGING_MAX_LATERAL_FORCE = 90.0
-JUNCTION_STAGING_EXTRA_DAMPING = 3.8
-JUNCTION_STAGING_CHILD_RETURN_FORCE = 190.0
-
-
-# J1-only rotated ingress/staging controller.
-# J0 keeps the original single-junction MOVE_TO_JUNCTION controller unchanged.
-J1_STAGING_TARGET_X = float(J1_CENTER.x - 10.0)
-J1_STAGING_MAX_X = float(J1_CENTER.x + 18.0)
-J1_STAGING_POSITION_GAIN = 3.4
-J1_STAGING_FORWARD_DAMPING = 6.5
-J1_STAGING_LATERAL_GAIN = 1.15
-J1_STAGING_LATERAL_DAMPING = 3.0
-J1_STAGING_MAX_FORWARD_FORCE = 220.0
-J1_STAGING_MAX_LATERAL_FORCE = 70.0
-J1_STAGING_INTERIOR_MARGIN = 7.0
-J1_ANCHOR_NEAR_PARK_RADIUS = 44.0
-JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT = 22.0
-
 RETURN_EGRESS_FORCE = 42.0 * MOTION_SPEED_MULTIPLIER
 RETURN_LANE_GAIN = 1.15
 RETURN_LANE_MAX_FORCE = 22.0
@@ -1175,24 +1149,10 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
             allowed_regions.add("J1_JUNCTION")
         return region in allowed_regions
 
-    if phase == SimulationPhase.STABILIZE_JUNCTION:
-        junction_id = resolve_current_junction_id()
-
-        # Same rule as the original J0 MOVE_TO_JUNCTION phase:
-        # before a child branch is selected, only the parent route and the
-        # current junction are open.  J1_UP/J1_DOWN stay closed, so the swarm
-        # cannot leak into a child corridor or run to its terminal wall.
-        if junction_id == "J1":
-            return region in {
-                "BOTTOM",
-                "JUNCTION",
-                "RIGHT",
-                "J1_JUNCTION",
-            }
-
-        return region in {"BOTTOM", "JUNCTION"}
-
-    if phase == SimulationPhase.NESTED_EDGE_BACKTRACK:
+    if phase in {
+        SimulationPhase.STABILIZE_JUNCTION,
+        SimulationPhase.NESTED_EDGE_BACKTRACK,
+    }:
         junction_id = resolve_current_junction_id()
         if junction_id == "J1":
             return region in {
@@ -1917,38 +1877,6 @@ def enter_child_junction(junction_id: str):
             "Cannot enter child junction without an active edge"
         )
 
-    arrival_edge = topology_edges[
-        arrival_edge_id
-    ]
-    incoming = arrival_edge.direction.copy()
-    if arrival_edge.end_node_id != junction_id:
-        incoming *= -1.0
-    if incoming.length_squared() > EPSILON:
-        incoming = incoming.normalize()
-        lateral = pygame.Vector2(
-            -incoming.y,
-            incoming.x,
-        )
-        for robot in robots:
-            if robot.role not in {
-                "ANCHOR",
-                "RELAY",
-                "TRUNK_RELAY",
-            }:
-                robot.junction_ingress_lateral[
-                    junction_id
-                ] = robot.position.dot(lateral)
-
-                # The swarm reaches a child junction with substantial forward
-                # momentum.  Limit only the inherited longitudinal component;
-                # lateral lane information and natural SPH motion are retained.
-                forward_speed = robot.velocity.dot(incoming)
-                if forward_speed > JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT:
-                    robot.velocity -= incoming * (
-                        forward_speed
-                        - JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT
-                    )
-
     push_junction_frame(
         junction_id,
         parent_edge_id=arrival_edge_id,
@@ -1976,12 +1904,6 @@ def enter_child_junction(junction_id: str):
         f"[Multi-Junction Test] "
         f"arrived={junction_id}, "
         f"stack={[frame.junction_id for frame in dfs_stack]}"
-    )
-    print(
-        f"[Shared Junction Module] "
-        f"junction={junction_id}, "
-        f"mode=ORIGINAL_J0_INGRESS_ROTATED, "
-        f"child_mouths=CLOSED_UNTIL_SELECTION"
     )
 
     # J1 주변 군집 안정화와 Anchor 선출 단계로 이동한다.
@@ -2426,184 +2348,6 @@ def get_physical_junction_center(
     )
 
 
-def get_junction_staging_position(
-    junction_id: str,
-) -> pygame.Vector2:
-    """Return the pre-selection staging point for any DFS junction.
-
-    The point uses the original J0 rule: stop 10 px inside the junction on the
-    parent-edge side.  Therefore J0 stages at (400, 360), while J1 stages at
-    (750, 350) when entered from the left.
-    """
-
-    center = get_physical_junction_center(
-        junction_id,
-    )
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return center
-
-    return center - incoming.normalize() * 10.0
-
-
-def get_junction_lateral_direction(
-    junction_id: str,
-) -> pygame.Vector2:
-    """Return the direction across the incoming corridor width."""
-
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return pygame.Vector2(1.0, 0.0)
-
-    incoming = incoming.normalize()
-    return pygame.Vector2(
-        -incoming.y,
-        incoming.x,
-    )
-
-
-def compute_junction_ingress_force(
-    robot: "Robot",
-    junction_id: str,
-) -> pygame.Vector2:
-    """Apply the original J0 ingress controller at any DFS junction.
-
-    This is not a new point-attraction or PD staging controller.  It is the
-    exact J0 MOVE_TO_JUNCTION rule expressed in the local coordinates of the
-    current junction:
-
-    * move only while the robot is before the staging plane;
-    * preserve the robot's incoming lateral lane;
-    * after crossing the staging plane, stop adding forward route force and
-      let the original global damping/SPH terms settle the swarm.
-
-    For J0 the result is identical to the old code:
-        y_distance = y - (center_y + 10)
-        force.y = -INITIAL_INGRESS_FORCE * scale
-        force.x = lane_x - x
-
-    For J1 the same equations are rotated 90 degrees:
-        x_distance = (J1_CENTER.x - 10) - x
-        force.x = +INITIAL_INGRESS_FORCE * scale
-        force.y = lane_y - y
-    """
-
-    if robot.role in {
-        "ANCHOR",
-        "RELAY",
-        "TRUNK_RELAY",
-    }:
-        return pygame.Vector2()
-
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return pygame.Vector2()
-
-    incoming = incoming.normalize()
-    lateral = pygame.Vector2(
-        -incoming.y,
-        incoming.x,
-    )
-
-    junction_center = get_physical_junction_center(
-        junction_id,
-    )
-
-    # Original J0 target is center_y + 10 while entering upward.  The generic
-    # form below gives the same point for J0 and the rotated point x=750 for J1.
-    staging_target = (
-        junction_center
-        - incoming * 10.0
-    )
-
-    lane_value = robot.junction_ingress_lateral.setdefault(
-        junction_id,
-        robot.position.dot(lateral),
-    )
-
-    remaining_distance = (
-        staging_target - robot.position
-    ).dot(incoming)
-
-    force = pygame.Vector2()
-
-    # This is exactly the original one-way J0 ingress force.  There is no
-    # attraction to the far wall and no bidirectional compression controller.
-    if remaining_distance > 0.0:
-        scale = max(
-            INITIAL_INGRESS_MIN_FORCE_SCALE,
-            min(
-                1.0,
-                remaining_distance
-                / INITIAL_INGRESS_BRAKE_DISTANCE,
-            ),
-        )
-        force += (
-            incoming
-            * INITIAL_INGRESS_FORCE
-            * scale
-        )
-
-    lateral_error = (
-        lane_value
-        - robot.position.dot(lateral)
-    )
-    lateral_force = clamp(
-        INITIAL_INGRESS_LANE_GAIN
-        * lateral_error,
-        -INITIAL_INGRESS_LANE_MAX_FORCE,
-        INITIAL_INGRESS_LANE_MAX_FORCE,
-    )
-    force += lateral * lateral_force
-
-    return force
-
-
-def compute_junction_staging_force(
-    robot: "Robot",
-    junction_id: str,
-) -> pygame.Vector2:
-    """Compatibility wrapper for the shared original-J0 ingress module."""
-
-    return compute_junction_ingress_force(
-        robot,
-        junction_id,
-    )
-
-
-def compute_j1_staging_force(
-    robot: "Robot",
-) -> pygame.Vector2:
-    """Compatibility wrapper; J1 now uses the exact same module as J0."""
-
-    return compute_junction_ingress_force(
-        robot,
-        "J1",
-    )
-
-
-def constrain_robot_to_j1_staging(
-    robot: "Robot",
-) -> None:
-    """No-op retained for compatibility.
-
-    The previous hard x-clamp and J1-only PD controller were the source of the
-    wall-side pile-up.  Child corridors are now closed by is_region_allowed()
-    until selection, exactly like J0's initial MOVE_TO_JUNCTION phase.
-    """
-
-    return
-
-
 def nested_edge_route_direction(
     position: pygame.Vector2,
     profile: EdgeTraversalProfile,
@@ -3003,12 +2747,6 @@ class Robot:
         self.position = pygame.Vector2(x, y)
         self.previous_position = self.position.copy()
         self.ingress_lane_x = float(x)
-        # Lateral lane coordinate used by the common Junction staging module.
-        # J0 enters upward, so its lateral coordinate is the initial x value.
-        # Child junction coordinates are recorded automatically on entry.
-        self.junction_ingress_lateral: dict[str, float] = {
-            "J0": float(x),
-        }
         self.velocity = pygame.Vector2()
         self.acceleration = pygame.Vector2()
         self.radius = ROBOT_RADIUS
@@ -3163,7 +2901,6 @@ class Robot:
         # ordinary robot cannot pass through a temporary gap while Shepherds
         # are still moving laterally into their slots.
         constrain_normal_behind_shepherd_curtain(self)
-        constrain_robot_to_j1_staging(self)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
         self._record_motion()
@@ -3596,13 +3333,7 @@ def get_active_command_anchor(
             )
         )
 
-        # During child-junction staging, a newly elected Anchor may still be
-        # travelling to its park point.  Do not replace the working upstream
-        # command source until the child Anchor itself has a Base path.
-        if (
-            child_anchor is not None
-            and child_anchor.connected_to_base
-        ):
+        if child_anchor is not None:
             return child_anchor
 
     return junction_anchor
@@ -5311,27 +5042,11 @@ def elect_anchor_for_junction(
             None,
         )
 
-    election_rect = (
-        anchor_election_rect
-        if junction_id == "J0"
-        else J1_ANCHOR_ELECTION_RECT
-    )
-
     candidates = [
         robot
         for robot in robots
         if robot.role == "NORMAL"
         and junction_id in robot.anchor_entry_times
-        and election_rect.collidepoint(
-            robot.position.x,
-            robot.position.y,
-        )
-        and (
-            junction_id != "J1"
-            or robot.position.distance_to(
-                J1_ANCHOR_PARK_POSITION,
-            ) <= J1_ANCHOR_NEAR_PARK_RADIUS
-        )
         and (
             junction_id == "J0"
             or robot.connected_to_base
@@ -6589,18 +6304,9 @@ def get_proxy_boundary_centers(
             if neighbor in partition and partition[neighbor] != branch:
                 boundary.append(centers[key])
                 break
-    # A single remaining region owns all cells and has no internal
-    # boundary.  Root candidates use Branch names; nested candidates use
-    # topology Edge IDs such as E_J1_UP.
+    # A single remaining Branch owns all cells and has no internal boundary.
     if not boundary:
-        if branch in EDGE_TRAVERSAL_PROFILES:
-            boundary = [
-                get_nested_edge_entrance(branch)
-            ]
-        else:
-            boundary = [
-                get_branch_entrance(branch)
-            ]
+        boundary = [get_branch_entrance(branch)]
     return boundary
 
 
@@ -9167,41 +8873,6 @@ def adaptive_shepherd_count():
     return int(clamp(count, SHEPHERD_MIN_COUNT, SHEPHERD_MAX_COUNT))
 
 
-def get_branch_edge_id(
-    branch: str,
-) -> str:
-    """Return the topology Edge represented by one physical branch name."""
-
-    if branch in NESTED_REGION_TO_EDGE:
-        return NESTED_REGION_TO_EDGE[branch]
-
-    if branch in BRANCH_TO_EDGE:
-        return BRANCH_TO_EDGE[branch]
-
-    raise ValueError(
-        f"No topology edge registered for branch={branch}"
-    )
-
-
-def branch_uses_terminal_shepherd(
-    branch: str,
-) -> bool:
-    """Return True only when the active Edge ends at a room/dead end.
-
-    An Edge that enters another Junction is a transit Edge. It must hand the
-    swarm to the child Junction controller instead of forming a Shepherd wall.
-    """
-
-    edge_id = get_branch_edge_id(branch)
-    profile = get_edge_traversal_profile(edge_id)
-    destination = topology_nodes[profile.destination_node_id]
-
-    return (
-        not profile.enters_child_junction
-        and destination.node_type != NodeType.JUNCTION
-    )
-
-
 def get_early_capture_rect(branch: str) -> pygame.Rect:
     saturation_rect = get_saturation_rect(branch)
     direction = BRANCH_DIRECTIONS[branch]
@@ -9288,11 +8959,6 @@ def shepherd_candidates(robots, branch, required_count):
     return candidates[:required_count]
 
 def capture_region_ready_for_shepherd(robots, branch):
-    # A Junction-connecting Edge such as E_J0_RIGHT never forms a Shepherd.
-    # It only transfers the swarm to the child Junction controller.
-    if not branch_uses_terminal_shepherd(branch):
-        return False
-
     required_count = adaptive_shepherd_count()
     capture_rect = get_early_capture_rect(branch)
     candidates = [
@@ -9342,14 +9008,6 @@ def assign_shepherd_slots(candidates, slots):
 
 
 def select_adaptive_shepherds(robots, branch, grid):
-    # Defensive guard: transit Edges must never create a Shepherd boundary.
-    if not branch_uses_terminal_shepherd(branch):
-        print(
-            f"[Shepherd] skipped transit edge="
-            f"{get_branch_edge_id(branch)}, branch={branch}"
-        )
-        return []
-
     reset_shepherd_roles(robots)
     required_count = adaptive_shepherd_count()
     slots = build_shepherd_slots(branch, required_count)
@@ -9529,21 +9187,42 @@ def compute_route_force(robot):
             return force
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        # J0 uses the shared module, but the equations are exactly the original
-        # single-junction MOVE_TO_JUNCTION equations.
-        force = compute_junction_ingress_force(
-            robot,
-            ROOT_JUNCTION_ID,
+        y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
+        if y_distance > 0.0:
+            scale = max(
+                INITIAL_INGRESS_MIN_FORCE_SCALE,
+                min(1.0, y_distance / INITIAL_INGRESS_BRAKE_DISTANCE),
+            )
+            force.y = -INITIAL_INGRESS_FORCE * scale
+        lane_error = robot.ingress_lane_x - robot.position.x
+        force.x = clamp(
+            INITIAL_INGRESS_LANE_GAIN * lane_error,
+            -INITIAL_INGRESS_LANE_MAX_FORCE,
+            INITIAL_INGRESS_LANE_MAX_FORCE,
         )
 
     elif phase == SimulationPhase.STABILIZE_JUNCTION:
         junction_id = resolve_current_junction_id()
-        if junction_id is not None:
-            # J1 is now the same J0 ingress module rotated by its incoming Edge.
-            # No J1-only point attraction, PD compression, or wall clamp remains.
-            force = compute_junction_ingress_force(
-                robot,
-                junction_id,
+        if junction_id == "J1":
+            if region == "RIGHT":
+                force = (
+                    normalized_direction_toward(
+                        robot.position,
+                        J1_CENTER,
+                    )
+                    * ROUTE_FORCE
+                    * relay_motion_scale
+                )
+            else:
+                force = pygame.Vector2()
+        else:
+            force = (
+                normalized_direction_toward(
+                    robot.position,
+                    active_junction_target,
+                )
+                * ROUTE_FORCE
+                * relay_motion_scale
             )
 
     elif phase in {
@@ -9796,7 +9475,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global junction_switch_timer, final_gather_timer, branch_entry_timer
     global active_branch
-    global relay_motion_scale
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
 
     if phase in {
@@ -9847,9 +9525,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             JunctionContext(junction_id=junction_id),
         )
 
-        # Entry was allowed only after child_junction_handoff_ready().  Freeze
-        # the parent Edge relay chain and gather locally at full staging speed.
-        relay_motion_scale = 1.0
+        # Keep completing the parent RIGHT relay chain until the child Anchor
+        # has a direct safe handoff link.
+        update_relay_deployment(robots, dt)
 
         child_anchor = elect_child_junction_anchor(
             robots,
@@ -9889,21 +9567,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"anchor_ready={anchor_ready}"
             )
 
-        junction_robot_count = sum(
-            robot.role == "NORMAL"
-            and get_robot_region(robot.position)
-            == (
-                "JUNCTION"
-                if junction_id == "J0"
-                else f"{junction_id}_JUNCTION"
-            )
-            for robot in robots
-        )
-
         if (
             anchor_ready
             and consensus_ready
-            and junction_robot_count >= JUNCTION_ENTRY_COUNT
             and context.selected_edge_id is None
         ):
             preferred_edge_id = choose_next_nested_edge_by_proxy(
@@ -9953,33 +9619,45 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 branch_entry_timer = 0.0
 
                 print(
-                    f"[Shared Edge Pipeline] "
+                    f"[Nested Edge Traverse] "
                     f"started edge={selected_edge_id}, "
-                    f"branch={active_branch}, "
-                    f"junction={junction_id}"
+                    f"branch={active_branch}"
                 )
-                # J1 also reuses the exact J0 terminal-branch pipeline:
-                # explore -> Shepherd -> saturation -> pressure -> backtrack.
-                phase = SimulationPhase.EXPLORE_BRANCH
-
+                phase = SimulationPhase.EXPLORE_NESTED_EDGE
     elif phase == SimulationPhase.EXPLORE_NESTED_EDGE:
-        # Compatibility path for an old saved state. New child-edge selections
-        # enter EXPLORE_BRANCH directly.
-        phase = SimulationPhase.EXPLORE_BRANCH
-        print(
-            f"[Shared Edge Pipeline] redirected legacy nested phase; "
-            f"branch={active_branch}"
-        )
+        update_nested_relay_deployment(robots, dt)
+
+        if capture_region_ready_for_shepherd(robots, active_branch):
+            selected = select_adaptive_shepherds(
+                robots,
+                active_branch,
+                spatial_grid,
+            )
+
+            if len(selected) == adaptive_shepherd_count():
+                phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
+                shepherd_form_timer = 0.0
+                enforce_shepherd_curtain_for_swarm(robots)
+                print(
+                    f"[Shepherd] capture-region election: "
+                    f"branch={active_branch}, count={len(selected)}"
+                )
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
-        # J0와 J1 모두 같은 탐색 단계에 들어온다. Relay 구현만 현재
-        # Edge의 source Junction에 따라 root/nested controller로 dispatch한다.
-        update_active_relay_deployment(
+        # 기존 방식 그대로:
+        # 군집이 먼저 이동하고 뒤쪽에 필요한 Relay를 남긴다.
+        update_relay_deployment(
             robots,
             dt,
         )
 
-        current_profile = get_current_edge_profile()
+        current_profile = (
+            get_edge_traversal_profile(
+                current_edge_id,
+            )
+            if current_edge_id is not None
+            else None
+        )
 
         # -----------------------------------------------------
         # 현재 Edge의 목적지가 또 다른 Junction인 경우
@@ -10008,9 +9686,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         # -----------------------------------------------------
         # 목적지가 ROOM 또는 DEAD_END인 경우에만 Shepherd 실행
         # -----------------------------------------------------
-        if not branch_uses_terminal_shepherd(active_branch):
-            return
-
         if capture_region_ready_for_shepherd(
             robots,
             active_branch,
@@ -10054,7 +9729,11 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             # Do not start pressure with an incomplete boundary. Return selected
             # robots to NORMAL and retry when the capture region is ready.
             reset_shepherd_roles(robots)
-            phase = SimulationPhase.EXPLORE_BRANCH
+            phase = (
+                SimulationPhase.EXPLORE_NESTED_EDGE
+                if active_branch_is_nested()
+                else SimulationPhase.EXPLORE_BRANCH
+            )
             print("[Shepherd] boundary formation timeout; election will retry")
 
     elif phase == SimulationPhase.FILL_BEHIND_SHEPHERD:

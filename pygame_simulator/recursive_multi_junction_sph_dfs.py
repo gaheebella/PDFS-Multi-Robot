@@ -228,6 +228,205 @@ early_capture_regions = {
 }
 
 # =========================================================
+# 2-1. Generic Junction and Branch geometry
+# =========================================================
+
+
+@dataclass
+class JunctionGeometry:
+    """Physical geometry and child-edge information for one Junction."""
+
+    junction_id: str
+    center: pygame.Vector2
+    junction_rect: pygame.Rect
+    anchor_election_rect: pygame.Rect
+    incoming_region: str
+    child_branch_ids: tuple[str, ...]
+
+
+@dataclass
+class BranchGeometry:
+    """Physical geometry for one Junction child Branch."""
+
+    branch_id: str
+    parent_junction_id: str
+    direction: pygame.Vector2
+
+    width: float
+    length: float
+
+    corridor_rect: pygame.Rect
+    mouth_position: pygame.Vector2
+    tip_target: pygame.Vector2
+
+    dead_end_rect: pygame.Rect
+    early_capture_rect: pygame.Rect
+
+    leads_to_junction: bool = False
+    child_junction_id: Optional[str] = None
+
+
+JUNCTION_GEOMETRIES: dict[str, JunctionGeometry] = {
+    "J0": JunctionGeometry(
+        junction_id="J0",
+        center=pygame.Vector2(
+            center_x,
+            center_y,
+        ),
+        junction_rect=junction_rect.copy(),
+        anchor_election_rect=anchor_election_rect.copy(),
+        incoming_region="BOTTOM",
+        child_branch_ids=(
+            "UP",
+            "LEFT",
+            "RIGHT",
+        ),
+    ),
+}
+
+
+BRANCH_GEOMETRIES: dict[str, BranchGeometry] = {
+    "UP": BranchGeometry(
+        branch_id="UP",
+        parent_junction_id="J0",
+        direction=pygame.Vector2(
+            0.0,
+            -1.0,
+        ),
+        width=float(corridor_width),
+        length=float(normal_length),
+        corridor_rect=up_rect.copy(),
+        mouth_position=pygame.Vector2(
+            center_x,
+            center_y - half_width,
+        ),
+        tip_target=pygame.Vector2(
+            center_x,
+            up_rect.top + 18.0,
+        ),
+        dead_end_rect=dead_end_regions["UP"].copy(),
+        early_capture_rect=early_capture_regions["UP"].copy(),
+    ),
+
+    "LEFT": BranchGeometry(
+        branch_id="LEFT",
+        parent_junction_id="J0",
+        direction=pygame.Vector2(
+            -1.0,
+            0.0,
+        ),
+        width=float(corridor_width),
+        length=float(normal_length),
+        corridor_rect=left_rect.copy(),
+        mouth_position=pygame.Vector2(
+            center_x - half_width,
+            center_y,
+        ),
+        tip_target=pygame.Vector2(
+            left_rect.left + 18.0,
+            center_y,
+        ),
+        dead_end_rect=dead_end_regions["LEFT"].copy(),
+        early_capture_rect=early_capture_regions["LEFT"].copy(),
+    ),
+
+    "RIGHT": BranchGeometry(
+        branch_id="RIGHT",
+        parent_junction_id="J0",
+        direction=pygame.Vector2(
+            1.0,
+            0.0,
+        ),
+        width=float(corridor_width),
+        length=float(right_length),
+        corridor_rect=right_rect.copy(),
+        mouth_position=pygame.Vector2(
+            center_x + half_width,
+            center_y,
+        ),
+        tip_target=pygame.Vector2(
+            right_rect.right - 18.0,
+            center_y,
+        ),
+        dead_end_rect=dead_end_regions["RIGHT"].copy(),
+        early_capture_rect=early_capture_regions["RIGHT"].copy(),
+    ),
+}
+
+
+ROOT_JUNCTION_ID = "J0"
+current_junction_id = ROOT_JUNCTION_ID
+
+
+def get_junction_geometry(
+    junction_id: str,
+) -> JunctionGeometry:
+    """Return registered physical geometry for a Junction."""
+
+    geometry = JUNCTION_GEOMETRIES.get(
+        junction_id,
+    )
+
+    if geometry is None:
+        raise ValueError(
+            f"Unknown Junction geometry: {junction_id}"
+        )
+
+    return geometry
+
+
+def get_branch_geometry(
+    branch_id: str,
+) -> BranchGeometry:
+    """Return registered physical geometry for a Branch."""
+
+    geometry = BRANCH_GEOMETRIES.get(
+        branch_id,
+    )
+
+    if geometry is None:
+        raise ValueError(
+            f"Unknown Branch geometry: {branch_id}"
+        )
+
+    return geometry
+
+
+def validate_geometry_registry() -> None:
+    """Validate Junction-to-Branch geometry references."""
+
+    for junction_id, junction in JUNCTION_GEOMETRIES.items():
+        for branch_id in junction.child_branch_ids:
+            branch = BRANCH_GEOMETRIES.get(
+                branch_id,
+            )
+
+            if branch is None:
+                raise ValueError(
+                    f"Junction {junction_id} references "
+                    f"unknown Branch {branch_id}"
+                )
+
+            if (
+                branch.parent_junction_id
+                != junction_id
+            ):
+                raise ValueError(
+                    f"Branch {branch_id} parent mismatch: "
+                    f"expected={junction_id}, "
+                    f"actual={branch.parent_junction_id}"
+                )
+
+    print(
+        "[Geometry] valid: "
+        f"junctions={len(JUNCTION_GEOMETRIES)}, "
+        f"branches={len(BRANCH_GEOMETRIES)}"
+    )
+
+
+validate_geometry_registry()
+
+# =========================================================
 # 3. State and branch metadata
 # =========================================================
 

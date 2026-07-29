@@ -17,9 +17,10 @@ Implemented research components
 
 Scope limitation
 ----------------
-The map contains root Junction J0 and child Junction J1. J0 keeps the
-original single-junction control pipeline, while J1 reuses the terminal-edge
-Shepherd/pressure pipeline after local staging and proxy child-edge selection.
+The map contains one T/cross junction. The code therefore implements DFS
+child ordering at one junction, not recursive multi-junction DFS-tree repair.
+The data structures are intentionally separated so they can be extended to a
+multi-junction topological graph later.
 """
 
 from __future__ import annotations
@@ -236,29 +237,18 @@ J1_ANCHOR_PARK_POSITION = (
     )
 )
 
-# Geometry construction constants.
-# 아래 Physics parameter 구역의 같은 값과 일치해야 한다.
-RELAY_SPACING = 30.0
-RELAY_END_CLEARANCE = 24.0
-RELAY_LANE_MARGIN = 22.0
-
 @dataclass
 class EdgeTraversalProfile:
-    """Physical and control geometry for one topology edge."""
+    """Physical traversal information corresponding to one topology edge."""
 
     edge_id: str
     source_junction_id: str
     destination_node_id: str
+
     physical_region: str
 
     direction: pygame.Vector2
-    junction_center: pygame.Vector2
-    mouth_position: pygame.Vector2
     target_position: pygame.Vector2
-    relay_end_position: pygame.Vector2
-
-    width: float
-    length: float
     corridor_rect: pygame.Rect
 
     enters_child_junction: bool = False
@@ -278,31 +268,11 @@ EDGE_TRAVERSAL_PROFILES: dict[
         source_junction_id="J0",
         destination_node_id="UP_ROOM",
         physical_region="UP",
-
         direction=pygame.Vector2(0.0, -1.0),
-
-        junction_center=pygame.Vector2(
-            center_x,
-            center_y,
-        ),
-
-        mouth_position=pygame.Vector2(
-            center_x,
-            center_y - half_width,
-        ),
-
         target_position=pygame.Vector2(
             center_x,
             up_rect.top + 18,
         ),
-
-        relay_end_position=pygame.Vector2(
-            center_x - half_width + RELAY_LANE_MARGIN,
-            up_rect.top + RELAY_END_CLEARANCE,
-        ),
-
-        width=float(corridor_width),
-        length=float(normal_length),
         corridor_rect=up_rect.copy(),
         enters_child_junction=False,
     ),
@@ -312,31 +282,11 @@ EDGE_TRAVERSAL_PROFILES: dict[
         source_junction_id="J0",
         destination_node_id="LEFT_ROOM",
         physical_region="LEFT",
-
         direction=pygame.Vector2(-1.0, 0.0),
-
-        junction_center=pygame.Vector2(
-            center_x,
-            center_y,
-        ),
-
-        mouth_position=pygame.Vector2(
-            center_x - half_width,
-            center_y,
-        ),
-
         target_position=pygame.Vector2(
             left_rect.left + 18,
             center_y,
         ),
-
-        relay_end_position=pygame.Vector2(
-            left_rect.left + RELAY_END_CLEARANCE,
-            center_y - half_width + RELAY_LANE_MARGIN,
-        ),
-
-        width=float(corridor_width),
-        length=float(normal_length),
         corridor_rect=left_rect.copy(),
         enters_child_junction=False,
     ),
@@ -346,33 +296,8 @@ EDGE_TRAVERSAL_PROFILES: dict[
         source_junction_id="J0",
         destination_node_id="J1",
         physical_region="RIGHT",
-
         direction=pygame.Vector2(1.0, 0.0),
-
-        junction_center=pygame.Vector2(
-            center_x,
-            center_y,
-        ),
-
-        mouth_position=pygame.Vector2(
-            center_x + half_width,
-            center_y,
-        ),
-
         target_position=J1_CENTER.copy(),
-
-        # J1 Anchor와 직접 통신할 수 있도록
-        # 마지막 Relay를 Anchor 한 칸 전에 배치한다.
-        relay_end_position=(
-            J1_ANCHOR_PARK_POSITION
-            - pygame.Vector2(
-                RELAY_SPACING,
-                0.0,
-            )
-        ),
-
-        width=float(corridor_width),
-        length=float(right_length),
         corridor_rect=right_rect.copy(),
         enters_child_junction=True,
     ),
@@ -382,28 +307,11 @@ EDGE_TRAVERSAL_PROFILES: dict[
         source_junction_id="J1",
         destination_node_id="J1_UP_ROOM",
         physical_region="J1_UP",
-
         direction=pygame.Vector2(0.0, -1.0),
-
-        junction_center=J1_CENTER.copy(),
-
-        mouth_position=pygame.Vector2(
-            J1_CENTER.x,
-            J1_CENTER.y - half_width,
-        ),
-
         target_position=pygame.Vector2(
             J1_CENTER.x,
             J1_UP_RECT.top + 18,
         ),
-
-        relay_end_position=pygame.Vector2(
-            J1_UP_RECT.left + RELAY_LANE_MARGIN,
-            J1_UP_RECT.top + RELAY_END_CLEARANCE,
-        ),
-
-        width=float(corridor_width),
-        length=float(normal_length),
         corridor_rect=J1_UP_RECT.copy(),
         enters_child_junction=False,
     ),
@@ -413,28 +321,11 @@ EDGE_TRAVERSAL_PROFILES: dict[
         source_junction_id="J1",
         destination_node_id="J1_DOWN_ROOM",
         physical_region="J1_DOWN",
-
         direction=pygame.Vector2(0.0, 1.0),
-
-        junction_center=J1_CENTER.copy(),
-
-        mouth_position=pygame.Vector2(
-            J1_CENTER.x,
-            J1_CENTER.y + half_width,
-        ),
-
         target_position=pygame.Vector2(
             J1_CENTER.x,
             J1_DOWN_RECT.bottom - 18,
         ),
-
-        relay_end_position=pygame.Vector2(
-            J1_DOWN_RECT.left + RELAY_LANE_MARGIN,
-            J1_DOWN_RECT.bottom - RELAY_END_CLEARANCE,
-        ),
-
-        width=float(corridor_width),
-        length=float(normal_length),
         corridor_rect=J1_DOWN_RECT.copy(),
         enters_child_junction=False,
     ),
@@ -584,26 +475,10 @@ class DFSFrame:
 
 @dataclass
 class JunctionContext:
-    """Runtime state owned by one junction."""
-
     junction_id: str
-
     anchor_robot_id: Optional[int] = None
-    anchor_position: Optional[
-        pygame.Vector2
-    ] = None
-
     arrival_edge_id: Optional[str] = None
     selected_edge_id: Optional[str] = None
-
-    relay_slots: list[dict] = field(
-        default_factory=list
-    )
-
-    relay_deploy_cooldown: float = 0.0
-    relay_retract_cooldown: float = 0.0
-    relay_retract_clear_timer: float = 0.0
-
     stable_timer: float = 0.0
 
 
@@ -742,33 +617,6 @@ INITIAL_INGRESS_TARGET_Y = center_y + 10.0
 INITIAL_INGRESS_BRAKE_DISTANCE = 34.0
 INITIAL_INGRESS_MIN_FORCE_SCALE = 0.18
 INITIAL_INGRESS_MAX_DT = 0.04
-
-# Generic junction staging controller.  It is used at J0, J1, and future
-# child junctions.  Unlike the original one-way ingress force, the
-# longitudinal PD term also brakes robots that have crossed the staging plane.
-JUNCTION_STAGING_LONGITUDINAL_KP = 7.0
-JUNCTION_STAGING_LONGITUDINAL_KD = 8.5
-JUNCTION_STAGING_LATERAL_KP = 1.4
-JUNCTION_STAGING_LATERAL_KD = 3.2
-JUNCTION_STAGING_MAX_LONGITUDINAL_FORCE = 430.0
-JUNCTION_STAGING_MAX_LATERAL_FORCE = 90.0
-JUNCTION_STAGING_EXTRA_DAMPING = 3.8
-JUNCTION_STAGING_CHILD_RETURN_FORCE = 190.0
-
-
-# J1-only rotated ingress/staging controller.
-# J0 keeps the original single-junction MOVE_TO_JUNCTION controller unchanged.
-J1_STAGING_TARGET_X = float(J1_CENTER.x - 10.0)
-J1_STAGING_MAX_X = float(J1_CENTER.x + 18.0)
-J1_STAGING_POSITION_GAIN = 3.4
-J1_STAGING_FORWARD_DAMPING = 6.5
-J1_STAGING_LATERAL_GAIN = 1.15
-J1_STAGING_LATERAL_DAMPING = 3.0
-J1_STAGING_MAX_FORWARD_FORCE = 220.0
-J1_STAGING_MAX_LATERAL_FORCE = 70.0
-J1_STAGING_INTERIOR_MARGIN = 7.0
-J1_ANCHOR_NEAR_PARK_RADIUS = 44.0
-JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT = 22.0
 
 RETURN_EGRESS_FORCE = 42.0 * MOTION_SPEED_MULTIPLIER
 RETURN_LANE_GAIN = 1.15
@@ -1175,24 +1023,10 @@ def is_region_allowed(position: pygame.Vector2) -> bool:
             allowed_regions.add("J1_JUNCTION")
         return region in allowed_regions
 
-    if phase == SimulationPhase.STABILIZE_JUNCTION:
-        junction_id = resolve_current_junction_id()
-
-        # Same rule as the original J0 MOVE_TO_JUNCTION phase:
-        # before a child branch is selected, only the parent route and the
-        # current junction are open.  J1_UP/J1_DOWN stay closed, so the swarm
-        # cannot leak into a child corridor or run to its terminal wall.
-        if junction_id == "J1":
-            return region in {
-                "BOTTOM",
-                "JUNCTION",
-                "RIGHT",
-                "J1_JUNCTION",
-            }
-
-        return region in {"BOTTOM", "JUNCTION"}
-
-    if phase == SimulationPhase.NESTED_EDGE_BACKTRACK:
+    if phase in {
+        SimulationPhase.STABILIZE_JUNCTION,
+        SimulationPhase.NESTED_EDGE_BACKTRACK,
+    }:
         junction_id = resolve_current_junction_id()
         if junction_id == "J1":
             return region in {
@@ -1917,38 +1751,6 @@ def enter_child_junction(junction_id: str):
             "Cannot enter child junction without an active edge"
         )
 
-    arrival_edge = topology_edges[
-        arrival_edge_id
-    ]
-    incoming = arrival_edge.direction.copy()
-    if arrival_edge.end_node_id != junction_id:
-        incoming *= -1.0
-    if incoming.length_squared() > EPSILON:
-        incoming = incoming.normalize()
-        lateral = pygame.Vector2(
-            -incoming.y,
-            incoming.x,
-        )
-        for robot in robots:
-            if robot.role not in {
-                "ANCHOR",
-                "RELAY",
-                "TRUNK_RELAY",
-            }:
-                robot.junction_ingress_lateral[
-                    junction_id
-                ] = robot.position.dot(lateral)
-
-                # The swarm reaches a child junction with substantial forward
-                # momentum.  Limit only the inherited longitudinal component;
-                # lateral lane information and natural SPH motion are retained.
-                forward_speed = robot.velocity.dot(incoming)
-                if forward_speed > JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT:
-                    robot.velocity -= incoming * (
-                        forward_speed
-                        - JUNCTION_ENTRY_LONGITUDINAL_SPEED_LIMIT
-                    )
-
     push_junction_frame(
         junction_id,
         parent_edge_id=arrival_edge_id,
@@ -1976,12 +1778,6 @@ def enter_child_junction(junction_id: str):
         f"[Multi-Junction Test] "
         f"arrived={junction_id}, "
         f"stack={[frame.junction_id for frame in dfs_stack]}"
-    )
-    print(
-        f"[Shared Junction Module] "
-        f"junction={junction_id}, "
-        f"mode=ORIGINAL_J0_INGRESS_ROTATED, "
-        f"child_mouths=CLOSED_UNTIL_SELECTION"
     )
 
     # J1 주변 군집 안정화와 Anchor 선출 단계로 이동한다.
@@ -2144,249 +1940,6 @@ def get_edge_traversal_profile(
     return profile
 
 
-def get_current_junction_context(
-) -> JunctionContext:
-    """Return the runtime context at the top of the DFS stack."""
-
-    frame = get_current_dfs_frame()
-
-    if frame is None:
-        raise RuntimeError(
-            "Cannot get JunctionContext: "
-            "DFS stack is empty"
-        )
-
-    return junction_contexts.setdefault(
-        frame.junction_id,
-        JunctionContext(
-            junction_id=frame.junction_id,
-            arrival_edge_id=frame.parent_edge_id,
-        ),
-    )
-
-
-def get_current_edge_profile(
-) -> Optional[EdgeTraversalProfile]:
-    """Return the traversal profile of the active DFS edge."""
-
-    frame = get_current_dfs_frame()
-
-    if (
-        frame is None
-        or frame.active_edge_id is None
-    ):
-        return None
-
-    return get_edge_traversal_profile(
-        frame.active_edge_id,
-    )
-
-def get_junction_anchor_position(
-    junction_id: str,
-) -> pygame.Vector2:
-    """Return the elected or planned Anchor position of one junction."""
-
-    context = junction_contexts.get(
-        junction_id,
-    )
-
-    if (
-        context is not None
-        and context.anchor_position is not None
-    ):
-        return context.anchor_position.copy()
-
-    if junction_id == "J0":
-        return ANCHOR_PARK_POSITION.copy()
-
-    if junction_id == "J1":
-        return J1_ANCHOR_PARK_POSITION.copy()
-
-    raise ValueError(
-        f"No Anchor position registered "
-        f"for junction={junction_id}"
-    )
-
-def get_edge_relay_path_start(
-    edge_id: str,
-) -> pygame.Vector2:
-    """Return the source Junction Anchor of an edge."""
-
-    profile = get_edge_traversal_profile(
-        edge_id,
-    )
-
-    return get_junction_anchor_position(
-        profile.source_junction_id,
-    )
-
-
-def get_edge_relay_path_end(
-    edge_id: str,
-) -> pygame.Vector2:
-    """Return the final Relay slot target of an edge."""
-
-    return get_edge_traversal_profile(
-        edge_id,
-    ).relay_end_position.copy()
-
-
-def edge_relay_path_progress(
-    position: pygame.Vector2,
-    edge_id: str,
-) -> float:
-    """Return progress along an Anchor-rooted edge Relay path."""
-
-    start = get_edge_relay_path_start(
-        edge_id,
-    )
-
-    end = get_edge_relay_path_end(
-        edge_id,
-    )
-
-    path_vector = end - start
-    path_length = path_vector.length()
-
-    if path_length <= EPSILON:
-        return 0.0
-
-    return clamp(
-        (
-            position - start
-        ).dot(
-            path_vector / path_length
-        ),
-        0.0,
-        path_length,
-    )
-
-def initialize_edge_relay_plan(
-    edge_id: str,
-) -> list[dict]:
-    """Create Relay slots from the source Junction Anchor."""
-
-    profile = get_edge_traversal_profile(
-        edge_id,
-    )
-
-    context = junction_contexts.setdefault(
-        profile.source_junction_id,
-        JunctionContext(
-            junction_id=profile.source_junction_id,
-        ),
-    )
-
-    start = get_edge_relay_path_start(
-        edge_id,
-    )
-
-    end = get_edge_relay_path_end(
-        edge_id,
-    )
-
-    path_vector = end - start
-    path_length = path_vector.length()
-
-    context.relay_slots = []
-    context.relay_deploy_cooldown = 0.0
-    context.relay_retract_cooldown = 0.0
-    context.relay_retract_clear_timer = 0.0
-
-    if path_length <= EPSILON:
-        return context.relay_slots
-
-    direction = path_vector / path_length
-    distance = RELAY_SPACING
-    index = 0
-
-    while distance <= path_length:
-        context.relay_slots.append(
-            {
-                "index": index,
-                "edge_id": edge_id,
-                "position": (
-                    start
-                    + direction * distance
-                ),
-                "path_distance": distance,
-            }
-        )
-
-        index += 1
-        distance += RELAY_SPACING
-
-    print(
-        f"[Edge Relay] "
-        f"junction={profile.source_junction_id}, "
-        f"edge={edge_id}, "
-        f"slots={len(context.relay_slots)}"
-    )
-
-    return context.relay_slots
-
-def activate_edge_relay_plan(
-    edge_id: str,
-) -> list[dict]:
-    """Activate the common Relay plan for one DFS edge.
-
-    The JunctionContext owns the canonical slots.
-    Legacy global lists are temporarily synchronized so the
-    existing deployment and retraction code keeps working.
-    """
-
-    global relay_slots
-    global nested_relay_slots
-    global nested_relay_edge_id
-
-    global relay_deploy_cooldown
-    global nested_relay_deploy_cooldown
-    global relay_retract_cooldown
-    global relay_retract_clear_timer
-    global relay_motion_scale
-
-    profile = get_edge_traversal_profile(
-        edge_id,
-    )
-
-    slots = initialize_edge_relay_plan(
-        edge_id,
-    )
-
-    relay_retract_cooldown = 0.0
-    relay_retract_clear_timer = 0.0
-    relay_motion_scale = 1.0
-
-    if (
-        profile.source_junction_id
-        == ROOT_JUNCTION_ID
-    ):
-        # J0에서 시작하는 Edge 계획이다.
-        relay_slots = slots
-        relay_deploy_cooldown = 0.0
-
-        # 이전에 사용한 J1 지역 계획을 초기화한다.
-        nested_relay_slots = []
-        nested_relay_edge_id = None
-        nested_relay_deploy_cooldown = 0.0
-
-    else:
-        # J1 또는 앞으로 추가될 하위 Junction의 Edge 계획이다.
-        # 상위 J0→J1 Relay chain은 유지해야 하므로
-        # relay_slots는 덮어쓰지 않는다.
-        nested_relay_slots = slots
-        nested_relay_edge_id = edge_id
-        nested_relay_deploy_cooldown = 0.0
-
-    print(
-        f"[Relay Plan Activated] "
-        f"junction={profile.source_junction_id}, "
-        f"edge={edge_id}, "
-        f"slots={len(slots)}"
-    )
-
-    return slots
-
 def print_edge_traversal_profile(
     edge_id: str,
 ):
@@ -2424,184 +1977,6 @@ def get_physical_junction_center(
     raise ValueError(
         f"No physical center registered for junction={junction_id}"
     )
-
-
-def get_junction_staging_position(
-    junction_id: str,
-) -> pygame.Vector2:
-    """Return the pre-selection staging point for any DFS junction.
-
-    The point uses the original J0 rule: stop 10 px inside the junction on the
-    parent-edge side.  Therefore J0 stages at (400, 360), while J1 stages at
-    (750, 350) when entered from the left.
-    """
-
-    center = get_physical_junction_center(
-        junction_id,
-    )
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return center
-
-    return center - incoming.normalize() * 10.0
-
-
-def get_junction_lateral_direction(
-    junction_id: str,
-) -> pygame.Vector2:
-    """Return the direction across the incoming corridor width."""
-
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return pygame.Vector2(1.0, 0.0)
-
-    incoming = incoming.normalize()
-    return pygame.Vector2(
-        -incoming.y,
-        incoming.x,
-    )
-
-
-def compute_junction_ingress_force(
-    robot: "Robot",
-    junction_id: str,
-) -> pygame.Vector2:
-    """Apply the original J0 ingress controller at any DFS junction.
-
-    This is not a new point-attraction or PD staging controller.  It is the
-    exact J0 MOVE_TO_JUNCTION rule expressed in the local coordinates of the
-    current junction:
-
-    * move only while the robot is before the staging plane;
-    * preserve the robot's incoming lateral lane;
-    * after crossing the staging plane, stop adding forward route force and
-      let the original global damping/SPH terms settle the swarm.
-
-    For J0 the result is identical to the old code:
-        y_distance = y - (center_y + 10)
-        force.y = -INITIAL_INGRESS_FORCE * scale
-        force.x = lane_x - x
-
-    For J1 the same equations are rotated 90 degrees:
-        x_distance = (J1_CENTER.x - 10) - x
-        force.x = +INITIAL_INGRESS_FORCE * scale
-        force.y = lane_y - y
-    """
-
-    if robot.role in {
-        "ANCHOR",
-        "RELAY",
-        "TRUNK_RELAY",
-    }:
-        return pygame.Vector2()
-
-    incoming = get_junction_incoming_direction(
-        junction_id,
-    )
-
-    if incoming.length_squared() <= EPSILON:
-        return pygame.Vector2()
-
-    incoming = incoming.normalize()
-    lateral = pygame.Vector2(
-        -incoming.y,
-        incoming.x,
-    )
-
-    junction_center = get_physical_junction_center(
-        junction_id,
-    )
-
-    # Original J0 target is center_y + 10 while entering upward.  The generic
-    # form below gives the same point for J0 and the rotated point x=750 for J1.
-    staging_target = (
-        junction_center
-        - incoming * 10.0
-    )
-
-    lane_value = robot.junction_ingress_lateral.setdefault(
-        junction_id,
-        robot.position.dot(lateral),
-    )
-
-    remaining_distance = (
-        staging_target - robot.position
-    ).dot(incoming)
-
-    force = pygame.Vector2()
-
-    # This is exactly the original one-way J0 ingress force.  There is no
-    # attraction to the far wall and no bidirectional compression controller.
-    if remaining_distance > 0.0:
-        scale = max(
-            INITIAL_INGRESS_MIN_FORCE_SCALE,
-            min(
-                1.0,
-                remaining_distance
-                / INITIAL_INGRESS_BRAKE_DISTANCE,
-            ),
-        )
-        force += (
-            incoming
-            * INITIAL_INGRESS_FORCE
-            * scale
-        )
-
-    lateral_error = (
-        lane_value
-        - robot.position.dot(lateral)
-    )
-    lateral_force = clamp(
-        INITIAL_INGRESS_LANE_GAIN
-        * lateral_error,
-        -INITIAL_INGRESS_LANE_MAX_FORCE,
-        INITIAL_INGRESS_LANE_MAX_FORCE,
-    )
-    force += lateral * lateral_force
-
-    return force
-
-
-def compute_junction_staging_force(
-    robot: "Robot",
-    junction_id: str,
-) -> pygame.Vector2:
-    """Compatibility wrapper for the shared original-J0 ingress module."""
-
-    return compute_junction_ingress_force(
-        robot,
-        junction_id,
-    )
-
-
-def compute_j1_staging_force(
-    robot: "Robot",
-) -> pygame.Vector2:
-    """Compatibility wrapper; J1 now uses the exact same module as J0."""
-
-    return compute_junction_ingress_force(
-        robot,
-        "J1",
-    )
-
-
-def constrain_robot_to_j1_staging(
-    robot: "Robot",
-) -> None:
-    """No-op retained for compatibility.
-
-    The previous hard x-clamp and J1-only PD controller were the source of the
-    wall-side pile-up.  Child corridors are now closed by is_region_allowed()
-    until selection, exactly like J0's initial MOVE_TO_JUNCTION phase.
-    """
-
-    return
 
 
 def nested_edge_route_direction(
@@ -3003,12 +2378,6 @@ class Robot:
         self.position = pygame.Vector2(x, y)
         self.previous_position = self.position.copy()
         self.ingress_lane_x = float(x)
-        # Lateral lane coordinate used by the common Junction staging module.
-        # J0 enters upward, so its lateral coordinate is the initial x value.
-        # Child junction coordinates are recorded automatically on entry.
-        self.junction_ingress_lateral: dict[str, float] = {
-            "J0": float(x),
-        }
         self.velocity = pygame.Vector2()
         self.acceleration = pygame.Vector2()
         self.radius = ROBOT_RADIUS
@@ -3163,7 +2532,6 @@ class Robot:
         # ordinary robot cannot pass through a temporary gap while Shepherds
         # are still moving laterally into their slots.
         constrain_normal_behind_shepherd_curtain(self)
-        constrain_robot_to_j1_staging(self)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
         self._record_motion()
@@ -3596,13 +2964,7 @@ def get_active_command_anchor(
             )
         )
 
-        # During child-junction staging, a newly elected Anchor may still be
-        # travelling to its park point.  Do not replace the working upstream
-        # command source until the child Anchor itself has a Base path.
-        if (
-            child_anchor is not None
-            and child_anchor.connected_to_base
-        ):
+        if child_anchor is not None:
             return child_anchor
 
     return junction_anchor
@@ -4084,24 +3446,31 @@ def get_relay_path_endpoint(branch):
     )
 
 
-def initialize_relay_plan(
-    branch: str,
-) -> None:
-    """Compatibility wrapper for a J0 branch."""
+def initialize_relay_plan(branch):
+    global relay_slots, relay_deploy_cooldown, relay_retract_cooldown
+    global relay_retract_clear_timer, relay_motion_scale
+    start = ANCHOR_PARK_POSITION.copy()
+    end = get_relay_path_endpoint(branch)
+    vector = end - start
+    length = vector.length()
+    relay_slots = []
+    relay_deploy_cooldown = relay_retract_cooldown = relay_retract_clear_timer = 0.0
+    relay_motion_scale = 1.0
+    if length <= EPSILON:
+        return
+    direction = vector / length
+    distance = RELAY_SPACING
+    index = 0
+    while distance <= length:
+        relay_slots.append({
+            "index": index,
+            "position": start + direction * distance,
+            "path_distance": distance,
+        })
+        index += 1
+        distance += RELAY_SPACING
+    print(f"[Relay] plan branch={branch}, slots={len(relay_slots)}")
 
-    if branch not in BRANCH_TO_EDGE:
-        raise ValueError(
-            f"No topology edge registered "
-            f"for branch={branch}"
-        )
-
-    edge_id = BRANCH_TO_EDGE[
-        branch
-    ]
-
-    activate_edge_relay_plan(
-        edge_id,
-    )
 
 def relay_path_progress(position, branch):
     start = ANCHOR_PARK_POSITION
@@ -4268,12 +3637,7 @@ def child_junction_handoff_ready(
     return nearest_distance <= COMM_SAFE_DISTANCE
 
 
-def update_relay_deployment(
-    robots,
-    dt: float,
-) -> None:
-    """Deploy a trailing Relay only when the moving swarm needs one."""
-
+def update_relay_deployment(robots, dt):
     global relay_deploy_cooldown
     global relay_motion_scale
 
@@ -4282,7 +3646,6 @@ def update_relay_deployment(
         relay_deploy_cooldown - dt,
     )
 
-    # 평상시 군집은 정상 속도로 이동한다.
     relay_motion_scale = 1.0
 
     if phase not in {
@@ -4293,78 +3656,48 @@ def update_relay_deployment(
     }:
         return
 
-    if (
-        junction_anchor is None
-        or active_branch is None
-    ):
+    if junction_anchor is None or active_branch is None:
         return
 
-    front_progress = (
-        get_exploration_front_progress(
-            robots,
-            active_branch,
-        )
+    front_progress = get_exploration_front_progress(
+        robots,
+        active_branch,
     )
-
     status = get_front_communication_status(
         robots,
         active_branch,
     )
-
     next_slot = get_next_undeployed_slot(
         robots,
     )
 
-    reached = (
-        next_slot is not None
-        and front_progress
-        >= (
-            next_slot["path_distance"]
-            - RELAY_DEPLOY_LOOKAHEAD
-        )
-    )
-
-    # J1 handoff 때문에 탐색 시작부터 느려지지 않도록 한다.
-    # 마지막 Relay 슬롯까지 군집이 도달했을 때만
-    # J1 Anchor handoff를 별도로 확인한다.
-    final_slot_reached = (
-        next_slot is not None
-        and bool(relay_slots)
-        and next_slot["index"]
-        == relay_slots[-1]["index"]
-        and reached
-    )
-
     handoff_required = (
         active_branch == "RIGHT"
-        and final_slot_reached
+        and resolve_current_junction_id() in {"J0", "J1"}
         and not child_junction_handoff_ready(
             robots,
             "J1",
         )
     )
 
-    communication_relay_required = (
-        status["needs_relay"]
+    reached = (
+        next_slot is not None
+        and front_progress
+        >= next_slot["path_distance"]
+        - RELAY_DEPLOY_LOOKAHEAD
     )
 
     should_deploy = (
         next_slot is not None
         and reached
         and (
-            communication_relay_required
+            status["needs_relay"]
             or handoff_required
         )
     )
 
-    # 통신 여유가 실제로 부족해졌을 때만 잠시 감속한다.
-    if (
-        communication_relay_required
-        or handoff_required
-    ):
-        relay_motion_scale = (
-            RELAY_WAIT_SPEED_SCALE
-        )
+    if status["needs_relay"] or handoff_required:
+        relay_motion_scale = RELAY_WAIT_SPEED_SCALE
 
     if (
         should_deploy
@@ -4374,35 +3707,23 @@ def update_relay_deployment(
             next_slot,
         )
     ):
-        relay_deploy_cooldown = (
-            RELAY_DEPLOY_COOLDOWN
-        )
+        relay_deploy_cooldown = RELAY_DEPLOY_COOLDOWN
+        relay_motion_scale = RELAY_FORMING_SPEED_SCALE
 
-        relay_motion_scale = (
-            RELAY_FORMING_SPEED_SCALE
-        )
-
-    # 선택된 뒤쪽 로봇이 가까운 Relay 슬롯에 정착하는
-    # 짧은 시간에만 감속한다.
-    unsettled_relays = [
-        relay
+    if any(
+        not relay_at_slot_is_settled(relay)
         for relay in get_active_branch_relays(
             robots,
         )
-        if not relay_at_slot_is_settled(
-            relay,
-        )
-    ]
-
-    if unsettled_relays:
+    ):
         relay_motion_scale = min(
             relay_motion_scale,
             RELAY_FORMING_SPEED_SCALE,
         )
 
-    # 실제 연결이 거의 끊긴 비상 상황에서만 정지한다.
     if status["connected_ratio"] < 0.55:
         relay_motion_scale = 0.0
+
 
 def get_junction_anchor_robot(
     robots,
@@ -4463,27 +3784,58 @@ def get_nested_relay_path_start(edge_id: str) -> pygame.Vector2:
         return J1_ANCHOR_PARK_POSITION.copy()
     return ANCHOR_PARK_POSITION.copy()
 
+
 def initialize_nested_relay_plan(
     edge_id: str,
 ) -> None:
-    """Compatibility wrapper for a child-Junction edge."""
+    """Create nested relay slots from the active Anchor, exactly like J0."""
 
-    profile = get_edge_traversal_profile(
-        edge_id,
-    )
+    global nested_relay_slots
+    global nested_relay_edge_id
+    global nested_relay_deploy_cooldown
+    global relay_motion_scale
 
-    if (
-        profile.source_junction_id
-        == ROOT_JUNCTION_ID
-    ):
-        raise ValueError(
-            f"Nested Relay plan received "
-            f"root edge={edge_id}"
+    start = get_nested_relay_path_start(edge_id)
+    end = get_nested_relay_path_end(edge_id)
+    path_vector = end - start
+    path_length = path_vector.length()
+
+    nested_relay_slots = []
+    nested_relay_edge_id = edge_id
+    nested_relay_deploy_cooldown = 0.0
+    relay_motion_scale = 1.0
+
+    if path_length <= EPSILON:
+        return
+
+    direction = path_vector / path_length
+    distance = RELAY_SPACING
+    index = 0
+
+    while distance <= path_length:
+        nested_relay_slots.append(
+            {
+                "index": index,
+                "edge_id": edge_id,
+                "position": start + direction * distance,
+                "path_distance": distance,
+            }
         )
+        index += 1
+        distance += RELAY_SPACING
 
-    activate_edge_relay_plan(
-        edge_id,
+    first_link = (
+        start.distance_to(nested_relay_slots[0]["position"])
+        if nested_relay_slots
+        else 0.0
     )
+
+    print(
+        f"[Nested Relay] plan edge={edge_id}, "
+        f"slots={len(nested_relay_slots)}, "
+        f"anchor_first={first_link:.2f}/{COMM_RANGE:.2f}"
+    )
+
 
 def nested_relay_path_progress(
     position: pygame.Vector2,
@@ -4655,7 +4007,6 @@ def select_nested_relay_candidate(
         if (
             robot.role == "NORMAL"
             and robot.connected_to_base
-            and robot.connected_to_active_anchor
             and get_robot_region(
                 robot.position,
             )
@@ -4779,11 +4130,8 @@ def get_nested_front_communication_status(
     connected = [
         robot
         for robot in front
-        if (
-            robot.connected_to_base
-            and robot.connected_to_active_anchor
-    )
-]
+        if robot.connected_to_base
+    ]
 
     connected_ratio = (
         len(connected)
@@ -4794,10 +4142,10 @@ def get_nested_front_communication_status(
     )
 
     margins = sorted(
-        robot.active_anchor_path_margin
+        robot.comm_path_margin
         for robot in connected
         if math.isfinite(
-            robot.active_anchor_path_margin
+            robot.comm_path_margin
         )
     )
 
@@ -4835,7 +4183,7 @@ def update_nested_relay_deployment(
     robots,
     dt: float,
 ) -> None:
-    """Leave trailing Relays only when J1 local communication needs them."""
+    """Deploy nested relays before the exploration front advances."""
 
     global nested_relay_deploy_cooldown
     global relay_motion_scale
@@ -4845,7 +4193,6 @@ def update_nested_relay_deployment(
         nested_relay_deploy_cooldown - dt,
     )
 
-    # Relay를 미리 배치하지 않고 군집이 먼저 이동한다.
     relay_motion_scale = 1.0
 
     if (
@@ -4868,8 +4215,6 @@ def update_nested_relay_deployment(
         profile.source_junction_id,
     )
 
-    # J1 Anchor 자체의 Base 연결이 끊긴 경우에만
-    # 자식 Branch 이동을 중단한다.
     if (
         source_anchor is None
         or not source_anchor.connected_to_base
@@ -4897,56 +4242,50 @@ def update_nested_relay_deployment(
         )
     )
 
-    reached = (
-        next_slot is not None
-        and front_progress
-        >= (
-            next_slot["path_distance"]
-            - RELAY_DEPLOY_LOOKAHEAD
-        )
-    )
-
-    # 중요:
-    # 첫 번째 Relay를 탐색 시작과 동시에 배치하지 않는다.
-    # 군집이 먼저 움직이고 로컬 통신 여유가 부족해진
-    # 순간에만 뒤쪽 로봇을 Relay로 남긴다.
-    should_deploy = (
-        next_slot is not None
-        and reached
-        and status["needs_relay"]
-    )
-
-    if status["needs_relay"]:
-        relay_motion_scale = (
-            RELAY_WAIT_SPEED_SCALE
-        )
-
-    if (
-        should_deploy
-        and nested_relay_deploy_cooldown
-        <= 0.0
-    ):
-        deployed = (
-            deploy_nested_relay_for_slot(
-                robots,
-                next_slot,
+    # 첫 번째 Relay는 탐색 시작 즉시 배치한다.
+    # 이후 Relay는 군집 선두가 슬롯에 접근하기 전에 선제 배치한다.
+    if next_slot is not None:
+        deploy_ready = (
+            next_slot["index"] == 0
+            or front_progress
+            >= (
+                next_slot["path_distance"]
+                - RELAY_DEPLOY_LOOKAHEAD
             )
         )
 
-        if deployed:
-            nested_relay_deploy_cooldown = (
-                RELAY_DEPLOY_COOLDOWN
+        if deploy_ready:
+            relay_motion_scale = min(
+                relay_motion_scale,
+                RELAY_WAIT_SPEED_SCALE,
             )
 
-            relay_motion_scale = (
-                RELAY_FORMING_SPEED_SCALE
-            )
+            if nested_relay_deploy_cooldown <= 0.0:
+                deployed = (
+                    deploy_nested_relay_for_slot(
+                        robots,
+                        next_slot,
+                    )
+                )
 
-    nested_relays = (
-        get_active_nested_relays(
-            robots,
-            nested_relay_edge_id,
-        )
+                if deployed:
+                    nested_relay_deploy_cooldown = (
+                        RELAY_DEPLOY_COOLDOWN
+                    )
+
+                    relay_motion_scale = min(
+                        relay_motion_scale,
+                        RELAY_FORMING_SPEED_SCALE,
+                    )
+
+                else:
+                    # 배치 후보를 찾지 못한 상태에서
+                    # 군집만 먼저 출발하지 못하게 막는다.
+                    relay_motion_scale = 0.0
+
+    nested_relays = get_active_nested_relays(
+        robots,
+        nested_relay_edge_id,
     )
 
     unsettled_relays = [
@@ -4957,18 +4296,33 @@ def update_nested_relay_deployment(
         )
     ]
 
-    # 슬롯 주변의 뒤쪽 로봇이 자리를 잡는
-    # 짧은 시간 동안에만 감속한다.
+    # 선택된 Relay가 슬롯에 도착할 때까지 군집을 감속한다.
     if unsettled_relays:
         relay_motion_scale = min(
             relay_motion_scale,
             RELAY_FORMING_SPEED_SCALE,
         )
 
-    # 기존 first_slot_ready 강제 정지는 삭제한다.
-    # 통신이 실제 위험 수준일 때만 정지한다.
+    # 첫 번째 슬롯이 아직 비어 있으면 실제 진입을 금지한다.
+    first_slot_ready = any(
+        relay.relay_index == 0
+        and relay_at_slot_is_settled(relay)
+        for relay in nested_relays
+    )
+
+    if nested_relay_slots and not first_slot_ready:
+        relay_motion_scale = 0.0
+
+    if status["needs_relay"]:
+        relay_motion_scale = min(
+            relay_motion_scale,
+            RELAY_WAIT_SPEED_SCALE,
+        )
+
     if status["connected_ratio"] < 0.55:
         relay_motion_scale = 0.0
+
+
 
 def active_branch_is_nested() -> bool:
     return active_branch in NESTED_BRANCHES
@@ -5311,27 +4665,11 @@ def elect_anchor_for_junction(
             None,
         )
 
-    election_rect = (
-        anchor_election_rect
-        if junction_id == "J0"
-        else J1_ANCHOR_ELECTION_RECT
-    )
-
     candidates = [
         robot
         for robot in robots
         if robot.role == "NORMAL"
         and junction_id in robot.anchor_entry_times
-        and election_rect.collidepoint(
-            robot.position.x,
-            robot.position.y,
-        )
-        and (
-            junction_id != "J1"
-            or robot.position.distance_to(
-                J1_ANCHOR_PARK_POSITION,
-            ) <= J1_ANCHOR_NEAR_PARK_RADIUS
-        )
         and (
             junction_id == "J0"
             or robot.connected_to_base
@@ -5382,9 +4720,6 @@ def elect_anchor_for_junction(
     selected.velocity.update(0.0, 0.0)
 
     context.anchor_robot_id = selected.robot_id
-    context.anchor_position = (
-        selected.anchor_position.copy()
-    )
     context.stable_timer = 0.0
 
     print(
@@ -6589,18 +5924,9 @@ def get_proxy_boundary_centers(
             if neighbor in partition and partition[neighbor] != branch:
                 boundary.append(centers[key])
                 break
-    # A single remaining region owns all cells and has no internal
-    # boundary.  Root candidates use Branch names; nested candidates use
-    # topology Edge IDs such as E_J1_UP.
+    # A single remaining Branch owns all cells and has no internal boundary.
     if not boundary:
-        if branch in EDGE_TRAVERSAL_PROFILES:
-            boundary = [
-                get_nested_edge_entrance(branch)
-            ]
-        else:
-            boundary = [
-                get_branch_entrance(branch)
-            ]
+        boundary = [get_branch_entrance(branch)]
     return boundary
 
 
@@ -9167,41 +8493,6 @@ def adaptive_shepherd_count():
     return int(clamp(count, SHEPHERD_MIN_COUNT, SHEPHERD_MAX_COUNT))
 
 
-def get_branch_edge_id(
-    branch: str,
-) -> str:
-    """Return the topology Edge represented by one physical branch name."""
-
-    if branch in NESTED_REGION_TO_EDGE:
-        return NESTED_REGION_TO_EDGE[branch]
-
-    if branch in BRANCH_TO_EDGE:
-        return BRANCH_TO_EDGE[branch]
-
-    raise ValueError(
-        f"No topology edge registered for branch={branch}"
-    )
-
-
-def branch_uses_terminal_shepherd(
-    branch: str,
-) -> bool:
-    """Return True only when the active Edge ends at a room/dead end.
-
-    An Edge that enters another Junction is a transit Edge. It must hand the
-    swarm to the child Junction controller instead of forming a Shepherd wall.
-    """
-
-    edge_id = get_branch_edge_id(branch)
-    profile = get_edge_traversal_profile(edge_id)
-    destination = topology_nodes[profile.destination_node_id]
-
-    return (
-        not profile.enters_child_junction
-        and destination.node_type != NodeType.JUNCTION
-    )
-
-
 def get_early_capture_rect(branch: str) -> pygame.Rect:
     saturation_rect = get_saturation_rect(branch)
     direction = BRANCH_DIRECTIONS[branch]
@@ -9288,11 +8579,6 @@ def shepherd_candidates(robots, branch, required_count):
     return candidates[:required_count]
 
 def capture_region_ready_for_shepherd(robots, branch):
-    # A Junction-connecting Edge such as E_J0_RIGHT never forms a Shepherd.
-    # It only transfers the swarm to the child Junction controller.
-    if not branch_uses_terminal_shepherd(branch):
-        return False
-
     required_count = adaptive_shepherd_count()
     capture_rect = get_early_capture_rect(branch)
     candidates = [
@@ -9342,14 +8628,6 @@ def assign_shepherd_slots(candidates, slots):
 
 
 def select_adaptive_shepherds(robots, branch, grid):
-    # Defensive guard: transit Edges must never create a Shepherd boundary.
-    if not branch_uses_terminal_shepherd(branch):
-        print(
-            f"[Shepherd] skipped transit edge="
-            f"{get_branch_edge_id(branch)}, branch={branch}"
-        )
-        return []
-
     reset_shepherd_roles(robots)
     required_count = adaptive_shepherd_count()
     slots = build_shepherd_slots(branch, required_count)
@@ -9529,21 +8807,42 @@ def compute_route_force(robot):
             return force
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        # J0 uses the shared module, but the equations are exactly the original
-        # single-junction MOVE_TO_JUNCTION equations.
-        force = compute_junction_ingress_force(
-            robot,
-            ROOT_JUNCTION_ID,
+        y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
+        if y_distance > 0.0:
+            scale = max(
+                INITIAL_INGRESS_MIN_FORCE_SCALE,
+                min(1.0, y_distance / INITIAL_INGRESS_BRAKE_DISTANCE),
+            )
+            force.y = -INITIAL_INGRESS_FORCE * scale
+        lane_error = robot.ingress_lane_x - robot.position.x
+        force.x = clamp(
+            INITIAL_INGRESS_LANE_GAIN * lane_error,
+            -INITIAL_INGRESS_LANE_MAX_FORCE,
+            INITIAL_INGRESS_LANE_MAX_FORCE,
         )
 
     elif phase == SimulationPhase.STABILIZE_JUNCTION:
         junction_id = resolve_current_junction_id()
-        if junction_id is not None:
-            # J1 is now the same J0 ingress module rotated by its incoming Edge.
-            # No J1-only point attraction, PD compression, or wall clamp remains.
-            force = compute_junction_ingress_force(
-                robot,
-                junction_id,
+        if junction_id == "J1":
+            if region == "RIGHT":
+                force = (
+                    normalized_direction_toward(
+                        robot.position,
+                        J1_CENTER,
+                    )
+                    * ROUTE_FORCE
+                    * relay_motion_scale
+                )
+            else:
+                force = pygame.Vector2()
+        else:
+            force = (
+                normalized_direction_toward(
+                    robot.position,
+                    active_junction_target,
+                )
+                * ROUTE_FORCE
+                * relay_motion_scale
             )
 
     elif phase in {
@@ -9796,7 +9095,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global phase, shepherd_form_timer, pressure_push_timer, flow_establish_timer
     global junction_switch_timer, final_gather_timer, branch_entry_timer
     global active_branch
-    global relay_motion_scale
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
 
     if phase in {
@@ -9847,9 +9145,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             JunctionContext(junction_id=junction_id),
         )
 
-        # Entry was allowed only after child_junction_handoff_ready().  Freeze
-        # the parent Edge relay chain and gather locally at full staging speed.
-        relay_motion_scale = 1.0
+        # Keep completing the parent RIGHT relay chain until the child Anchor
+        # has a direct safe handoff link.
+        update_relay_deployment(robots, dt)
 
         child_anchor = elect_child_junction_anchor(
             robots,
@@ -9889,21 +9187,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"anchor_ready={anchor_ready}"
             )
 
-        junction_robot_count = sum(
-            robot.role == "NORMAL"
-            and get_robot_region(robot.position)
-            == (
-                "JUNCTION"
-                if junction_id == "J0"
-                else f"{junction_id}_JUNCTION"
-            )
-            for robot in robots
-        )
-
         if (
             anchor_ready
             and consensus_ready
-            and junction_robot_count >= JUNCTION_ENTRY_COUNT
             and context.selected_edge_id is None
         ):
             preferred_edge_id = choose_next_nested_edge_by_proxy(
@@ -9953,93 +9239,67 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 branch_entry_timer = 0.0
 
                 print(
-                    f"[Shared Edge Pipeline] "
+                    f"[Nested Edge Traverse] "
                     f"started edge={selected_edge_id}, "
-                    f"branch={active_branch}, "
-                    f"junction={junction_id}"
+                    f"branch={active_branch}"
                 )
-                # J1 also reuses the exact J0 terminal-branch pipeline:
-                # explore -> Shepherd -> saturation -> pressure -> backtrack.
-                phase = SimulationPhase.EXPLORE_BRANCH
-
+                phase = SimulationPhase.EXPLORE_NESTED_EDGE
     elif phase == SimulationPhase.EXPLORE_NESTED_EDGE:
-        # Compatibility path for an old saved state. New child-edge selections
-        # enter EXPLORE_BRANCH directly.
-        phase = SimulationPhase.EXPLORE_BRANCH
-        print(
-            f"[Shared Edge Pipeline] redirected legacy nested phase; "
-            f"branch={active_branch}"
-        )
+        update_nested_relay_deployment(robots, dt)
 
-    elif phase == SimulationPhase.EXPLORE_BRANCH:
-        # J0와 J1 모두 같은 탐색 단계에 들어온다. Relay 구현만 현재
-        # Edge의 source Junction에 따라 root/nested controller로 dispatch한다.
-        update_active_relay_deployment(
-            robots,
-            dt,
-        )
-
-        current_profile = get_current_edge_profile()
-
-        # -----------------------------------------------------
-        # 현재 Edge의 목적지가 또 다른 Junction인 경우
-        # -----------------------------------------------------
-        if (
-            current_profile is not None
-            and current_profile.enters_child_junction
-        ):
-            destination_node = topology_nodes[
-                current_profile.destination_node_id
-            ]
-
-            # E_J0_RIGHT는 Dead-end가 아니라 J1 진입 Edge다.
-            # 따라서 Shepherd를 만들지 않고 J1 도착만 검사한다.
-            if child_junction_arrival_ready(
-                robots,
-                destination_node.node_id,
-            ):
-                enter_child_junction(
-                    destination_node.node_id,
-                )
-
-            # 아래 Shepherd 선발 코드로 절대 내려가지 않는다.
-            return
-
-        # -----------------------------------------------------
-        # 목적지가 ROOM 또는 DEAD_END인 경우에만 Shepherd 실행
-        # -----------------------------------------------------
-        if not branch_uses_terminal_shepherd(active_branch):
-            return
-
-        if capture_region_ready_for_shepherd(
-            robots,
-            active_branch,
-        ):
+        if capture_region_ready_for_shepherd(robots, active_branch):
             selected = select_adaptive_shepherds(
                 robots,
                 active_branch,
                 spatial_grid,
             )
 
-            if (
-                len(selected)
-                == adaptive_shepherd_count()
-            ):
-                phase = (
-                    SimulationPhase
-                    .FORM_SHEPHERD_BOUNDARY
-                )
-
+            if len(selected) == adaptive_shepherd_count():
+                phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
                 shepherd_form_timer = 0.0
-
-                enforce_shepherd_curtain_for_swarm(
-                    robots,
+                enforce_shepherd_curtain_for_swarm(robots)
+                print(
+                    f"[Shepherd] capture-region election: "
+                    f"branch={active_branch}, count={len(selected)}"
                 )
 
+    elif phase == SimulationPhase.EXPLORE_BRANCH:
+        update_relay_deployment(robots, dt)
+
+        destination_node = get_current_edge_destination_node()
+
+        if (
+            current_edge_leads_to_junction()
+            and destination_node is not None
+            and child_junction_arrival_ready(
+                robots,
+                destination_node.node_id,
+            )
+        ):
+            enter_child_junction(destination_node.node_id)
+            return
+
+        # Dead-end 또는 Room으로 이어지는 Edge에서만
+        # Shepherd를 선출하고 압력 Backtracking을 시작한다.
+
+
+        # Preserve the original timing: wait until the leading robots enter the
+        # dead-end capture region. Only the required count is now width-adaptive.
+        if capture_region_ready_for_shepherd(robots, active_branch):
+            selected = select_adaptive_shepherds(
+                robots,
+                active_branch,
+                spatial_grid,
+            )
+            if len(selected) == adaptive_shepherd_count():
+                phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
+                shepherd_form_timer = 0.0
+                # Close a continuous full-width virtual gate immediately.  Any
+                # ordinary robot already beyond the planned line is moved to
+                # its safe Junction side before the next physics frame.
+                enforce_shepherd_curtain_for_swarm(robots)
                 print(
-                    "[Shepherd] "
-                    f"capture-region election: "
-                    f"branch={active_branch}, "
+                    f"[Shepherd] capture-region election: branch={active_branch}, "
                     f"count={len(selected)}"
                 )
 
@@ -10054,7 +9314,11 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             # Do not start pressure with an incomplete boundary. Return selected
             # robots to NORMAL and retry when the capture region is ready.
             reset_shepherd_roles(robots)
-            phase = SimulationPhase.EXPLORE_BRANCH
+            phase = (
+                SimulationPhase.EXPLORE_NESTED_EDGE
+                if active_branch_is_nested()
+                else SimulationPhase.EXPLORE_BRANCH
+            )
             print("[Shepherd] boundary formation timeout; election will retry")
 
     elif phase == SimulationPhase.FILL_BEHIND_SHEPHERD:

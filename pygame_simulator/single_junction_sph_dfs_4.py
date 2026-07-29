@@ -3,17 +3,15 @@
 Implemented research components
 -------------------------------
 1. NORMAL-to-NORMAL local voting for distributed Junction decisions.
-2. One elected Junction Anchor verifies the NORMAL quorum, finalizes the fixed
-   priority proposal, and broadcasts the resulting branch/gate command.
-3. Fixed RIGHT -> UP -> LEFT priority agreed through peer consensus.
-4. Dead-end saturation detection using speed, density, occupancy,
+2. Fixed RIGHT -> UP -> LEFT priority agreed through peer consensus.
+3. Dead-end saturation detection using speed, density, occupancy,
    front stagnation, and dwell time.
-5. Width-adaptive Shepherd count and peer-auction role self-election.
-6. Pressure-dominant SPH motion with only a weak directional bias.
-7. Fixed Base-rooted LOS communication with reactive tail Breadcrumb relays.
-8. The original dead-end first-arrival Shepherd selection timing is retained,
+4. Width-adaptive Shepherd count and peer-auction role self-election.
+5. Pressure-dominant SPH motion with only a weak directional bias.
+6. Fixed Base-rooted LOS communication with reactive tail Breadcrumb relays.
+7. The original dead-end first-arrival Shepherd selection timing is retained,
    but the Shepherd count is computed from corridor width.
-9. Pressure starts only after the ordinary robots saturate behind the formed
+8. Pressure starts only after the ordinary robots saturate behind the formed
    Shepherd boundary; Breadcrumb release logic and final gathering remain.
 
 Scope limitation
@@ -299,13 +297,6 @@ branch_states = {branch: "UNVISITED" for branch in BRANCHES}
 branch_order_plan: list[str] = []
 branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
 distributed_consensus_branch: Optional[str] = None
-normal_consensus_proposal: Optional[str] = None
-normal_consensus_vote_counts = {
-    branch: 0 for branch in FIXED_BRANCH_ORDER
-}
-normal_consensus_voter_count = 0
-normal_consensus_quorum = 0
-anchor_finalization_sequence = 0
 transfer_branch: Optional[str] = None
 final_base_transfer_active = False
 previous_branch_direction = pygame.Vector2(0.0, -1.0)  # incoming from BASE
@@ -498,7 +489,6 @@ ANCHOR_WEIGHT_PARKING = 0.20
 ANCHOR_WEIGHT_DIRECTION = 0.15
 ANCHOR_WEIGHT_COMMUNICATION = 0.35
 ANCHOR_LOCAL_COMM_RANGE = 56.0 * MAP_SCALE
-ANCHOR_POLICY_VERSION = "NORMAL_PROPOSAL_ANCHOR_FINALIZE_V2"
 
 # Dead-end saturation
 SATURATION_MIN_TIP_ROBOTS = 18
@@ -1931,7 +1921,7 @@ def get_anchor_message(anchor):
 
 
 def propagate_base_message(robots, anchor):
-    """Compute Base-rooted paths and relay the Anchor-finalized command.
+    """Compute Base-rooted paths and mirror the NORMAL peer-consensus state.
 
     The Base is only a communication root/observer. It does not select a
     branch, assign roles, or issue motion commands.
@@ -2823,7 +2813,7 @@ def elect_junction_anchor(robots):
     )
     junction_anchor.role = "ANCHOR"
     junction_anchor.anchor_position = ANCHOR_PARK_POSITION.copy()
-    junction_anchor.local_branch_states = branch_states.copy()
+    junction_anchor.local_branch_states = branch_states
     junction_anchor.selected_branch = None
     junction_anchor.branch_gate_states = branch_gate_states.copy()
     print(
@@ -2831,80 +2821,6 @@ def elect_junction_anchor(robots):
         f"entry={junction_anchor.anchor_region_entry_time:.3f}"
     )
     return junction_anchor
-
-
-def preserve_consensus_at_anchor(
-    anchor: Optional["Robot"],
-    selected_branch: Optional[str] = None,
-    clear_selection: bool = False,
-) -> None:
-    """Store a NORMAL peer-consensus result without making Anchor decide it."""
-    if anchor is None or anchor.role != "ANCHOR":
-        return
-    anchor.local_branch_states = branch_states.copy()
-    if clear_selection:
-        anchor.selected_branch = None
-        anchor.distributed_branch_decision = None
-    elif selected_branch is not None:
-        anchor.selected_branch = selected_branch
-        anchor.distributed_branch_decision = selected_branch
-    anchor.branch_gate_states = branch_gate_states.copy()
-
-
-def anchor_finalize_branch_consensus(
-    anchor: Optional["Robot"],
-    robots,
-    proposed_branch: Optional[str],
-) -> Optional[str]:
-    """Validate a NORMAL proposal and convert it into an Anchor gate command.
-
-    NORMAL robots create the branch information through peer voting.  The
-    Junction Anchor is the only component that turns a quorum-backed proposal
-    into the finalized branch state and OPEN/CLOSED gate command.
-    """
-    global distributed_consensus_branch
-    global anchor_finalization_sequence
-
-    if (
-        anchor is None
-        or anchor.role != "ANCHOR"
-        or not anchor_deployment_ready(anchor, robots)
-        or proposed_branch is None
-    ):
-        return None
-
-    expected_branch = next(
-        (
-            branch
-            for branch in FIXED_BRANCH_ORDER
-            if branch_states.get(branch) == "UNVISITED"
-        ),
-        None,
-    )
-    if (
-        proposed_branch != expected_branch
-        or normal_consensus_vote_counts.get(proposed_branch, 0)
-        < normal_consensus_quorum
-    ):
-        return None
-
-    distributed_consensus_branch = proposed_branch
-    anchor_finalization_sequence += 1
-    apply_consensus_branch_gates(proposed_branch)
-    preserve_consensus_at_anchor(anchor, proposed_branch)
-
-    for robot in robots:
-        if robot.role == "NORMAL" and robot.connected_to_base:
-            robot.distributed_branch_decision = proposed_branch
-
-    print(
-        f"[Anchor Finalize] seq={anchor_finalization_sequence}, "
-        f"anchor={anchor.robot_id}, branch={proposed_branch}, "
-        f"votes={normal_consensus_vote_counts[proposed_branch]}/"
-        f"{normal_consensus_voter_count}, "
-        f"quorum={normal_consensus_quorum}"
-    )
-    return proposed_branch
 
 
 def reachable_nodes_without_branch(branch: str) -> set[str]:
@@ -4194,65 +4110,33 @@ def branch_is_feasible(branch: str, robots) -> bool:
     return len(connected_normals) >= required_mobile_roles
 
 
-def update_distributed_branch_consensus(
-    robots,
-    include_transfer_body: bool = False,
-) -> Optional[str]:
-    """Create a quorum-backed NORMAL proposal for Anchor finalization.
-
-    This function never opens a gate and never writes the finalized branch.
-    During a cross-branch handoff, connected NORMAL mass already inside the
-    provisional transfer branch may also participate in the proposal.
-    """
-    global normal_consensus_proposal
-    global normal_consensus_vote_counts
-    global normal_consensus_voter_count
-    global normal_consensus_quorum
-
-    eligible_regions = {"JUNCTION"}
-    if include_transfer_body and transfer_branch is not None:
-        eligible_regions.add(transfer_branch)
-
+def update_distributed_branch_consensus(robots) -> Optional[str]:
+    """Run a local NORMAL-to-NORMAL vote without an Anchor decision maker."""
+    global distributed_consensus_branch
     voters = [
         robot
         for robot in robots
         if robot.role == "NORMAL"
         and robot.connected_to_base
-        and get_robot_region(robot.position) in eligible_regions
+        and get_robot_region(robot.position) == "JUNCTION"
     ]
-    normal_consensus_voter_count = len(voters)
-    normal_consensus_vote_counts = {
-        branch: 0 for branch in FIXED_BRANCH_ORDER
-    }
-    normal_consensus_quorum = max(
-        DISTRIBUTED_VOTE_MIN_ROBOTS,
-        math.ceil(len(voters) * DISTRIBUTED_VOTE_QUORUM_RATIO),
-    )
-    normal_consensus_proposal = None
     if len(voters) < DISTRIBUTED_VOTE_MIN_ROBOTS:
-        return None
-
-    unvisited = [
-        branch
-        for branch in FIXED_BRANCH_ORDER
-        if branch_states.get(branch) == "UNVISITED"
-    ]
-    if not unvisited:
         return None
 
     for robot in voters:
         preferred = next(
             (
-                branch for branch in unvisited
+                branch
+                for branch in FIXED_BRANCH_ORDER
                 if robot.local_branch_states.get(branch) == "UNVISITED"
             ),
-            unvisited[0],
+            None,
         )
         local_peers = [
             peer
             for peer in robot.comm_neighbors
             if getattr(peer, "role", None) == "NORMAL"
-            and get_robot_region(peer.position) in eligible_regions
+            and get_robot_region(peer.position) == "JUNCTION"
             and robot.position.distance_to(peer.position)
             <= DISTRIBUTED_VOTE_NEIGHBOR_RANGE
         ]
@@ -4264,7 +4148,7 @@ def update_distributed_branch_consensus(
         ]
         counts = {
             branch: peer_votes.count(branch)
-            for branch in unvisited
+            for branch in FIXED_BRANCH_ORDER
             if robot.local_branch_states.get(branch) == "UNVISITED"
         }
         if preferred is not None:
@@ -4285,28 +4169,32 @@ def update_distributed_branch_consensus(
         branch: sum(robot.branch_vote == branch for robot in voters)
         for branch in FIXED_BRANCH_ORDER
     }
-    normal_consensus_vote_counts = vote_counts
     selected = max(
-        unvisited,
+        FIXED_BRANCH_ORDER,
         key=lambda branch: (
             vote_counts[branch],
             -FIXED_BRANCH_ORDER.index(branch),
         ),
     )
-    if vote_counts[selected] < normal_consensus_quorum:
+    quorum = max(
+        DISTRIBUTED_VOTE_MIN_ROBOTS,
+        math.ceil(len(voters) * DISTRIBUTED_VOTE_QUORUM_RATIO),
+    )
+    if vote_counts[selected] < quorum:
         return None
 
-    normal_consensus_proposal = selected
+    distributed_consensus_branch = selected
+    for robot in voters:
+        robot.distributed_branch_decision = selected
     print(
-        f"[NORMAL Proposal] branch={selected}, "
-        f"votes={vote_counts[selected]}/{len(voters)}, "
-        f"quorum={normal_consensus_quorum}"
+        f"[Distributed Consensus] branch={selected}, "
+        f"votes={vote_counts[selected]}/{len(voters)}"
     )
     return selected
 
 
 def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
-    """Apply the branch-mouth state finalized by the Junction Anchor."""
+    """Apply the branch-mouth state agreed by the NORMAL peer consensus."""
     global branch_gate_states
     if open_branch is None:
         branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
@@ -4315,13 +4203,8 @@ def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
             branch: "OPEN" if branch == open_branch else "CLOSED"
             for branch in BRANCHES
         }
-    preserve_consensus_at_anchor(
-        junction_anchor,
-        open_branch,
-        clear_selection=open_branch is None,
-    )
     print(
-        "[Anchor Gate Command] "
+        "[Distributed Gate Consensus] "
         + ", ".join(
             f"{branch}={branch_gate_states[branch]}"
             for branch in BRANCHES
@@ -4346,7 +4229,6 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
         )
         for branch in BRANCHES
     }
-    preserve_consensus_at_anchor(junction_anchor)
     for robot in robots:
         region = get_robot_region(robot.position)
         robot.transfer_target = (
@@ -4380,7 +4262,6 @@ def begin_final_base_transfer(robots, source: str) -> None:
         branch: "OPEN" if branch == source else "CLOSED"
         for branch in BRANCHES
     }
-    preserve_consensus_at_anchor(junction_anchor)
     for robot in robots:
         robot.transfer_target = (
             "BOTTOM"
@@ -4397,7 +4278,6 @@ def begin_final_base_transfer(robots, source: str) -> None:
 def close_all_branch_gates() -> None:
     global branch_gate_states
     branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
-    preserve_consensus_at_anchor(junction_anchor)
     print("[Gate] UP=CLOSED, LEFT=CLOSED, RIGHT=CLOSED")
 
 
@@ -4419,10 +4299,8 @@ def update_draining_branch_gate(robots) -> None:
     ]
     if remaining:
         branch_gate_states[branch] = "OPEN"
-        preserve_consensus_at_anchor(junction_anchor)
         return
     branch_gate_states[branch] = "CLOSED"
-    preserve_consensus_at_anchor(junction_anchor)
     draining_branch = None
     print(f"[Pipeline Drain] source gate closed: {branch}")
 
@@ -4489,7 +4367,7 @@ def next_unvisited_transfer_branch(source: str) -> Optional[str]:
 
 
 def choose_next_branch(anchor, robots, reference_density: float):
-    """Activate the branch already finalized by the Junction Anchor.
+    """Select the next unvisited branch using the fixed DFS route.
 
     The branch route is always Base -> RIGHT -> UP -> LEFT -> Base.
     Proxy partitioning, demand-ratio allocation, and rollout scoring do not
@@ -4503,16 +4381,9 @@ def choose_next_branch(anchor, robots, reference_density: float):
     global selected_branch_entry_lambda, branch_entry_timer
 
     selected = distributed_consensus_branch
-    if (
-        anchor is None
-        or anchor.role != "ANCHOR"
-        or selected is None
-        or anchor.selected_branch != selected
-        or anchor.branch_gate_states.get(selected) != "OPEN"
-        or branch_states.get(selected) != "UNVISITED"
-    ):
+    if selected is None or branch_states.get(selected) != "UNVISITED":
         if anchor is not None:
-            preserve_consensus_at_anchor(anchor)
+            anchor.selected_branch = None
         return None
 
     if not branch_is_feasible(selected, robots):
@@ -4538,7 +4409,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
     if anchor is not None:
         anchor.local_branch_states[selected] = "ACTIVE"
         anchor.selected_branch = selected
-    preserve_consensus_at_anchor(anchor, selected)
+    apply_consensus_branch_gates(selected)
     active_branch = selected
     branch_order_plan.append(selected)
     selected_branch_entry_lambda, _ = rollout_stiffness_for_branch(
@@ -4565,25 +4436,19 @@ def complete_active_branch(anchor, branch, robots):
         robot.distributed_branch_decision = None
     if anchor is not None:
         anchor.local_branch_states[branch] = "VISITED"
-        preserve_consensus_at_anchor(
-            anchor,
-            clear_selection=True,
-        )
+        anchor.selected_branch = None
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
     print(f"[DFS] completed={branch}")
 
 
 def release_anchor_for_final_return(anchor):
-    global junction_anchor
     if anchor is None:
         return
     anchor.role = "NORMAL"
     anchor.anchor_position = None
     anchor.selected_branch = None
-    anchor.distributed_branch_decision = None
     anchor.velocity.update(0.0, 0.0)
-    junction_anchor = None
 
 
 def begin_final_gather():
@@ -6482,7 +6347,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global draining_branch
 
     update_draining_branch_gate(robots)
-    update_anchor_entry_records(robots, simulation_time)
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
@@ -6492,9 +6356,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         branch_entry_timer += dt
     update_initial_release_flow_event(robots, dt)
 
-    # NORMAL robots create a proposal. The elected Anchor verifies the
-    # quorum, finalizes the fixed-priority choice, and emits the gate command.
-    anchor = junction_anchor
+    # No control Anchor is elected. NORMAL robots make branch decisions by
+    # exchanging local votes; the Base only remains the communication root.
+    anchor = None
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         update_relay_deployment(robots, dt)
@@ -6508,20 +6372,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             robots_in_junction >= DISTRIBUTED_VOTE_MIN_ROBOTS
             and voted_branch is not None
         ):
-            if anchor is None:
-                anchor = elect_junction_anchor(robots)
-            finalized_branch = anchor_finalize_branch_consensus(
-                anchor,
-                robots,
-                voted_branch,
-            )
-            if finalized_branch is None:
-                return
-            selected = choose_next_branch(
-                anchor,
-                robots,
-                reference_density,
-            )
+            selected = choose_next_branch(None, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -6714,16 +6565,11 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             next_branch = transfer_branch
             if pipeline_switch_ready and remaining > 0:
                 draining_branch = completed_branch
-            if branch_states.get(completed_branch) != "VISITED":
-                complete_active_branch(
-                    anchor,
-                    completed_branch,
-                    robots,
-                )
+            complete_active_branch(anchor, completed_branch, robots)
             if final_base_transfer_active:
                 reset_shepherd_roles(robots)
                 final_base_transfer_active = False
-                begin_final_return(anchor, robots)
+                begin_final_return(None, robots)
                 print(
                     f"[Final Base Transfer] completed "
                     f"{completed_branch} -> BASE; "
@@ -6731,25 +6577,14 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 )
             elif next_branch is not None:
                 reset_shepherd_roles(robots)
-                voted_branch = update_distributed_branch_consensus(
-                    robots,
-                    include_transfer_body=True,
-                )
-                finalized_branch = anchor_finalize_branch_consensus(
-                    anchor,
-                    robots,
-                    voted_branch,
-                )
-                if finalized_branch != next_branch:
-                    return
+                distributed_consensus_branch = next_branch
                 selected = choose_next_branch(
-                    anchor,
+                    None,
                     robots,
                     reference_density,
                 )
                 if draining_branch is not None:
                     branch_gate_states[draining_branch] = "OPEN"
-                    preserve_consensus_at_anchor(anchor)
                 saturation_tracker.reset(selected)
                 if (
                     selected == pre_shepherd_branch
@@ -6791,18 +6626,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             return
         voted_branch = update_distributed_branch_consensus(robots)
         if voted_branch is not None:
-            finalized_branch = anchor_finalize_branch_consensus(
-                anchor,
-                robots,
-                voted_branch,
-            )
-            if finalized_branch is None:
-                return
-            selected = choose_next_branch(
-                anchor,
-                robots,
-                reference_density,
-            )
+            selected = choose_next_branch(None, robots, reference_density)
             if selected is None:
                 begin_final_gather()
             else:
@@ -6913,7 +6737,7 @@ def draw_branch_colour_fields(surface):
 
 
 def draw_branch_gates(surface):
-    """Draw peer-consensus gates whose state is retained by the Anchor."""
+    """Draw the Anchor-commanded artificial walls at closed branch mouths."""
     gate_lines = {
         "UP": (
             (center_x - half_width + 3, center_y - half_width),
@@ -7134,9 +6958,6 @@ def draw_pre_shepherd_curtain(surface):
 def reset_dfs_state():
     global phase, active_branch, branch_states, branch_order_plan
     global branch_gate_states, distributed_consensus_branch, transfer_branch
-    global normal_consensus_proposal, normal_consensus_vote_counts
-    global normal_consensus_voter_count, normal_consensus_quorum
-    global anchor_finalization_sequence
     global final_base_transfer_active
     global previous_branch_direction, junction_anchor, simulation_time
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
@@ -7166,13 +6987,6 @@ def reset_dfs_state():
     branch_order_plan = []
     branch_gate_states = {branch: "CLOSED" for branch in BRANCHES}
     distributed_consensus_branch = None
-    normal_consensus_proposal = None
-    normal_consensus_vote_counts = {
-        branch: 0 for branch in FIXED_BRANCH_ORDER
-    }
-    normal_consensus_voter_count = 0
-    normal_consensus_quorum = 0
-    anchor_finalization_sequence = 0
     transfer_branch = None
     final_base_transfer_active = False
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
@@ -7506,7 +7320,7 @@ while running:
         for robot in robots
     )
     hud_lines = [
-        "Pressure-driven SPH | NORMAL proposal + Anchor finalize | Breadcrumb relay",
+        "Pressure-driven SPH | Distributed NORMAL consensus | Breadcrumb relay",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | phase={phase.name}",
         f"Sketch sequence stage={get_sequence_stage()}/6",
         (
@@ -7542,22 +7356,8 @@ while running:
             + f"cruise={get_initial_release_cruise_blend():.2f}"
         ),
         (
-            "Decision=NORMAL proposal -> Anchor finalize | "
-            f"proposal={normal_consensus_proposal or '-'} "
-            f"votes={normal_consensus_vote_counts.get(normal_consensus_proposal, 0) if normal_consensus_proposal else 0}/"
-            f"{normal_consensus_voter_count} "
-            f"quorum={normal_consensus_quorum}"
-        ),
-        (
-            f"Anchor policy={ANCHOR_POLICY_VERSION} | "
-            + (
-                f"id={junction_anchor.robot_id} "
-                f"stored={junction_anchor.selected_branch or '-'} "
-                f"connected={junction_anchor.connected_to_base} "
-                f"finalize-seq={anchor_finalization_sequence}"
-                if junction_anchor is not None
-                else "WAITING_FOR_JUNCTION_NORMAL"
-            )
+            "Decision=NORMAL peer consensus | "
+            f"Junction voters={sum(robot.role == 'NORMAL' and get_robot_region(robot.position) == 'JUNCTION' for robot in robots)}"
         ),
         (
             f"Fluid body={FLUID_BODY_POLICY_VERSION} | "
