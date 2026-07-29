@@ -76,6 +76,8 @@ SHEPHERD_COLOR = (106, 70, 150)
 # the navy NORMAL swarm, purple Shepherds, and brown Breadcrumb relays.
 ANCHOR_COLOR = (20, 220, 90)
 ANCHOR_RING_COLOR = (0, 72, 34)
+COMM_BRIDGE_COLOR = (0, 190, 215)
+COMM_BRIDGE_LINK_COLOR = (0, 154, 190)
 BASE_COLOR = (44, 72, 120)
 TRUNK_RELAY_COLOR = (142, 82, 60)
 RELAY_COLOR = (168, 112, 44)
@@ -440,6 +442,13 @@ viscoelastic_last_seen: dict[tuple[int, int], int] = {}
 
 communication_sequence = 0
 last_message_signature = None
+communication_redundant_links: list[tuple[object, object]] = []
+backtrack_bridge_required_count = 0
+backtrack_bridge_candidate_count = 0
+backtrack_bridge_candidate_dwell = 0.0
+backtrack_bridge_risk_level = "STABLE"
+backtrack_bridge_natural_redundancy = 0
+backtrack_bridge_natural_margin = 0.0
 relay_slots: list[dict] = []
 relay_deploy_cooldown = 0.0
 relay_retract_cooldown = 0.0
@@ -594,6 +603,10 @@ RETURN_TRUNK_RELEASE_INITIAL_SPEED = 12.0
 RETURN_TRUNK_READY_BOTTOM_TOLERANCE = 2
 RETURN_TRUNK_READY_CONNECTED_RATIO = 0.97
 RETURN_TRUNK_FORCE_RELEASE_TIMEOUT = 2.50
+RETURN_DONE_DWELL_TIME = 0.35
+RETURN_ENTRY_RECOVERY_TIMEOUT = 1.50
+RETURN_ENTRY_RECOVERY_DISTANCE = 18.0 * MAP_SCALE
+RETURN_STRAGGLER_FORCE_MULTIPLIER = 1.80
 NORMAL_PHYSICS_MAX_DT = 0.05
 
 ISOLATION_NEIGHBOR_THRESHOLD = 4
@@ -724,6 +737,21 @@ COMM_MAX_LOCAL_NEIGHBORS = 16
 SHOW_COMM_LINKS_DEFAULT = True
 SHOW_DENSITY_COLOR_DEFAULT = True
 COMM_UPDATE_INTERVAL_FRAMES = 1
+BACKTRACK_BRIDGE_GUARD_COUNT = 4
+BACKTRACK_BRIDGE_SLOT_SPREAD = 12.0 * MAP_SCALE
+BACKTRACK_BRIDGE_CENTER_OFFSET = 8.0 * MAP_SCALE
+BACKTRACK_BRIDGE_RECRUIT_RADIUS = 95.0 * MAP_SCALE
+BACKTRACK_BRIDGE_POSITION_GAIN = 18.0
+BACKTRACK_BRIDGE_DAMPING_GAIN = 7.0
+BACKTRACK_BRIDGE_FORCE_LIMIT = 150.0 * MOTION_SPEED_MULTIPLIER
+BACKTRACK_BRIDGE_EXTRA_LINKS_PER_SIDE = 3
+BACKTRACK_BRIDGE_POSITION_TOLERANCE = 4.0 * MAP_SCALE
+BACKTRACK_BRIDGE_TARGET_REDUNDANCY = 3
+BACKTRACK_BRIDGE_STABLE_MARGIN = COMM_RANGE * 0.22
+BACKTRACK_BRIDGE_DANGER_MARGIN = COMM_RANGE * 0.08
+BACKTRACK_BRIDGE_DEPLOY_DWELL = 0.12
+BACKTRACK_BRIDGE_RELEASE_DWELL = 0.80
+BACKTRACK_BRIDGE_POLICY_VERSION = "EVENT_TRIGGERED_ADAPTIVE_BRIDGE_V2"
 ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
 ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
 ANCHOR_MIN_DIRECT_NEIGHBORS = 1
@@ -826,6 +854,9 @@ return_trunk_release_pending = False
 return_trunk_retract_timer = 0.0
 return_trunk_last_released_id = None
 return_trunk_force_timer = 0.0
+return_done_dwell = 0.0
+return_entry_stall_timer = 0.0
+return_last_bottom_count = 0
 
 # Branch-entrance/SPH-state measurement parameters
 BRANCH_ENTRANCE_CONGESTION_RADIUS = 52.0 * MAP_SCALE
@@ -1624,6 +1655,9 @@ class Robot:
         self.current_junction_id: Optional[str] = None
         self.anchor_junction_id: Optional[str] = None
         self.known_junction_states: dict[str, dict] = {}
+        self.comm_bridge_target: Optional[pygame.Vector2] = None
+        self.comm_bridge_index = -1
+        self.comm_bridge_branch: Optional[str] = None
 
         self.anchor_region_entry_time: Optional[float] = None
         self.anchor_region_entry_times: dict[str, float] = {}
@@ -1838,6 +1872,8 @@ class Robot:
             color = RELAY_COLOR
         elif self.role in {"SHEPHERD", "PRE_SHEPHERD"}:
             color = SHEPHERD_COLOR
+        elif self.comm_bridge_target is not None:
+            color = COMM_BRIDGE_COLOR
         elif show_density_color:
             color = density_to_color(self.density, color_reference_density)
         else:
@@ -1870,6 +1906,14 @@ class Robot:
             )
         elif self.role in {"SHEPHERD", "PRE_SHEPHERD"}:
             pygame.draw.circle(surface, SHEPHERD_COLOR, (x, y), draw_radius + 2, width=1)
+        elif self.comm_bridge_target is not None:
+            pygame.draw.circle(
+                surface,
+                COMM_BRIDGE_LINK_COLOR,
+                (x, y),
+                draw_radius + 3,
+                width=2,
+            )
         elif self.base_reserve:
             pygame.draw.circle(
                 surface,
@@ -1976,6 +2020,378 @@ def iter_physics_neighbor_candidates(robot, grid):
 # =========================================================
 
 
+def get_backtrack_bridge_slots(branch: str) -> list[pygame.Vector2]:
+    """Return parallel Junction slots linking the Base side to one Branch."""
+    outgoing = BRANCH_DIRECTIONS.get(
+        branch,
+        pygame.Vector2(1.0, 0.0),
+    )
+    incoming = pygame.Vector2(0.0, 1.0)
+    diagonal = incoming + outgoing
+    if diagonal.length_squared() <= EPSILON:
+        diagonal = outgoing.copy()
+    diagonal = diagonal.normalize()
+    lateral = pygame.Vector2(-diagonal.y, diagonal.x)
+    center = pygame.Vector2(junction_rect.center)
+    slot_center = center + diagonal * BACKTRACK_BRIDGE_CENTER_OFFSET
+    offsets = (
+        -1.5,
+        -0.5,
+        0.5,
+        1.5,
+    )
+    return [
+        slot_center
+        + lateral * BACKTRACK_BRIDGE_SLOT_SPREAD * offset
+        for offset in offsets[:BACKTRACK_BRIDGE_GUARD_COUNT]
+    ]
+
+
+def clear_backtrack_bridge_guards(robots) -> None:
+    for robot in robots:
+        if robot.comm_bridge_target is None:
+            continue
+        robot.comm_bridge_target = None
+        robot.comm_bridge_index = -1
+        robot.comm_bridge_branch = None
+
+
+def assess_backtrack_bridge_demand(robots) -> dict[str, object]:
+    """Estimate how many temporary guards the natural mesh currently needs."""
+    active_guards = {
+        robot.robot_id
+        for robot in robots
+        if robot.comm_bridge_target is not None
+    }
+    branch_robots = [
+        robot
+        for robot in robots
+        if get_robot_region(robot.position) == active_branch
+    ]
+    if not branch_robots:
+        return {
+            "required": 0,
+            "risk": "STABLE",
+            "redundancy": BACKTRACK_BRIDGE_TARGET_REDUNDANCY,
+            "margin": COMM_RANGE,
+            "connected_ratio": 1.0,
+        }
+
+    natural_pairs = set()
+    base_interface_nodes = set()
+    branch_interface_nodes = set()
+    interface_margins = []
+    for robot in robots:
+        if robot.robot_id in active_guards:
+            continue
+        robot_region = get_robot_region(robot.position)
+        for neighbor in robot.comm_neighbors:
+            neighbor_id = getattr(neighbor, "robot_id", -1)
+            if neighbor_id < 0 or neighbor_id in active_guards:
+                continue
+            pair = tuple(sorted((robot.robot_id, neighbor_id)))
+            if pair in natural_pairs:
+                continue
+            natural_pairs.add(pair)
+            neighbor_region = get_robot_region(neighbor.position)
+            regions = {robot_region, neighbor_region}
+            junction_robot_id = (
+                robot.robot_id
+                if robot_region == "JUNCTION"
+                else neighbor_id
+                if neighbor_region == "JUNCTION"
+                else None
+            )
+            if junction_robot_id is None:
+                continue
+            if regions == {"BOTTOM", "JUNCTION"}:
+                base_interface_nodes.add(junction_robot_id)
+                interface_margins.append(
+                    COMM_RANGE
+                    - robot.position.distance_to(neighbor.position)
+                )
+            elif regions == {active_branch, "JUNCTION"}:
+                branch_interface_nodes.add(junction_robot_id)
+                interface_margins.append(
+                    COMM_RANGE
+                    - robot.position.distance_to(neighbor.position)
+                )
+
+    redundancy = min(
+        len(base_interface_nodes),
+        len(branch_interface_nodes),
+    )
+    if interface_margins:
+        ordered_margins = sorted(interface_margins)
+        robust_index = min(
+            len(ordered_margins) - 1,
+            int(0.20 * len(ordered_margins)),
+        )
+        robust_margin = ordered_margins[robust_index]
+    else:
+        robust_margin = -COMM_RANGE
+
+    overall_connected_ratio = sum(
+        robot.connected_to_base for robot in robots
+    ) / max(len(robots), 1)
+    branch_connected_ratio = sum(
+        robot.connected_to_base for robot in branch_robots
+    ) / max(len(branch_robots), 1)
+    connected_ratio = min(
+        overall_connected_ratio,
+        branch_connected_ratio,
+    )
+    link_deficit = max(
+        0,
+        BACKTRACK_BRIDGE_TARGET_REDUNDANCY - redundancy,
+    )
+    disconnected_branch_count = sum(
+        not robot.connected_to_base for robot in branch_robots
+    )
+    disconnected_demand = math.ceil(
+        disconnected_branch_count
+        / max(BACKTRACK_BRIDGE_EXTRA_LINKS_PER_SIDE, 1)
+    )
+
+    if (
+        connected_ratio < 0.90
+        or redundancy == 0
+        or robust_margin <= BACKTRACK_BRIDGE_DANGER_MARGIN
+    ):
+        risk = "DANGER"
+        required = max(2, link_deficit, disconnected_demand)
+        if connected_ratio < 0.90:
+            required = BACKTRACK_BRIDGE_GUARD_COUNT
+    elif (
+        connected_ratio < 1.0
+        or redundancy < BACKTRACK_BRIDGE_TARGET_REDUNDANCY
+        or robust_margin < BACKTRACK_BRIDGE_STABLE_MARGIN
+    ):
+        risk = "CAUTION"
+        required = max(1, link_deficit, disconnected_demand)
+        required = min(required, 2)
+    else:
+        risk = "STABLE"
+        required = 0
+
+    return {
+        "required": int(clamp(
+            required,
+            0,
+            BACKTRACK_BRIDGE_GUARD_COUNT,
+        )),
+        "risk": risk,
+        "redundancy": redundancy,
+        "margin": robust_margin,
+        "connected_ratio": connected_ratio,
+    }
+
+
+def update_backtrack_bridge_guards(robots, dt) -> None:
+    """Adaptively hold only the number of bridge guards required by risk."""
+    global backtrack_bridge_required_count
+    global backtrack_bridge_candidate_count
+    global backtrack_bridge_candidate_dwell
+    global backtrack_bridge_risk_level
+    global backtrack_bridge_natural_redundancy
+    global backtrack_bridge_natural_margin
+
+    if phase != SimulationPhase.FLOW_BACKTRACK:
+        clear_backtrack_bridge_guards(robots)
+        backtrack_bridge_required_count = 0
+        backtrack_bridge_candidate_count = 0
+        backtrack_bridge_candidate_dwell = 0.0
+        backtrack_bridge_risk_level = "STABLE"
+        backtrack_bridge_natural_redundancy = 0
+        backtrack_bridge_natural_margin = COMM_RANGE
+        return
+
+    assessment = assess_backtrack_bridge_demand(robots)
+    desired_count = assessment["required"]
+    backtrack_bridge_risk_level = assessment["risk"]
+    backtrack_bridge_natural_redundancy = assessment["redundancy"]
+    backtrack_bridge_natural_margin = assessment["margin"]
+
+    if desired_count != backtrack_bridge_candidate_count:
+        backtrack_bridge_candidate_count = desired_count
+        backtrack_bridge_candidate_dwell = 0.0
+    else:
+        backtrack_bridge_candidate_dwell += dt
+
+    dwell_required = (
+        BACKTRACK_BRIDGE_DEPLOY_DWELL
+        if desired_count > backtrack_bridge_required_count
+        else BACKTRACK_BRIDGE_RELEASE_DWELL
+    )
+    if (
+        desired_count != backtrack_bridge_required_count
+        and backtrack_bridge_candidate_dwell >= dwell_required
+    ):
+        backtrack_bridge_required_count = desired_count
+        backtrack_bridge_candidate_dwell = 0.0
+        print(
+            "[Backtrack Bridge] "
+            f"risk={backtrack_bridge_risk_level}, "
+            f"required={backtrack_bridge_required_count}, "
+            f"natural_redundancy="
+            f"{backtrack_bridge_natural_redundancy}, "
+            f"margin={backtrack_bridge_natural_margin:.1f}"
+        )
+
+    slots = get_backtrack_bridge_slots(active_branch)
+    existing_by_index = {}
+    for robot in robots:
+        if robot.comm_bridge_target is None:
+            continue
+        if (
+            robot.role != "NORMAL"
+            or robot.comm_bridge_branch != active_branch
+            or robot.comm_bridge_index >= len(slots)
+            or robot.comm_bridge_index
+            >= backtrack_bridge_required_count
+        ):
+            robot.comm_bridge_target = None
+            robot.comm_bridge_index = -1
+            robot.comm_bridge_branch = None
+            continue
+        robot.comm_bridge_target = slots[robot.comm_bridge_index].copy()
+        existing_by_index[robot.comm_bridge_index] = robot
+
+    for slot_index, slot in enumerate(
+        slots[:backtrack_bridge_required_count]
+    ):
+        if slot_index in existing_by_index:
+            continue
+        candidates = [
+            robot
+            for robot in robots
+            if (
+                robot.role == "NORMAL"
+                and robot.comm_bridge_target is None
+                and not robot.base_reserve
+                and robot.transfer_target is None
+                and get_robot_region(robot.position) in {"BOTTOM", "JUNCTION"}
+                and robot.position.distance_to(slot)
+                <= BACKTRACK_BRIDGE_RECRUIT_RADIUS
+            )
+        ]
+        if not candidates:
+            continue
+        candidate = min(
+            candidates,
+            key=lambda robot: (
+                0
+                if get_robot_region(robot.position) == "BOTTOM"
+                else 1,
+                robot.position.distance_squared_to(slot),
+                robot.robot_id,
+            ),
+        )
+        candidate.comm_bridge_target = slot.copy()
+        candidate.comm_bridge_index = slot_index
+        candidate.comm_bridge_branch = active_branch
+
+
+def compute_backtrack_bridge_force(robot) -> pygame.Vector2:
+    target = robot.comm_bridge_target
+    if target is None or phase != SimulationPhase.FLOW_BACKTRACK:
+        return pygame.Vector2()
+    force = (
+        (target - robot.position) * BACKTRACK_BRIDGE_POSITION_GAIN
+        - robot.velocity * BACKTRACK_BRIDGE_DAMPING_GAIN
+    )
+    if force.length_squared() > BACKTRACK_BRIDGE_FORCE_LIMIT**2:
+        force.scale_to_length(BACKTRACK_BRIDGE_FORCE_LIMIT)
+    return force
+
+
+def add_redundant_backtrack_bridge_links(
+    robots,
+    linked_pairs: set[tuple[int, int]],
+) -> None:
+    """Add explicit Base-side and Branch-side links for every bridge guard."""
+    global communication_redundant_links
+    communication_redundant_links = []
+    if phase != SimulationPhase.FLOW_BACKTRACK:
+        return
+
+    bridges = sorted(
+        (
+            robot
+            for robot in robots
+            if robot.comm_bridge_target is not None
+            and robot.comm_bridge_branch == active_branch
+        ),
+        key=lambda robot: robot.comm_bridge_index,
+    )
+    recorded_pairs = set()
+    for bridge in bridges:
+        for side_region in ("BOTTOM", active_branch):
+            candidates = []
+            for other in robots:
+                if other is bridge or get_robot_region(other.position) != side_region:
+                    continue
+                distance_sq = bridge.position.distance_squared_to(other.position)
+                if distance_sq > COMM_RANGE**2:
+                    continue
+                if not has_line_of_sight(bridge.position, other.position):
+                    continue
+                candidates.append((distance_sq, other.robot_id, other))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            for _, _, other in candidates[
+                :BACKTRACK_BRIDGE_EXTRA_LINKS_PER_SIDE
+            ]:
+                pair = tuple(sorted((bridge.robot_id, other.robot_id)))
+                if pair not in linked_pairs:
+                    linked_pairs.add(pair)
+                    bridge.comm_neighbors.append(other)
+                    other.comm_neighbors.append(bridge)
+                if pair not in recorded_pairs:
+                    recorded_pairs.add(pair)
+                    communication_redundant_links.append((bridge, other))
+
+
+def get_backtrack_bridge_stats(robots) -> dict[str, object]:
+    guards = [
+        robot
+        for robot in robots
+        if robot.comm_bridge_target is not None
+    ]
+    ready = 0
+    base_links = 0
+    branch_links = 0
+    settled = 0
+    for guard in guards:
+        base_count = sum(
+            get_robot_region(neighbor.position) == "BOTTOM"
+            for neighbor in guard.comm_neighbors
+            if getattr(neighbor, "role", None) != "BASE"
+        )
+        branch_count = sum(
+            get_robot_region(neighbor.position) == active_branch
+            for neighbor in guard.comm_neighbors
+            if getattr(neighbor, "role", None) != "BASE"
+        )
+        base_links += base_count
+        branch_links += branch_count
+        ready += base_count > 0 and branch_count > 0
+        settled += (
+            guard.position.distance_to(guard.comm_bridge_target)
+            <= BACKTRACK_BRIDGE_POSITION_TOLERANCE
+        )
+    return {
+        "guards": len(guards),
+        "required": backtrack_bridge_required_count,
+        "risk": backtrack_bridge_risk_level,
+        "natural_redundancy": backtrack_bridge_natural_redundancy,
+        "natural_margin": backtrack_bridge_natural_margin,
+        "ready": ready,
+        "settled": settled,
+        "base_links": base_links,
+        "branch_links": branch_links,
+    }
+
+
 def update_communication_neighbors(robots, grid):
     """Build a sparse local mesh and explicit Base links with LOS checks."""
     range_sq = COMM_RANGE**2
@@ -2013,6 +2429,8 @@ def update_communication_neighbors(robots, grid):
             continue
         base_station.comm_neighbors.append(robot)
         robot.comm_neighbors.append(base_station)
+
+    add_redundant_backtrack_bridge_links(robots, linked_pairs)
 
 
 def get_anchor_deployment_motion_scale(anchor):
@@ -2438,6 +2856,14 @@ def draw_communication_links(surface, robots):
             robot.position,
             parent.position,
             width=COMM_LINK_WIDTH,
+        )
+    for bridge, neighbor in communication_redundant_links:
+        pygame.draw.line(
+            surface,
+            COMM_BRIDGE_LINK_COLOR,
+            bridge.position,
+            neighbor.position,
+            width=max(2, COMM_LINK_WIDTH + 1),
         )
 
 # =========================================================
@@ -4973,6 +5399,8 @@ def begin_final_gather():
 def begin_final_return(anchor, robots):
     global phase, relay_slots, relay_motion_scale
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
+    global return_done_dwell, return_entry_stall_timer
+    global return_last_bottom_count
     release_transient_roles_for_final_return(robots)
     relay_slots = []
     relay_motion_scale = 1.0
@@ -4982,8 +5410,46 @@ def begin_final_return(anchor, robots):
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
     return_trunk_force_timer = 0.0
+    return_done_dwell = 0.0
+    return_entry_stall_timer = 0.0
+    return_last_bottom_count = sum(
+        get_robot_region(robot.position) == "BOTTOM"
+        for robot in robots
+    )
     phase = SimulationPhase.RETURN_TO_BASE
     print("[DFS] return to base")
+
+
+def recover_return_entry_stragglers(robots) -> int:
+    """Move boundary-stalled NORMAL robots safely inside the Base corridor."""
+    recovered = 0
+    for robot in robots:
+        if (
+            robot.role != "NORMAL"
+            or get_robot_region(robot.position) != "JUNCTION"
+            or bottom_rect.top - robot.position.y
+            > RETURN_ENTRY_RECOVERY_DISTANCE
+        ):
+            continue
+        target = pygame.Vector2(
+            clamp(
+                robot.position.x,
+                bottom_rect.left + robot.radius + 1.0,
+                bottom_rect.right - robot.radius - 1.0,
+            ),
+            bottom_rect.top + robot.radius + 1.0,
+        )
+        if not is_walkable(target, robot.radius):
+            continue
+        robot.position = target
+        robot.previous_position = target.copy()
+        robot.velocity.update(0.0, RETURN_TRUNK_RELEASE_INITIAL_SPEED)
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+        recovered += 1
+    if recovered:
+        print(f"[Final Return Recovery] boundary_stragglers={recovered}")
+    return recovered
 
 # =========================================================
 # 12-1. Junction stability consensus
@@ -5272,26 +5738,43 @@ def release_transient_roles_for_final_return(robots):
     global pre_shepherd_branch
     global pre_shepherd_pack_dwell, pre_shepherd_pack_ready
 
-    released = 0
+    released_shepherds = 0
+    released_relays = 0
     for robot in robots:
-        if robot.role not in {"SHEPHERD", "PRE_SHEPHERD"}:
-            continue
-        robot.role = "NORMAL"
-        robot.shepherd_anchor = None
-        robot.shepherd_origin = None
-        robot.shepherd_branch = None
-        robot.transfer_target = None
-        robot.velocity.update(0.0, 0.0)
-        robot.acceleration.update(0.0, 0.0)
-        robot.filtered_acceleration.update(0.0, 0.0)
-        released += 1
+        robot.comm_bridge_target = None
+        robot.comm_bridge_index = -1
+        robot.comm_bridge_branch = None
+
+        if robot.role in {"SHEPHERD", "PRE_SHEPHERD"}:
+            robot.role = "NORMAL"
+            robot.shepherd_anchor = None
+            robot.shepherd_origin = None
+            robot.shepherd_branch = None
+            robot.transfer_target = None
+            robot.velocity.update(0.0, 0.0)
+            robot.acceleration.update(0.0, 0.0)
+            robot.filtered_acceleration.update(0.0, 0.0)
+            released_shepherds += 1
+        elif robot.role == "RELAY":
+            # Branch Breadcrumbs are transient. Only TRUNK_RELAY robots remain
+            # for the deliberate Junction-to-Base sequential retraction.
+            robot.role = "NORMAL"
+            robot.relay_anchor = None
+            robot.relay_index = -1
+            robot.transfer_target = None
+            robot.velocity.update(0.0, RETURN_TRUNK_RELEASE_INITIAL_SPEED)
+            robot.acceleration.update(0.0, 0.0)
+            robot.filtered_acceleration.update(0.0, 0.0)
+            released_relays += 1
 
     pre_shepherd_branch = None
     pre_shepherd_pack_dwell = 0.0
     pre_shepherd_pack_ready = False
-    if released:
+    if released_shepherds or released_relays:
         print(
-            f"[Final Cleanup] released transient Shepherd roles={released}"
+            "[Final Cleanup] "
+            f"released_shepherds={released_shepherds}, "
+            f"released_branch_relays={released_relays}"
         )
 
 
@@ -6450,7 +6933,26 @@ def compute_route_force(robot):
         force = normalized_direction_toward(robot.position, target) * FINAL_GATHER_FORCE
     elif phase == SimulationPhase.RETURN_TO_BASE:
         if region in BRANCHES:
-            force = normalized_direction_toward(robot.position, junction_target) * OUTLET_FORCE
+            force = (
+                normalized_direction_toward(
+                    robot.position,
+                    junction_target,
+                )
+                * OUTLET_FORCE
+                * RETURN_STRAGGLER_FORCE_MULTIPLIER
+            )
+        elif region == "JUNCTION":
+            force = (
+                direction_toward_base_path(robot.position)
+                * RETURN_EGRESS_FORCE
+                * RETURN_STRAGGLER_FORCE_MULTIPLIER
+            )
+            lane_error = robot.ingress_lane_x - robot.position.x
+            force.x += clamp(
+                RETURN_LANE_GAIN * lane_error,
+                -RETURN_LANE_MAX_FORCE,
+                RETURN_LANE_MAX_FORCE,
+            )
         else:
             bottom_target = get_bottom_hold_point()
             y_distance = bottom_target.y - robot.position.y
@@ -6461,6 +6963,7 @@ def compute_route_force(robot):
             force.x = clamp(RETURN_LANE_GAIN * lane_error, -RETURN_LANE_MAX_FORCE, RETURN_LANE_MAX_FORCE)
 
     force += compute_virtual_valve_force(robot)
+    force += compute_backtrack_bridge_force(robot)
 
     if region in {"UP", "BOTTOM"}:
         force.x += CENTERING_GAIN * (center_x - robot.position.x)
@@ -6903,10 +7406,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global distributed_consensus_branch, transfer_branch
     global final_base_transfer_active
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
+    global return_done_dwell, return_entry_stall_timer
+    global return_last_bottom_count
     global draining_branch
 
     update_draining_branch_gate(robots)
     update_anchor_entry_records(robots, simulation_time)
+    update_backtrack_bridge_guards(robots, dt)
 
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
@@ -7223,6 +7729,12 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
         global return_trunk_last_released_id, return_trunk_force_timer
+        if any(
+            robot.role in {"RELAY", "SHEPHERD", "PRE_SHEPHERD"}
+            for robot in robots
+        ):
+            release_transient_roles_for_final_return(robots)
+
         in_bottom = sum(get_robot_region(robot.position) == "BOTTOM" for robot in robots)
         trunk_relays = get_trunk_relays(robots)
         connected_count = sum(robot.connected_to_base for robot in robots)
@@ -7271,7 +7783,34 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 return_trunk_force_timer = 0.0
                 return_trunk_last_released_id = None
 
-        if in_bottom >= RETURN_BOTTOM_TARGET_COUNT and special == 0:
+        if in_bottom > return_last_bottom_count:
+            return_last_bottom_count = in_bottom
+            return_entry_stall_timer = 0.0
+        elif in_bottom < RETURN_BOTTOM_TARGET_COUNT:
+            return_entry_stall_timer += dt
+
+        if return_entry_stall_timer >= RETURN_ENTRY_RECOVERY_TIMEOUT:
+            recovered = recover_return_entry_stragglers(robots)
+            return_entry_stall_timer = 0.0
+            if recovered:
+                in_bottom = sum(
+                    get_robot_region(robot.position) == "BOTTOM"
+                    for robot in robots
+                )
+                return_last_bottom_count = max(
+                    return_last_bottom_count,
+                    in_bottom,
+                )
+
+        done_ready = (
+            in_bottom >= RETURN_BOTTOM_TARGET_COUNT
+            and special == 0
+            and not return_trunk_release_pending
+        )
+        return_done_dwell = (
+            return_done_dwell + dt if done_ready else 0.0
+        )
+        if return_done_dwell >= RETURN_DONE_DWELL_TIME:
             phase = SimulationPhase.DONE
             metrics.completion_time = simulation_time
             print(f"[DFS] done, robots={in_bottom}/{len(robots)}")
@@ -7552,7 +8091,14 @@ def reset_dfs_state():
     global initial_release_average_speed
     global viscoelastic_step, viscoelastic_rest_lengths
     global viscoelastic_last_seen
-    global last_message_signature, relay_slots, relay_deploy_cooldown
+    global last_message_signature, communication_redundant_links
+    global backtrack_bridge_required_count
+    global backtrack_bridge_candidate_count
+    global backtrack_bridge_candidate_dwell
+    global backtrack_bridge_risk_level
+    global backtrack_bridge_natural_redundancy
+    global backtrack_bridge_natural_margin
+    global relay_slots, relay_deploy_cooldown
     global relay_retract_cooldown, relay_retract_clear_timer, relay_motion_scale
     global trunk_relay_slots, trunk_relay_deploy_cooldown, base_station
     global last_proxy_partition, last_proxy_cell_centers
@@ -7561,6 +8107,9 @@ def reset_dfs_state():
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
     global return_trunk_release_pending, return_trunk_retract_timer
+    global return_trunk_last_released_id, return_trunk_force_timer
+    global return_done_dwell, return_entry_stall_timer
+    global return_last_bottom_count
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = FIXED_BRANCH_ORDER[0]
@@ -7592,6 +8141,13 @@ def reset_dfs_state():
     viscoelastic_last_seen = {}
     communication_sequence = 0
     last_message_signature = None
+    communication_redundant_links = []
+    backtrack_bridge_required_count = 0
+    backtrack_bridge_candidate_count = 0
+    backtrack_bridge_candidate_dwell = 0.0
+    backtrack_bridge_risk_level = "STABLE"
+    backtrack_bridge_natural_redundancy = 0
+    backtrack_bridge_natural_margin = COMM_RANGE
     relay_slots = []
     relay_deploy_cooldown = relay_retract_cooldown = relay_retract_clear_timer = 0.0
     relay_motion_scale = 1.0
@@ -7610,6 +8166,9 @@ def reset_dfs_state():
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
     return_trunk_force_timer = 0.0
+    return_done_dwell = 0.0
+    return_entry_stall_timer = 0.0
+    return_last_bottom_count = 0
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
     metrics = ExperimentMetrics()
@@ -7816,6 +8375,7 @@ while running:
     normal_count, shepherd_count, relay_count = count_branch_roles(robots, active_branch)
     communication_stats = get_communication_stats(robots)
     front_comm = get_front_communication_status(robots, active_branch)
+    backtrack_bridge_stats = get_backtrack_bridge_stats(robots)
     communication_parent_distances = [
         robot.position.distance_to(robot.comm_parent.position)
         for robot in robots
@@ -7900,6 +8460,24 @@ while running:
     )
     return_branch_robot_count = sum(
         get_robot_region(robot.position) in BRANCHES
+        for robot in robots
+    )
+    return_bottom_count = sum(
+        get_robot_region(robot.position) == "BOTTOM"
+        for robot in robots
+    )
+    return_junction_count = sum(
+        get_robot_region(robot.position) == "JUNCTION"
+        for robot in robots
+    )
+    return_special_count = sum(
+        robot.role in {
+            "ANCHOR",
+            "RELAY",
+            "TRUNK_RELAY",
+            "SHEPHERD",
+            "PRE_SHEPHERD",
+        }
         for robot in robots
     )
     hud_lines = [
@@ -8037,6 +8615,21 @@ while running:
             f"max parent gap={communication_max_parent_distance:.1f}/"
             f"{COMM_GUARD_HARD_LIMIT:.1f}"
         ),
+        (
+            f"Backtrack bridge={BACKTRACK_BRIDGE_POLICY_VERSION} | "
+            f"risk={backtrack_bridge_stats['risk']} "
+            f"required={backtrack_bridge_stats['required']} "
+            f"guards={backtrack_bridge_stats['guards']} "
+            f"settled={backtrack_bridge_stats['settled']} "
+            f"ready={backtrack_bridge_stats['ready']}"
+        ),
+        (
+            f"Natural bridge k="
+            f"{backtrack_bridge_stats['natural_redundancy']} "
+            f"margin={backtrack_bridge_stats['natural_margin']:.1f} | "
+            f"links B={backtrack_bridge_stats['base_links']} "
+            f"{active_branch}={backtrack_bridge_stats['branch_links']}"
+        ),
         f"Base direct={communication_stats['direct']} | Breadcrumbs={len(get_active_branch_relays(robots))}",
         f"Front comm ratio={front_comm['connected_ratio']:.2f} | relay need={front_comm['needs_relay']}",
         f"Reactive relays={len(get_relays(robots))} | preplanned slots=0",
@@ -8099,6 +8692,14 @@ while running:
         (
             f"Final gate={FINAL_GATE_POLICY_VERSION} | "
             f"branch robots={return_branch_robot_count}"
+        ),
+        (
+            f"Return status: B={return_bottom_count}/{len(robots)} "
+            f"J={return_junction_count} "
+            f"special={return_special_count} "
+            f"pending-trunk={return_trunk_release_pending} "
+            f"done-dwell={return_done_dwell:.2f}/"
+            f"{RETURN_DONE_DWELL_TIME:.2f}"
         ),
         (
             f"Shepherd line depth={get_shepherd_curtain_depth(active_branch):.1f} "
