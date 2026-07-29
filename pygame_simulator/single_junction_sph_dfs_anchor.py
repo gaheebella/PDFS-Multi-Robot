@@ -8264,6 +8264,7 @@ show_regions = True
 show_comm_links = SHOW_COMM_LINKS_DEFAULT
 communication_frame_counter = 0
 
+
 while running:
     raw_dt = max(clock.tick(FPS) / 1000.0, 1.0 / 240.0)
     frame_dt = min(
