@@ -2269,7 +2269,7 @@ def update_backtrack_bridge_guards(robots, dt) -> None:
                 robot.role == "NORMAL"
                 and robot.comm_bridge_target is None
                 and not robot.base_reserve
-                and robot.transfer_target is None
+                and robot.transfer_target in {None, transfer_branch}
                 and get_robot_region(robot.position) in {"BOTTOM", "JUNCTION"}
                 and robot.position.distance_to(slot)
                 <= BACKTRACK_BRIDGE_RECRUIT_RADIUS
@@ -5144,9 +5144,11 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
             if region in {
                 source,
                 "JUNCTION",
+                "BOTTOM",
                 draining_branch,
             }
             and robot.role in {"NORMAL", "SHEPHERD"}
+            and not robot.base_reserve
             else None
         )
     junction_seed_count = sum(
@@ -5158,6 +5160,24 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
         f"[Cross-Branch Transfer] {source} -> {target}; "
         f"{source}=OPEN, {target}=OPEN, "
         f"junction_seed={junction_seed_count}"
+    )
+
+
+def finish_cross_branch_transfer(robots, target: str) -> None:
+    """End only the transient handoff after the target becomes active."""
+    global transfer_branch
+    if transfer_branch != target:
+        return
+    cleared_count = 0
+    for robot in robots:
+        if robot.transfer_target != target:
+            continue
+        robot.transfer_target = None
+        cleared_count += 1
+    transfer_branch = None
+    print(
+        f"[Cross-Branch Transfer] handoff released; "
+        f"active={target}, cleared={cleared_count}"
     )
 
 
@@ -6809,6 +6829,7 @@ def compute_route_force(robot):
         if (
             transfer_branch == active_branch
             and robot.transfer_target != active_branch
+            and region not in {"BOTTOM", "JUNCTION"}
         ):
             # Base-side robots receive no artificial suction. With no
             # Shepherd behind them, the low-density tail remains near Base.
@@ -6823,6 +6844,7 @@ def compute_route_force(robot):
         if (
             transfer_branch == active_branch
             and robot.transfer_target != active_branch
+            and region not in {"BOTTOM", "JUNCTION"}
         ):
             force = pygame.Vector2()
         elif robot.role == "SHEPHERD":
@@ -6840,6 +6862,7 @@ def compute_route_force(robot):
         if (
             transfer_branch == active_branch
             and robot.transfer_target != active_branch
+            and region not in {"BOTTOM", "JUNCTION"}
         ):
             force = pygame.Vector2()
         elif robot.role == "SHEPHERD":
@@ -7658,6 +7681,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     robots,
                     reference_density,
                 )
+                if selected is not None:
+                    finish_cross_branch_transfer(robots, selected)
                 if draining_branch is not None:
                     branch_gate_states[draining_branch] = "OPEN"
                     preserve_consensus_at_anchor(anchor)
