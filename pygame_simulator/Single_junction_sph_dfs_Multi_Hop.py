@@ -569,6 +569,7 @@ class KHopCaptureState:
         default_factory=list
     )
     candidate_observer_ids: set[int] = field(default_factory=set)
+    straggler_wait_elapsed: float = 0.0
 
 
 @dataclass
@@ -1365,6 +1366,14 @@ NATURAL_SPREAD_COHORT_MIN_BASE_CONNECTIVITY = 0.72
 NATURAL_SPREAD_COHORT_MIN_WIDTH = ROBOT_RADIUS * 4.0
 NATURAL_SPREAD_COHORT_MAX_ANGLE_STD = math.radians(25.0)
 NATURAL_SPREAD_COHORT_MIN_SEPARATION = math.radians(52.0)
+# Once >= NATURAL_SPREAD_MIN_COHORTS have validated, do not finalize the
+# split immediately if another detected-but-not-yet-valid candidate is
+# still accumulating its own dwell -- a straight-through exit's evidence
+# converges slower (see detect_khop_straight_continuation_cluster) and
+# would otherwise always lose the race to already-mature turning cohorts.
+# Bounded well under NATURAL_SPREAD_CANDIDATE_TIMEOUT so an indefinitely
+# stuck straggler still cannot block confirmation forever.
+NATURAL_SPREAD_STRAGGLER_GRACE_TIME = 1.5
 KHOP_SPLIT_MIN_GROUP_SIZE = 18
 KHOP_SPLIT_CLUSTER_MATCH_DEGREES = 18.0
 KHOP_SPLIT_CLUSTER_MIN_RADIUS = COMM_SAFE_DISTANCE * 0.62
@@ -5380,23 +5389,17 @@ def detect_khop_straight_continuation_cluster(
         khop_state.robot_by_id[robot_id].connected_to_base
         for robot_id in members
     ) / len(members)
-    # Match the turning-cohort's own instantaneous variance formula rather
-    # than root.heading_stability_ema: that field is an EMA over
-    # KHOP_EVIDENCE_FILTER_TIME and has not converged this soon after
-    # CONTROLLED_SPREAD begins, which would fail a genuinely stable heading
-    # on lag alone.
-    heading_sum = pygame.Vector2()
-    moving_count = 0
-    for robot_id in members:
-        velocity = khop_state.robot_by_id[robot_id].khop_velocity_ema
-        if velocity.length_squared() > 1.0:
-            heading_sum += velocity.normalize()
-            moving_count += 1
-    direction_variance = (
-        1.0 - heading_sum.length() / moving_count
-        if moving_count > 0
-        else 1.0
-    )
+    # direction_variance exists to express uncertainty in an *inferred*
+    # heading: a turning cohort's true direction is unknown and must be
+    # estimated from scattered witness velocity samples, which is exactly
+    # what that noise measures. The straight lane has no such uncertainty
+    # -- its heading isn't inferred from anyone's motion, it is root.heading
+    # by construction. Per-member velocity noise (tried both raw and
+    # EMA-smoothed) instead measures the cap's own in-place jitter from
+    # holding its slot formation, which has a steady-state floor around
+    # 0.13-0.3 that never reliably clears NATURAL_SPREAD_COHORT_MAX_VARIANCE
+    # regardless of smoothing -- it was answering a different question.
+    direction_variance = 0.0
     return KHopSplitCluster(
         heading=incoming.copy(),
         robot_ids=members,
@@ -5477,6 +5480,7 @@ def begin_khop_controlled_spread(
     khop_state.cohort_evidence = []
     khop_state.last_cluster_headings = []
     khop_state.last_cluster_sizes = []
+    khop_state.straggler_wait_elapsed = 0.0
     khop_state.events.append({
         "time": simulation_time,
         "event": "SPREAD_ANOMALY_DETECTED",
@@ -5512,6 +5516,7 @@ def cancel_khop_junction_candidate() -> None:
     khop_state.candidate_observer_ids = set()
     khop_state.last_cluster_headings = []
     khop_state.last_cluster_sizes = []
+    khop_state.straggler_wait_elapsed = 0.0
     khop_state.motion_origin_by_robot.clear()
     khop_state.motion_dwell_by_robot.clear()
     khop_state.recognition_state = SpaceRecognitionState.NORMAL_CORRIDOR
@@ -6554,7 +6559,7 @@ def update_khop_capture_state(
                 khop_state.split_cluster_dwell - dt * 0.20,
             )
         candidate_clusters = valid_clusters
-        if (
+        ready = (
             len(candidate_clusters) >= NATURAL_SPREAD_MIN_COHORTS
             and all(
                 angle_between(first.heading, second.heading)
@@ -6562,11 +6567,30 @@ def update_khop_capture_state(
                 for index, first in enumerate(candidate_clusters)
                 for second in candidate_clusters[index + 1:]
             )
-        ):
+        )
+        if ready:
+            # A still-forming candidate (e.g. a straight-through exit, whose
+            # evidence converges slower than a turning cohort's) should not
+            # be dropped just because other cohorts happened to validate
+            # first. Wait a bounded grace period for it to either validate
+            # or fall out of detection before finalizing without it.
+            stragglers_pending = len(clusters) > len(candidate_clusters)
+            if (
+                stragglers_pending
+                and khop_state.straggler_wait_elapsed
+                < NATURAL_SPREAD_STRAGGLER_GRACE_TIME
+                and khop_state.candidate_elapsed
+                < NATURAL_SPREAD_CANDIDATE_TIMEOUT
+            ):
+                khop_state.straggler_wait_elapsed += dt
+                return
+            khop_state.straggler_wait_elapsed = 0.0
             khop_state.recognition_state = SpaceRecognitionState.JUNCTION_CONFIRMED
             split_khop_from_clusters(robots, candidate_clusters)
-        elif khop_state.candidate_elapsed >= NATURAL_SPREAD_CANDIDATE_TIMEOUT:
-            cancel_khop_junction_candidate()
+        else:
+            khop_state.straggler_wait_elapsed = 0.0
+            if khop_state.candidate_elapsed >= NATURAL_SPREAD_CANDIDATE_TIMEOUT:
+                cancel_khop_junction_candidate()
         return
 
     if khop_state.stage not in {"SEQUENTIAL_DFS", "EXPLORING"}:

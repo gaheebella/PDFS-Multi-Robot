@@ -2,25 +2,33 @@
 
 Branch: `feature/rebuild-multi-junction-from-single`
 File: `pygame_simulator/Single_junction_sph_dfs_Multi_Hop.py`
-Last commit: `47c936e Add straight-through branch discovery to natural-spread Junction detection`
+
+## Status: RESOLVED
+
+The straight-through (UP) branch is now reliably discovered alongside the
+two turning branches (LEFT/RIGHT). Verified via headless runs
+(`--headless-steps=3000`): all three branches (`T_up`, `T_left`, `T_right`)
+are confirmed, rollout-ordered, explored one at a time, each reaches a
+correctly local-evidence-only dead-end confirmation, each Marker goes
+`PENDING -> COMPLETED -> BLOCKING`, and the run ends at `KHOP_COMPLETE`
+with all groups `GATEKEEPING`. No crashes.
 
 ## What this is
 
-`Single_junction_sph_dfs_Multi_Hop.py` already implements a natural-spread,
+`Single_junction_sph_dfs_Multi_Hop.py` implements a natural-spread,
 no-forward-sensor K-hop Junction/branch discovery pipeline (see the module
-docstring and `SpaceRecognitionState`). Verified end-to-end via headless runs:
-root Leader/cap forms -> natural lateral spread detected -> cohort
-clustering/validation -> Junction confirmed -> Max-Min d-cluster branch
-Leader election -> rollout-cost-ordered sequential DFS -> local
-clearance/density/pressure-based dead-end detection (no coordinates) ->
-Marker PENDING->COMPLETED->BLOCKING consensus -> next branch -> all
-branches COMPLETED/BLOCKING -> KHOP_COMPLETE. No crashes observed.
+docstring and `SpaceRecognitionState`). Root Leader/cap forms -> natural
+lateral spread detected -> cohort clustering/validation -> Junction
+confirmed -> Max-Min d-cluster branch Leader election -> rollout-cost-
+ordered sequential DFS -> local clearance/density/pressure-based dead-end
+detection (no coordinates) -> Marker consensus -> next branch -> all
+branches COMPLETED/BLOCKING -> KHOP_COMPLETE.
 
-## The bug that was found and partially fixed this session
+## The bug that was found and fixed
 
 The physical map is a genuine 3-way junction (straight/UP + LEFT + RIGHT),
-but the discovery pipeline only ever confirmed 2 cohorts (the two turning
-branches) and silently dropped the straight-through one.
+but the discovery pipeline originally only ever confirmed 2 cohorts (the
+turning branches) and silently dropped the straight-through one.
 
 Root cause: a branch is normally "witnessed" by a NORMAL robot that slips
 past the front Leader into new territory and accumulates travel/dwell
@@ -29,74 +37,63 @@ there (`detect_persistent_non_corridor_motion`,
 witnessed this way — nothing is permitted ahead of the front Leader in its
 own heading, so nobody can "slip past" it to prove that direction.
 
-### Fix applied (in `detect_khop_directional_clusters`, ~line 5210)
+### Fix (all in `Single_junction_sph_dfs_Multi_Hop.py`, ~line 5210-5420
+and the `CONTROLLED_SPREAD` block of `update_khop_capture_state`)
 
-1. Broadened the observation role filter from `role == "NORMAL"` to
-   `role in KHOP_DYNAMIC_ROLES` (`{"NORMAL", "KHOP_LEADER", "KHOP_SHEPHERD"}`)
-   — captured cap members are the same fluid population, just a different
-   capture-tree role.
-2. Added `detect_khop_straight_continuation_cluster` (new function, right
-   after `detect_khop_directional_clusters`): evidences the straight lane
-   from the root group's own measured state instead of a witness —
-   `max(forward-travel-since-formation, root.forward_clearance)` for travel,
-   `root.connectivity_ratio` / base-connectivity for connectivity, corridor
-   width from `root.estimated_width`, and an instantaneous per-member
-   heading-variance for direction stability. This candidate is merged into
-   the same `clusters` list and judged by the same
-   `validate_directional_cohorts` thresholds as a turning cohort.
+1. `detect_khop_directional_clusters`: broadened the observation role
+   filter from `NORMAL`-only to `KHOP_DYNAMIC_ROLES`
+   (`{"NORMAL", "KHOP_LEADER", "KHOP_SHEPHERD"}`) — captured cap members
+   are the same fluid population, just a different capture-tree role. No
+   longer requires >=2 turning clusters up front before returning
+   anything (down to 1, or 0 if only the straight candidate applies).
+2. `detect_khop_straight_continuation_cluster` (new): evidences the
+   straight lane from the root group's own measured state instead of a
+   witness observation:
+   - `mean_travel`: `max(forward-travel-since-formation, root.forward_clearance)`
+     — the same local clearance probe already used (inverted) for
+     dead-end confirmation stands in for "no one has slipped past to
+     prove this territory," since CONTROLLED_SPREAD deliberately holds
+     the root's own displacement still while cohorts are validated.
+   - `direction_variance = 0.0` — **this is the key correction**. That
+     field is meant to express uncertainty in an *inferred* heading (a
+     turning cohort's true direction is unknown and estimated from
+     scattered witness velocities). The straight lane has no such
+     uncertainty: its heading isn't inferred, it *is* `root.heading` by
+     construction. Per-member cap velocity noise (tried both raw
+     instantaneous and `root.heading_stability_ema`-smoothed) was
+     answering a different question — the cap's own in-place
+     slot-holding jitter — and has a steady-state floor around 0.13-0.3
+     that never reliably clears `NATURAL_SPREAD_COHORT_MAX_VARIANCE`
+     (0.13) regardless of smoothing.
+   - `connectivity_ratio` / base-connectivity from `root.connectivity_ratio`
+     and root members' `connected_to_base`; `lateral_width` from
+     `root.estimated_width`.
+   This candidate is merged into the same `clusters` list and judged by
+   the identical `validate_directional_cohorts` thresholds as a turning
+   cohort.
+3. `update_khop_capture_state` (`CONTROLLED_SPREAD` stage): added a
+   bounded grace period (`NATURAL_SPREAD_STRAGGLER_GRACE_TIME = 1.5s`,
+   tracked in `KHopCaptureState.straggler_wait_elapsed`) so that once
+   `>= NATURAL_SPREAD_MIN_COHORTS` have validated, the split does not
+   finalize immediately if another detected-but-not-yet-valid candidate
+   is still present — it waits up to the grace window (still bounded
+   well under the overall `NATURAL_SPREAD_CANDIDATE_TIMEOUT = 5.0s`) for
+   the straggler to either validate or drop out. This turned out not to
+   be strictly necessary once `direction_variance = 0.0` let the
+   straight candidate validate on the same fast timescale as the turning
+   ones (`candidate=0.56` in the successful run, same as the pre-fix
+   2-cohort baseline), but it's kept as a general safety margin for
+   topologies where a genuine straggler is slower.
 
-### Confirmed by headless testing
+## How to test
 
-- `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=N`
-  (see the module docstring / top of file for all `--headless-*` /
-  `--initial-leader-id=` CLI flags).
-- The straight-through candidate **is now detected** every frame during
-  `CONTROLLED_SPREAD` (shows up in the `clusters=[...]` headless summary
-  with heading ≈ `(0.0, -1.0)`, size ≈ root's captured member count).
-- It is **not yet validated** in the runs tried so far —
-  `valid-cohorts=2`, only `T_left`/`T_right` end up in the branch queue.
-
-## Remaining problem: `direction_variance` for the straight cluster
-
-`NATURAL_SPREAD_COHORT_MAX_VARIANCE = 0.13`. Two ways of computing the
-straight cluster's `direction_variance` were tried, both borderline:
-
-- **Instantaneous** (`1 - |sum of per-member khop_velocity_ema headings| / count`,
-  same formula the turning clusters use): very noisy frame to frame
-  (observed swinging between ~0.01 and ~0.95 within the same
-  ~0.5s window) — the cap's individual members jitter locally to hold
-  their slot even while the group's net motion is stable, so this signal
-  rarely stays under 0.13 for the full `NATURAL_SPREAD_COHORT_MIN_DWELL`
-  (0.48s) needed to validate. **This is what's currently committed.**
-- **EMA** (`1 - root.heading_stability_ema`, already maintained by
-  `update_khop_group_statistics` every `KHOP_CAPTURE_REFRESH_TIME`): much
-  smoother, converges monotonically (observed 0.455 -> 0.135 over the
-  same window) but in the tested run never quite crossed under 0.130
-  before the two turning cohorts finished their own validation and the
-  split fired with just 2.
-
-Because the split triggers as soon as `len(valid clusters) >= 2`
-(`NATURAL_SPREAD_MIN_COHORTS`), the straight cluster is racing the turning
-clusters' own dwell timers and is currently losing by a small margin.
-
-### Things to try next (not yet attempted)
-
-1. Switch `direction_variance` to the EMA form and either loosen
-   `NATURAL_SPREAD_COHORT_MAX_VARIANCE` slightly for this case or seed
-   `root.heading_stability_ema` from its value at the moment
-   `begin_khop_controlled_spread` fires (it was presumably already
-   stable during ordinary `ADVANCING`, before the slowdown/jitter
-   transient this EMA is currently recovering from).
-2. Don't let the split fire the instant 2 valid clusters exist while a
-   3rd detected-but-unresolved candidate is still accumulating dwell —
-   give still-forming candidates a short grace window (bounded by
-   `NATURAL_SPREAD_CANDIDATE_TIMEOUT = 5.0s`) before finalizing with
-   fewer than all currently-tracked clusters. This is the more general
-   fix and would also help future non-3-way topologies.
-3. Re-derive the diagnostic prints (removed before commit — see git
-   history / this session's transcript for the exact `print(...)` block
-   that was in `detect_khop_straight_continuation_cluster`) if more
-   frame-by-frame data is needed again.
+```
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=3000
+```
+(see the module docstring / top of file for all `--headless-*` /
+`--initial-leader-id=` CLI flags). Look for `valid-cohorts=3` and a
+`groups=[...]` list containing `T_up`, `T_left`, `T_right` all
+`GATEKEEPING` at `stage=COMPLETE` in the final `[Headless]` summary line.
 
 ## Repo housekeeping
 
