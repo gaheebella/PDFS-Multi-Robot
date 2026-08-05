@@ -570,6 +570,7 @@ class KHopCaptureState:
     )
     candidate_observer_ids: set[int] = field(default_factory=set)
     straggler_wait_elapsed: float = 0.0
+    return_to_base_dwell: float = 0.0
 
 
 @dataclass
@@ -1339,6 +1340,15 @@ KHOP_CAP_FORM_MAX_TIME = 4.00
 KHOP_STREAM_FORCE = 2.5 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_FORCE = 28.0 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_DAMPING = 5.0
+# Once every locally discovered Branch is COMPLETED/BLOCKING there is no more
+# Junction left to guard, so every remaining physical role (Gatekeeper,
+# Marker, stray Leader/Shepherd/Relay) is released back to NORMAL and the
+# whole body is driven home to the fixed Base origin instead of being left
+# wherever forward propulsion happened to stop.
+KHOP_RETURN_TO_BASE_FORCE = 30.0 * MOTION_SPEED_MULTIPLIER
+KHOP_RETURN_TO_BASE_DAMPING = 4.0
+KHOP_RETURN_BASE_READY_RATIO = 0.95
+KHOP_RETURN_BASE_DWELL = 0.50
 KHOP_LOCAL_PROBE_STEP = max(ROBOT_RADIUS * 2.5, 3.0 * MAP_SCALE)
 KHOP_LOCAL_PROBE_DISTANCE = COMM_RANGE * 1.55
 KHOP_NAVIGATION_CLEARANCE = KHOP_LOCAL_PROBE_DISTANCE * 0.88
@@ -4031,48 +4041,48 @@ def khop_cap_slot_offsets(
     group: KHopShepherdGroup,
     shepherd_count: int,
 ) -> list[tuple[float, float]]:
-    """Build a three-row curved cap in Leader-local (side, forward) axes."""
+    """Build straight, corridor-width barrier rows in Leader-local
+    (side, forward) axes.
+
+    A tapered/crescent cap leaves both edges of the corridor uncovered near
+    the walls, so the main body slips around it instead of being blocked --
+    not something a real physical robot line could pass off as a gate. Every
+    row here spans the full sensed corridor width evenly (spreading fewer
+    robots wider rather than clustering them at the center) and rows stack
+    directly behind one another at a fixed depth step, matching a straight
+    Shepherd fence a real robot line could actually form.
+    """
     if shepherd_count <= 0:
         return []
     spacing = max(
         ROBOT_RADIUS * 2.6,
         KHOP_CAP_EQUILIBRIUM_DISTANCE,
     )
-    rows = min(KHOP_CAP_ROWS, shepherd_count)
-    per_row = [shepherd_count // rows] * rows
-    for index in range(shepherd_count % rows):
-        per_row[index] += 1
-    widest_row = max(per_row)
-    sensed_half_width = max(
-        spacing,
+    half_width = max(
+        spacing * 0.5,
         (khop_estimate_corridor_width(group) - ROBOT_RADIUS * 4.0) * 0.5,
     )
-    needed_half_width = spacing * max(widest_row - 1, 1) * 0.5
-    half_width = min(sensed_half_width, needed_half_width)
+    per_row = max(2, math.floor(2.0 * half_width / spacing) + 1)
+    rows = max(1, math.ceil(shepherd_count / per_row))
     slots: list[tuple[float, float]] = []
-    for row_index, count in enumerate(per_row):
-        row_half_width = max(
-            spacing * 0.5,
-            half_width - row_index * spacing * 0.10,
-        )
+    remaining = shepherd_count
+    for row_index in range(rows):
+        count = min(per_row, remaining)
+        if count <= 0:
+            break
+        remaining -= count
         lateral_values = (
             [0.0]
             if count == 1
             else [
-                -row_half_width
-                + 2.0 * row_half_width * index / (count - 1)
+                -half_width + 2.0 * half_width * index / (count - 1)
                 for index in range(count)
             ]
         )
+        # Rows stack straight behind the front one; none of them taper
+        # inward, so the barrier's lateral reach never shrinks with depth.
+        depth = spacing * (0.72 + row_index * 0.85)
         for lateral in lateral_values:
-            normalized_side = abs(lateral) / max(row_half_width, EPSILON)
-            # The center stays closest to the Leader and the sides trail,
-            # yielding the arched/crescent cap drawn in the meeting sketch.
-            depth = spacing * (
-                0.72
-                + row_index * 0.72
-                + 0.62 * normalized_side**1.7
-            )
             slots.append((lateral, -depth))
     return slots
 
@@ -5890,6 +5900,41 @@ def release_khop_group_relays(
     return released
 
 
+def release_khop_survivors_for_return(robots: list["Robot"]) -> int:
+    """Stand down every remaining physical role once nothing is left to guard.
+
+    Every locally discovered Branch is COMPLETED/BLOCKING at this point, so
+    the Gatekeepers, Markers, and any straggling Leader/Shepherd/Relay no
+    longer have a Junction to protect. Releasing them lets the whole body
+    become one ordinary NORMAL swarm again for the walk back to Base,
+    instead of leaving physical barriers frozen at each branch mouth
+    forever.
+    """
+    released = 0
+    for robot in robots:
+        if robot.role in {
+            "GATEKEEPER",
+            "MARKER",
+            "KHOP_LEADER",
+            "KHOP_SHEPHERD",
+            "RELAY",
+        }:
+            robot.role = "NORMAL"
+            released += 1
+        robot.khop_stream_id = None
+        robot.khop_group_id = None
+        robot.khop_parent_id = None
+        robot.khop_hop = -1
+        robot.khop_stationary_target = None
+        robot.marker_group_id = None
+        robot.relay_anchor = None
+        robot.relay_index = -1
+        robot.dhop_staging_group_id = None
+    for group in khop_branch_groups():
+        group.state = KHopGroupState.RELEASED
+    return released
+
+
 def update_khop_relay_deployment(
     group: KHopShepherdGroup,
     robots: list["Robot"],
@@ -6424,6 +6469,34 @@ def update_khop_capture_state(
     update_khop_local_motion_estimates(robots, dt)
     khop_state.capture_refresh_elapsed += dt
 
+    if khop_state.stage == "RETURNING_TO_BASE":
+        in_base = sum(
+            get_robot_region(robot.position) == "BOTTOM"
+            for robot in robots
+        )
+        khop_state.last_split_group_size = in_base
+        ready = in_base >= math.ceil(
+            len(robots) * KHOP_RETURN_BASE_READY_RATIO
+        )
+        khop_state.return_to_base_dwell = (
+            khop_state.return_to_base_dwell + dt if ready else 0.0
+        )
+        if khop_state.return_to_base_dwell >= KHOP_RETURN_BASE_DWELL:
+            khop_state.stage = "COMPLETE"
+            phase = SimulationPhase.DONE
+            metrics.completion_time = simulation_time
+            khop_state.consensus_sequence += 1
+            khop_state.events.append({
+                "time": simulation_time,
+                "event": "RETURNED_TO_BASE",
+                "in_base": in_base,
+                "total": len(robots),
+            })
+            print(
+                f"[K-hop] swarm gathered back at Base: {in_base}/{len(robots)}"
+            )
+        return
+
     if khop_state.stage == "FORMING_ROOT":
         root = khop_state.groups.get(khop_state.root_group_id or "")
         if root is None:
@@ -6689,16 +6762,20 @@ def update_khop_capture_state(
         and khop_state.completion_consensus_dwell
         >= KHOP_COMPLETION_CONSENSUS_DWELL
     ):
-        khop_state.stage = "COMPLETE"
-        phase = SimulationPhase.DONE
-        metrics.completion_time = simulation_time
+        khop_state.stage = "RETURNING_TO_BASE"
+        khop_state.return_to_base_dwell = 0.0
+        released = release_khop_survivors_for_return(robots)
         khop_state.consensus_sequence += 1
         khop_state.events.append({
             "time": simulation_time,
             "event": "ALL_BRANCHES_BLOCKING",
             "consensus_sequence": khop_state.consensus_sequence,
+            "released": released,
         })
-        print("[K-hop] all locally discovered branches are COMPLETED/BLOCKING")
+        print(
+            "[K-hop] all locally discovered branches are COMPLETED/BLOCKING; "
+            f"released={released}, walking home to Base"
+        )
         return
 
     active_group_exists = any(
@@ -6761,7 +6838,7 @@ def compute_khop_tree_force(robot: "Robot") -> pygame.Vector2:
 
 
 def compute_khop_cap_force(robot: "Robot") -> pygame.Vector2:
-    """Pull one Shepherd toward its curved physical slot behind the Leader."""
+    """Pull one Shepherd toward its straight, corridor-width fence slot."""
     if not KHOP_CAPTURE_ENABLED or robot.role != "KHOP_SHEPHERD":
         return pygame.Vector2()
     group = khop_state.groups.get(robot.khop_group_id or "")
@@ -6806,6 +6883,21 @@ def compute_khop_corridor_centering_force(robot: "Robot") -> pygame.Vector2:
 def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
     if robot.role in {"MARKER", "GATEKEEPER", "ANCHOR", "RELAY", "TRUNK_RELAY"}:
         return pygame.Vector2()
+    if khop_state.stage == "RETURNING_TO_BASE":
+        # Nothing is left to guard once every locally discovered Branch is
+        # COMPLETED/BLOCKING; walk the whole body back to the fixed,
+        # always-known Base origin instead of leaving it wherever forward
+        # propulsion happened to stop.
+        direction = direction_toward_base_path(robot.position)
+        if direction.length_squared() <= EPSILON:
+            return -robot.velocity * KHOP_RETURN_TO_BASE_DAMPING
+        desired_velocity = direction * (FLOW_BACKTRACK_MAX_SPEED * 0.55)
+        return limit_vector(
+            direction * KHOP_RETURN_TO_BASE_FORCE
+            + (desired_velocity - robot.velocity)
+            * KHOP_RETURN_TO_BASE_DAMPING,
+            KHOP_TREE_FORCE_LIMIT,
+        )
     if khop_state.stage == "COMPLETE":
         return -robot.velocity * KHOP_RETURN_DAMPING
     group = khop_state.groups.get(robot.khop_stream_id or "")
@@ -6992,6 +7084,43 @@ def compute_khop_gatekeeping_force(robot: "Robot") -> pygame.Vector2:
         ]
         for gatekeeper in physical_gatekeepers:
             delta = robot.position - gatekeeper.position
+            distance = delta.length()
+            if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
+                continue
+            ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
+            away = delta / distance
+            outward_component = max(0.0, away.dot(-group.heading))
+            total += (
+                -group.heading * KHOP_GATEKEEPER_FORCE * ratio**2
+                + away
+                * KHOP_GATEKEEPER_FORCE
+                * ratio**2
+                * (0.35 + 0.65 * outward_component)
+            )
+    for group in khop_branch_groups():
+        # A not-yet-activated Branch has no physical Gatekeeper yet -- only
+        # its still-forming cap -- but nothing should be able to drift into
+        # it before its turn either. Give the same physical repulsion to any
+        # robot that is not this cap's own member, so a foreign stream (or
+        # loose main-body fluid) cannot slip past a straight cap line the
+        # same way it couldn't slip past a completed Gatekeeper line. The
+        # cap's own members are excluded so this never fights the slot force
+        # that is still packing them into position.
+        if group.state not in {
+            KHopGroupState.FORMING,
+            KHopGroupState.WAITING,
+        }:
+            continue
+        if robot.khop_group_id == group.group_id:
+            continue
+        cap_members = [
+            candidate
+            for candidate in khop_state.robot_by_id.values()
+            if candidate.khop_group_id == group.group_id
+            and candidate.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}
+        ]
+        for member in cap_members:
+            delta = robot.position - member.position
             distance = delta.length()
             if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
                 continue
@@ -11402,6 +11531,17 @@ def adaptive_equilibrium_radius(robot: "Robot") -> float:
     if KHOP_CAPTURE_ENABLED:
         if robot.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}:
             return KHOP_CAP_EQUILIBRIUM_DISTANCE
+        if (
+            khop_state.stage == "RETURNING_TO_BASE"
+            and robot.role == "NORMAL"
+        ):
+            # The Base rectangle physically cannot hold the whole swarm at
+            # ordinary flow spacing; without compacting, robots jam at the
+            # entrance and the walk home can never reach the ready ratio.
+            return max(
+                ROBOT_RADIUS * 2.05,
+                SAFE_RADIUS * RETURN_PACKED_EQUILIBRIUM_SCALE,
+            )
         return SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE
     """Phase-local equilibrium spacing used by pair repulsion."""
     if (
@@ -11841,7 +11981,16 @@ def compute_pressures(robots, reference_density):
         robot.pressure = max(0.0, raw_pressure)
         if KHOP_CAPTURE_ENABLED:
             if robot.role in KHOP_DYNAMIC_ROLES:
-                robot.pressure *= SPH_MOTION_PRESSURE_BOOST
+                if (
+                    khop_state.stage == "RETURNING_TO_BASE"
+                    and robot.role == "NORMAL"
+                ):
+                    # Match the tighter RETURNING_TO_BASE equilibrium radius
+                    # with a gentler pressure response, or the full motion
+                    # boost fights the compaction and nobody can pack in.
+                    robot.pressure *= RETURN_PACKING_PRESSURE_SCALE
+                else:
+                    robot.pressure *= SPH_MOTION_PRESSURE_BOOST
             continue
         if (
             robot.role == "NORMAL"
