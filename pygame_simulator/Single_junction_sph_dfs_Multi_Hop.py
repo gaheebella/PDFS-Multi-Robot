@@ -1340,6 +1340,17 @@ KHOP_CAP_FORM_MAX_TIME = 4.00
 KHOP_STREAM_FORCE = 2.5 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_FORCE = 28.0 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_DAMPING = 5.0
+# A captured cap member (Leader/Shepherd) is only ever a small fraction of
+# the swarm (~29 robots sized to the corridor width). Everyone else keeps
+# khop_stream_id == None until it is individually captured or a Branch
+# stream is assigned to it, which used to mean zero directed route force
+# for the whole rest of the body -- raw SPH pressure alone diffuses it
+# radially across the open Junction (and partway into every Branch) long
+# before any physical cap has finished forming at a single mouth. This
+# keeps the uncaptured body one coherent stream behind whichever front is
+# currently leading, weak enough that the cap (KHOP_LEADER_FORCE /
+# KHOP_SHEPHERD_FORCE, both well above this) always stays ahead of it.
+KHOP_UNASSIGNED_FOLLOW_FORCE = KHOP_STREAM_FORCE
 # Once every locally discovered Branch is COMPLETED/BLOCKING there is no more
 # Junction left to guard, so every remaining physical role (Gatekeeper,
 # Marker, stray Leader/Shepherd/Relay) is released back to NORMAL and the
@@ -6880,6 +6891,44 @@ def compute_khop_corridor_centering_force(robot: "Robot") -> pygame.Vector2:
     )
 
 
+def compute_khop_unassigned_follow_force(robot: "Robot") -> pygame.Vector2:
+    """Keep the un-captured swarm one coherent stream behind whichever
+    front currently leads (the root before a split, the active Branch
+    after), instead of leaving it to raw, undirected pressure diffusion.
+    """
+    if robot.role != "NORMAL" or khop_state.stage == "FORMING_ROOT":
+        return pygame.Vector2()
+    heading: Optional[pygame.Vector2] = None
+    if khop_state.stage in {"ADVANCING", "CONTROLLED_SPREAD"}:
+        root = khop_state.groups.get(khop_state.root_group_id or "")
+        if root is not None:
+            heading = root.heading
+    elif khop_state.stage in {"SEQUENTIAL_DFS", "EXPLORING"}:
+        active = khop_state.groups.get(khop_state.active_group_id or "")
+        if active is not None:
+            heading = active.heading
+    if heading is None or heading.length_squared() <= EPSILON:
+        return pygame.Vector2()
+    forward = heading.normalize()
+    force = forward * KHOP_UNASSIGNED_FOLLOW_FORCE
+    if khop_state.stage == "CONTROLLED_SPREAD":
+        # Reinforce a genuinely witnessed lateral flow instead of dragging
+        # it straight back onto the old corridor heading -- the whole point
+        # is to let a real spread persist long enough to become a candidate.
+        motion = robot.khop_velocity_ema
+        if motion.length() >= NATURAL_SPREAD_MIN_SPEED:
+            motion_heading = motion.normalize()
+            lateral = abs(forward.cross(motion_heading))
+            if (
+                lateral >= math.sin(NATURAL_SPREAD_LATERAL_ANGLE)
+                and motion_heading.dot(forward) > -0.30
+            ):
+                force += motion_heading * (
+                    KHOP_UNASSIGNED_FOLLOW_FORCE * 0.70
+                )
+    return limit_vector(force, KHOP_TREE_FORCE_LIMIT)
+
+
 def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
     if robot.role in {"MARKER", "GATEKEEPER", "ANCHOR", "RELAY", "TRUNK_RELAY"}:
         return pygame.Vector2()
@@ -6915,7 +6964,7 @@ def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
                 - robot.velocity * (KHOP_RETURN_DAMPING * 0.60),
                 KHOP_TREE_FORCE_LIMIT,
             )
-        return pygame.Vector2()
+        return compute_khop_unassigned_follow_force(robot)
     if group.state in {
         KHopGroupState.GATEKEEPING,
         KHopGroupState.RELEASED,
@@ -6941,38 +6990,11 @@ def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
         and group.group_id == khop_state.root_group_id
         and khop_state.split_origin is not None
     ):
-        forward = group.heading.normalize()
-        if robot.role == "NORMAL":
-            relative = robot.position - khop_state.split_origin
-            radius = relative.length()
-            force = forward * (
-                KHOP_STREAM_FORCE * NATURAL_SPREAD_CANDIDATE_SLOW_SCALE
-            )
-            motion = robot.khop_velocity_ema
-            if motion.length() >= NATURAL_SPREAD_MIN_SPEED:
-                motion_heading = motion.normalize()
-                lateral = abs(forward.cross(motion_heading))
-                if (
-                    lateral >= math.sin(NATURAL_SPREAD_LATERAL_ANGLE)
-                    and motion_heading.dot(forward) > -0.30
-                ):
-                    # Preserve a witnessed flow; never manufacture a radial
-                    # heading for robots that had not already spread.
-                    force += motion_heading * (KHOP_STREAM_FORCE * 0.70)
-            limit_start = NATURAL_SPREAD_LIMIT_RADIUS * 0.82
-            if radius > limit_start and radius > EPSILON:
-                excess = clamp(
-                    (radius - limit_start)
-                    / max(NATURAL_SPREAD_LIMIT_RADIUS - limit_start, EPSILON),
-                    0.0,
-                    1.0,
-                )
-                force += -relative.normalize() * (
-                    NATURAL_SPREAD_LIMIT_GAIN * excess
-                )
-            return limit_vector(force, NATURAL_SPREAD_LIMIT_FORCE)
-        # Hold the original cap near the candidate while the ordinary body
-        # supplies all directional evidence.
+        # Only the captured Leader/Shepherd cap ever reaches this branch
+        # (a plain NORMAL robot's khop_stream_id is never the root's, so it
+        # is handled by compute_khop_unassigned_follow_force instead). Hold
+        # the cap near the candidate point while the ordinary body's own
+        # motion supplies all the directional evidence being validated.
         return -robot.velocity * KHOP_RETURN_DAMPING
 
     leader_packet = min(
