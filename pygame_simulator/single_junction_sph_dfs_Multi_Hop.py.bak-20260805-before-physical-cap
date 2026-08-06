@@ -1,44 +1,33 @@
-"""SPH-based localization-free natural-spread DFS prototype (method B).
+"""SPH-based localization-free K-hop Capture Shepherd prototype (method B).
 
 Implemented research components
 -------------------------------
-1. A manually seeded front Leader captures a width-adaptive K-hop tree and
-   packs its Shepherds into a three-row curved physical cap before moving.
-2. The tree is rebuilt from the live local communication graph while the cap
-   slots keep it cohesive instead of allowing a long, arbitrary BFS chain.
-3. Junction discovery never uses a forward/open-angle probe. Ordinary SPH
-   motion continues until several robots naturally acquire a persistent
-   non-corridor velocity and displacement while remaining locally connected.
-4. The first lateral flow only registers a Junction candidate. The main body
-   is then slowed and the already-occurring spread is range-limited while
-   directional cohorts prove count, travel, persistence, coherence,
-   connectivity, and multi-robot passability.
-5. Actual SPH spread positions are clustered through the live communication
-   graph. Inside each component, branch Leaders are elected by the Max-Min
-   d-cluster heuristic (d Floodmax plus d Floodmin rounds, Rules 1-4,
-   gateways, and convergecast parents) from Amis et al., INFOCOM 2000.
-6. All elected branch caps form at their entrances first. Only one cap then
-   explores at a time in locally evaluated rollout-cost order;
-   inactive caps remain physical gates. A confirmed cap returns before the
-   next branch is activated, matching the staged sequential DFS sketch.
-7. Leader and Marker state is exchanged through bounded-hop packets over the
+1. A manually seeded front Leader captures a width-adaptive K-hop tree.
+2. The tree is rebuilt from the live local communication graph while moving.
+3. Free-space probes only release the single incoming cap into DISPERSING; they
+   never assign robots to pre-authored UP/LEFT/RIGHT streams.
+4. Actual SPH spread positions are clustered through the live communication
+   graph. Every persistent directional component then elects its own front
+   Leader and builds a separate K-hop Shepherd tree.
+5. Leader and Marker state is exchanged through bounded-hop packets over the
    same live communication graph used by the capture trees.
-8. Local forward clearance, pressure, contact compression, density, speed, and
+6. Local forward clearance, pressure, contact compression, density, speed, and
    dwell confirm a dead-end without exposing dead-end coordinates.
-9. A physical Marker/Pebble broadcasts PENDING -> COMPLETED -> BLOCKING, and a
+7. A physical Marker/Pebble broadcasts PENDING -> COMPLETED -> BLOCKING, and a
    retained two-row Shepherd group replaces each simulated virtual gate.
-10. Compatible groups merge through local Leader packets; duplicate Leaders and
+8. Compatible groups merge through local Leader packets; duplicate Leaders and
    surplus Shepherds are released into the remaining streams.
-11. Reactive Breadcrumb robots are frozen only when the measured Base-path
+9. Reactive Breadcrumb robots are frozen only when the measured Base-path
    margin of an advancing K-hop stream needs support.
 
 Scope limitation
 ----------------
 The environment still contains one T/cross junction for controlled comparison.
-Map rectangles are used by collision and rendering only; the d-hop controller
-does not query Junction, Branch, or dead-end rectangles. Branch cohorts are
-discovered from motion rather than map-labelled regions. Method A (boundary
-surface tension) remains a separate follow-up experiment.
+Map rectangles are used by collision and rendering only; the K-hop controller
+does not query Junction, Branch, or dead-end rectangles. Concurrent branch
+groups make this Marker-based distributed physical exploration rather than a
+strict sequential DFS implementation. Method A (boundary surface tension) is a
+separate follow-up experiment and is intentionally not mixed into method B.
 """
 
 from __future__ import annotations
@@ -68,17 +57,8 @@ def integer_cli_option(name: str, default: Optional[int]) -> Optional[int]:
     return default
 
 
-def string_cli_option(name: str, default: Optional[str]) -> Optional[str]:
-    prefix = f"--{name}="
-    for argument in sys.argv[1:]:
-        if argument.startswith(prefix):
-            return argument[len(prefix):]
-    return default
-
-
 HEADLESS_STEP_LIMIT = integer_cli_option("headless-steps", None)
 HEADLESS_DT_MS = integer_cli_option("headless-dt-ms", 1000 // 60) or 16
-HEADLESS_SNAPSHOT_PATH = string_cli_option("headless-snapshot", None)
 INITIAL_KHOP_LEADER_ID = integer_cli_option("initial-leader-id", None)
 
 # =========================================================
@@ -116,7 +96,6 @@ MARKER_PENDING_COLOR = (230, 174, 48)
 MARKER_COMPLETE_COLOR = (220, 70, 70)
 GATEKEEPER_COLOR = (194, 52, 126)
 KHOP_TREE_LINK_COLOR = (133, 82, 184)
-DHOP_ACTIVE_STREAM_COLOR = (105, 210, 105)
 # High-luminance green makes the stationary Anchor immediately distinct from
 # the navy NORMAL swarm, purple Shepherds, and brown Breadcrumb relays.
 ANCHOR_COLOR = (20, 220, 90)
@@ -337,23 +316,8 @@ class SimulationPhase(Enum):
     DONE = auto()
 
 
-class SpaceRecognitionState(Enum):
-    """Motion-evidence state machine used before a Junction exists."""
-
-    NORMAL_CORRIDOR = auto()
-    SPREAD_ANOMALY = auto()
-    JUNCTION_CANDIDATE = auto()
-    CONTROLLED_SPREAD = auto()
-    COHORT_FORMATION = auto()
-    COHORT_VALIDATION = auto()
-    JUNCTION_CONFIRMED = auto()
-    NOT_A_JUNCTION = auto()
-    COHORT_MERGE = auto()
-
-
 class KHopGroupState(Enum):
     FORMING = auto()
-    WAITING = auto()
     EXPLORING = auto()
     DEAD_END_CONFIRMED = auto()
     RETURNING = auto()
@@ -440,16 +404,6 @@ class MarkerRecord:
     sequence_number: int = 0
     completion_witness_id: Optional[int] = None
     last_broadcast_at: float = 0.0
-    parent_junction_id: Optional[str] = None
-    local_branch_direction: tuple[float, float] = (0.0, 0.0)
-    cohort_robot_ids: tuple[int, ...] = ()
-    estimated_passage_width: float = 0.0
-    required_guard_count: int = 0
-    branch_leader_id: Optional[int] = None
-    rollout_cost: float = float("inf")
-    rollout_rank: int = -1
-    return_direction_local: tuple[float, float] = (0.0, 0.0)
-    marker_epoch: int = 1
 
 
 @dataclass
@@ -467,18 +421,6 @@ class KHopShepherdGroup:
     seed_robot_ids: set[int] = field(default_factory=set)
     tree_parent: dict[int, Optional[int]] = field(default_factory=dict)
     hop_by_robot: dict[int, int] = field(default_factory=dict)
-    cap_slot_by_robot: dict[int, tuple[float, float]] = field(default_factory=dict)
-    cap_mean_error: float = float("inf")
-    cap_formation_dwell: float = 0.0
-    cap_formation_elapsed: float = 0.0
-    cap_anchor: Optional[pygame.Vector2] = None
-    dhop_winner_by_robot: dict[int, list[int]] = field(default_factory=dict)
-    dhop_sender_by_robot: dict[int, list[int]] = field(default_factory=dict)
-    dhop_clusterhead_by_robot: dict[int, int] = field(default_factory=dict)
-    dhop_rule_by_robot: dict[int, int] = field(default_factory=dict)
-    dhop_clusterhead_ids: set[int] = field(default_factory=set)
-    dhop_gateway_ids: set[int] = field(default_factory=set)
-    dhop_parent_by_robot: dict[int, Optional[int]] = field(default_factory=dict)
     marker_id: Optional[str] = None
     dead_end_confirmed: bool = False
     dead_end_dwell: float = 0.0
@@ -504,29 +446,11 @@ class KHopShepherdGroup:
     connectivity_ema: float = 1.0
     heading_stability_ema: float = 0.0
     estimated_width: float = 0.0
-    width_locked: bool = False
     relay_deploy_cooldown: float = 0.0
     merge_partner_id: Optional[str] = None
     merge_dwell: float = 0.0
     merged_into: Optional[str] = None
     created_at: float = 0.0
-    rollout_cost: float = float("inf")
-    rollout_rank: int = -1
-
-
-@dataclass
-class DirectionalCohortEvidence:
-    """Persistent evidence for one motion-created outgoing flow."""
-
-    heading: pygame.Vector2
-    robot_ids: set[int] = field(default_factory=set)
-    dwell: float = 0.0
-    mean_travel: float = 0.0
-    direction_variance: float = 1.0
-    connectivity_ratio: float = 0.0
-    connected_to_base_ratio: float = 0.0
-    lateral_width: float = 0.0
-    valid: bool = False
 
 
 @dataclass
@@ -546,32 +470,18 @@ class KHopCaptureState:
     message_delivery_count: int = 0
     completion_consensus_dwell: float = 0.0
     last_split_group_size: int = 0
-    controlled_spread_elapsed: float = 0.0
+    last_open_clearances: dict[str, float] = field(default_factory=dict)
+    split_pressure_ema: float = 0.0
+    split_connectivity_ema: float = 1.0
+    split_heading_ema: float = 0.0
+    dispersing_elapsed: float = 0.0
+    expected_split_count: int = 0
+    expected_open_headings: list[tuple[float, float]] = field(default_factory=list)
     split_cluster_signature: tuple[int, ...] = ()
     split_cluster_dwell: float = 0.0
-    pending_split_clusters: list[KHopSplitCluster] = field(default_factory=list)
     last_cluster_headings: list[tuple[float, float]] = field(default_factory=list)
     last_cluster_sizes: list[int] = field(default_factory=list)
-    branch_queue: list[str] = field(default_factory=list)
-    active_group_id: Optional[str] = None
-    sequential_visit_order: list[str] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
-    recognition_state: SpaceRecognitionState = (
-        SpaceRecognitionState.NORMAL_CORRIDOR
-    )
-    anomaly_dwell: float = 0.0
-    candidate_elapsed: float = 0.0
-    candidate_cooldown: float = 0.0
-    motion_origin_by_robot: dict[int, pygame.Vector2] = field(
-        default_factory=dict
-    )
-    motion_dwell_by_robot: dict[int, float] = field(default_factory=dict)
-    cohort_evidence: list[DirectionalCohortEvidence] = field(
-        default_factory=list
-    )
-    candidate_observer_ids: set[int] = field(default_factory=set)
-    straggler_wait_elapsed: float = 0.0
-    return_to_base_dwell: float = 0.0
 
 
 @dataclass
@@ -581,26 +491,6 @@ class KHopSplitCluster:
     heading: pygame.Vector2
     robot_ids: set[int]
     angle: float
-    mean_travel: float = 0.0
-    direction_variance: float = 1.0
-    connectivity_ratio: float = 0.0
-    connected_to_base_ratio: float = 0.0
-    lateral_width: float = 0.0
-
-
-@dataclass
-class MaxMinDClusterResult:
-    """Per-node output of the paper's 2d-round Max-Min heuristic."""
-
-    depth: int
-    winner_by_robot: dict[int, list[int]]
-    sender_by_robot: dict[int, list[int]]
-    clusterhead_by_robot: dict[int, int]
-    rule_by_robot: dict[int, int]
-    clusterhead_ids: set[int]
-    gateway_ids: set[int]
-    parent_by_robot: dict[int, Optional[int]]
-    hop_to_clusterhead: dict[int, int]
 
 
 BRANCHES = ("UP", "LEFT", "RIGHT")
@@ -1297,24 +1187,18 @@ COMM_GUARD_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
 COMM_RECOVERY_RANGE = 84.0 * MAP_SCALE
 COMM_RECOVERY_GAIN = 12.0
 COMM_MAX_LOCAL_NEIGHBORS = 16
-SHOW_COMM_LINKS_DEFAULT = False
+SHOW_COMM_LINKS_DEFAULT = True
 SHOW_DENSITY_COLOR_DEFAULT = True
 COMM_UPDATE_INTERVAL_FRAMES = 1
 
 # Localization-free K-hop Capture Shepherd (method B)
-KHOP_CAPTURE_POLICY_VERSION = "NATURAL_SPREAD_MAXMIN_DFS_V6"
-NATURAL_SPREAD_POLICY_VERSION = "MOTION_COHORT_JUNCTION_V1"
+KHOP_CAPTURE_POLICY_VERSION = "LOCAL_KHOP_CAPTURE_V3_NATURAL_SPLIT"
 KHOP_CAPTURE_DEPTH = 4
-DHOP_CLUSTER_DEPTH = KHOP_CAPTURE_DEPTH
 KHOP_CAPTURE_REFRESH_TIME = 0.10
 KHOP_MESSAGE_HOP_LIMIT = KHOP_CAPTURE_DEPTH + 2
 KHOP_MARKER_MESSAGE_HOP_LIMIT = KHOP_CAPTURE_DEPTH * 2
 KHOP_MESSAGE_MAX_AGE = 0.35
-# A cap only needs to fully cover the corridor cross-section once, not
-# several rows deep -- extra rows just mean more robots to capture and
-# position before the barrier is functionally ready, slowing down exactly
-# the window a gate is supposed to be protecting.
-KHOP_CAPTURE_THICKNESS_ROWS = 1
+KHOP_CAPTURE_THICKNESS_ROWS = 3
 KHOP_CAPTURE_COUNT_MARGIN = 1.20
 KHOP_TREE_TARGET_DISTANCE = COMM_SAFE_DISTANCE * 0.58
 KHOP_TREE_SPRING_GAIN = 24.0
@@ -1322,169 +1206,46 @@ KHOP_TREE_DAMPING_GAIN = 6.0
 KHOP_TREE_FORCE_LIMIT = 150.0 * MOTION_SPEED_MULTIPLIER
 KHOP_LEADER_FORCE = 25.0 * MOTION_SPEED_MULTIPLIER
 KHOP_SHEPHERD_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_ROWS = 3
-# Must match khop_cap_line_spacing() (defined later, near
-# khop_required_shepherd_count): the SPH pair-repulsion equilibrium
-# between physical cap bodies has to agree with the slot-attraction
-# target spacing, or the two forces fight each other and the line can
-# never actually pack as tight as its slots ask for.
-KHOP_CAP_EQUILIBRIUM_DISTANCE = ROBOT_RADIUS * 2.30
-KHOP_CAP_POSITION_GAIN = 28.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_VELOCITY_GAIN = 8.0
-KHOP_CAP_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_ANCHOR_GAIN = 45.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_FORM_SPEED = 42.0 * MOTION_SPEED_MULTIPLIER
-KHOP_LEADER_TRACK_SPEED = 10.0 * MOTION_SPEED_MULTIPLIER
-KHOP_LEADER_CENTER_SPEED_GAIN = 0.60
-KHOP_CAP_CENTERING_GAIN = 9.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_CENTERING_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_FORM_TOLERANCE = KHOP_CAP_EQUILIBRIUM_DISTANCE * 1.50
-KHOP_CAP_FORM_DWELL = 0.35
-KHOP_CAP_FORM_MAX_TIME = 4.00
-# The root group (parent_group_id is None) never receives the physical
-# barrier/gatekeeping repulsion (compute_khop_barrier_segment_force only
-# applies to khop_branch_groups(), i.e. groups *with* a parent_group_id) --
-# it only needs to anchor the Leader's position for CONTROLLED_SPREAD's
-# straight-through evidence, never to physically block anything. Giving it
-# the same full-corridor-width barrier-line shape used for branch gates
-# (khop_cap_slot_offsets) sat a ~30-member dense line right across the
-# Junction entrance -- where the natural-spread anomaly actually gets
-# detected, near the boundary, not the Junction's geometric center -- that
-# the trailing swarm had to physically compress against to get past. Root
-# packs into a narrow multi-row column instead, half this wide, leaving
-# both flanks of the corridor open for the rest of the body to keep flowing.
-KHOP_ROOT_CAP_HALF_WIDTH = ROBOT_RADIUS * 2.30 * 1.5
 # Ordinary particles are primarily SPH mass. Leaders and their captured
 # Shepherd tree provide the directional seed; this deliberately small term
 # only prevents an unassigned particle from stalling at a symmetric split.
 KHOP_STREAM_FORCE = 2.5 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_FORCE = 28.0 * MOTION_SPEED_MULTIPLIER
 KHOP_RETURN_DAMPING = 5.0
-# A captured cap member (Leader/Shepherd) is only ever a small fraction of
-# the swarm (~29 robots sized to the corridor width). Everyone else keeps
-# khop_stream_id == None until it is individually captured or a Branch
-# stream is assigned to it, which used to mean zero directed route force
-# for the whole rest of the body -- raw SPH pressure alone diffuses it
-# radially across the open Junction (and partway into every Branch) long
-# before any physical cap has finished forming at a single mouth. This
-# keeps the uncaptured body one coherent stream behind whichever front is
-# currently leading, weak enough that the cap (KHOP_LEADER_FORCE /
-# KHOP_SHEPHERD_FORCE, both well above this) always stays ahead of it.
-# KHOP_STREAM_FORCE itself (2.5x) turned out too faint to meaningfully
-# out-compete raw SPH pressure diffusion once ~700 robots are involved --
-# the body still scattered even once this force pointed the right way.
-KHOP_UNASSIGNED_FOLLOW_FORCE = 10.0 * MOTION_SPEED_MULTIPLIER
-# Once every locally discovered Branch is COMPLETED/BLOCKING there is no more
-# Junction left to guard, so every remaining physical role (Gatekeeper,
-# Marker, stray Leader/Shepherd/Relay) is released back to NORMAL and the
-# whole body is driven home to the fixed Base origin instead of being left
-# wherever forward propulsion happened to stop.
-KHOP_RETURN_TO_BASE_FORCE = 30.0 * MOTION_SPEED_MULTIPLIER
-KHOP_RETURN_TO_BASE_DAMPING = 4.0
-KHOP_RETURN_BASE_READY_RATIO = 0.95
-KHOP_RETURN_BASE_DWELL = 0.50
 KHOP_LOCAL_PROBE_STEP = max(ROBOT_RADIUS * 2.5, 3.0 * MAP_SCALE)
 KHOP_LOCAL_PROBE_DISTANCE = COMM_RANGE * 1.55
-KHOP_NAVIGATION_CLEARANCE = KHOP_LOCAL_PROBE_DISTANCE * 0.88
-# Junction discovery thresholds use only robot motion and the live local mesh.
-# Local wall clearance remains available exclusively for collision safety and
-# dead-end confirmation after a Branch has already been registered.
-NATURAL_SPREAD_LATERAL_ANGLE = math.radians(32.0)
-NATURAL_SPREAD_MIN_SPEED = 2.0 * MOTION_SPEED_MULTIPLIER
-NATURAL_SPREAD_MIN_TRAVEL = max(ROBOT_RADIUS * 3.0, 4.5 * MAP_SCALE)
-# Witness-count anomaly threshold, expressed as a ratio of the locally
-# observable population (khop_reachable_robot_count(leader,
-# NATURAL_SPREAD_LOCAL_HOPS), see natural_spread_anomaly_threshold()) rather
-# than a fixed absolute robot count. An absolute count's meaning silently
-# shifts whenever cap/witness-pool sizes change for unrelated reasons (this
-# is exactly what happened when the root cap grew from 29 to ~38 members in
-# an earlier round: the same raw threshold suddenly meant a much smaller
-# fraction of the locally reachable swarm). The ratio below is calibrated to
-# reproduce the previously tuned absolute threshold (7) at the locally
-# observed population measured at anomaly detection (~483 reachable robots).
-NATURAL_SPREAD_ANOMALY_ROBOT_RATIO = 0.0145
-NATURAL_SPREAD_ANOMALY_ROBOTS_MIN = 3
-NATURAL_SPREAD_ANOMALY_DWELL = 0.22
-NATURAL_SPREAD_LOCAL_HOPS = KHOP_CAPTURE_DEPTH + 2
-NATURAL_SPREAD_CANDIDATE_TIMEOUT = 5.0
-NATURAL_SPREAD_RETRY_COOLDOWN = 1.0
-NATURAL_SPREAD_CANDIDATE_SLOW_SCALE = 0.32
-NATURAL_SPREAD_LIMIT_RADIUS = COMM_SAFE_DISTANCE * 2.05
-NATURAL_SPREAD_LIMIT_GAIN = 18.0 * MOTION_SPEED_MULTIPLIER
-NATURAL_SPREAD_LIMIT_FORCE = 65.0 * MOTION_SPEED_MULTIPLIER
-NATURAL_SPREAD_MIN_COHORTS = 2
-NATURAL_SPREAD_COHORT_MIN_TRAVEL = COMM_SAFE_DISTANCE * 0.48
-NATURAL_SPREAD_COHORT_MIN_DWELL = 0.48
-NATURAL_SPREAD_COHORT_MAX_VARIANCE = 0.13
-NATURAL_SPREAD_COHORT_MIN_CONNECTIVITY = 0.82
-NATURAL_SPREAD_COHORT_MIN_BASE_CONNECTIVITY = 0.72
-NATURAL_SPREAD_COHORT_MIN_WIDTH = ROBOT_RADIUS * 4.0
-NATURAL_SPREAD_COHORT_MAX_ANGLE_STD = math.radians(25.0)
-NATURAL_SPREAD_COHORT_MIN_SEPARATION = math.radians(52.0)
-# Once >= NATURAL_SPREAD_MIN_COHORTS have validated, do not finalize the
-# split immediately if another detected-but-not-yet-valid candidate is
-# still accumulating its own dwell -- a straight-through exit's evidence
-# converges slower (see detect_khop_straight_continuation_cluster) and
-# would otherwise always lose the race to already-mature turning cohorts.
-# Bounded well under NATURAL_SPREAD_CANDIDATE_TIMEOUT so an indefinitely
-# stuck straggler still cannot block confirmation forever.
-NATURAL_SPREAD_STRAGGLER_GRACE_TIME = 1.5
-# KHOP_SPLIT_MIN_GROUP_SIZE is a physical/geometric floor -- the fewest
-# robots that can plausibly hold a barrier line/gate or a connected capture
-# tree, driven by corridor width (see khop_required_shepherd_count), not by
-# how large the swarm's locally observable population happens to be. It is
-# intentionally left as an absolute constant and used only for those
-# physical-viability checks (cap formation completeness, connected-tree
-# re-election, retry candidate pool, dead-end member-count failure).
+KHOP_OPEN_CLEARANCE = COMM_SAFE_DISTANCE * 1.10
 KHOP_SPLIT_MIN_GROUP_SIZE = 18
+KHOP_SPLIT_HEADING_DEGREES = 60.0
+KHOP_SPLIT_DWELL_TIME = 0.35
+KHOP_SPLIT_FILTER_TIME = 0.28
+KHOP_SPLIT_MIN_HEADING_STABILITY = 0.58
+KHOP_SPLIT_MAX_CONNECTIVITY_DROP = 0.38
+KHOP_DISPERSING_MIN_TIME = 0.45
+KHOP_DISPERSING_MAX_WAIT = 5.00
+KHOP_SPLIT_CLUSTER_DWELL = 0.40
+KHOP_SPLIT_CLUSTER_ANGLE_DEGREES = 34.0
 KHOP_SPLIT_CLUSTER_MATCH_DEGREES = 18.0
-KHOP_SPLIT_CLUSTER_MIN_RADIUS = COMM_SAFE_DISTANCE * 0.62
-KHOP_SPLIT_CLUSTER_MAX_RADIUS = NATURAL_SPREAD_LIMIT_RADIUS * 1.05
+KHOP_SPLIT_CLUSTER_MIN_RADIUS = COMM_SAFE_DISTANCE * 1.10
+KHOP_SPLIT_CLUSTER_MAX_RADIUS = KHOP_LOCAL_PROBE_DISTANCE * 1.80
 KHOP_SPLIT_CLUSTER_BACKWARD_COSINE = -0.30
-# Cluster/cohort-size validity floor (detect_khop_directional_clusters,
-# detect_khop_straight_continuation_cluster, validate_directional_cohorts,
-# split_khop_from_clusters), unlike KHOP_SPLIT_MIN_GROUP_SIZE above, IS a
-# detection-evidence threshold -- "is this cluster big enough to trust as
-# real cohort evidence" -- so it is normalized as a ratio of the locally
-# observable population (khop_state.last_split_group_size, frozen at the
-# moment CONTROLLED_SPREAD began) via khop_split_cluster_min_size() instead
-# of the fixed absolute count it used to share with KHOP_SPLIT_MIN_GROUP_SIZE.
-# Calibrated to reproduce the previously tuned absolute threshold (18) at
-# the locally observed population measured at anomaly detection (~483).
-KHOP_SPLIT_CLUSTER_MIN_RATIO = 0.0373
-KHOP_SPLIT_CLUSTER_MIN_SIZE_FLOOR = 6
+KHOP_SPLIT_CLUSTER_MIN_SIZE = KHOP_SPLIT_MIN_GROUP_SIZE
+KHOP_DISPERSING_FORCE = 7.0 * MOTION_SPEED_MULTIPLIER
 KHOP_STREAM_LATERAL_BAND = COMM_SAFE_DISTANCE * 0.45
 KHOP_LEADER_REELECT_DISTANCE = COMM_SAFE_DISTANCE * 0.32
 KHOP_LEADER_REELECT_DWELL = 0.35
 KHOP_FRONT_NEIGHBOR_CONE_DEGREES = 55.0
 KHOP_DEAD_END_CLEARANCE = max(ROBOT_RADIUS * 3.0, 6.0 * MAP_SCALE)
-# These three must actually mean "a real queue has backed up behind the
-# cap," not just "the Leader is touching a wall": with the old thresholds
-# (density 0.25 / pressure 0.006 / contact 0.075) ordinary ambient density
-# right after the front merely arrives already clears all three, so
-# Pressure Push effectively started on a clearance+dwell timer regardless
-# of how much was actually queued up. Raised to require density/pressure/
-# contact compression that only build up once robots are genuinely packed
-# in behind the cap.
-KHOP_DEAD_END_DENSITY_RATIO = 0.70
+KHOP_DEAD_END_DENSITY_RATIO = 0.42
 KHOP_DEAD_END_MAX_SPEED = 7.0
-KHOP_DEAD_END_MIN_PRESSURE_RATIO = 0.05
-KHOP_DEAD_END_MIN_CONTACT_COMPRESSION = 0.28
+KHOP_DEAD_END_MIN_PRESSURE_RATIO = 0.006
+KHOP_DEAD_END_MIN_CONTACT_COMPRESSION = 0.075
 KHOP_DEAD_END_DWELL_TIME = 0.80
 KHOP_GROUP_FAILURE_DWELL_TIME = 0.80
 KHOP_RETRY_DELAY = 0.50
 KHOP_MAX_RETRIES = 2
 KHOP_MARKER_RETURN_RADIUS = COMM_SAFE_DISTANCE * 0.85
-# Keep the Pebble on the Junction side of a staged cap; the cap Leader waits
-# farther outward at KHOP_BRANCH_STAGING_OFFSET. Both must clear the open
-# Junction cross-section itself, not just sit a short step from the split
-# point -- a small offset leaves the Marker/cap still inside the wide open
-# area shared by every Branch, where nothing narrows the passage and the
-# cap cannot act as a chokepoint. Sized generously past this map's
-# Junction opening so the Marker/cap land inside the confined Branch
-# corridor proper.
-KHOP_MARKER_OFFSET = COMM_SAFE_DISTANCE * 2.20
-KHOP_BRANCH_STAGING_OFFSET = COMM_SAFE_DISTANCE * 3.40
+KHOP_MARKER_OFFSET = COMM_SAFE_DISTANCE * 1.30
 KHOP_GATEKEEPER_ROWS = 2
 KHOP_GATEKEEPER_ROW_GAP = max(ROBOT_RADIUS * 2.4, 3.5 * MAP_SCALE)
 KHOP_GATEKEEPER_FORCE_RADIUS = COMM_SAFE_DISTANCE * 0.70
@@ -2543,15 +2304,7 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         writer.writerow(["shepherd_distance", f"{shepherd_distance:.6f}"])
         writer.writerow(["anchor_distance", f"{anchor_distance:.6f}"])
         writer.writerow(["khop_policy", KHOP_CAPTURE_POLICY_VERSION])
-        writer.writerow(["junction_discovery_policy", NATURAL_SPREAD_POLICY_VERSION])
-        writer.writerow(["space_recognition_state", khop_state.recognition_state.name])
-        writer.writerow(["forward_open_angle_pre_detection", "DISABLED"])
         writer.writerow(["khop_capture_depth", KHOP_CAPTURE_DEPTH])
-        writer.writerow(["dhop_cluster_depth", DHOP_CLUSTER_DEPTH])
-        writer.writerow([
-            "dhop_sequential_visit_order",
-            " > ".join(khop_state.sequential_visit_order),
-        ])
         writer.writerow(["khop_stage", khop_state.stage])
         writer.writerow(["khop_consensus_sequence", khop_state.consensus_sequence])
         writer.writerow(["khop_message_deliveries", khop_state.message_delivery_count])
@@ -2562,11 +2315,6 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         writer.writerow(["khop_leader_distance", f"{khop_leader_distance:.6f}"])
         writer.writerow(["khop_shepherd_distance", f"{khop_shepherd_distance:.6f}"])
         writer.writerow(["khop_event_count", len(khop_state.events)])
-        for group in sorted(khop_branch_groups(), key=lambda item: item.rollout_rank):
-            writer.writerow([
-                f"cohort_rollout_{group.group_id}",
-                f"rank={group.rollout_rank}; cost={group.rollout_cost:.6f}",
-            ])
         for index, event in enumerate(khop_state.events, start=1):
             writer.writerow([
                 f"khop_event_{index}",
@@ -2671,11 +2419,6 @@ class Robot:
         self.khop_velocity_ema = pygame.Vector2()
         self.khop_neighbor_count_ema = 0.0
         self.khop_last_marker_id: Optional[str] = None
-        self.dhop_clusterhead_id: Optional[int] = None
-        self.dhop_parent_id: Optional[int] = None
-        self.dhop_gateway = False
-        self.dhop_selection_rule = 0
-        self.dhop_staging_group_id: Optional[str] = None
 
         self.shepherd_anchor: Optional[pygame.Vector2] = None
         self.shepherd_origin: Optional[pygame.Vector2] = None
@@ -2750,133 +2493,6 @@ class Robot:
 
     def update(self, dt: float):
         old_position = self.position.copy()
-
-        if (
-            KHOP_CAPTURE_ENABLED
-            and self.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}
-        ):
-            group = khop_state.groups.get(self.khop_group_id or "")
-            if (
-                group is not None
-                and self.role == "KHOP_LEADER"
-                and group.state == KHopGroupState.EXPLORING
-            ):
-                forward = group.heading.normalize()
-                side = pygame.Vector2(-forward.y, forward.x)
-                side_probe = COMM_RANGE * 1.25
-                left_clearance = khop_local_clearance(
-                    self.position,
-                    -side,
-                    side_probe,
-                )
-                right_clearance = khop_local_clearance(
-                    self.position,
-                    side,
-                    side_probe,
-                )
-                sensed_width = khop_estimate_corridor_width(group)
-                enclosed_cross_section = (
-                    left_clearance + right_clearance
-                    < sensed_width * 0.90
-                )
-                lateral_speed = (
-                    clamp(
-                        (right_clearance - left_clearance)
-                        * KHOP_LEADER_CENTER_SPEED_GAIN,
-                        -KHOP_LEADER_TRACK_SPEED * 0.80,
-                        KHOP_LEADER_TRACK_SPEED * 0.80,
-                    )
-                    if enclosed_cross_section
-                    else 0.0
-                )
-                forward_clearance = khop_local_clearance(
-                    self.position,
-                    forward,
-                    KHOP_LOCAL_PROBE_DISTANCE,
-                )
-                forward_speed = (
-                    0.0
-                    if forward_clearance <= KHOP_DEAD_END_CLEARANCE * 1.15
-                    else KHOP_LEADER_TRACK_SPEED
-                )
-                if (
-                    khop_state.stage == "CONTROLLED_SPREAD"
-                    and group.group_id == khop_state.root_group_id
-                ):
-                    # Stage 3 of the sketch: the original cap stays at the
-                    # Junction while ordinary mass spreads and the new local
-                    # components elect their own Leaders.
-                    forward_speed = 0.0
-                desired_velocity = (
-                    forward * forward_speed
-                    + side * lateral_speed
-                )
-                x_position = pygame.Vector2(
-                    self.position.x + desired_velocity.x * dt,
-                    self.position.y,
-                )
-                if is_walkable(x_position, self.radius):
-                    self.position.x = x_position.x
-                y_position = pygame.Vector2(
-                    self.position.x,
-                    self.position.y + desired_velocity.y * dt,
-                )
-                if is_walkable(y_position, self.radius):
-                    self.position.y = y_position.y
-                self.velocity = (self.position - old_position) / max(dt, EPSILON)
-                self.acceleration.update(0.0, 0.0)
-                self.filtered_acceleration.update(0.0, 0.0)
-                self.previous_position = old_position
-                self._record_motion()
-                return
-            cap_tracking_state = (
-                group is not None
-                and (
-                    group.state in {
-                        KHopGroupState.FORMING,
-                        KHopGroupState.WAITING,
-                    }
-                    or self.role == "KHOP_SHEPHERD"
-                    and group.state in {
-                        KHopGroupState.EXPLORING,
-                        KHopGroupState.DEAD_END_CONFIRMED,
-                        KHopGroupState.RETURNING,
-                        KHopGroupState.MERGING,
-                    }
-                )
-            )
-            if cap_tracking_state:
-                if self.role == "KHOP_LEADER":
-                    target = group.cap_anchor
-                else:
-                    slot = group.cap_slot_by_robot.get(self.robot_id)
-                    target = (
-                        khop_cap_world_target(group, slot)
-                        if slot is not None
-                        else None
-                    )
-                if target is not None:
-                    error = target - self.position
-                    step = KHOP_CAP_FORM_SPEED * dt
-                    next_position = (
-                        target.copy()
-                        if error.length() <= step
-                        else self.position + error.normalize() * step
-                    ) if error.length_squared() > EPSILON else self.position.copy()
-                    if is_walkable(next_position, self.radius):
-                        self.position = next_position
-                if group.state in {
-                    KHopGroupState.FORMING,
-                    KHopGroupState.WAITING,
-                } or dt <= EPSILON:
-                    self.velocity.update(0.0, 0.0)
-                else:
-                    self.velocity = (self.position - old_position) / dt
-                self.acceleration.update(0.0, 0.0)
-                self.filtered_acceleration.update(0.0, 0.0)
-                self.previous_position = old_position
-                self._record_motion()
-                return
 
         if (
             KHOP_CAPTURE_ENABLED
@@ -3093,12 +2709,6 @@ class Robot:
             color = SHEPHERD_COLOR
         elif self.comm_bridge_target is not None:
             color = COMM_BRIDGE_COLOR
-        elif (
-            KHOP_CAPTURE_ENABLED
-            and self.role == "NORMAL"
-            and self.khop_stream_id == khop_state.active_group_id
-        ):
-            color = DHOP_ACTIVE_STREAM_COLOR
         elif show_density_color:
             color = density_to_color(self.density, color_reference_density)
         else:
@@ -4058,31 +3668,15 @@ def khop_marker_packet(
 def khop_estimate_corridor_width(
     group: Optional[KHopShepherdGroup],
 ) -> float:
-    """Estimate width from two robot-local wall rays, then lock it.
-
-    Previously blended toward each new measurement at a slow 20%-per-refresh
-    rate, which both took many refresh cycles to approach even its own
-    (already conservative) asymptote and kept quietly drifting for as long
-    as a group stayed FORMING/EXPLORING -- a physical Shepherd line that
-    keeps resizing itself doesn't read as one fixed barrier. Once the first
-    two-sided wall reading comes back valid, take it directly (no blending)
-    and lock the group's width for the rest of its lifetime: the cap forms
-    to its real measured span immediately instead of over dozens of cycles,
-    and never dynamically changes afterward.
-    """
+    """Estimate width from two robot-local wall rays, retaining the last value."""
     fallback = COMM_SAFE_DISTANCE * 1.85
     if group is None:
         return fallback
-    if group.width_locked:
-        return group.estimated_width or fallback
     leader = khop_state.robot_by_id.get(group.leader_id)
     if leader is None or group.heading.length_squared() <= EPSILON:
         return group.estimated_width or fallback
     side = pygame.Vector2(-group.heading.y, group.heading.x).normalize()
-    # The old ray was shorter than half of this experiment's corridor, so a
-    # centered Leader never saw either wall and always used the narrow
-    # fallback.  A cap must measure both walls before choosing its row width.
-    maximum = COMM_RANGE * 1.45
+    maximum = COMM_SAFE_DISTANCE * 1.35
     left = khop_local_clearance(leader.position, -side, maximum)
     right = khop_local_clearance(leader.position, side, maximum)
     if left < maximum - KHOP_LOCAL_PROBE_STEP and right < maximum - KHOP_LOCAL_PROBE_STEP:
@@ -4092,36 +3686,26 @@ def khop_estimate_corridor_width(
             ROBOT_RADIUS * 6.0,
             COMM_RANGE * 2.0,
         )
-        group.estimated_width = measured
-        group.width_locked = True
+        previous = group.estimated_width or fallback
+        # A Leader brushing a wall or sitting at a closed end sees one nearly
+        # zero side ray. That must not collapse a previously measured corridor
+        # width and under-recruit the physical gate.
+        if measured >= previous * 0.72:
+            group.estimated_width = previous * 0.80 + measured * 0.20
     return group.estimated_width or fallback
-
-
-def khop_cap_line_spacing() -> float:
-    """Canonical slot-to-slot spacing for a single-row cap/gate line.
-
-    Shared by khop_required_shepherd_count (how many robots a full-width
-    line needs) and khop_cap_slot_offsets (where those slots actually sit),
-    so the recruited headcount always matches what one tightly packed row
-    can hold -- a mismatch here is what silently reintroduces extra rows
-    even when KHOP_CAPTURE_THICKNESS_ROWS == 1.
-
-    Deliberately near the physical minimum (just enough for two robot
-    bodies to sit side by side without overlapping), not the much wider
-    NORMAL_EQUILIBRIUM_SCALE spacing the general fluid body flows at --
-    a gate line needs to be dense enough that nothing can fit through a
-    gap between adjacent members, not comfortably spaced.
-    """
-    return ROBOT_RADIUS * 2.30
 
 
 def khop_required_shepherd_count(
     group: Optional[KHopShepherdGroup] = None,
 ) -> int:
-    """Estimate a capture group sized to one tightly packed cap/gate line."""
+    """Estimate a thick capture group from locally sensed width and spacing."""
+    equilibrium_distance = max(
+        ROBOT_RADIUS * 2.2,
+        SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE,
+    )
     robots_across = math.ceil(
         khop_estimate_corridor_width(group)
-        / max(khop_cap_line_spacing(), EPSILON)
+        / max(equilibrium_distance * 0.82, EPSILON)
     ) + 1
     return max(
         KHOP_SPLIT_MIN_GROUP_SIZE,
@@ -4130,164 +3714,6 @@ def khop_required_shepherd_count(
             * KHOP_CAPTURE_THICKNESS_ROWS
             * KHOP_CAPTURE_COUNT_MARGIN
         ),
-    )
-
-
-def khop_cap_slot_offsets(
-    group: KHopShepherdGroup,
-    shepherd_count: int,
-) -> list[tuple[float, float]]:
-    """Build straight, corridor-width barrier rows in Leader-local
-    (side, forward) axes.
-
-    A tapered/crescent cap leaves both edges of the corridor uncovered near
-    the walls, so the main body slips around it instead of being blocked --
-    not something a real physical robot line could pass off as a gate. Every
-    row here spans the full sensed corridor width evenly (spreading fewer
-    robots wider rather than clustering them at the center) and rows stack
-    directly behind one another at a fixed depth step, matching a straight
-    Shepherd fence a real robot line could actually form.
-    """
-    if shepherd_count <= 0:
-        return []
-    spacing = khop_cap_line_spacing()
-    half_width = (
-        KHOP_ROOT_CAP_HALF_WIDTH
-        if group.parent_group_id is None
-        else max(
-            spacing * 0.5,
-            (khop_estimate_corridor_width(group) - ROBOT_RADIUS * 4.0) * 0.5,
-        )
-    )
-    per_row = max(2, math.floor(2.0 * half_width / spacing) + 1)
-    rows = max(1, math.ceil(shepherd_count / per_row))
-    slots: list[tuple[float, float]] = []
-    remaining = shepherd_count
-    for row_index in range(rows):
-        count = min(per_row, remaining)
-        if count <= 0:
-            break
-        remaining -= count
-        lateral_values = (
-            [0.0]
-            if count == 1
-            else [
-                -half_width + 2.0 * half_width * index / (count - 1)
-                for index in range(count)
-            ]
-        )
-        # Rows stack straight behind the front one; none of them taper
-        # inward, so the barrier's lateral reach never shrinks with depth.
-        depth = spacing * (0.72 + row_index * 0.85)
-        for lateral in lateral_values:
-            slots.append((lateral, -depth))
-    return slots
-
-
-def khop_cap_world_target(
-    group: KHopShepherdGroup,
-    slot: tuple[float, float],
-) -> Optional[pygame.Vector2]:
-    leader = khop_state.robot_by_id.get(group.leader_id)
-    if leader is None or group.heading.length_squared() <= EPSILON:
-        return None
-    forward = group.heading.normalize()
-    side = pygame.Vector2(-forward.y, forward.x)
-    lateral, axial = slot
-    # A Leader can be off-center while turning into a branch. Contract only
-    # the lateral coordinate until the local collision mask confirms that the
-    # requested physical slot lies inside the corridor.
-    for lateral_scale in (1.0, 0.86, 0.72, 0.58, 0.44, 0.30, 0.0):
-        target = (
-            leader.position
-            + side * lateral * lateral_scale
-            + forward * axial
-        )
-        if is_mask_clear_at(target, ROBOT_RADIUS * 1.35):
-            return target
-    return leader.position + forward * axial
-
-
-def assign_khop_cap_slots(group: KHopShepherdGroup) -> None:
-    """Keep Shepherd IDs on stable geometric slots around the live Leader."""
-    member_ids = sorted(group.member_robot_ids - {group.leader_id})
-    slots = khop_cap_slot_offsets(group, len(member_ids))
-    old_slots = group.cap_slot_by_robot
-    assigned: dict[int, tuple[float, float]] = {}
-    remaining_slots = list(slots)
-    slot_reuse_limit = max(
-        ROBOT_RADIUS * 3.0,
-        KHOP_CAP_EQUILIBRIUM_DISTANCE * 0.65,
-    )
-    for robot_id in member_ids:
-        old_slot = old_slots.get(robot_id)
-        if old_slot is None or not remaining_slots:
-            continue
-        nearest = min(
-            remaining_slots,
-            key=lambda slot: math.dist(slot, old_slot),
-        )
-        if math.dist(nearest, old_slot) <= slot_reuse_limit:
-            assigned[robot_id] = nearest
-            remaining_slots.remove(nearest)
-
-    remaining_ids = [robot_id for robot_id in member_ids if robot_id not in assigned]
-    while remaining_ids and remaining_slots:
-        best_robot_id, best_slot = min(
-            (
-                (robot_id, slot)
-                for robot_id in remaining_ids
-                for slot in remaining_slots
-            ),
-            key=lambda pair: (
-                khop_state.robot_by_id[pair[0]].position.distance_squared_to(
-                    khop_cap_world_target(group, pair[1])
-                    or khop_state.robot_by_id[pair[0]].position
-                ),
-                pair[0],
-                pair[1],
-            ),
-        )
-        assigned[best_robot_id] = best_slot
-        remaining_ids.remove(best_robot_id)
-        remaining_slots.remove(best_slot)
-    group.cap_slot_by_robot = assigned
-
-
-def update_khop_cap_formation(
-    group: KHopShepherdGroup,
-    dt: float,
-) -> bool:
-    """Return True only after the physical cap is packed and connected."""
-    group.cap_formation_elapsed += dt
-    errors = []
-    for robot_id, slot in group.cap_slot_by_robot.items():
-        robot = khop_state.robot_by_id.get(robot_id)
-        target = khop_cap_world_target(group, slot)
-        if robot is not None and target is not None:
-            errors.append(robot.position.distance_to(target))
-    group.cap_mean_error = (
-        sum(errors) / len(errors)
-        if errors
-        else float("inf")
-    )
-    connected_enough = (
-        len(group.member_robot_ids)
-        >= min(KHOP_SPLIT_MIN_GROUP_SIZE, khop_required_shepherd_count(group))
-    )
-    packed = connected_enough and group.cap_mean_error <= KHOP_CAP_FORM_TOLERANCE
-    group.cap_formation_dwell = (
-        group.cap_formation_dwell + dt
-        if packed
-        else max(0.0, group.cap_formation_dwell - dt * 0.5)
-    )
-    return (
-        group.cap_formation_dwell >= KHOP_CAP_FORM_DWELL
-        or (
-            connected_enough
-            and group.cap_formation_elapsed >= KHOP_CAP_FORM_MAX_TIME
-            and group.cap_mean_error <= KHOP_CAP_FORM_TOLERANCE * 1.8
-        )
     )
 
 
@@ -4332,6 +3758,26 @@ def khop_local_clearance(
     return maximum_distance
 
 
+def khop_open_heading_probes(
+    leader: "Robot",
+    forward: pygame.Vector2,
+) -> dict[str, tuple[pygame.Vector2, float]]:
+    direction = (
+        forward.normalize()
+        if forward.length_squared() > EPSILON
+        else pygame.Vector2(0.0, -1.0)
+    )
+    headings = {
+        "FORWARD": direction,
+        "LEFT_TURN": pygame.Vector2(direction.y, -direction.x),
+        "RIGHT_TURN": pygame.Vector2(-direction.y, direction.x),
+    }
+    return {
+        name: (heading, khop_local_clearance(leader.position, heading))
+        for name, heading in headings.items()
+    }
+
+
 def khop_marker_state_for_robot(robot_id: int) -> MarkerState:
     for marker in khop_state.markers.values():
         if marker.robot_id == robot_id:
@@ -4342,7 +3788,7 @@ def khop_marker_state_for_robot(robot_id: int) -> MarkerState:
 def initialize_khop_capture(robots: list["Robot"]) -> None:
     """Manually seed the initial front Leader, as agreed for experiment one."""
     global khop_state
-    khop_state = KHopCaptureState(stage="FORMING_ROOT")
+    khop_state = KHopCaptureState(stage="ADVANCING")
     khop_state.robot_by_id = {robot.robot_id: robot for robot in robots}
     if not robots:
         return
@@ -4360,11 +3806,6 @@ def initialize_khop_capture(robots: list["Robot"]) -> None:
         robot.khop_velocity_ema.update(0.0, 0.0)
         robot.khop_neighbor_count_ema = 0.0
         robot.khop_last_marker_id = None
-        robot.dhop_clusterhead_id = None
-        robot.dhop_parent_id = None
-        robot.dhop_gateway = False
-        robot.dhop_selection_rule = 0
-        robot.dhop_staging_group_id = None
         if robot.role in {
             "KHOP_LEADER",
             "KHOP_SHEPHERD",
@@ -4402,12 +3843,12 @@ def initialize_khop_capture(robots: list["Robot"]) -> None:
         origin=leader.position.copy(),
         display_branch="UP",
         state=KHopGroupState.FORMING,
-        cap_anchor=leader.position.copy(),
         created_at=simulation_time,
     )
     khop_state.root_group_id = root.group_id
     khop_state.groups[root.group_id] = root
     rebuild_khop_capture_tree(root, robots)
+    root.state = KHopGroupState.EXPLORING
     khop_state.events.append({
         "time": simulation_time,
         "event": "INITIAL_LEADER",
@@ -4472,38 +3913,6 @@ def khop_reachable_robot_count(leader: "Robot", maximum_hop: int) -> int:
     return len(khop_reachable_robots(leader, maximum_hop))
 
 
-def natural_spread_anomaly_threshold() -> int:
-    """Witness count needed to flag a natural-spread anomaly.
-
-    Normalized as a ratio of khop_state.last_split_group_size (the locally
-    observable population at NATURAL_SPREAD_LOCAL_HOPS, set immediately
-    before this is consulted) instead of a fixed absolute robot count --
-    see NATURAL_SPREAD_ANOMALY_ROBOT_RATIO for why.
-    """
-    return max(
-        NATURAL_SPREAD_ANOMALY_ROBOTS_MIN,
-        round(
-            NATURAL_SPREAD_ANOMALY_ROBOT_RATIO * khop_state.last_split_group_size
-        ),
-    )
-
-
-def khop_split_cluster_min_size() -> int:
-    """Minimum robot count for a candidate cluster/cohort to be trusted.
-
-    Normalized as a ratio of khop_state.last_split_group_size (frozen at the
-    moment CONTROLLED_SPREAD began) instead of the fixed absolute count this
-    used to share with KHOP_SPLIT_MIN_GROUP_SIZE -- see
-    KHOP_SPLIT_CLUSTER_MIN_RATIO for why.
-    """
-    return max(
-        KHOP_SPLIT_CLUSTER_MIN_SIZE_FLOOR,
-        round(
-            KHOP_SPLIT_CLUSTER_MIN_RATIO * khop_state.last_split_group_size
-        ),
-    )
-
-
 def rebuild_khop_capture_tree(
     group: KHopShepherdGroup,
     robots: list["Robot"],
@@ -4515,11 +3924,6 @@ def rebuild_khop_capture_tree(
         return
 
     target_count = khop_required_shepherd_count(group)
-    cap_targets = [
-        target
-        for slot in khop_cap_slot_offsets(group, max(0, target_count - 1))
-        if (target := khop_cap_world_target(group, slot)) is not None
-    ]
     queue: deque[tuple["Robot", int]] = deque([(leader, 0)])
     selected: list["Robot"] = []
     parent: dict[int, Optional[int]] = {leader.robot_id: None}
@@ -4540,13 +3944,6 @@ def rebuild_khop_capture_tree(
                 and khop_capture_eligible(neighbor, group.group_id)
             ),
             key=lambda neighbor: (
-                min(
-                    (
-                        neighbor.position.distance_squared_to(target)
-                        for target in cap_targets
-                    ),
-                    default=0.0,
-                ),
                 current.position.distance_squared_to(neighbor.position),
                 -(
                     neighbor.position - group.origin
@@ -4590,7 +3987,6 @@ def rebuild_khop_capture_tree(
             if captured.robot_id == group.leader_id
             else "KHOP_SHEPHERD"
         )
-    assign_khop_cap_slots(group)
 
 
 def khop_has_forward_neighbor(
@@ -4802,7 +4198,7 @@ def update_khop_group_statistics(
         group.forward_clearance = khop_local_clearance(
             leader.position,
             group.heading,
-            KHOP_NAVIGATION_CLEARANCE,
+            KHOP_OPEN_CLEARANCE,
         )
 
 
@@ -4811,17 +4207,11 @@ def update_khop_front_leader(
     robots: list["Robot"],
     dt: float,
 ) -> None:
-    # Branch Leaders are elected by the paper's Max-Min 2d-round heuristic.
-    # Do not silently replace them with the former geometric front heuristic.
-    if group.dhop_clusterhead_ids:
-        group.leader_candidate_id = None
-        group.leader_candidate_dwell = 0.0
-        return
     if group.state != KHopGroupState.EXPLORING:
         group.leader_candidate_id = None
         group.leader_candidate_dwell = 0.0
         return
-    if group.forward_clearance <= KHOP_NAVIGATION_CLEARANCE * 0.35:
+    if group.forward_clearance <= KHOP_OPEN_CLEARANCE * 0.35:
         group.leader_candidate_id = None
         group.leader_candidate_dwell = 0.0
         return
@@ -4970,7 +4360,6 @@ def merge_khop_groups(
     duplicate.member_robot_ids.clear()
     duplicate.tree_parent.clear()
     duplicate.hop_by_robot.clear()
-    duplicate.cap_slot_by_robot.clear()
     survivor.merge_partner_id = None
     survivor.merge_dwell = 0.0
     rebuild_khop_capture_tree(survivor, robots)
@@ -5079,624 +4468,177 @@ def khop_largest_connected_component(robot_ids: set[int]) -> set[int]:
     return largest
 
 
-def dhop_shortest_path(
-    start_id: int,
-    target_id: int,
-    neighbors_by_robot: dict[int, list[int]],
-) -> list[int]:
-    """Return one deterministic local path used by the convergecast phase."""
-    if start_id == target_id:
-        return [start_id]
-    queue = deque([start_id])
-    previous: dict[int, Optional[int]] = {start_id: None}
-    while queue:
-        current = queue.popleft()
-        for neighbor_id in neighbors_by_robot.get(current, []):
-            if neighbor_id in previous:
-                continue
-            previous[neighbor_id] = current
-            if neighbor_id == target_id:
-                queue.clear()
-                break
-            queue.append(neighbor_id)
-    if target_id not in previous:
-        return []
-    path = [target_id]
-    while path[-1] != start_id:
-        parent_id = previous[path[-1]]
-        if parent_id is None:
-            return []
-        path.append(parent_id)
-    path.reverse()
-    return path
-
-
-def run_maxmin_d_cluster(
-    robot_ids: set[int],
-    depth: int = DHOP_CLUSTER_DEPTH,
-) -> MaxMinDClusterResult:
-    """Run Amis et al.'s synchronous Floodmax/Floodmin d-clustering.
-
-    Every node starts with its own unique robot ID, logs one WINNER and SENDER
-    per round, performs d Floodmax rounds followed by d Floodmin rounds, then
-    applies Rules 1-3. Gateway detection and Rule 4 are resolved during the
-    convergecast construction.
-    """
-    active_ids = {
-        robot_id
-        for robot_id in robot_ids
-        if robot_id in khop_state.robot_by_id
-    }
-    neighbors_by_robot = {
-        robot_id: sorted({
-            neighbor_id
-            for neighbor in khop_state.robot_by_id[robot_id].comm_neighbors
-            if (neighbor_id := getattr(neighbor, "robot_id", -1)) in active_ids
-        })
-        for robot_id in active_ids
-    }
-    winner_by_robot = {robot_id: [] for robot_id in active_ids}
-    sender_by_robot = {robot_id: [] for robot_id in active_ids}
-    current_winner = {robot_id: robot_id for robot_id in active_ids}
-
-    def flood_round(select_maximum: bool) -> None:
-        nonlocal current_winner
-        next_winner: dict[int, int] = {}
-        for robot_id in sorted(active_ids):
-            sources = [robot_id, *neighbors_by_robot[robot_id]]
-            values = [current_winner[source_id] for source_id in sources]
-            selected_value = (
-                max(values) if select_maximum else min(values)
-            )
-            selected_sender = min(
-                source_id
-                for source_id in sources
-                if current_winner[source_id] == selected_value
-            )
-            next_winner[robot_id] = selected_value
-            winner_by_robot[robot_id].append(selected_value)
-            sender_by_robot[robot_id].append(selected_sender)
-        current_winner = next_winner
-
-    for _ in range(max(1, depth)):
-        flood_round(select_maximum=True)
-    for _ in range(max(1, depth)):
-        flood_round(select_maximum=False)
-
-    clusterhead_by_robot: dict[int, int] = {}
-    rule_by_robot: dict[int, int] = {}
-    for robot_id in sorted(active_ids):
-        max_winners = winner_by_robot[robot_id][:depth]
-        min_winners = winner_by_robot[robot_id][depth:]
-        # Rule 1: seeing one's own original ID in Floodmin proves that some
-        # other node elected it, so it declares itself a clusterhead.
-        if robot_id in min_winners:
-            selected_head = robot_id
-            selected_rule = 1
-        else:
-            # Rule 2: a node pair appears at least once in both d-round halves;
-            # choose the minimum such ID for fairness/load distribution.
-            node_pairs = set(max_winners) & set(min_winners)
-            if node_pairs:
-                selected_head = min(node_pairs)
-                selected_rule = 2
-            else:
-                # Rule 3: no pair exists, so choose the largest Floodmax ID,
-                # the only candidate guaranteed by the paper to survive.
-                selected_head = max(max_winners, default=robot_id)
-                selected_rule = 3
-        clusterhead_by_robot[robot_id] = selected_head
-        rule_by_robot[robot_id] = selected_rule
-
-    clusterhead_ids = set(clusterhead_by_robot.values())
-    # Paper Rule 4: if convergecast encounters a nearer clusterhead on the
-    # selected path, that first clusterhead adopts the node as its child.
-    for robot_id in sorted(active_ids):
-        selected_head = clusterhead_by_robot[robot_id]
-        path = dhop_shortest_path(
-            robot_id,
-            selected_head,
-            neighbors_by_robot,
-        )
-        nearer_heads = [
-            node_id
-            for node_id in path[1:-1]
-            if node_id in clusterhead_ids
-        ]
-        if nearer_heads:
-            clusterhead_by_robot[robot_id] = nearer_heads[0]
-            rule_by_robot[robot_id] = 4
-
-    clusterhead_ids = set(clusterhead_by_robot.values())
-    gateway_ids = {
-        robot_id
-        for robot_id in active_ids
-        if any(
-            clusterhead_by_robot.get(neighbor_id)
-            != clusterhead_by_robot[robot_id]
-            for neighbor_id in neighbors_by_robot[robot_id]
-        )
-    }
-    parent_by_robot: dict[int, Optional[int]] = {}
-    hop_to_clusterhead: dict[int, int] = {}
-    for robot_id in sorted(active_ids):
-        selected_head = clusterhead_by_robot[robot_id]
-        path = dhop_shortest_path(
-            robot_id,
-            selected_head,
-            neighbors_by_robot,
-        )
-        if not path:
-            clusterhead_by_robot[robot_id] = robot_id
-            clusterhead_ids.add(robot_id)
-            parent_by_robot[robot_id] = None
-            hop_to_clusterhead[robot_id] = 0
-            rule_by_robot[robot_id] = 1
-            continue
-        parent_by_robot[robot_id] = path[1] if len(path) > 1 else None
-        hop_to_clusterhead[robot_id] = len(path) - 1
-
-    return MaxMinDClusterResult(
-        depth=depth,
-        winner_by_robot=winner_by_robot,
-        sender_by_robot=sender_by_robot,
-        clusterhead_by_robot=clusterhead_by_robot,
-        rule_by_robot=rule_by_robot,
-        clusterhead_ids=clusterhead_ids,
-        gateway_ids=gateway_ids,
-        parent_by_robot=parent_by_robot,
-        hop_to_clusterhead=hop_to_clusterhead,
-    )
-
-
-def detect_persistent_non_corridor_motion(
-    root: KHopShepherdGroup,
-    dt: float,
-) -> set[int]:
-    """Return a connected set that *already* moved away from corridor flow.
-
-    The observer is the live bounded-hop neighborhood of the root Leader. No
-    wall ray, Junction rectangle, branch label, or pre-authored location is
-    consulted. A robot must accumulate both lateral velocity dwell and actual
-    travel before it contributes evidence.
-    """
-    leader = khop_state.robot_by_id.get(root.leader_id)
-    if leader is None or root.heading.length_squared() <= EPSILON:
-        return set()
-    forward = root.heading.normalize()
-    reachable = khop_reachable_robots(leader, NATURAL_SPREAD_LOCAL_HOPS)
-    reachable_ids = {robot.robot_id for robot in reachable}
-    active_ids: set[int] = set()
-    for robot in reachable:
-        if robot.role != "NORMAL":
-            continue
-        velocity = robot.khop_velocity_ema
-        speed = velocity.length()
-        lateral = (
-            abs(forward.cross(velocity / speed))
-            if speed > EPSILON
-            else 0.0
-        )
-        distinct_motion = (
-            speed >= NATURAL_SPREAD_MIN_SPEED
-            and lateral >= math.sin(NATURAL_SPREAD_LATERAL_ANGLE)
-            and velocity.dot(forward) > -speed * 0.30
-        )
-        if distinct_motion:
-            khop_state.motion_origin_by_robot.setdefault(
-                robot.robot_id,
-                robot.position.copy(),
-            )
-            dwell = khop_state.motion_dwell_by_robot.get(robot.robot_id, 0.0)
-            khop_state.motion_dwell_by_robot[robot.robot_id] = dwell + dt
-            travel = robot.position.distance_to(
-                khop_state.motion_origin_by_robot[robot.robot_id]
-            )
-            if (
-                khop_state.motion_dwell_by_robot[robot.robot_id]
-                >= NATURAL_SPREAD_ANOMALY_DWELL
-                and travel >= NATURAL_SPREAD_MIN_TRAVEL
-            ):
-                active_ids.add(robot.robot_id)
-        else:
-            dwell = max(
-                0.0,
-                khop_state.motion_dwell_by_robot.get(robot.robot_id, 0.0)
-                - dt * 1.5,
-            )
-            if dwell <= EPSILON:
-                khop_state.motion_dwell_by_robot.pop(robot.robot_id, None)
-                khop_state.motion_origin_by_robot.pop(robot.robot_id, None)
-            else:
-                khop_state.motion_dwell_by_robot[robot.robot_id] = dwell
-
-    for robot_id in list(khop_state.motion_dwell_by_robot):
-        if robot_id not in reachable_ids:
-            khop_state.motion_dwell_by_robot.pop(robot_id, None)
-            khop_state.motion_origin_by_robot.pop(robot_id, None)
-    component = khop_largest_connected_component(active_ids)
-    khop_state.candidate_observer_ids = component
-    return component
-
-
-def _motion_kmeans(
-    observations: list[tuple[float, int, pygame.Vector2, float]],
-    cluster_count: int,
-) -> tuple[list[float], list[list[tuple[float, int, pygame.Vector2, float]]]]:
-    """Deterministic 1-D angular clustering of robot-created headings."""
-    ordered = sorted(observations, key=lambda item: (item[0], item[1]))
-    centers = [
-        ordered[min(
-            len(ordered) - 1,
-            round((index + 0.5) * len(ordered) / cluster_count - 0.5),
-        )][0]
-        for index in range(cluster_count)
-    ]
-    groups: list[list[tuple[float, int, pygame.Vector2, float]]] = []
-    for _ in range(10):
-        groups = [[] for _ in centers]
-        for observation in ordered:
-            selected = min(
-                range(len(centers)),
-                key=lambda index: abs(observation[0] - centers[index]),
-            )
-            groups[selected].append(observation)
-        if any(not group for group in groups):
-            return [], []
-        updated = [
-            sum(item[0] for item in group) / len(group)
-            for group in groups
-        ]
-        if max(abs(a - b) for a, b in zip(updated, centers)) < math.radians(0.5):
-            centers = updated
-            break
-        centers = updated
-    combined = sorted(zip(centers, groups), key=lambda item: item[0])
-    return [item[0] for item in combined], [item[1] for item in combined]
-
-
 def detect_khop_directional_clusters(
     robots: list["Robot"],
     root: KHopShepherdGroup,
 ) -> list[KHopSplitCluster]:
-    """Form candidate cohorts exclusively from observed travel directions."""
+    """Find already-spread directional components; never assign a direction."""
     origin = khop_state.split_origin
-    if origin is None or root.heading.length_squared() <= EPSILON:
+    if origin is None:
         return []
     incoming = root.heading.normalize()
-    observations: list[tuple[float, int, pygame.Vector2, float]] = []
+    observations: list[tuple[float, int, pygame.Vector2]] = []
     for robot in robots:
-        if robot.role not in KHOP_DYNAMIC_ROLES:
-            continue
-        # A robot still captured in root's own cap is exclusively the
-        # straight-continuation candidate's evidence
-        # (detect_khop_straight_continuation_cluster); letting the same
-        # robot_id also land in a turning k-means cluster here let two
-        # Branch groups independently pick it as their Max-Min head after
-        # the split, producing two groups that shared one Leader.
-        if robot.khop_group_id == root.group_id:
+        if robot.role in {"MARKER", "GATEKEEPER", "ANCHOR", "RELAY", "TRUNK_RELAY"}:
             continue
         relative = robot.position - origin
-        travel = relative.length()
+        radius = relative.length()
         if not (
             KHOP_SPLIT_CLUSTER_MIN_RADIUS
-            <= travel
+            <= radius
             <= KHOP_SPLIT_CLUSTER_MAX_RADIUS
         ):
             continue
-        displacement_heading = relative / travel
+        displacement_heading = relative / radius
         if displacement_heading.dot(incoming) < KHOP_SPLIT_CLUSTER_BACKWARD_COSINE:
             continue
-        velocity = robot.khop_velocity_ema
-        if velocity.length() >= NATURAL_SPREAD_MIN_SPEED:
-            velocity_heading = velocity.normalize()
-            if velocity_heading.dot(incoming) >= KHOP_SPLIT_CLUSTER_BACKWARD_COSINE:
-                blended = displacement_heading * 0.72 + velocity_heading * 0.28
-                observed_heading = (
-                    blended.normalize()
-                    if blended.length_squared() > EPSILON
-                    else displacement_heading
-                )
-            else:
-                observed_heading = displacement_heading
-        else:
-            observed_heading = displacement_heading
+        observed_heading = displacement_heading
         angle = math.atan2(
             incoming.cross(observed_heading),
             incoming.dot(observed_heading),
         )
-        observations.append((angle, robot.robot_id, observed_heading, travel))
-    # A witness can only ever report a *turning* exit this way: nothing is
-    # permitted ahead of the front Leader in its own heading, so a
-    # straight-through exit has no one to slip past into new territory and
-    # register as an observation here. It is measured separately below from
-    # the root's own advance and merged in, rather than requiring >= 2
-    # turning clusters up front.
-    cluster_min_size = khop_split_cluster_min_size()
-    maximum_count = min(4, len(observations) // max(cluster_min_size, 1))
+        observations.append((angle, robot.robot_id, observed_heading))
+    if not observations:
+        return []
+    observations.sort(key=lambda item: (item[0], item[1]))
+    cluster_count = min(
+        max(2, khop_state.expected_split_count),
+        len(observations) // max(KHOP_SPLIT_CLUSTER_MIN_SIZE, 1),
+    )
+    if cluster_count < 2:
+        return []
 
-    selected: list[KHopSplitCluster] = []
-    for cluster_count in range(maximum_count, 0, -1):
-        centers, angular_groups = _motion_kmeans(observations, cluster_count)
-        if not centers or any(
-            second - first < NATURAL_SPREAD_COHORT_MIN_SEPARATION
-            for first, second in zip(centers, centers[1:])
-        ):
-            continue
-        proposed: list[KHopSplitCluster] = []
-        for center, angular_group in zip(centers, angular_groups):
-            if len(angular_group) < cluster_min_size:
-                proposed = []
-                break
-            angular_std = math.sqrt(
-                sum((item[0] - center) ** 2 for item in angular_group)
-                / len(angular_group)
+    # The count comes from local open-space sensing, but centers come only from
+    # actual robot motion/position samples. No UP/LEFT/RIGHT direction is fed to
+    # this one-dimensional angular k-means.
+    centers = [
+        observations[min(
+            len(observations) - 1,
+            round((index + 0.5) * len(observations) / cluster_count - 0.5),
+        )][0]
+        for index in range(cluster_count)
+    ]
+    angular_groups: list[list[tuple[float, int, pygame.Vector2]]] = []
+    for _ in range(8):
+        angular_groups = [[] for _ in centers]
+        for observation in observations:
+            center_index = min(
+                range(len(centers)),
+                key=lambda index: abs(observation[0] - centers[index]),
             )
-            if angular_std > NATURAL_SPREAD_COHORT_MAX_ANGLE_STD:
-                proposed = []
-                break
-            raw_ids = {item[1] for item in angular_group}
-            component = khop_largest_connected_component(raw_ids)
-            connectivity_ratio = len(component) / max(1, len(raw_ids))
-            if len(component) < cluster_min_size:
-                proposed = []
-                break
-            component_samples = [item for item in angular_group if item[1] in component]
-            heading_sum = sum((item[2] for item in component_samples), pygame.Vector2())
-            if heading_sum.length_squared() <= EPSILON:
-                proposed = []
-                break
-            mean_heading = heading_sum.normalize()
-            direction_variance = 1.0 - heading_sum.length() / len(component_samples)
-            connected_to_base_ratio = sum(
-                bool(khop_state.robot_by_id[robot_id].connected_to_base)
-                for robot_id in component
-            ) / len(component)
-            side = pygame.Vector2(-mean_heading.y, mean_heading.x)
-            lateral_offsets = [
-                (khop_state.robot_by_id[robot_id].position - origin).dot(side)
-                for robot_id in component
-            ]
-            proposed.append(KHopSplitCluster(
-                heading=mean_heading,
-                robot_ids=component,
-                angle=math.atan2(
-                    incoming.cross(mean_heading),
-                    incoming.dot(mean_heading),
-                ),
-                mean_travel=sum(item[3] for item in component_samples) / len(component_samples),
-                direction_variance=direction_variance,
-                connectivity_ratio=connectivity_ratio,
-                connected_to_base_ratio=connected_to_base_ratio,
-                lateral_width=max(lateral_offsets) - min(lateral_offsets),
-            ))
-        if proposed:
-            selected = sorted(proposed, key=lambda cluster: cluster.angle)
-            break
-
-    straight_cluster = detect_khop_straight_continuation_cluster(
-        root,
-        origin,
-        incoming,
-    )
-    if straight_cluster is not None:
-        selected = [
-            cluster
-            for cluster in selected
-            if angle_between(cluster.heading, incoming)
-            >= NATURAL_SPREAD_COHORT_MIN_SEPARATION
+            angular_groups[center_index].append(observation)
+        new_centers = [
+            sum(item[0] for item in group) / len(group)
+            if group
+            else centers[index]
+            for index, group in enumerate(angular_groups)
         ]
-        selected.append(straight_cluster)
-    return sorted(selected, key=lambda cluster: cluster.angle)
+        if max(
+            abs(new - old) for new, old in zip(new_centers, centers)
+        ) < math.radians(0.5):
+            centers = new_centers
+            break
+        centers = new_centers
 
-
-def detect_khop_straight_continuation_cluster(
-    root: KHopShepherdGroup,
-    origin: pygame.Vector2,
-    incoming: pygame.Vector2,
-) -> Optional[KHopSplitCluster]:
-    """Treat the root's own unblocked forward advance as a branch candidate.
-
-    A straight-through exit can never be witnessed the way a turning one is:
-    nobody is permitted ahead of the front Leader in its own heading, so
-    nobody can slip past it into new territory and register as an
-    observation. Its evidence instead comes directly from the Leader/cap's
-    own measured forward progress, connectivity, and heading stability since
-    the anomaly was flagged -- evaluated against the same criteria
-    (validate_directional_cohorts) a turning cohort must pass.
-    """
-    leader = khop_state.robot_by_id.get(root.leader_id)
-    if leader is None:
-        return None
-    members = {
-        robot_id
-        for robot_id in root.member_robot_ids
-        if robot_id in khop_state.robot_by_id
-    }
-    if len(members) < khop_split_cluster_min_size():
-        return None
-    # A turning cohort's mean_travel is how far a new witness moved since it
-    # first looked anomalous -- proof a fresh direction is actually usable.
-    # The straight lane has no such moment to measure from (it never looked
-    # anomalous), and CONTROLLED_SPREAD deliberately holds the root's own
-    # advance near-still while cohorts are being validated, so displacement
-    # alone stalls at whatever it was the instant the candidate opened.
-    # root.forward_clearance is the same short-range probe already used to
-    # confirm a dead-end (inverted here: a large clear run ahead is exactly
-    # as much proof the lane is open as a witness's own travel would be).
-    del origin
-    forward_travel = max(
-        0.0,
-        (leader.position - root.origin).dot(incoming),
-        root.forward_clearance,
+    ordered = sorted(
+        zip(centers, angular_groups),
+        key=lambda item: item[0],
     )
-    connected_to_base_ratio = sum(
-        khop_state.robot_by_id[robot_id].connected_to_base
-        for robot_id in members
-    ) / len(members)
-    # direction_variance exists to express uncertainty in an *inferred*
-    # heading: a turning cohort's true direction is unknown and must be
-    # estimated from scattered witness velocity samples, which is exactly
-    # what that noise measures. The straight lane has no such uncertainty
-    # -- its heading isn't inferred from anyone's motion, it is root.heading
-    # by construction. Per-member velocity noise (tried both raw and
-    # EMA-smoothed) instead measures the cap's own in-place jitter from
-    # holding its slot formation, which has a steady-state floor around
-    # 0.13-0.3 that never reliably clears NATURAL_SPREAD_COHORT_MAX_VARIANCE
-    # regardless of smoothing -- it was answering a different question.
-    direction_variance = 0.0
-    return KHopSplitCluster(
-        heading=incoming.copy(),
-        robot_ids=members,
-        angle=0.0,
-        mean_travel=forward_travel,
-        direction_variance=direction_variance,
-        connectivity_ratio=root.connectivity_ratio,
-        connected_to_base_ratio=connected_to_base_ratio,
-        lateral_width=root.estimated_width,
-    )
+    centers = [item[0] for item in ordered]
+    angular_groups = [item[1] for item in ordered]
+    if any(
+        second - first
+        < math.radians(KHOP_SPLIT_HEADING_DEGREES * 0.72)
+        for first, second in zip(centers, centers[1:])
+    ):
+        return []
 
-
-def validate_directional_cohorts(
-    clusters: list[KHopSplitCluster],
-    dt: float,
-) -> list[KHopSplitCluster]:
-    """Persist cohort evidence and return only physically validated exits."""
-    previous = list(khop_state.cohort_evidence)
-    updated: list[DirectionalCohortEvidence] = []
+    clusters: list[KHopSplitCluster] = []
+    for angular_group in angular_groups:
+        component = khop_largest_connected_component({
+            robot_id for _, robot_id, _ in angular_group
+        })
+        if len(component) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+            continue
+        headings = [
+            heading
+            for _, robot_id, heading in angular_group
+            if robot_id in component
+        ]
+        mean_heading = sum(headings, pygame.Vector2())
+        if mean_heading.length_squared() <= EPSILON:
+            continue
+        mean_heading = mean_heading.normalize()
+        component_angles = [
+            angle
+            for angle, robot_id, _ in angular_group
+            if robot_id in component
+        ]
+        mean_angle = sum(component_angles) / len(component_angles)
+        clusters.append(KHopSplitCluster(
+            heading=mean_heading,
+            robot_ids=component,
+            angle=mean_angle,
+        ))
+    clusters.sort(key=lambda cluster: cluster.angle)
+    if any(
+        angle_between(first.heading, second.heading)
+        < math.radians(KHOP_SPLIT_HEADING_DEGREES * 0.72)
+        for index, first in enumerate(clusters)
+        for second in clusters[index + 1:]
+    ):
+        return []
+    unmatched_expected = [
+        pygame.Vector2(values).normalize()
+        for values in khop_state.expected_open_headings
+        if pygame.Vector2(values).length_squared() > EPSILON
+    ]
     for cluster in clusters:
-        match = min(
-            previous,
-            key=lambda evidence: angle_between(evidence.heading, cluster.heading),
-            default=None,
+        if not unmatched_expected:
+            return []
+        nearest = min(
+            unmatched_expected,
+            key=lambda expected: angle_between(expected, cluster.heading),
         )
-        if (
-            match is None
-            or angle_between(match.heading, cluster.heading)
-            > math.radians(KHOP_SPLIT_CLUSTER_MATCH_DEGREES)
-        ):
-            match = DirectionalCohortEvidence(heading=cluster.heading.copy())
-        else:
-            previous.remove(match)
-        instantaneous_valid = (
-            len(cluster.robot_ids) >= khop_split_cluster_min_size()
-            and cluster.mean_travel >= NATURAL_SPREAD_COHORT_MIN_TRAVEL
-            and cluster.direction_variance <= NATURAL_SPREAD_COHORT_MAX_VARIANCE
-            and cluster.connectivity_ratio >= NATURAL_SPREAD_COHORT_MIN_CONNECTIVITY
-            and cluster.connected_to_base_ratio >= NATURAL_SPREAD_COHORT_MIN_BASE_CONNECTIVITY
-            and cluster.lateral_width >= NATURAL_SPREAD_COHORT_MIN_WIDTH
-        )
-        match.heading = cluster.heading.copy()
-        match.robot_ids = set(cluster.robot_ids)
-        match.mean_travel = cluster.mean_travel
-        match.direction_variance = cluster.direction_variance
-        match.connectivity_ratio = cluster.connectivity_ratio
-        match.connected_to_base_ratio = cluster.connected_to_base_ratio
-        match.lateral_width = cluster.lateral_width
-        match.dwell = match.dwell + dt if instantaneous_valid else max(0.0, match.dwell - dt)
-        match.valid = match.dwell >= NATURAL_SPREAD_COHORT_MIN_DWELL
-        updated.append(match)
-    khop_state.cohort_evidence = updated
-    valid_clusters: list[KHopSplitCluster] = []
-    for cluster in clusters:
-        evidence = min(
-            updated,
-            key=lambda item: angle_between(item.heading, cluster.heading),
-            default=None,
-        )
-        if evidence is not None and evidence.valid:
-            valid_clusters.append(cluster)
-    return valid_clusters
+        if angle_between(nearest, cluster.heading) > math.radians(46.0):
+            return []
+        # Membership came entirely from natural spread. Once a component is
+        # matched to a locally sensed opening, use that wall-ray direction as
+        # its Tree axis so the new cap travels along the corridor, not along a
+        # diagonal from the old Leader.
+        cluster.heading = nearest.copy()
+        unmatched_expected.remove(nearest)
+    if unmatched_expected:
+        return []
+    return clusters
 
 
-def begin_khop_controlled_spread(
+def begin_khop_dispersing(
     root: KHopShepherdGroup,
     leader: "Robot",
+    open_headings: list[pygame.Vector2],
 ) -> None:
-    """Slow and bound an anomaly that natural SPH motion already created."""
-    khop_state.stage = "CONTROLLED_SPREAD"
-    khop_state.recognition_state = SpaceRecognitionState.SPREAD_ANOMALY
+    khop_state.stage = "DISPERSING"
     khop_state.split_origin = leader.position.copy()
-    khop_state.controlled_spread_elapsed = 0.0
-    khop_state.candidate_elapsed = 0.0
+    khop_state.dispersing_elapsed = 0.0
+    khop_state.expected_split_count = max(2, len(open_headings))
+    khop_state.expected_open_headings = [
+        (heading.x, heading.y)
+        for heading in open_headings
+        if heading.length_squared() > EPSILON
+    ]
     khop_state.split_cluster_signature = ()
     khop_state.split_cluster_dwell = 0.0
-    khop_state.pending_split_clusters = []
-    khop_state.cohort_evidence = []
-    khop_state.last_cluster_headings = []
-    khop_state.last_cluster_sizes = []
-    khop_state.straggler_wait_elapsed = 0.0
     khop_state.events.append({
         "time": simulation_time,
-        "event": "SPREAD_ANOMALY_DETECTED",
+        "event": "NATURAL_DISPERSAL_STARTED",
         "leader": leader.robot_id,
-        "witnesses": sorted(khop_state.candidate_observer_ids),
+        "expected_local_openings": khop_state.expected_split_count,
     })
     print(
-        f"[Natural spread] Leader={leader.robot_id}, "
-        f"witnesses={len(khop_state.candidate_observer_ids)}; "
-        "slowing the main body for cohort validation"
-    )
-
-
-def cancel_khop_junction_candidate() -> None:
-    """Merge temporary cohorts and resume ordinary corridor motion."""
-    khop_state.recognition_state = SpaceRecognitionState.NOT_A_JUNCTION
-    khop_state.events.append({
-        "time": simulation_time,
-        "event": "JUNCTION_CANDIDATE_REJECTED",
-        "elapsed": khop_state.candidate_elapsed,
-        "cohorts": len(khop_state.cohort_evidence),
-    })
-    khop_state.recognition_state = SpaceRecognitionState.COHORT_MERGE
-    khop_state.stage = "ADVANCING"
-    khop_state.split_origin = None
-    khop_state.controlled_spread_elapsed = 0.0
-    khop_state.candidate_elapsed = 0.0
-    khop_state.candidate_cooldown = NATURAL_SPREAD_RETRY_COOLDOWN
-    khop_state.split_cluster_signature = ()
-    khop_state.split_cluster_dwell = 0.0
-    khop_state.pending_split_clusters = []
-    khop_state.cohort_evidence = []
-    khop_state.candidate_observer_ids = set()
-    khop_state.last_cluster_headings = []
-    khop_state.last_cluster_sizes = []
-    khop_state.straggler_wait_elapsed = 0.0
-    khop_state.motion_origin_by_robot.clear()
-    khop_state.motion_dwell_by_robot.clear()
-    khop_state.recognition_state = SpaceRecognitionState.NORMAL_CORRIDOR
-
-
-def natural_cohort_rollout_cost(cluster: KHopSplitCluster) -> float:
-    """Short local rollout proxy computed only from witnessed cohort data."""
-    members = [
-        khop_state.robot_by_id[robot_id]
-        for robot_id in cluster.robot_ids
-        if robot_id in khop_state.robot_by_id
-    ]
-    if not members:
-        return float("inf")
-    mean_density = sum(robot.density_ratio for robot in members) / len(members)
-    mean_speed = sum(robot.khop_velocity_ema.length() for robot in members) / len(members)
-    speed_variance = sum(
-        (robot.khop_velocity_ema.length() - mean_speed) ** 2
-        for robot in members
-    ) / len(members)
-    turn_cost = abs(cluster.angle) / math.pi
-    density_cost = max(0.0, mean_density - 1.0)
-    travel_credit = clamp(
-        cluster.mean_travel / max(NATURAL_SPREAD_LIMIT_RADIUS, EPSILON),
-        0.0,
-        1.0,
-    )
-    return (
-        3.0 * cluster.direction_variance
-        + 2.5 * (1.0 - cluster.connectivity_ratio)
-        + 2.0 * (1.0 - cluster.connected_to_base_ratio)
-        + 0.8 * density_cost
-        + 0.02 * math.sqrt(max(0.0, speed_variance))
-        + 0.35 * turn_cost
-        + 0.75 * (1.0 - travel_credit)
+        f"[K-hop Spread] Leader={leader.robot_id}, "
+        f"local openings={khop_state.expected_split_count}; "
+        "waiting for persistent communication clusters"
     )
 
 
@@ -5717,11 +4659,9 @@ def split_khop_from_clusters(
             robot.khop_group_id = None
             robot.khop_parent_id = None
             robot.khop_hop = -1
-            robot.dhop_staging_group_id = None
     root.member_robot_ids.clear()
     root.tree_parent.clear()
     root.hop_by_robot.clear()
-    root.cap_slot_by_robot.clear()
 
     for robot in robots:
         if robot.role in KHOP_DYNAMIC_ROLES:
@@ -5732,42 +4672,8 @@ def split_khop_from_clusters(
 
     local_groups: list[KHopShepherdGroup] = []
     used_group_ids: set[str] = set()
-    claimed_robot_ids: set[int] = set()
     for index, cluster in enumerate(clusters):
         heading = cluster.heading.normalize()
-        # Clusters are independently detected (k-means turning candidates
-        # plus the straight-continuation candidate) and are not guaranteed
-        # disjoint -- a robot the two happened to agree on would otherwise
-        # let its own Max-Min run pick it as Leader in both resulting
-        # groups. First cluster in sorted (angle) order keeps a contested
-        # robot; later ones treat it as already spoken for.
-        cluster_robot_ids = cluster.robot_ids - claimed_robot_ids
-        if len(cluster_robot_ids) < khop_split_cluster_min_size():
-            continue
-        claimed_robot_ids |= cluster_robot_ids
-        dhop_result = run_maxmin_d_cluster(
-            cluster_robot_ids,
-            DHOP_CLUSTER_DEPTH,
-        )
-        member_counts: dict[int, int] = {}
-        for selected_head in dhop_result.clusterhead_by_robot.values():
-            member_counts[selected_head] = member_counts.get(selected_head, 0) + 1
-        if not member_counts:
-            continue
-        # A directional component may contain multiple paper-valid d-clusters.
-        # The largest one supplies this branch's physical cap; ties choose the
-        # smaller ID, preserving Max-Min's Rule-2 fairness preference.
-        primary_head = max(
-            member_counts,
-            key=lambda head_id: (member_counts[head_id], -head_id),
-        )
-        primary_members = {
-            robot_id
-            for robot_id, selected_head
-            in dhop_result.clusterhead_by_robot.items()
-            if selected_head == primary_head
-        }
-        primary_members.add(primary_head)
         display_branch = khop_display_branch(heading)
         base_group_id = f"T_{display_branch.lower()}"
         group_id = base_group_id
@@ -5784,72 +4690,32 @@ def split_khop_from_clusters(
             display_branch=display_branch,
             parent_group_id=root.group_id,
             state=KHopGroupState.FORMING,
-            seed_robot_ids=primary_members,
-            estimated_width=max(cluster.lateral_width, root.estimated_width),
-            dhop_winner_by_robot=dhop_result.winner_by_robot,
-            dhop_sender_by_robot=dhop_result.sender_by_robot,
-            dhop_clusterhead_by_robot=dhop_result.clusterhead_by_robot,
-            dhop_rule_by_robot=dhop_result.rule_by_robot,
-            dhop_clusterhead_ids=dhop_result.clusterhead_ids,
-            dhop_gateway_ids=dhop_result.gateway_ids,
-            dhop_parent_by_robot=dhop_result.parent_by_robot,
+            seed_robot_ids=set(cluster.robot_ids),
+            estimated_width=root.estimated_width,
             created_at=simulation_time,
-            rollout_cost=natural_cohort_rollout_cost(cluster),
         )
-        for robot_id in cluster_robot_ids:
+        for robot_id in cluster.robot_ids:
             robot = khop_state.robot_by_id.get(robot_id)
             if robot is not None:
                 robot.khop_stream_id = group_id
                 robot.khop_heading = heading.copy()
-                robot.dhop_clusterhead_id = (
-                    dhop_result.clusterhead_by_robot.get(robot_id)
-                )
-                robot.dhop_parent_id = dhop_result.parent_by_robot.get(robot_id)
-                robot.dhop_gateway = robot_id in dhop_result.gateway_ids
-                robot.dhop_selection_rule = dhop_result.rule_by_robot.get(
-                    robot_id,
-                    0,
-                )
-        group.leader_id = primary_head
-        # cluster.heading (passed in as `heading`) is a k-means mean of
-        # scattered pre-filter witness headings for a *turning* cohort --
-        # individual witnesses can each differ from the true branch axis by
-        # up to NATURAL_SPREAD_COHORT_MAX_ANGLE_STD (25 degrees), and that
-        # skew was silently driving every downstream physical measurement
-        # that treats group.heading as the branch's forward axis: corridor-
-        # width wall probes (khop_estimate_corridor_width), cap slot/
-        # barrier-line orientation (khop_cap_slot_offsets), and the dead-end
-        # forward-clearance probe -- rendering visibly diagonal, undersized
-        # gate lines instead of a straight line across the real corridor.
-        # The elected branch Leader's actual physical position relative to
-        # the split origin is a much cleaner directional signal for a
-        # *turning* branch (it already passed Max-Min d-cluster election and
-        # connectivity filtering, not just the raw pre-filter observation),
-        # so prefer it once it's non-trivial.
-        #
-        # The straight-through candidate must be excluded (direction_variance
-        # == 0.0 identifies it, see detect_khop_straight_continuation_cluster):
-        # its heading is exact by construction (root.heading), but its
-        # cluster_robot_ids are the root cap's own members, held nearly
-        # stationary by CONTROLLED_SPREAD -- their tiny in-place slot-holding
-        # displacement from origin is positional *noise*, not a corridor
-        # direction signal, and a first attempt at this fix that didn't
-        # special-case it visibly regressed T_up's cap convergence (mean_error
-        # 0.0 -> 4.9, members 34 -> 20) by replacing an already-exact heading
-        # with a noisy one.
-        if cluster.direction_variance > EPSILON:
-            leader_robot = khop_state.robot_by_id.get(primary_head)
-            if leader_robot is not None:
-                displacement = leader_robot.position - origin
-                # Guarded by a minimum displacement so a Leader still near
-                # the origin (displacement dominated by positional noise)
-                # falls back to the original cluster heading instead of
-                # normalizing a near-zero-length vector.
-                if displacement.length_squared() > (ROBOT_RADIUS * 2.0) ** 2:
-                    group.heading = displacement.normalize()
-        group.cap_anchor = (
-            origin + group.heading * KHOP_BRANCH_STAGING_OFFSET
+        leader_candidates = [
+            khop_state.robot_by_id[robot_id]
+            for robot_id in cluster.robot_ids
+            if robot_id in khop_state.robot_by_id
+        ]
+        if not leader_candidates:
+            continue
+        leader_candidate = max(
+            leader_candidates,
+            key=lambda robot: (
+                not khop_has_forward_neighbor(robot, heading),
+                (robot.position - origin).dot(heading),
+                robot.khop_neighbor_count_ema,
+                -robot.robot_id,
+            ),
         )
+        group.leader_id = leader_candidate.robot_id
         khop_state.groups[group_id] = group
         local_groups.append(group)
 
@@ -5870,14 +4736,6 @@ def split_khop_from_clusters(
             robot_id=marker_robot.robot_id,
             position=marker_target.copy(),
             origin_leader_id=group.leader_id,
-            parent_junction_id=root.group_id,
-            local_branch_direction=(group.heading.x, group.heading.y),
-            cohort_robot_ids=tuple(sorted(group.seed_robot_ids)),
-            estimated_passage_width=group.estimated_width,
-            required_guard_count=khop_required_gatekeeper_count(group),
-            branch_leader_id=group.leader_id,
-            rollout_cost=group.rollout_cost,
-            return_direction_local=(-group.heading.x, -group.heading.y),
         )
         khop_state.markers[marker_id] = marker
         group.marker_id = marker_id
@@ -5892,6 +4750,7 @@ def split_khop_from_clusters(
             group.state = KHopGroupState.RELEASED
             continue
         rebuild_khop_capture_tree(group, robots)
+        group.state = KHopGroupState.EXPLORING
         khop_state.events.append({
             "time": simulation_time,
             "event": "BRANCH_GROUP_CREATED",
@@ -5902,47 +4761,13 @@ def split_khop_from_clusters(
             "heading": (group.heading.x, group.heading.y),
         })
         print(
-            f"[Max-Min d-hop] group={group.group_id}, d={DHOP_CLUSTER_DEPTH}, "
-            f"rounds={2 * DHOP_CLUSTER_DEPTH}, "
+            f"[K-hop Split] group={group.group_id}, "
             f"Leader={group.leader_id}, marker={group.marker_id}, "
-            f"component={len(group.dhop_clusterhead_by_robot)}, "
-            f"heads={sorted(group.dhop_clusterhead_ids)}, "
-            f"gateways={len(group.dhop_gateway_ids)}, "
-            f"primary-members={len(group.seed_robot_ids)}, "
+            f"cluster={len(group.seed_robot_ids)}, "
             f"captured={len(group.member_robot_ids)}"
         )
 
-    rollout_order = sorted(
-        local_groups,
-        key=lambda group: (group.rollout_cost, group.leader_id),
-    )
-    for rank, group in enumerate(rollout_order, start=1):
-        group.rollout_rank = rank
-        marker = khop_state.markers.get(group.marker_id or "")
-        if marker is not None:
-            marker.rollout_rank = rank
-    khop_state.branch_queue = [group.group_id for group in rollout_order]
-    khop_state.events.append({
-        "time": simulation_time,
-        "event": "JUNCTION_CONFIRMED",
-        "cohorts": len(local_groups),
-        "rollout_order": tuple(khop_state.branch_queue),
-        "rollout_costs": tuple(
-            (group.group_id, round(group.rollout_cost, 6))
-            for group in rollout_order
-        ),
-    })
-    print(
-        "[Natural rollout] "
-        + " > ".join(
-            f"{group.group_id}(J={group.rollout_cost:.3f})"
-            for group in rollout_order
-        )
-    )
-    khop_state.active_group_id = None
-    khop_state.sequential_visit_order = []
-    khop_state.stage = "SEQUENTIAL_DFS"
-    khop_state.recognition_state = SpaceRecognitionState.JUNCTION_CONFIRMED
+    khop_state.stage = "EXPLORING"
     khop_state.consensus_sequence += 1
     phase = SimulationPhase.EXPLORE_BRANCH
 
@@ -5953,23 +4778,16 @@ def update_khop_unassigned_streams(robots: list["Robot"]) -> None:
     for robot in robots:
         if robot.role != "NORMAL":
             continue
-        current_group = khop_state.groups.get(robot.khop_stream_id or "")
-        if (
-            current_group is not None
-            and current_group.state in {
-                KHopGroupState.EXPLORING,
-                KHopGroupState.DEAD_END_CONFIRMED,
-                KHopGroupState.RETURNING,
-                KHopGroupState.MERGING,
-            }
-        ):
+        if robot.khop_stream_id in valid_group_ids:
             continue
-        robot.khop_stream_id = None
         candidates = [
             message
             for message in khop_messages(robot, KHopMessageKind.LEADER_STATUS)
             if message.group_id in valid_group_ids
-            and message.state == KHopGroupState.EXPLORING.name
+            and message.state in {
+                KHopGroupState.FORMING.name,
+                KHopGroupState.EXPLORING.name,
+            }
         ]
         if not candidates:
             continue
@@ -5987,7 +4805,6 @@ def update_khop_unassigned_streams(robots: list["Robot"]) -> None:
             ),
         )
         robot.khop_stream_id = selected.group_id
-        robot.dhop_staging_group_id = None
         packet_heading = pygame.Vector2(selected.heading)
         if packet_heading.length_squared() > EPSILON:
             robot.khop_heading = packet_heading.normalize()
@@ -5999,51 +4816,6 @@ def khop_branch_groups() -> list[KHopShepherdGroup]:
         for group in khop_state.groups.values()
         if group.parent_group_id is not None and group.merged_into is None
     ]
-
-
-def release_waiting_group_fluid(
-    group: KHopShepherdGroup,
-    robots: list["Robot"],
-) -> None:
-    """Keep only the elected physical cap at an inactive branch entrance."""
-    for robot in robots:
-        if (
-            robot.role == "NORMAL"
-            and robot.khop_stream_id == group.group_id
-        ):
-            robot.khop_stream_id = None
-            robot.dhop_staging_group_id = group.group_id
-
-
-def activate_next_sequential_branch(robots: list["Robot"]) -> bool:
-    """Activate left-turn, straight, then right-turn by local signed angle."""
-    if khop_state.active_group_id is not None:
-        return False
-    while khop_state.branch_queue:
-        group_id = khop_state.branch_queue.pop(0)
-        group = khop_state.groups.get(group_id)
-        if group is None or group.state != KHopGroupState.WAITING:
-            continue
-        group.state = KHopGroupState.EXPLORING
-        group.dead_end_dwell = 0.0
-        group.failure_dwell = 0.0
-        khop_state.active_group_id = group_id
-        khop_state.sequential_visit_order.append(group_id)
-        khop_state.consensus_sequence += 1
-        khop_state.events.append({
-            "time": simulation_time,
-            "event": "SEQUENTIAL_BRANCH_ACTIVATED",
-            "group": group_id,
-            "leader": group.leader_id,
-            "visit_index": len(khop_state.sequential_visit_order),
-        })
-        print(
-            f"[Sequential DFS] activate={group_id}, "
-            f"Leader={group.leader_id}, order="
-            f"{khop_state.sequential_visit_order}"
-        )
-        return True
-    return False
 
 
 def khop_group_relays(
@@ -6079,41 +4851,6 @@ def release_khop_group_relays(
             "group": group.group_id,
             "count": len(released),
         })
-    return released
-
-
-def release_khop_survivors_for_return(robots: list["Robot"]) -> int:
-    """Stand down every remaining physical role once nothing is left to guard.
-
-    Every locally discovered Branch is COMPLETED/BLOCKING at this point, so
-    the Gatekeepers, Markers, and any straggling Leader/Shepherd/Relay no
-    longer have a Junction to protect. Releasing them lets the whole body
-    become one ordinary NORMAL swarm again for the walk back to Base,
-    instead of leaving physical barriers frozen at each branch mouth
-    forever.
-    """
-    released = 0
-    for robot in robots:
-        if robot.role in {
-            "GATEKEEPER",
-            "MARKER",
-            "KHOP_LEADER",
-            "KHOP_SHEPHERD",
-            "RELAY",
-        }:
-            robot.role = "NORMAL"
-            released += 1
-        robot.khop_stream_id = None
-        robot.khop_group_id = None
-        robot.khop_parent_id = None
-        robot.khop_hop = -1
-        robot.khop_stationary_target = None
-        robot.marker_group_id = None
-        robot.relay_anchor = None
-        robot.relay_index = -1
-        robot.dhop_staging_group_id = None
-    for group in khop_branch_groups():
-        group.state = KHopGroupState.RELEASED
     return released
 
 
@@ -6315,7 +5052,6 @@ def activate_khop_marker_gate(group: KHopShepherdGroup) -> None:
     group.member_robot_ids = gatekeeper_ids
     group.tree_parent.clear()
     group.hop_by_robot.clear()
-    group.cap_slot_by_robot.clear()
     group.state = KHopGroupState.GATEKEEPING
     released.extend(release_khop_group_relays(group, list(khop_state.robot_by_id.values())))
     khop_reassign_released_streams(released)
@@ -6364,7 +5100,6 @@ def release_unconfirmed_khop_group(group: KHopShepherdGroup) -> None:
     group.member_robot_ids.clear()
     group.tree_parent.clear()
     group.hop_by_robot.clear()
-    group.cap_slot_by_robot.clear()
     group.state = KHopGroupState.RELEASED
     khop_reassign_released_streams(released)
     khop_state.consensus_sequence += 1
@@ -6424,11 +5159,7 @@ def start_khop_retry(group: KHopShepherdGroup, robots: list["Robot"]) -> bool:
     )
     group.leader_id = new_leader.robot_id
     group.origin = marker.position.copy()
-    group.cap_anchor = new_leader.position.copy()
     group.state = KHopGroupState.FORMING
-    group.cap_mean_error = float("inf")
-    group.cap_formation_dwell = 0.0
-    group.cap_formation_elapsed = 0.0
     group.dead_end_confirmed = False
     group.dead_end_dwell = 0.0
     group.failure_dwell = 0.0
@@ -6441,6 +5172,7 @@ def start_khop_retry(group: KHopShepherdGroup, robots: list["Robot"]) -> bool:
     marker.origin_leader_id = new_leader.robot_id
     marker.sequence_number += 1
     rebuild_khop_capture_tree(group, robots)
+    group.state = KHopGroupState.EXPLORING
     khop_state.consensus_sequence += 1
     khop_state.events.append({
         "time": simulation_time,
@@ -6489,31 +5221,18 @@ def update_khop_dead_end_detection(
         )
         return
     forward_speed = max(0.0, leader.velocity.dot(group.heading))
-    # Three independently sufficient crowding signals, not a hard AND of all
-    # three. A 14000-step run found T_right (the last-queued branch) stuck
-    # indefinitely: its local density plateaued at a genuine steady state of
-    # 0.61 -- never climbing further no matter how long it waited -- while
-    # clearance already showed the front sitting at the dead-end wall and
-    # contact compression (0.426) already comfortably cleared
-    # KHOP_DEAD_END_MIN_CONTACT_COMPRESSION (0.28). Density-ratio is a
-    # branch-geometry-dependent proxy (a wider corridor spreads the same
-    # physical jam over more area, reading a lower ratio for the same real
-    # crowding) and treating it as a mandatory extra condition on top of an
-    # already-crowding-proven contact/pressure signal reintroduced exactly
-    # the kind of single-point-of-failure gate the round-3 multi-signal
-    # design was meant to avoid, just shifted from "too easy to satisfy" to
-    # "impossible to satisfy for some branches." Density stays one of the
-    # signals (still fires it directly when a branch's density does spike),
-    # it just no longer has to fire *in addition to* pressure or contact.
-    crowding_observed = (
+    density_observed = (
         group.density_evidence_ema >= KHOP_DEAD_END_DENSITY_RATIO
-        or group.pressure_evidence_ema >= KHOP_DEAD_END_MIN_PRESSURE_RATIO
+    )
+    compression_observed = (
+        group.pressure_evidence_ema >= KHOP_DEAD_END_MIN_PRESSURE_RATIO
         or group.compression_evidence_ema
         >= KHOP_DEAD_END_MIN_CONTACT_COMPRESSION
     )
     local_dead_end = (
         group.forward_clearance <= KHOP_DEAD_END_CLEARANCE
-        and crowding_observed
+        and density_observed
+        and compression_observed
         and forward_speed <= KHOP_DEAD_END_MAX_SPEED
     )
     group.dead_end_dwell = (
@@ -6664,64 +5383,6 @@ def update_khop_capture_state(
     update_khop_local_motion_estimates(robots, dt)
     khop_state.capture_refresh_elapsed += dt
 
-    if khop_state.stage == "RETURNING_TO_BASE":
-        in_base = sum(
-            get_robot_region(robot.position) == "BOTTOM"
-            for robot in robots
-        )
-        khop_state.last_split_group_size = in_base
-        ready = in_base >= math.ceil(
-            len(robots) * KHOP_RETURN_BASE_READY_RATIO
-        )
-        khop_state.return_to_base_dwell = (
-            khop_state.return_to_base_dwell + dt if ready else 0.0
-        )
-        if khop_state.return_to_base_dwell >= KHOP_RETURN_BASE_DWELL:
-            khop_state.stage = "COMPLETE"
-            phase = SimulationPhase.DONE
-            metrics.completion_time = simulation_time
-            khop_state.consensus_sequence += 1
-            khop_state.events.append({
-                "time": simulation_time,
-                "event": "RETURNED_TO_BASE",
-                "in_base": in_base,
-                "total": len(robots),
-            })
-            print(
-                f"[K-hop] swarm gathered back at Base: {in_base}/{len(robots)}"
-            )
-        return
-
-    if khop_state.stage == "FORMING_ROOT":
-        root = khop_state.groups.get(khop_state.root_group_id or "")
-        if root is None:
-            return
-        if khop_state.capture_refresh_elapsed >= KHOP_CAPTURE_REFRESH_TIME:
-            rebuild_khop_capture_tree(root, robots)
-            update_khop_group_statistics(
-                root,
-                khop_state.capture_refresh_elapsed,
-            )
-            khop_state.capture_refresh_elapsed = 0.0
-        if update_khop_cap_formation(root, dt):
-            root.state = KHopGroupState.EXPLORING
-            khop_state.stage = "ADVANCING"
-            khop_state.consensus_sequence += 1
-            khop_state.events.append({
-                "time": simulation_time,
-                "event": "ROOT_CAP_FORMED",
-                "group": root.group_id,
-                "leader": root.leader_id,
-                "members": len(root.member_robot_ids),
-                "mean_error": root.cap_mean_error,
-            })
-            print(
-                f"[K-hop Cap] root formed: Leader={root.leader_id}, "
-                f"members={len(root.member_robot_ids)}, "
-                f"mean_error={root.cap_mean_error:.1f}"
-            )
-        return
-
     if khop_state.stage == "ADVANCING":
         root = khop_state.groups.get(khop_state.root_group_id or "")
         if root is None:
@@ -6741,42 +5402,82 @@ def update_khop_capture_state(
         leader = khop_state.robot_by_id.get(root.leader_id)
         if leader is None:
             return
+        probes = khop_open_heading_probes(leader, root.heading)
+        khop_state.last_open_clearances = {
+            name: clearance
+            for name, (_, clearance) in probes.items()
+        }
+        open_probes = [
+            (name, heading, clearance)
+            for name, (heading, clearance) in probes.items()
+            if clearance >= KHOP_OPEN_CLEARANCE
+        ]
         local_group_size = khop_reachable_robot_count(
             leader,
-            NATURAL_SPREAD_LOCAL_HOPS,
+            KHOP_CAPTURE_DEPTH,
         )
         khop_state.last_split_group_size = local_group_size
-        khop_state.candidate_cooldown = max(
-            0.0,
-            khop_state.candidate_cooldown - dt,
+        heading_separated = (
+            len(open_probes) >= 3
+            and min(
+                angle_between(a[1], b[1])
+                for index, a in enumerate(open_probes)
+                for b in open_probes[index + 1:]
+            ) >= math.radians(KHOP_SPLIT_HEADING_DEGREES)
         )
-        natural_witnesses = (
-            detect_persistent_non_corridor_motion(root, dt)
-            if khop_state.candidate_cooldown <= 0.0
-            else set()
+        khop_state.split_pressure_ema = khop_ema(
+            khop_state.split_pressure_ema,
+            max(root.pressure_evidence_ema, root.compression_evidence_ema),
+            dt,
+            KHOP_SPLIT_FILTER_TIME,
+        )
+        khop_state.split_connectivity_ema = khop_ema(
+            khop_state.split_connectivity_ema,
+            root.connectivity_ratio,
+            dt,
+            KHOP_SPLIT_FILTER_TIME,
+        )
+        khop_state.split_heading_ema = khop_ema(
+            khop_state.split_heading_ema,
+            root.heading_stability_ema,
+            dt,
+            KHOP_SPLIT_FILTER_TIME,
+        )
+        local_flow_evidence = (
+            root.density_evidence_ema >= KHOP_DEAD_END_DENSITY_RATIO * 0.80
+            or khop_state.split_pressure_ema
+            >= min(
+                KHOP_DEAD_END_MIN_PRESSURE_RATIO,
+                KHOP_DEAD_END_MIN_CONTACT_COMPRESSION,
+            )
+            or 1.0 - khop_state.split_connectivity_ema
+            >= KHOP_SPLIT_MAX_CONNECTIVITY_DROP * 0.25
         )
         split_detected = (
-            len(natural_witnesses) >= natural_spread_anomaly_threshold()
+            local_group_size >= KHOP_SPLIT_MIN_GROUP_SIZE * 3
+            and heading_separated
+            and khop_state.split_heading_ema
+            >= KHOP_SPLIT_MIN_HEADING_STABILITY
+            and local_flow_evidence
         )
         khop_state.split_dwell = (
             khop_state.split_dwell + dt
             if split_detected
-            else max(0.0, khop_state.split_dwell - dt * 1.5)
+            else max(0.0, khop_state.split_dwell - dt)
         )
-        if khop_state.split_dwell >= NATURAL_SPREAD_ANOMALY_DWELL:
-            begin_khop_controlled_spread(root, leader)
+        if khop_state.split_dwell >= KHOP_SPLIT_DWELL_TIME:
+            begin_khop_dispersing(
+                root,
+                leader,
+                [heading for _, heading, _ in open_probes],
+            )
         return
 
-    if khop_state.stage == "CONTROLLED_SPREAD":
+    if khop_state.stage == "DISPERSING":
         root = khop_state.groups.get(khop_state.root_group_id or "")
         if root is None:
             return
-        khop_state.controlled_spread_elapsed += dt
-        khop_state.candidate_elapsed += dt
-        if khop_state.candidate_elapsed < 0.10:
-            khop_state.recognition_state = SpaceRecognitionState.JUNCTION_CANDIDATE
-        elif khop_state.candidate_elapsed < 0.22:
-            khop_state.recognition_state = SpaceRecognitionState.CONTROLLED_SPREAD
+        khop_state.dispersing_elapsed += dt
         if khop_state.capture_refresh_elapsed >= KHOP_CAPTURE_REFRESH_TIME:
             rebuild_khop_capture_tree(root, robots)
             update_khop_group_statistics(
@@ -6785,18 +5486,6 @@ def update_khop_capture_state(
             )
             khop_state.capture_refresh_elapsed = 0.0
         clusters = detect_khop_directional_clusters(robots, root)
-        if clusters:
-            khop_state.recognition_state = SpaceRecognitionState.COHORT_FORMATION
-            khop_state.last_cluster_headings = [
-                (cluster.heading.x, cluster.heading.y)
-                for cluster in clusters
-            ]
-            khop_state.last_cluster_sizes = [
-                len(cluster.robot_ids) for cluster in clusters
-            ]
-        valid_clusters = validate_directional_cohorts(clusters, dt)
-        if clusters:
-            khop_state.recognition_state = SpaceRecognitionState.COHORT_VALIDATION
         signature = tuple(
             round(
                 math.degrees(cluster.angle)
@@ -6804,64 +5493,31 @@ def update_khop_capture_state(
             )
             for cluster in clusters
         )
-        if signature:
-            if signature == khop_state.split_cluster_signature:
-                khop_state.split_cluster_dwell += dt
-            else:
-                khop_state.split_cluster_signature = signature
-                khop_state.split_cluster_dwell = dt
-            khop_state.pending_split_clusters = [
-                KHopSplitCluster(
-                    heading=cluster.heading.copy(),
-                    robot_ids=set(cluster.robot_ids),
-                    angle=cluster.angle,
-                )
-                for cluster in clusters
-            ]
-        else:
-            # A sparse boundary can lose one graph edge for a frame. Preserve
-            # the last locally witnessed components and decay confidence
-            # gradually instead of erasing the complete observation.
-            khop_state.split_cluster_dwell = max(
-                0.0,
-                khop_state.split_cluster_dwell - dt * 0.20,
-            )
-        candidate_clusters = valid_clusters
-        ready = (
-            len(candidate_clusters) >= NATURAL_SPREAD_MIN_COHORTS
-            and all(
-                angle_between(first.heading, second.heading)
-                >= NATURAL_SPREAD_COHORT_MIN_SEPARATION
-                for index, first in enumerate(candidate_clusters)
-                for second in candidate_clusters[index + 1:]
-            )
+        stable_count = len(clusters) >= khop_state.expected_split_count
+        timed_fallback = (
+            khop_state.dispersing_elapsed >= KHOP_DISPERSING_MAX_WAIT
+            and len(clusters) >= 2
         )
-        if ready:
-            # A still-forming candidate (e.g. a straight-through exit, whose
-            # evidence converges slower than a turning cohort's) should not
-            # be dropped just because other cohorts happened to validate
-            # first. Wait a bounded grace period for it to either validate
-            # or fall out of detection before finalizing without it.
-            stragglers_pending = len(clusters) > len(candidate_clusters)
-            if (
-                stragglers_pending
-                and khop_state.straggler_wait_elapsed
-                < NATURAL_SPREAD_STRAGGLER_GRACE_TIME
-                and khop_state.candidate_elapsed
-                < NATURAL_SPREAD_CANDIDATE_TIMEOUT
-            ):
-                khop_state.straggler_wait_elapsed += dt
-                return
-            khop_state.straggler_wait_elapsed = 0.0
-            khop_state.recognition_state = SpaceRecognitionState.JUNCTION_CONFIRMED
-            split_khop_from_clusters(robots, candidate_clusters)
+        if signature and signature == khop_state.split_cluster_signature:
+            khop_state.split_cluster_dwell += dt
         else:
-            khop_state.straggler_wait_elapsed = 0.0
-            if khop_state.candidate_elapsed >= NATURAL_SPREAD_CANDIDATE_TIMEOUT:
-                cancel_khop_junction_candidate()
+            khop_state.split_cluster_signature = signature
+            khop_state.split_cluster_dwell = 0.0
+        khop_state.last_cluster_headings = [
+            (cluster.heading.x, cluster.heading.y) for cluster in clusters
+        ]
+        khop_state.last_cluster_sizes = [
+            len(cluster.robot_ids) for cluster in clusters
+        ]
+        if (
+            khop_state.dispersing_elapsed >= KHOP_DISPERSING_MIN_TIME
+            and khop_state.split_cluster_dwell >= KHOP_SPLIT_CLUSTER_DWELL
+            and (stable_count or timed_fallback)
+        ):
+            split_khop_from_clusters(robots, clusters)
         return
 
-    if khop_state.stage not in {"SEQUENTIAL_DFS", "EXPLORING"}:
+    if khop_state.stage != "EXPLORING":
         return
 
     update_khop_unassigned_streams(robots)
@@ -6871,18 +5527,11 @@ def update_khop_capture_state(
     for group in khop_branch_groups():
         if group.state in {
             KHopGroupState.FORMING,
-            KHopGroupState.WAITING,
             KHopGroupState.EXPLORING,
             KHopGroupState.DEAD_END_CONFIRMED,
             KHopGroupState.RETURNING,
         }:
-            # A WAITING cap is already fully formed and stationary -- there
-            # is no live front to track, so leave its roster and slots
-            # exactly as they packed instead of re-running BFS capture every
-            # refresh cycle. A gate that keeps quietly reselecting members
-            # (even onto the same straight shape) reads as an unstable
-            # formation rather than one fixed line holding position.
-            if refresh_tree and group.state != KHopGroupState.WAITING:
+            if refresh_tree:
                 update_khop_front_leader(
                     group,
                     robots,
@@ -6890,28 +5539,8 @@ def update_khop_capture_state(
                 )
                 rebuild_khop_capture_tree(group, robots)
             update_khop_group_statistics(group, dt)
-            if group.state == KHopGroupState.FORMING:
-                if update_khop_cap_formation(group, dt):
-                    group.state = KHopGroupState.WAITING
-                    release_waiting_group_fluid(group, robots)
-                    khop_state.consensus_sequence += 1
-                    khop_state.events.append({
-                        "time": simulation_time,
-                        "event": "BRANCH_CAP_FORMED",
-                        "group": group.group_id,
-                        "leader": group.leader_id,
-                        "members": len(group.member_robot_ids),
-                        "mean_error": group.cap_mean_error,
-                    })
-                    print(
-                        f"[K-hop Cap] group={group.group_id} staged, "
-                        f"Leader={group.leader_id}, "
-                        f"members={len(group.member_robot_ids)}, "
-                        f"mean_error={group.cap_mean_error:.1f}"
-                    )
-            elif group.state != KHopGroupState.WAITING:
-                update_khop_relay_deployment(group, robots, dt)
-                update_khop_dead_end_detection(group, dt)
+            update_khop_relay_deployment(group, robots, dt)
+            update_khop_dead_end_detection(group, dt)
 
         if group.state == KHopGroupState.RETURNING:
             local_contact, dead_end_witnessed = khop_marker_acknowledges_return(
@@ -6923,20 +5552,6 @@ def update_khop_capture_state(
                     activate_khop_marker_gate(group)
                 else:
                     release_unconfirmed_khop_group(group)
-
-    active_group = khop_state.groups.get(khop_state.active_group_id or "")
-    if active_group is not None and active_group.state in {
-        KHopGroupState.GATEKEEPING,
-        KHopGroupState.RELEASED,
-    }:
-        khop_state.active_group_id = None
-    branch_groups = khop_branch_groups()
-    if (
-        khop_state.active_group_id is None
-        and branch_groups
-        and all(group.state != KHopGroupState.FORMING for group in branch_groups)
-    ):
-        activate_next_sequential_branch(robots)
 
     if refresh_tree:
         update_khop_group_merging(
@@ -6963,26 +5578,21 @@ def update_khop_capture_state(
         and khop_state.completion_consensus_dwell
         >= KHOP_COMPLETION_CONSENSUS_DWELL
     ):
-        khop_state.stage = "RETURNING_TO_BASE"
-        khop_state.return_to_base_dwell = 0.0
-        released = release_khop_survivors_for_return(robots)
+        khop_state.stage = "COMPLETE"
+        phase = SimulationPhase.DONE
+        metrics.completion_time = simulation_time
         khop_state.consensus_sequence += 1
         khop_state.events.append({
             "time": simulation_time,
             "event": "ALL_BRANCHES_BLOCKING",
             "consensus_sequence": khop_state.consensus_sequence,
-            "released": released,
         })
-        print(
-            "[K-hop] all locally discovered branches are COMPLETED/BLOCKING; "
-            f"released={released}, walking home to Base"
-        )
+        print("[K-hop] all locally discovered branches are COMPLETED/BLOCKING")
         return
 
     active_group_exists = any(
         group.state in {
             KHopGroupState.FORMING,
-            KHopGroupState.WAITING,
             KHopGroupState.EXPLORING,
             KHopGroupState.DEAD_END_CONFIRMED,
             KHopGroupState.RETURNING,
@@ -7005,7 +5615,7 @@ def update_khop_capture_state(
                 and start_khop_retry(selected_retry, robots)
             ):
                 khop_state.retry_dwell = 0.0
-                khop_state.stage = "SEQUENTIAL_DFS"
+                khop_state.stage = "EXPLORING"
     elif active_group_exists:
         khop_state.retry_dwell = 0.0
     elif any(group.state == KHopGroupState.RELEASED for group in branch_groups):
@@ -7038,184 +5648,50 @@ def compute_khop_tree_force(robot: "Robot") -> pygame.Vector2:
     return limit_vector(force, KHOP_TREE_FORCE_LIMIT)
 
 
-def compute_khop_cap_force(robot: "Robot") -> pygame.Vector2:
-    """Pull one Shepherd toward its straight, corridor-width fence slot."""
-    if not KHOP_CAPTURE_ENABLED or robot.role != "KHOP_SHEPHERD":
+def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
+    if robot.role in {"MARKER", "GATEKEEPER", "ANCHOR", "RELAY", "TRUNK_RELAY"}:
         return pygame.Vector2()
-    group = khop_state.groups.get(robot.khop_group_id or "")
+    if khop_state.stage == "COMPLETE":
+        return -robot.velocity * KHOP_RETURN_DAMPING
+    group = khop_state.groups.get(robot.khop_stream_id or "")
     if group is None or group.state in {
         KHopGroupState.GATEKEEPING,
         KHopGroupState.RELEASED,
     }:
         return pygame.Vector2()
-    slot = group.cap_slot_by_robot.get(robot.robot_id)
-    target = khop_cap_world_target(group, slot) if slot is not None else None
-    leader = khop_state.robot_by_id.get(group.leader_id)
-    if target is None or leader is None:
-        return pygame.Vector2()
-    position_error = target - robot.position
-    velocity_error = leader.velocity - robot.velocity
-    force = (
-        position_error * KHOP_CAP_POSITION_GAIN
-        + velocity_error * KHOP_CAP_VELOCITY_GAIN
-    )
-    return limit_vector(force, KHOP_CAP_FORCE_LIMIT)
-
-
-def compute_khop_corridor_centering_force(robot: "Robot") -> pygame.Vector2:
-    """Center a live Leader using only its two local side-wall ranges."""
-    if not KHOP_CAPTURE_ENABLED or robot.role != "KHOP_LEADER":
-        return pygame.Vector2()
-    group = khop_state.groups.get(robot.khop_group_id or "")
-    if group is None or group.state != KHopGroupState.EXPLORING:
-        return pygame.Vector2()
-    forward = group.heading.normalize()
-    side = pygame.Vector2(-forward.y, forward.x)
-    maximum = COMM_RANGE * 1.25
-    left_clearance = khop_local_clearance(robot.position, -side, maximum)
-    right_clearance = khop_local_clearance(robot.position, side, maximum)
-    imbalance = right_clearance - left_clearance
-    return limit_vector(
-        side * imbalance * KHOP_CAP_CENTERING_GAIN,
-        KHOP_CAP_CENTERING_FORCE_LIMIT,
-    )
-
-
-def compute_khop_unassigned_follow_force(robot: "Robot") -> pygame.Vector2:
-    """Keep the un-captured swarm one coherent stream behind whichever
-    front currently leads (the root before a split, the active Branch
-    after), instead of leaving it to raw, undirected pressure diffusion.
-    """
-    if robot.role != "NORMAL" or khop_state.stage == "FORMING_ROOT":
-        return pygame.Vector2()
-    heading: Optional[pygame.Vector2] = None
-    if khop_state.stage in {"ADVANCING", "CONTROLLED_SPREAD"}:
-        root = khop_state.groups.get(khop_state.root_group_id or "")
-        if root is not None:
-            heading = root.heading
-    elif khop_state.stage in {"SEQUENTIAL_DFS", "EXPLORING"}:
-        target_group_id = khop_state.active_group_id
-        if target_group_id is None and khop_state.branch_queue:
-            # Every Branch cap can still be FORMING right after the split,
-            # with none yet "active" -- the exact window that let the body
-            # spread past every mouth before any cap was ready. Head for the
-            # rollout-cheapest Branch (already decided at split time) so it
-            # arrives behind that cap instead of fanning out toward all of
-            # them at once.
-            target_group_id = khop_state.branch_queue[0]
-        active = khop_state.groups.get(target_group_id or "")
-        if active is not None:
-            # A raw constant push along active.heading only works for a
-            # robot that already has a clear line to the active branch's
-            # mouth. One still physically inside a *different* branch
-            # corridor just gets pinned against that corridor's own side
-            # wall instead of actually reaching the active one -- this was
-            # what left the general body visibly scattered across every
-            # corridor instead of funneling into whichever branch is
-            # actually being explored. Route through the Junction like a
-            # return-to-base robot would, using the branch's display label
-            # (previously display-only, "control never queries its rect")
-            # as the coordinate-routing target -- the same category of
-            # fixed-geometry steering assist already used for
-            # RETURNING_TO_BASE, not a change to any discovery decision.
-            routed = direction_toward_branch_path(
-                robot.position,
-                active.display_branch,
-            )
-            heading = (
-                routed
-                if routed.length_squared() > EPSILON
-                else active.heading
-            )
-    if heading is None or heading.length_squared() <= EPSILON:
-        return pygame.Vector2()
-    forward = heading.normalize()
-    force = forward * KHOP_UNASSIGNED_FOLLOW_FORCE
-    if khop_state.stage == "CONTROLLED_SPREAD":
-        # Reinforce a genuinely witnessed lateral flow instead of dragging
-        # it straight back onto the old corridor heading -- the whole point
-        # is to let a real spread persist long enough to become a candidate.
-        motion = robot.khop_velocity_ema
-        if motion.length() >= NATURAL_SPREAD_MIN_SPEED:
-            motion_heading = motion.normalize()
-            lateral = abs(forward.cross(motion_heading))
-            if (
-                lateral >= math.sin(NATURAL_SPREAD_LATERAL_ANGLE)
-                and motion_heading.dot(forward) > -0.30
-            ):
-                force += motion_heading * (
-                    KHOP_UNASSIGNED_FOLLOW_FORCE * 0.70
-                )
-    return limit_vector(force, KHOP_TREE_FORCE_LIMIT)
-
-
-def compute_khop_route_force(robot: "Robot") -> pygame.Vector2:
-    if robot.role in {"MARKER", "GATEKEEPER", "ANCHOR", "RELAY", "TRUNK_RELAY"}:
-        return pygame.Vector2()
-    if khop_state.stage == "RETURNING_TO_BASE":
-        # Nothing is left to guard once every locally discovered Branch is
-        # COMPLETED/BLOCKING; walk the whole body back to the fixed,
-        # always-known Base origin instead of leaving it wherever forward
-        # propulsion happened to stop.
-        direction = direction_toward_base_path(robot.position)
-        if direction.length_squared() <= EPSILON:
-            return -robot.velocity * KHOP_RETURN_TO_BASE_DAMPING
-        desired_velocity = direction * (FLOW_BACKTRACK_MAX_SPEED * 0.55)
-        return limit_vector(
-            direction * KHOP_RETURN_TO_BASE_FORCE
-            + (desired_velocity - robot.velocity)
-            * KHOP_RETURN_TO_BASE_DAMPING,
-            KHOP_TREE_FORCE_LIMIT,
-        )
-    if khop_state.stage == "COMPLETE":
-        return -robot.velocity * KHOP_RETURN_DAMPING
-    group = khop_state.groups.get(robot.khop_stream_id or "")
-    if group is None:
-        staged_group = khop_state.groups.get(
-            robot.dhop_staging_group_id or ""
-        )
-        if staged_group is not None and staged_group.state in {
-            KHopGroupState.FORMING,
-            KHopGroupState.WAITING,
-        }:
-            direction = -staged_group.heading.normalize()
-            return limit_vector(
-                direction * (KHOP_RETURN_FORCE * 0.45)
-                - robot.velocity * (KHOP_RETURN_DAMPING * 0.60),
-                KHOP_TREE_FORCE_LIMIT,
-            )
-        return compute_khop_unassigned_follow_force(robot)
-    if group.state in {
-        KHopGroupState.GATEKEEPING,
-        KHopGroupState.RELEASED,
-    }:
-        return pygame.Vector2()
-
-    if group.state in {
-        KHopGroupState.FORMING,
-        KHopGroupState.WAITING,
-    }:
-        # Do not let the Leader run away while its bounded-hop Shepherds are
-        # still packing into the physical cap. Slot forces do the forming.
-        if robot.role == "KHOP_LEADER" and group.cap_anchor is not None:
-            return limit_vector(
-                (group.cap_anchor - robot.position) * KHOP_CAP_ANCHOR_GAIN
-                - robot.velocity * KHOP_RETURN_DAMPING,
-                KHOP_CAP_FORCE_LIMIT,
-            )
-        return -robot.velocity * KHOP_RETURN_DAMPING
 
     if (
-        khop_state.stage == "CONTROLLED_SPREAD"
+        khop_state.stage == "DISPERSING"
         and group.group_id == khop_state.root_group_id
         and khop_state.split_origin is not None
     ):
-        # Only the captured Leader/Shepherd cap ever reaches this branch
-        # (a plain NORMAL robot's khop_stream_id is never the root's, so it
-        # is handled by compute_khop_unassigned_follow_force instead). Hold
-        # the cap near the candidate point while the ordinary body's own
-        # motion supplies all the directional evidence being validated.
-        return -robot.velocity * KHOP_RETURN_DAMPING
+        forward = group.heading.normalize()
+        if robot.role == "NORMAL":
+            relative = robot.position - khop_state.split_origin
+            radius = relative.length()
+            if radius > KHOP_SPLIT_CLUSTER_MAX_RADIUS:
+                return forward * (KHOP_STREAM_FORCE * 0.25)
+            if radius <= EPSILON or relative.dot(forward) < -COMM_SAFE_DISTANCE * 0.55:
+                spread_heading = forward
+            else:
+                spread_heading = relative.normalize()
+                if spread_heading.dot(forward) < KHOP_SPLIT_CLUSTER_BACKWARD_COSINE:
+                    spread_heading = forward
+            compression_weight = clamp(
+                (robot.density_ratio - 0.25) / 0.75,
+                0.25,
+                1.0,
+            )
+            return spread_heading * KHOP_DISPERSING_FORCE * compression_weight
+        # The original K-hop cap keeps advancing as one shallow front while
+        # ordinary SPH mass fans out around it, matching stages 2->3.
+        root_scale = 0.45
+        magnitude = (
+            KHOP_LEADER_FORCE
+            if robot.role == "KHOP_LEADER"
+            else KHOP_SHEPHERD_FORCE
+        )
+        return forward * magnitude * root_scale
 
     leader_packet = min(
         khop_messages(
@@ -7310,95 +5786,36 @@ def compute_khop_gatekeeping_force(robot: "Robot") -> pygame.Vector2:
             + side * KHOP_GATEKEEPER_FORCE * 0.30 * ratio
         )
     for group in khop_branch_groups():
-        if group.state not in {
-            KHopGroupState.FORMING,
-            KHopGroupState.WAITING,
-            KHopGroupState.EXPLORING,
-            KHopGroupState.DEAD_END_CONFIRMED,
-            KHopGroupState.RETURNING,
-            KHopGroupState.GATEKEEPING,
-        }:
+        if group.state != KHopGroupState.GATEKEEPING:
             continue
-        total += compute_khop_barrier_segment_force(robot, group)
-    return limit_vector(total, KHOP_GATEKEEPER_FORCE_LIMIT)
-
-
-def khop_barrier_line_point(
-    group: KHopShepherdGroup,
-) -> Optional[pygame.Vector2]:
-    """Current position of a group's blocking line, if it should have one.
-
-    FORMING/WAITING hold at the fixed staging point (group.cap_anchor);
-    GATEKEEPING holds at the fixed post-completion Marker; an actively
-    advancing/retreating group (EXPLORING/DEAD_END_CONFIRMED/RETURNING)
-    tracks its live Leader, since that is where its own physical cap
-    actually is right now, not where it started.
-    """
-    if group.state in {KHopGroupState.FORMING, KHopGroupState.WAITING}:
-        return group.cap_anchor
-    if group.state == KHopGroupState.GATEKEEPING:
         marker = khop_state.markers.get(group.marker_id or "")
-        return marker.position if marker is not None else None
-    if group.state in {
-        KHopGroupState.EXPLORING,
-        KHopGroupState.DEAD_END_CONFIRMED,
-        KHopGroupState.RETURNING,
-    }:
-        leader = khop_state.robot_by_id.get(group.leader_id)
-        return leader.position if leader is not None else None
-    return None
-
-
-def compute_khop_barrier_segment_force(
-    robot: "Robot",
-    group: KHopShepherdGroup,
-) -> pygame.Vector2:
-    """Repel a non-member from a group's current line as a straight wall
-    segment spanning the corridor width, instead of only from wherever its
-    individual physical bodies happen to be right now. This is what gives
-    full-width coverage immediately -- even mid-formation, before a single
-    Shepherd body has actually reached its slot -- rather than protection
-    only as good as however far the cap has already converged.
-    """
-    if (
-        robot.khop_group_id == group.group_id
-        or robot.khop_stream_id == group.group_id
-    ):
-        return pygame.Vector2()
-    if group.heading.length_squared() <= EPSILON:
-        return pygame.Vector2()
-    anchor = khop_barrier_line_point(group)
-    if anchor is None:
-        return pygame.Vector2()
-    forward = group.heading.normalize()
-    side = pygame.Vector2(-forward.y, forward.x)
-    half_width = max(
-        khop_cap_line_spacing(),
-        (khop_estimate_corridor_width(group) - ROBOT_RADIUS * 4.0) * 0.5,
-    )
-    relative = robot.position - anchor
-    depth = relative.dot(forward)
-    if depth <= 0.0:
-        # Already on the safe (Junction/Base) side of the line; a robot
-        # properly trailing the cap from behind should be free to pack up
-        # close against it, not get shoved away by its own gate.
-        return pygame.Vector2()
-    lateral = clamp(relative.dot(side), -half_width, half_width)
-    closest = anchor + side * lateral
-    delta = robot.position - closest
-    distance = delta.length()
-    if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
-        return pygame.Vector2()
-    ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
-    away = delta / distance
-    outward_component = max(0.0, away.dot(-forward))
-    return (
-        -forward * KHOP_GATEKEEPER_FORCE * ratio**2
-        + away
-        * KHOP_GATEKEEPER_FORCE
-        * ratio**2
-        * (0.35 + 0.65 * outward_component)
-    )
+        if marker is None:
+            continue
+        relative_to_entrance = robot.position - marker.position
+        if relative_to_entrance.dot(group.heading) < -KHOP_GATEKEEPER_FORCE_RADIUS:
+            continue
+        physical_gatekeepers = [
+            candidate
+            for candidate in khop_state.robot_by_id.values()
+            if candidate.marker_group_id == group.group_id
+            and candidate.role in {"MARKER", "GATEKEEPER"}
+        ]
+        for gatekeeper in physical_gatekeepers:
+            delta = robot.position - gatekeeper.position
+            distance = delta.length()
+            if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
+                continue
+            ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
+            away = delta / distance
+            outward_component = max(0.0, away.dot(-group.heading))
+            total += (
+                -group.heading * KHOP_GATEKEEPER_FORCE * ratio**2
+                + away
+                * KHOP_GATEKEEPER_FORCE
+                * ratio**2
+                * (0.35 + 0.65 * outward_component)
+            )
+    return limit_vector(total, KHOP_GATEKEEPER_FORCE_LIMIT)
 
 
 def draw_khop_capture_network(surface, robots: list["Robot"]) -> None:
@@ -7429,92 +5846,42 @@ def draw_khop_capture_network(surface, robots: list["Robot"]) -> None:
             True,
             color,
         )
-        group = khop_state.groups.get(marker.group_id)
-        heading = (
-            group.heading.normalize()
-            if group is not None and group.heading.length_squared() > EPSILON
-            else pygame.Vector2(1.0, 0.0)
-        )
-        if heading.x < -0.5:
-            label_position = (
-                marker.position.x - label.get_width() - 10,
-                marker.position.y - label.get_height() * 0.5,
-            )
-        elif heading.x > 0.5:
-            label_position = (
-                marker.position.x + 10,
-                marker.position.y - label.get_height() * 0.5,
-            )
-        elif heading.y < -0.5:
-            label_position = (
-                marker.position.x - label.get_width() * 0.5,
-                marker.position.y - label.get_height() - 10,
-            )
-        else:
-            label_position = (
-                marker.position.x - label.get_width() * 0.5,
-                marker.position.y + 10,
-            )
-        surface.blit(label, label_position)
-
-
-def save_khop_headless_snapshot(
-    path: str,
-    robots: list["Robot"],
-    color_reference_density: float,
-) -> None:
-    """Save the physical K-hop frame used by automated visual checks."""
-    snapshot = pygame.Surface((SIMULATION_VIEW_WIDTH, SCREEN_HEIGHT))
-    snapshot.fill(BACKGROUND_COLOR)
-    pygame.draw.polygon(snapshot, FLOOR_COLOR, cross_points)
-    pygame.draw.polygon(snapshot, WALL_COLOR, cross_points, width=2)
-    pygame.draw.circle(snapshot, JUNCTION_COLOR, (center_x, center_y), 5)
-    pygame.draw.circle(snapshot, BASE_COLOR, BASE_POSITION, 6)
-    draw_khop_capture_network(snapshot, robots)
-    for robot in robots:
-        robot.draw(snapshot, color_reference_density, True)
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pygame.image.save(snapshot, str(output_path))
-    print(f"[Headless] snapshot={output_path.resolve()}")
+        surface.blit(label, (marker.position.x + 7, marker.position.y - 15))
 
 
 def build_khop_hud_lines(robots: list["Robot"]) -> list[str]:
     communication_stats = get_communication_stats(robots)
     root_group = khop_state.groups.get(khop_state.root_group_id or "")
     lines = [
-        "SPH | Natural-spread Junction discovery | K-hop Shepherd",
+        "SPH | Localization-free K-hop Capture Shepherd",
         f"FPS={clock.get_fps():.1f} | robots={len(robots)} | stage={khop_state.stage}",
         (
             f"Policy={KHOP_CAPTURE_POLICY_VERSION} | K={KHOP_CAPTURE_DEPTH} | "
-            f"d={DHOP_CLUSTER_DEPTH} | "
             f"target/group={khop_required_shepherd_count(root_group)}"
         ),
         (
-            f"Recognition={khop_state.recognition_state.name} | "
-            f"policy={NATURAL_SPREAD_POLICY_VERSION}"
+            "Spread rule: no branch assignment | local N>="
+            f"{KHOP_SPLIT_MIN_GROUP_SIZE * 3} | "
+            f"opening dwell={khop_state.split_dwell:.2f}/{KHOP_SPLIT_DWELL_TIME:.2f}s"
         ),
         (
-            f"Natural anomaly: witnesses={len(khop_state.candidate_observer_ids)}/"
-            f"{natural_spread_anomaly_threshold()} | "
-            f"dwell={khop_state.split_dwell:.2f}s | "
-            f"candidate={khop_state.candidate_elapsed:.2f}/"
-            f"{NATURAL_SPREAD_CANDIDATE_TIMEOUT:.2f}s"
+            f"Natural clusters: sizes={khop_state.last_cluster_sizes or '-'} | "
+            f"expected={khop_state.expected_split_count or '-'} | "
+            f"dwell={khop_state.split_cluster_dwell:.2f}/"
+            f"{KHOP_SPLIT_CLUSTER_DWELL:.2f}s"
         ),
         (
-            f"Motion cohorts: sizes={khop_state.last_cluster_sizes or '-'} | "
-            f"valid={sum(evidence.valid for evidence in khop_state.cohort_evidence)}/"
-            f"{NATURAL_SPREAD_MIN_COHORTS} | "
-            "forward/open-angle pre-detection=OFF"
+            "Local clearance: "
+            + " | ".join(
+                f"{name}={value:.1f}"
+                for name, value in khop_state.last_open_clearances.items()
+            )
+            if khop_state.last_open_clearances
+            else "Local clearance: waiting"
         ),
         (
             f"Consensus sequence={khop_state.consensus_sequence} | "
             f"packet deliveries={khop_state.message_delivery_count}"
-        ),
-        (
-            f"Sequential active={khop_state.active_group_id or '-'} | "
-            f"queue={khop_state.branch_queue or '-'} | "
-            f"visited={khop_state.sequential_visit_order or '-'}"
         ),
         "Groups:",
     ]
@@ -7525,18 +5892,10 @@ def build_khop_hud_lines(robots: list["Robot"]) -> list[str]:
                 f"  {group.group_id}: {group.state.name} | leader={group.leader_id} | "
                 f"tree={len(group.member_robot_ids)} | retry={group.retry_count}/"
                 f"{KHOP_MAX_RETRIES} | heading="
-                f"({group.heading.x:+.1f},{group.heading.y:+.1f}) | "
-                f"rollout={group.rollout_cost:.3f} rank={group.rollout_rank}"
-            ),
-            (
-                f"    Max-Min heads={sorted(group.dhop_clusterhead_ids) or '-'} | "
-                f"gateways={len(group.dhop_gateway_ids)} | "
-                f"rounds={2 * DHOP_CLUSTER_DEPTH}"
+                f"({group.heading.x:+.1f},{group.heading.y:+.1f})"
             ),
             (
                 f"    hop={max(group.hop_by_robot.values(), default=0)}/{KHOP_CAPTURE_DEPTH} | "
-                f"cap-error={group.cap_mean_error:.1f}/"
-                f"{KHOP_CAP_FORM_TOLERANCE:.1f} | "
                 f"clear={group.forward_clearance:.1f} | rho={group.density_evidence_ema:.2f} | "
                 f"P={group.pressure_evidence_ema:.3f} | "
                 f"contact={group.compression_evidence_ema:.3f} | dead-end dwell="
@@ -10491,42 +8850,6 @@ def direction_toward_base_path(position: pygame.Vector2) -> pygame.Vector2:
     return pygame.Vector2()
 
 
-def direction_toward_branch_path(
-    position: pygame.Vector2,
-    target_branch: str,
-) -> pygame.Vector2:
-    """Piecewise free-space direction from anywhere to a named branch mouth.
-
-    Mirrors direction_toward_base_path's region-hop pattern (already the
-    accepted way this K-hop pipeline lets general-body *steering* consult
-    fixed geometry, distinct from the strictly local-evidence-only
-    Junction/branch *discovery* decisions elsewhere in the file) instead of
-    a raw constant-direction bias. compute_khop_unassigned_follow_force
-    used to just push every NORMAL robot toward the active branch's
-    heading regardless of where it physically was -- a robot already
-    inside a *different* branch corridor can't reach the active one that
-    way, it just gets pinned against its own corridor's side wall. Route
-    it back through that corridor's entrance and the Junction center
-    first, same as a return-to-base robot would be.
-
-    Returns a zero vector once the robot is already inside target_branch's
-    own region -- the caller should fall back to the branch's own heading
-    to keep advancing further into it from there.
-    """
-    region = get_robot_region(position)
-    if region == target_branch:
-        return pygame.Vector2()
-    if region == "JUNCTION":
-        return normalized_direction_toward(
-            position,
-            get_branch_entrance(target_branch),
-        )
-    entrance = get_region_entrance(region)
-    if entrance is not None:
-        return normalized_direction_toward(position, entrance)
-    return pygame.Vector2()
-
-
 def get_sequence_stage() -> int:
     """Return the six-stage state shown in the user's flow sketch."""
     if final_base_transfer_active:
@@ -11829,19 +10152,6 @@ def collective_equilibrium_activation() -> float:
 
 def adaptive_equilibrium_radius(robot: "Robot") -> float:
     if KHOP_CAPTURE_ENABLED:
-        if robot.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}:
-            return KHOP_CAP_EQUILIBRIUM_DISTANCE
-        if (
-            khop_state.stage == "RETURNING_TO_BASE"
-            and robot.role == "NORMAL"
-        ):
-            # The Base rectangle physically cannot hold the whole swarm at
-            # ordinary flow spacing; without compacting, robots jam at the
-            # entrance and the walk home can never reach the ready ratio.
-            return max(
-                ROBOT_RADIUS * 2.05,
-                SAFE_RADIUS * RETURN_PACKED_EQUILIBRIUM_SCALE,
-            )
         return SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE
     """Phase-local equilibrium spacing used by pair repulsion."""
     if (
@@ -12281,16 +10591,7 @@ def compute_pressures(robots, reference_density):
         robot.pressure = max(0.0, raw_pressure)
         if KHOP_CAPTURE_ENABLED:
             if robot.role in KHOP_DYNAMIC_ROLES:
-                if (
-                    khop_state.stage == "RETURNING_TO_BASE"
-                    and robot.role == "NORMAL"
-                ):
-                    # Match the tighter RETURNING_TO_BASE equilibrium radius
-                    # with a gentler pressure response, or the full motion
-                    # boost fights the compaction and nobody can pack in.
-                    robot.pressure *= RETURN_PACKING_PRESSURE_SCALE
-                else:
-                    robot.pressure *= SPH_MOTION_PRESSURE_BOOST
+                robot.pressure *= SPH_MOTION_PRESSURE_BOOST
             continue
         if (
             robot.role == "NORMAL"
@@ -14408,22 +12709,7 @@ def compute_sph_forces(
                 and distance_sq <= viscoelastic_link_sq
             )
             if viscoelastic_pair:
-                khop_cap_pair = (
-                    KHOP_CAPTURE_ENABLED
-                    and robot_i.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}
-                    and robot_j.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}
-                )
-                if khop_cap_pair:
-                    # A newly captured pair may still carry the much wider
-                    # NORMAL-particle rest length from a previous frame.
-                    # Replace that role-stale memory immediately so it does
-                    # not tear the dense cap apart for several seconds.
-                    viscoelastic_rest_lengths[pair] = clamp(
-                        pair_equilibrium_radius,
-                        VISCOELASTIC_REST_MIN,
-                        VISCOELASTIC_REST_MAX,
-                    )
-                elif pair not in viscoelastic_rest_lengths:
+                if pair not in viscoelastic_rest_lengths:
                     viscoelastic_rest_lengths[pair] = clamp(
                         pair_equilibrium_radius,
                         VISCOELASTIC_REST_MIN,
@@ -14452,7 +12738,7 @@ def compute_sph_forces(
                     # equilibrium.  The old bidirectional relaxation silently
                     # cancelled every spacing increase while the route force
                     # packed robots into the Branch.
-                    if distance > equilibrium_target and not khop_cap_pair:
+                    if distance > equilibrium_target:
                         relaxation = clamp(
                             VISCOELASTIC_REST_RELAXATION * dt,
                             0.0,
@@ -14619,8 +12905,6 @@ def compute_sph_forces(
             communication_grid,
         )
         khop_tree_force = compute_khop_tree_force(robot_i)
-        khop_cap_force = compute_khop_cap_force(robot_i)
-        khop_centering_force = compute_khop_corridor_centering_force(robot_i)
         khop_gatekeeping_force = compute_khop_gatekeeping_force(robot_i)
         shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
         pre_shepherd_curtain_force = (
@@ -14704,8 +12988,6 @@ def compute_sph_forces(
             + route_force
             + connectivity_force
             + khop_tree_force
-            + khop_cap_force
-            + khop_centering_force
             + khop_gatekeeping_force
             + shepherd_curtain_force
             + pre_shepherd_curtain_force
@@ -15923,7 +14205,6 @@ while running:
                         round(group.pressure_evidence_ema, 3),
                         round(group.compression_evidence_ema, 3),
                         round(group.dead_end_dwell, 2),
-                        round(group.cap_mean_error, 1),
                     ))
                 root_group = khop_state.groups.get(
                     khop_state.root_group_id or ""
@@ -15939,26 +14220,13 @@ while running:
                     f"{headless_groups}, "
                     f"split-dwell={khop_state.split_dwell:.2f}, "
                     f"split-N={khop_state.last_split_group_size}, "
-                    f"candidate={khop_state.candidate_elapsed:.2f}, "
-                    f"recognition={khop_state.recognition_state.name}, "
-                    f"witnesses={len(khop_state.candidate_observer_ids)}, "
+                    f"dispersing={khop_state.dispersing_elapsed:.2f}, "
                     f"clusters={khop_state.last_cluster_sizes}/"
                     f"{[(round(x, 2), round(y, 2)) for x, y in khop_state.last_cluster_headings]}, "
-                    f"valid-cohorts={sum(e.valid for e in khop_state.cohort_evidence)}, "
-                    f"root-cap={len(root_group.member_robot_ids) if root_group is not None else 0}/"
-                    f"{round(root_group.cap_mean_error, 1) if root_group is not None else '-'}, "
-                    f"active={khop_state.active_group_id or '-'}, "
-                    f"queue={khop_state.branch_queue}, "
-                    f"visited={khop_state.sequential_visit_order}, "
+                    f"clearances={khop_state.last_open_clearances}, "
                     f"root-pos="
                     f"{tuple(round(value, 1) for value in root_leader.position) if root_leader is not None else '-'}"
                 )
-                if HEADLESS_SNAPSHOT_PATH:
-                    save_khop_headless_snapshot(
-                        HEADLESS_SNAPSHOT_PATH,
-                        robots,
-                        color_reference_density,
-                    )
                 running = False
                 continue
     else:
