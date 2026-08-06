@@ -1378,7 +1378,18 @@ KHOP_NAVIGATION_CLEARANCE = KHOP_LOCAL_PROBE_DISTANCE * 0.88
 NATURAL_SPREAD_LATERAL_ANGLE = math.radians(32.0)
 NATURAL_SPREAD_MIN_SPEED = 2.0 * MOTION_SPEED_MULTIPLIER
 NATURAL_SPREAD_MIN_TRAVEL = max(ROBOT_RADIUS * 3.0, 4.5 * MAP_SCALE)
-NATURAL_SPREAD_ANOMALY_ROBOTS = 7
+# Witness-count anomaly threshold, expressed as a ratio of the locally
+# observable population (khop_reachable_robot_count(leader,
+# NATURAL_SPREAD_LOCAL_HOPS), see natural_spread_anomaly_threshold()) rather
+# than a fixed absolute robot count. An absolute count's meaning silently
+# shifts whenever cap/witness-pool sizes change for unrelated reasons (this
+# is exactly what happened when the root cap grew from 29 to ~38 members in
+# an earlier round: the same raw threshold suddenly meant a much smaller
+# fraction of the locally reachable swarm). The ratio below is calibrated to
+# reproduce the previously tuned absolute threshold (7) at the locally
+# observed population measured at anomaly detection (~483 reachable robots).
+NATURAL_SPREAD_ANOMALY_ROBOT_RATIO = 0.0145
+NATURAL_SPREAD_ANOMALY_ROBOTS_MIN = 3
 NATURAL_SPREAD_ANOMALY_DWELL = 0.22
 NATURAL_SPREAD_LOCAL_HOPS = KHOP_CAPTURE_DEPTH + 2
 NATURAL_SPREAD_CANDIDATE_TIMEOUT = 5.0
@@ -1404,12 +1415,30 @@ NATURAL_SPREAD_COHORT_MIN_SEPARATION = math.radians(52.0)
 # Bounded well under NATURAL_SPREAD_CANDIDATE_TIMEOUT so an indefinitely
 # stuck straggler still cannot block confirmation forever.
 NATURAL_SPREAD_STRAGGLER_GRACE_TIME = 1.5
+# KHOP_SPLIT_MIN_GROUP_SIZE is a physical/geometric floor -- the fewest
+# robots that can plausibly hold a barrier line/gate or a connected capture
+# tree, driven by corridor width (see khop_required_shepherd_count), not by
+# how large the swarm's locally observable population happens to be. It is
+# intentionally left as an absolute constant and used only for those
+# physical-viability checks (cap formation completeness, connected-tree
+# re-election, retry candidate pool, dead-end member-count failure).
 KHOP_SPLIT_MIN_GROUP_SIZE = 18
 KHOP_SPLIT_CLUSTER_MATCH_DEGREES = 18.0
 KHOP_SPLIT_CLUSTER_MIN_RADIUS = COMM_SAFE_DISTANCE * 0.62
 KHOP_SPLIT_CLUSTER_MAX_RADIUS = NATURAL_SPREAD_LIMIT_RADIUS * 1.05
 KHOP_SPLIT_CLUSTER_BACKWARD_COSINE = -0.30
-KHOP_SPLIT_CLUSTER_MIN_SIZE = KHOP_SPLIT_MIN_GROUP_SIZE
+# Cluster/cohort-size validity floor (detect_khop_directional_clusters,
+# detect_khop_straight_continuation_cluster, validate_directional_cohorts,
+# split_khop_from_clusters), unlike KHOP_SPLIT_MIN_GROUP_SIZE above, IS a
+# detection-evidence threshold -- "is this cluster big enough to trust as
+# real cohort evidence" -- so it is normalized as a ratio of the locally
+# observable population (khop_state.last_split_group_size, frozen at the
+# moment CONTROLLED_SPREAD began) via khop_split_cluster_min_size() instead
+# of the fixed absolute count it used to share with KHOP_SPLIT_MIN_GROUP_SIZE.
+# Calibrated to reproduce the previously tuned absolute threshold (18) at
+# the locally observed population measured at anomaly detection (~483).
+KHOP_SPLIT_CLUSTER_MIN_RATIO = 0.0373
+KHOP_SPLIT_CLUSTER_MIN_SIZE_FLOOR = 6
 KHOP_STREAM_LATERAL_BAND = COMM_SAFE_DISTANCE * 0.45
 KHOP_LEADER_REELECT_DISTANCE = COMM_SAFE_DISTANCE * 0.32
 KHOP_LEADER_REELECT_DWELL = 0.35
@@ -4416,6 +4445,38 @@ def khop_reachable_robot_count(leader: "Robot", maximum_hop: int) -> int:
     return len(khop_reachable_robots(leader, maximum_hop))
 
 
+def natural_spread_anomaly_threshold() -> int:
+    """Witness count needed to flag a natural-spread anomaly.
+
+    Normalized as a ratio of khop_state.last_split_group_size (the locally
+    observable population at NATURAL_SPREAD_LOCAL_HOPS, set immediately
+    before this is consulted) instead of a fixed absolute robot count --
+    see NATURAL_SPREAD_ANOMALY_ROBOT_RATIO for why.
+    """
+    return max(
+        NATURAL_SPREAD_ANOMALY_ROBOTS_MIN,
+        round(
+            NATURAL_SPREAD_ANOMALY_ROBOT_RATIO * khop_state.last_split_group_size
+        ),
+    )
+
+
+def khop_split_cluster_min_size() -> int:
+    """Minimum robot count for a candidate cluster/cohort to be trusted.
+
+    Normalized as a ratio of khop_state.last_split_group_size (frozen at the
+    moment CONTROLLED_SPREAD began) instead of the fixed absolute count this
+    used to share with KHOP_SPLIT_MIN_GROUP_SIZE -- see
+    KHOP_SPLIT_CLUSTER_MIN_RATIO for why.
+    """
+    return max(
+        KHOP_SPLIT_CLUSTER_MIN_SIZE_FLOOR,
+        round(
+            KHOP_SPLIT_CLUSTER_MIN_RATIO * khop_state.last_split_group_size
+        ),
+    )
+
+
 def rebuild_khop_capture_tree(
     group: KHopShepherdGroup,
     robots: list["Robot"],
@@ -5324,7 +5385,8 @@ def detect_khop_directional_clusters(
     # register as an observation here. It is measured separately below from
     # the root's own advance and merged in, rather than requiring >= 2
     # turning clusters up front.
-    maximum_count = min(4, len(observations) // max(KHOP_SPLIT_CLUSTER_MIN_SIZE, 1))
+    cluster_min_size = khop_split_cluster_min_size()
+    maximum_count = min(4, len(observations) // max(cluster_min_size, 1))
 
     selected: list[KHopSplitCluster] = []
     for cluster_count in range(maximum_count, 0, -1):
@@ -5336,7 +5398,7 @@ def detect_khop_directional_clusters(
             continue
         proposed: list[KHopSplitCluster] = []
         for center, angular_group in zip(centers, angular_groups):
-            if len(angular_group) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+            if len(angular_group) < cluster_min_size:
                 proposed = []
                 break
             angular_std = math.sqrt(
@@ -5349,7 +5411,7 @@ def detect_khop_directional_clusters(
             raw_ids = {item[1] for item in angular_group}
             component = khop_largest_connected_component(raw_ids)
             connectivity_ratio = len(component) / max(1, len(raw_ids))
-            if len(component) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+            if len(component) < cluster_min_size:
                 proposed = []
                 break
             component_samples = [item for item in angular_group if item[1] in component]
@@ -5424,7 +5486,7 @@ def detect_khop_straight_continuation_cluster(
         for robot_id in root.member_robot_ids
         if robot_id in khop_state.robot_by_id
     }
-    if len(members) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+    if len(members) < khop_split_cluster_min_size():
         return None
     # A turning cohort's mean_travel is how far a new witness moved since it
     # first looked anomalous -- proof a fresh direction is actually usable.
@@ -5490,7 +5552,7 @@ def validate_directional_cohorts(
         else:
             previous.remove(match)
         instantaneous_valid = (
-            len(cluster.robot_ids) >= KHOP_SPLIT_CLUSTER_MIN_SIZE
+            len(cluster.robot_ids) >= khop_split_cluster_min_size()
             and cluster.mean_travel >= NATURAL_SPREAD_COHORT_MIN_TRAVEL
             and cluster.direction_variance <= NATURAL_SPREAD_COHORT_MAX_VARIANCE
             and cluster.connectivity_ratio >= NATURAL_SPREAD_COHORT_MIN_CONNECTIVITY
@@ -5653,7 +5715,7 @@ def split_khop_from_clusters(
         # groups. First cluster in sorted (angle) order keeps a contested
         # robot; later ones treat it as already spoken for.
         cluster_robot_ids = cluster.robot_ids - claimed_robot_ids
-        if len(cluster_robot_ids) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+        if len(cluster_robot_ids) < khop_split_cluster_min_size():
             continue
         claimed_robot_ids |= cluster_robot_ids
         dhop_result = run_maxmin_d_cluster(
@@ -6618,7 +6680,7 @@ def update_khop_capture_state(
             else set()
         )
         split_detected = (
-            len(natural_witnesses) >= NATURAL_SPREAD_ANOMALY_ROBOTS
+            len(natural_witnesses) >= natural_spread_anomaly_threshold()
         )
         khop_state.split_dwell = (
             khop_state.split_dwell + dt
@@ -7337,7 +7399,7 @@ def build_khop_hud_lines(robots: list["Robot"]) -> list[str]:
         ),
         (
             f"Natural anomaly: witnesses={len(khop_state.candidate_observer_ids)}/"
-            f"{NATURAL_SPREAD_ANOMALY_ROBOTS} | "
+            f"{natural_spread_anomaly_threshold()} | "
             f"dwell={khop_state.split_dwell:.2f}s | "
             f"candidate={khop_state.candidate_elapsed:.2f}/"
             f"{NATURAL_SPREAD_CANDIDATE_TIMEOUT:.2f}s"
