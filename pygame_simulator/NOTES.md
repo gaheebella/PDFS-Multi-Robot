@@ -144,6 +144,103 @@ three groups `RELEASED`.
      also setting `group.state = RELEASED` in
      `release_khop_survivors_for_return`.
 
+## Third round of fixes: physical Shepherd/Gatekeeper behavior (GUI-reported)
+
+Status: **CODE COMPLETE, PARTIALLY VERIFIED**. Found via live GUI screenshots
+(not just headless logs) that the physical formation didn't match the
+intended design (reference sketches showed straight full-width caps
+sitting right at each Branch mouth). Eight distinct issues were reported;
+all now have code fixes applied. A 14000-step extended headless run to
+confirm full 3-branch completion end-to-end is running as of this note
+(started, not yet finished) -- an 8000-step run already confirmed the
+critical bug below is fixed and density stays sane, but hadn't finished
+all 3 branches within that window. **GUI visual confirmation of the
+original 8 complaints has not happened yet** -- only headless log/number
+evidence so far.
+
+### Issues reported and fixes applied
+
+1. **Cap formation too slow -> leaks before the line is ready.** Individual
+   per-member repulsion (`compute_khop_gatekeeping_force`) was only ever as
+   good as wherever physical bodies currently were mid-formation. Replaced
+   with `compute_khop_barrier_segment_force`: a straight wall-segment
+   repulsion computed from the group's *target* line position
+   (`khop_barrier_line_point`), active immediately from group creation
+   regardless of how far individual members have physically converged.
+2. **Cap should be one straight line spanning the corridor width, fixed in
+   shape, not thick, densely packed (no gaps).**
+   - `KHOP_CAPTURE_THICKNESS_ROWS`: 3 -> 1 (no more multi-row requirement).
+   - New shared `khop_cap_line_spacing()` (`ROBOT_RADIUS * 2.30`, near the
+     physical minimum) used by both `khop_required_shepherd_count` (how
+     many robots) and `khop_cap_slot_offsets` (where they sit) -- these
+     were previously inconsistent (count assumed tight spacing, placement
+     used a much wider one), which is exactly what silently reintroduced
+     extra rows even with thickness=1.
+   - `KHOP_CAP_EQUILIBRIUM_DISTANCE` (SPH pair-repulsion equilibrium
+     between physical cap bodies) now equals the same tight spacing, so
+     the physical repulsion doesn't fight the slot-attraction force's
+     tighter target.
+   - `KHOP_CAP_FORM_TOLERANCE` raised to 1.5x equilibrium distance (was
+     0.85x) so formation-complete dwell is still reachable at the new
+     tight spacing.
+   - A `WAITING` (fully formed, not yet its turn) group's roster/slots are
+     no longer re-selected via BFS every refresh cycle -- this is what was
+     making an already-formed gate visibly keep changing.
+   - Color legend: green NORMAL robot = `khop_stream_id` matches the
+     currently active Branch; blue (density-colored) = not yet assigned to
+     that stream.
+3. **General swarm has no force toward the active Branch, just scatters.**
+   `KHOP_UNASSIGNED_FOLLOW_FORCE` (see prior section) was too weak
+   (`KHOP_STREAM_FORCE` = 2.5x `MOTION_SPEED_MULTIPLIER`) to meaningfully
+   out-compete raw SPH pressure diffusion once ~700 robots are involved.
+   Raised to `10.0 * MOTION_SPEED_MULTIPLIER` (4x stronger), still well
+   under `KHOP_SHEPHERD_FORCE`/`KHOP_LEADER_FORCE` so the cap stays ahead.
+4. **Pressure Push (backtrack) seems to start on a timer, not real
+   crowding.** `KHOP_DEAD_END_DENSITY_RATIO` (0.25), `KHOP_DEAD_END_
+   MIN_PRESSURE_RATIO` (0.006), `KHOP_DEAD_END_MIN_CONTACT_COMPRESSION`
+   (0.075) were all so low that ordinary ambient density right after the
+   front merely arrived already cleared them -- dead-end confirmation was
+   effectively gated by clearance + dwell alone. Raised to 0.70 / 0.05 /
+   0.28 respectively so it requires a real queue. Confirmed in the 8000-
+   step run: T_up/T_left dead-ends now fire at density=0.71-0.74,
+   contact=0.41-0.44, clearly past ambient.
+5/6/7/8. **Gatekeepers/Markers sit near the open Junction center instead
+   of each Branch's actual (narrower) mouth** -- root cause of the
+   "awkward cross shape in the middle," "Shepherd doesn't actually block
+   anything," and "why did everyone suddenly compress toward the center"
+   complaints. `KHOP_MARKER_OFFSET` (was `COMM_SAFE_DISTANCE * 0.55` ~=
+   15px) and `KHOP_BRANCH_STAGING_OFFSET` (was `* 1.65` ~= 46px) left both
+   well inside the ~84px-wide open Junction cross-section for every
+   Branch, regardless of which one, so they visually clustered together
+   near the middle instead of spreading to each Branch's actual confined
+   corridor. Raised to `* 2.20` (~62px) and `* 3.40` (~95px) so they clear
+   the Junction opening and land inside the real Branch corridor.
+
+### Critical bug found and fixed during verification of the above
+
+**Two Branch groups ended up sharing the same Leader robot**, causing
+severe overcompression (density ratio observed at 5.5x reference,
+pressure ratio 4.05x -- a real jam, both groups' cap/barrier lines
+computed from literally the same physical robot). Root cause: the earlier
+straight-through-branch fix (second round, above) had broadened
+`detect_khop_directional_clusters`'s observation role filter to include
+`KHOP_DYNAMIC_ROLES` (not just `NORMAL`), so a robot still captured in
+root's own cap could *also* get swept into a turning k-means cluster's
+`robot_ids`. With this round's larger cap size (29 -> ~35-38, from the
+tighter spacing needing more robots), that overlap became likely enough
+to actually happen. Two fixes, both applied:
+- `detect_khop_directional_clusters` now explicitly excludes any robot
+  still in `root.member_robot_ids` from the turning-cluster observation
+  loop -- it's the straight-continuation candidate's evidence exclusively.
+- `split_khop_from_clusters` now tracks `claimed_robot_ids` across
+  clusters and subtracts them before each cluster's own Max-Min run and
+  stream assignment, so overlapping `cluster.robot_ids` (from any future
+  source, not just this one) can never again let two groups agree on the
+  same Leader.
+
+Verified fixed in the 8000-step re-run: three groups, three distinct
+Leaders (740/743/723), density ratios back in the 0.6-1.1 range.
+
 ## Repo housekeeping
 
 - `single_junction_sph_dfs_Multi_Hop.py.bak-*` (4 files, lowercase `s`,

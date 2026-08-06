@@ -1309,7 +1309,11 @@ KHOP_CAPTURE_REFRESH_TIME = 0.10
 KHOP_MESSAGE_HOP_LIMIT = KHOP_CAPTURE_DEPTH + 2
 KHOP_MARKER_MESSAGE_HOP_LIMIT = KHOP_CAPTURE_DEPTH * 2
 KHOP_MESSAGE_MAX_AGE = 0.35
-KHOP_CAPTURE_THICKNESS_ROWS = 3
+# A cap only needs to fully cover the corridor cross-section once, not
+# several rows deep -- extra rows just mean more robots to capture and
+# position before the barrier is functionally ready, slowing down exactly
+# the window a gate is supposed to be protecting.
+KHOP_CAPTURE_THICKNESS_ROWS = 1
 KHOP_CAPTURE_COUNT_MARGIN = 1.20
 KHOP_TREE_TARGET_DISTANCE = COMM_SAFE_DISTANCE * 0.58
 KHOP_TREE_SPRING_GAIN = 24.0
@@ -1318,10 +1322,12 @@ KHOP_TREE_FORCE_LIMIT = 150.0 * MOTION_SPEED_MULTIPLIER
 KHOP_LEADER_FORCE = 25.0 * MOTION_SPEED_MULTIPLIER
 KHOP_SHEPHERD_FORCE = 16.0 * MOTION_SPEED_MULTIPLIER
 KHOP_CAP_ROWS = 3
-KHOP_CAP_EQUILIBRIUM_DISTANCE = max(
-    ROBOT_RADIUS * 2.8,
-    SAFE_RADIUS * 1.45,
-)
+# Must match khop_cap_line_spacing() (defined later, near
+# khop_required_shepherd_count): the SPH pair-repulsion equilibrium
+# between physical cap bodies has to agree with the slot-attraction
+# target spacing, or the two forces fight each other and the line can
+# never actually pack as tight as its slots ask for.
+KHOP_CAP_EQUILIBRIUM_DISTANCE = ROBOT_RADIUS * 2.30
 KHOP_CAP_POSITION_GAIN = 28.0 * MOTION_SPEED_MULTIPLIER
 KHOP_CAP_VELOCITY_GAIN = 8.0
 KHOP_CAP_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
@@ -1331,7 +1337,7 @@ KHOP_LEADER_TRACK_SPEED = 10.0 * MOTION_SPEED_MULTIPLIER
 KHOP_LEADER_CENTER_SPEED_GAIN = 0.60
 KHOP_CAP_CENTERING_GAIN = 9.0 * MOTION_SPEED_MULTIPLIER
 KHOP_CAP_CENTERING_FORCE_LIMIT = 220.0 * MOTION_SPEED_MULTIPLIER
-KHOP_CAP_FORM_TOLERANCE = KHOP_CAP_EQUILIBRIUM_DISTANCE * 0.85
+KHOP_CAP_FORM_TOLERANCE = KHOP_CAP_EQUILIBRIUM_DISTANCE * 1.50
 KHOP_CAP_FORM_DWELL = 0.35
 KHOP_CAP_FORM_MAX_TIME = 4.00
 # Ordinary particles are primarily SPH mass. Leaders and their captured
@@ -1350,7 +1356,10 @@ KHOP_RETURN_DAMPING = 5.0
 # keeps the uncaptured body one coherent stream behind whichever front is
 # currently leading, weak enough that the cap (KHOP_LEADER_FORCE /
 # KHOP_SHEPHERD_FORCE, both well above this) always stays ahead of it.
-KHOP_UNASSIGNED_FOLLOW_FORCE = KHOP_STREAM_FORCE
+# KHOP_STREAM_FORCE itself (2.5x) turned out too faint to meaningfully
+# out-compete raw SPH pressure diffusion once ~700 robots are involved --
+# the body still scattered even once this force pointed the right way.
+KHOP_UNASSIGNED_FOLLOW_FORCE = 10.0 * MOTION_SPEED_MULTIPLIER
 # Once every locally discovered Branch is COMPLETED/BLOCKING there is no more
 # Junction left to guard, so every remaining physical role (Gatekeeper,
 # Marker, stray Leader/Shepherd/Relay) is released back to NORMAL and the
@@ -1406,23 +1415,33 @@ KHOP_LEADER_REELECT_DISTANCE = COMM_SAFE_DISTANCE * 0.32
 KHOP_LEADER_REELECT_DWELL = 0.35
 KHOP_FRONT_NEIGHBOR_CONE_DEGREES = 55.0
 KHOP_DEAD_END_CLEARANCE = max(ROBOT_RADIUS * 3.0, 6.0 * MAP_SCALE)
-# The physical cap uses its own close equilibrium spacing, so its kernel
-# density ratio is lower than the old free-SPH BFS chain. Clearance and strong
-# contact compression remain mandatory; this value only confirms that the cap
-# still contains a material front at the wall.
-KHOP_DEAD_END_DENSITY_RATIO = 0.25
+# These three must actually mean "a real queue has backed up behind the
+# cap," not just "the Leader is touching a wall": with the old thresholds
+# (density 0.25 / pressure 0.006 / contact 0.075) ordinary ambient density
+# right after the front merely arrives already clears all three, so
+# Pressure Push effectively started on a clearance+dwell timer regardless
+# of how much was actually queued up. Raised to require density/pressure/
+# contact compression that only build up once robots are genuinely packed
+# in behind the cap.
+KHOP_DEAD_END_DENSITY_RATIO = 0.70
 KHOP_DEAD_END_MAX_SPEED = 7.0
-KHOP_DEAD_END_MIN_PRESSURE_RATIO = 0.006
-KHOP_DEAD_END_MIN_CONTACT_COMPRESSION = 0.075
+KHOP_DEAD_END_MIN_PRESSURE_RATIO = 0.05
+KHOP_DEAD_END_MIN_CONTACT_COMPRESSION = 0.28
 KHOP_DEAD_END_DWELL_TIME = 0.80
 KHOP_GROUP_FAILURE_DWELL_TIME = 0.80
 KHOP_RETRY_DELAY = 0.50
 KHOP_MAX_RETRIES = 2
 KHOP_MARKER_RETURN_RADIUS = COMM_SAFE_DISTANCE * 0.85
 # Keep the Pebble on the Junction side of a staged cap; the cap Leader waits
-# farther outward at KHOP_BRANCH_STAGING_OFFSET.
-KHOP_MARKER_OFFSET = COMM_SAFE_DISTANCE * 0.55
-KHOP_BRANCH_STAGING_OFFSET = COMM_SAFE_DISTANCE * 1.65
+# farther outward at KHOP_BRANCH_STAGING_OFFSET. Both must clear the open
+# Junction cross-section itself, not just sit a short step from the split
+# point -- a small offset leaves the Marker/cap still inside the wide open
+# area shared by every Branch, where nothing narrows the passage and the
+# cap cannot act as a chokepoint. Sized generously past this map's
+# Junction opening so the Marker/cap land inside the confined Branch
+# corridor proper.
+KHOP_MARKER_OFFSET = COMM_SAFE_DISTANCE * 2.20
+KHOP_BRANCH_STAGING_OFFSET = COMM_SAFE_DISTANCE * 3.40
 KHOP_GATEKEEPER_ROWS = 2
 KHOP_GATEKEEPER_ROW_GAP = max(ROBOT_RADIUS * 2.4, 3.5 * MAP_SCALE)
 KHOP_GATEKEEPER_FORCE_RADIUS = COMM_SAFE_DISTANCE * 0.70
@@ -4026,17 +4045,31 @@ def khop_estimate_corridor_width(
     return group.estimated_width or fallback
 
 
+def khop_cap_line_spacing() -> float:
+    """Canonical slot-to-slot spacing for a single-row cap/gate line.
+
+    Shared by khop_required_shepherd_count (how many robots a full-width
+    line needs) and khop_cap_slot_offsets (where those slots actually sit),
+    so the recruited headcount always matches what one tightly packed row
+    can hold -- a mismatch here is what silently reintroduces extra rows
+    even when KHOP_CAPTURE_THICKNESS_ROWS == 1.
+
+    Deliberately near the physical minimum (just enough for two robot
+    bodies to sit side by side without overlapping), not the much wider
+    NORMAL_EQUILIBRIUM_SCALE spacing the general fluid body flows at --
+    a gate line needs to be dense enough that nothing can fit through a
+    gap between adjacent members, not comfortably spaced.
+    """
+    return ROBOT_RADIUS * 2.30
+
+
 def khop_required_shepherd_count(
     group: Optional[KHopShepherdGroup] = None,
 ) -> int:
-    """Estimate a thick capture group from locally sensed width and spacing."""
-    equilibrium_distance = max(
-        ROBOT_RADIUS * 2.2,
-        SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE,
-    )
+    """Estimate a capture group sized to one tightly packed cap/gate line."""
     robots_across = math.ceil(
         khop_estimate_corridor_width(group)
-        / max(equilibrium_distance * 0.82, EPSILON)
+        / max(khop_cap_line_spacing(), EPSILON)
     ) + 1
     return max(
         KHOP_SPLIT_MIN_GROUP_SIZE,
@@ -4065,10 +4098,7 @@ def khop_cap_slot_offsets(
     """
     if shepherd_count <= 0:
         return []
-    spacing = max(
-        ROBOT_RADIUS * 2.6,
-        KHOP_CAP_EQUILIBRIUM_DISTANCE,
-    )
+    spacing = khop_cap_line_spacing()
     half_width = max(
         spacing * 0.5,
         (khop_estimate_corridor_width(group) - ROBOT_RADIUS * 4.0) * 0.5,
@@ -5248,10 +5278,15 @@ def detect_khop_directional_clusters(
     incoming = root.heading.normalize()
     observations: list[tuple[float, int, pygame.Vector2, float]] = []
     for robot in robots:
-        # Root-captured members are the same fluid population under a
-        # different capture-tree role; excluding them here would only ever
-        # matter for a member who has drifted out of its cap slot.
         if robot.role not in KHOP_DYNAMIC_ROLES:
+            continue
+        # A robot still captured in root's own cap is exclusively the
+        # straight-continuation candidate's evidence
+        # (detect_khop_straight_continuation_cluster); letting the same
+        # robot_id also land in a turning k-means cluster here let two
+        # Branch groups independently pick it as their Max-Min head after
+        # the split, producing two groups that shared one Leader.
+        if robot.khop_group_id == root.group_id:
             continue
         relative = robot.position - origin
         travel = relative.length()
@@ -5608,10 +5643,21 @@ def split_khop_from_clusters(
 
     local_groups: list[KHopShepherdGroup] = []
     used_group_ids: set[str] = set()
+    claimed_robot_ids: set[int] = set()
     for index, cluster in enumerate(clusters):
         heading = cluster.heading.normalize()
+        # Clusters are independently detected (k-means turning candidates
+        # plus the straight-continuation candidate) and are not guaranteed
+        # disjoint -- a robot the two happened to agree on would otherwise
+        # let its own Max-Min run pick it as Leader in both resulting
+        # groups. First cluster in sorted (angle) order keeps a contested
+        # robot; later ones treat it as already spoken for.
+        cluster_robot_ids = cluster.robot_ids - claimed_robot_ids
+        if len(cluster_robot_ids) < KHOP_SPLIT_CLUSTER_MIN_SIZE:
+            continue
+        claimed_robot_ids |= cluster_robot_ids
         dhop_result = run_maxmin_d_cluster(
-            cluster.robot_ids,
+            cluster_robot_ids,
             DHOP_CLUSTER_DEPTH,
         )
         member_counts: dict[int, int] = {}
@@ -5661,7 +5707,7 @@ def split_khop_from_clusters(
             created_at=simulation_time,
             rollout_cost=natural_cohort_rollout_cost(cluster),
         )
-        for robot_id in cluster.robot_ids:
+        for robot_id in cluster_robot_ids:
             robot = khop_state.robot_by_id.get(robot_id)
             if robot is not None:
                 robot.khop_stream_id = group_id
@@ -6692,7 +6738,13 @@ def update_khop_capture_state(
             KHopGroupState.DEAD_END_CONFIRMED,
             KHopGroupState.RETURNING,
         }:
-            if refresh_tree:
+            # A WAITING cap is already fully formed and stationary -- there
+            # is no live front to track, so leave its roster and slots
+            # exactly as they packed instead of re-running BFS capture every
+            # refresh cycle. A gate that keeps quietly reselecting members
+            # (even onto the same straight shape) reads as an unstable
+            # formation rather than one fixed line holding position.
+            if refresh_tree and group.state != KHopGroupState.WAITING:
                 update_khop_front_leader(
                     group,
                     robots,
@@ -6904,7 +6956,16 @@ def compute_khop_unassigned_follow_force(robot: "Robot") -> pygame.Vector2:
         if root is not None:
             heading = root.heading
     elif khop_state.stage in {"SEQUENTIAL_DFS", "EXPLORING"}:
-        active = khop_state.groups.get(khop_state.active_group_id or "")
+        target_group_id = khop_state.active_group_id
+        if target_group_id is None and khop_state.branch_queue:
+            # Every Branch cap can still be FORMING right after the split,
+            # with none yet "active" -- the exact window that let the body
+            # spread past every mouth before any cap was ready. Head for the
+            # rollout-cheapest Branch (already decided at split time) so it
+            # arrives behind that cap instead of fanning out toward all of
+            # them at once.
+            target_group_id = khop_state.branch_queue[0]
+        active = khop_state.groups.get(target_group_id or "")
         if active is not None:
             heading = active.heading
     if heading is None or heading.length_squared() <= EPSILON:
@@ -7090,73 +7151,95 @@ def compute_khop_gatekeeping_force(robot: "Robot") -> pygame.Vector2:
             + side * KHOP_GATEKEEPER_FORCE * 0.30 * ratio
         )
     for group in khop_branch_groups():
-        if group.state != KHopGroupState.GATEKEEPING:
-            continue
-        marker = khop_state.markers.get(group.marker_id or "")
-        if marker is None:
-            continue
-        relative_to_entrance = robot.position - marker.position
-        if relative_to_entrance.dot(group.heading) < -KHOP_GATEKEEPER_FORCE_RADIUS:
-            continue
-        physical_gatekeepers = [
-            candidate
-            for candidate in khop_state.robot_by_id.values()
-            if candidate.marker_group_id == group.group_id
-            and candidate.role in {"MARKER", "GATEKEEPER"}
-        ]
-        for gatekeeper in physical_gatekeepers:
-            delta = robot.position - gatekeeper.position
-            distance = delta.length()
-            if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
-                continue
-            ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
-            away = delta / distance
-            outward_component = max(0.0, away.dot(-group.heading))
-            total += (
-                -group.heading * KHOP_GATEKEEPER_FORCE * ratio**2
-                + away
-                * KHOP_GATEKEEPER_FORCE
-                * ratio**2
-                * (0.35 + 0.65 * outward_component)
-            )
-    for group in khop_branch_groups():
-        # A not-yet-activated Branch has no physical Gatekeeper yet -- only
-        # its still-forming cap -- but nothing should be able to drift into
-        # it before its turn either. Give the same physical repulsion to any
-        # robot that is not this cap's own member, so a foreign stream (or
-        # loose main-body fluid) cannot slip past a straight cap line the
-        # same way it couldn't slip past a completed Gatekeeper line. The
-        # cap's own members are excluded so this never fights the slot force
-        # that is still packing them into position.
         if group.state not in {
             KHopGroupState.FORMING,
             KHopGroupState.WAITING,
+            KHopGroupState.EXPLORING,
+            KHopGroupState.DEAD_END_CONFIRMED,
+            KHopGroupState.RETURNING,
+            KHopGroupState.GATEKEEPING,
         }:
             continue
-        if robot.khop_group_id == group.group_id:
-            continue
-        cap_members = [
-            candidate
-            for candidate in khop_state.robot_by_id.values()
-            if candidate.khop_group_id == group.group_id
-            and candidate.role in {"KHOP_LEADER", "KHOP_SHEPHERD"}
-        ]
-        for member in cap_members:
-            delta = robot.position - member.position
-            distance = delta.length()
-            if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
-                continue
-            ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
-            away = delta / distance
-            outward_component = max(0.0, away.dot(-group.heading))
-            total += (
-                -group.heading * KHOP_GATEKEEPER_FORCE * ratio**2
-                + away
-                * KHOP_GATEKEEPER_FORCE
-                * ratio**2
-                * (0.35 + 0.65 * outward_component)
-            )
+        total += compute_khop_barrier_segment_force(robot, group)
     return limit_vector(total, KHOP_GATEKEEPER_FORCE_LIMIT)
+
+
+def khop_barrier_line_point(
+    group: KHopShepherdGroup,
+) -> Optional[pygame.Vector2]:
+    """Current position of a group's blocking line, if it should have one.
+
+    FORMING/WAITING hold at the fixed staging point (group.cap_anchor);
+    GATEKEEPING holds at the fixed post-completion Marker; an actively
+    advancing/retreating group (EXPLORING/DEAD_END_CONFIRMED/RETURNING)
+    tracks its live Leader, since that is where its own physical cap
+    actually is right now, not where it started.
+    """
+    if group.state in {KHopGroupState.FORMING, KHopGroupState.WAITING}:
+        return group.cap_anchor
+    if group.state == KHopGroupState.GATEKEEPING:
+        marker = khop_state.markers.get(group.marker_id or "")
+        return marker.position if marker is not None else None
+    if group.state in {
+        KHopGroupState.EXPLORING,
+        KHopGroupState.DEAD_END_CONFIRMED,
+        KHopGroupState.RETURNING,
+    }:
+        leader = khop_state.robot_by_id.get(group.leader_id)
+        return leader.position if leader is not None else None
+    return None
+
+
+def compute_khop_barrier_segment_force(
+    robot: "Robot",
+    group: KHopShepherdGroup,
+) -> pygame.Vector2:
+    """Repel a non-member from a group's current line as a straight wall
+    segment spanning the corridor width, instead of only from wherever its
+    individual physical bodies happen to be right now. This is what gives
+    full-width coverage immediately -- even mid-formation, before a single
+    Shepherd body has actually reached its slot -- rather than protection
+    only as good as however far the cap has already converged.
+    """
+    if (
+        robot.khop_group_id == group.group_id
+        or robot.khop_stream_id == group.group_id
+    ):
+        return pygame.Vector2()
+    if group.heading.length_squared() <= EPSILON:
+        return pygame.Vector2()
+    anchor = khop_barrier_line_point(group)
+    if anchor is None:
+        return pygame.Vector2()
+    forward = group.heading.normalize()
+    side = pygame.Vector2(-forward.y, forward.x)
+    half_width = max(
+        khop_cap_line_spacing(),
+        (khop_estimate_corridor_width(group) - ROBOT_RADIUS * 4.0) * 0.5,
+    )
+    relative = robot.position - anchor
+    depth = relative.dot(forward)
+    if depth <= 0.0:
+        # Already on the safe (Junction/Base) side of the line; a robot
+        # properly trailing the cap from behind should be free to pack up
+        # close against it, not get shoved away by its own gate.
+        return pygame.Vector2()
+    lateral = clamp(relative.dot(side), -half_width, half_width)
+    closest = anchor + side * lateral
+    delta = robot.position - closest
+    distance = delta.length()
+    if distance <= EPSILON or distance >= KHOP_GATEKEEPER_FORCE_RADIUS:
+        return pygame.Vector2()
+    ratio = 1.0 - distance / KHOP_GATEKEEPER_FORCE_RADIUS
+    away = delta / distance
+    outward_component = max(0.0, away.dot(-forward))
+    return (
+        -forward * KHOP_GATEKEEPER_FORCE * ratio**2
+        + away
+        * KHOP_GATEKEEPER_FORCE
+        * ratio**2
+        * (0.35 + 0.65 * outward_component)
+    )
 
 
 def draw_khop_capture_network(surface, robots: list["Robot"]) -> None:
