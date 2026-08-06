@@ -6426,18 +6426,31 @@ def update_khop_dead_end_detection(
         )
         return
     forward_speed = max(0.0, leader.velocity.dot(group.heading))
-    density_observed = (
+    # Three independently sufficient crowding signals, not a hard AND of all
+    # three. A 14000-step run found T_right (the last-queued branch) stuck
+    # indefinitely: its local density plateaued at a genuine steady state of
+    # 0.61 -- never climbing further no matter how long it waited -- while
+    # clearance already showed the front sitting at the dead-end wall and
+    # contact compression (0.426) already comfortably cleared
+    # KHOP_DEAD_END_MIN_CONTACT_COMPRESSION (0.28). Density-ratio is a
+    # branch-geometry-dependent proxy (a wider corridor spreads the same
+    # physical jam over more area, reading a lower ratio for the same real
+    # crowding) and treating it as a mandatory extra condition on top of an
+    # already-crowding-proven contact/pressure signal reintroduced exactly
+    # the kind of single-point-of-failure gate the round-3 multi-signal
+    # design was meant to avoid, just shifted from "too easy to satisfy" to
+    # "impossible to satisfy for some branches." Density stays one of the
+    # signals (still fires it directly when a branch's density does spike),
+    # it just no longer has to fire *in addition to* pressure or contact.
+    crowding_observed = (
         group.density_evidence_ema >= KHOP_DEAD_END_DENSITY_RATIO
-    )
-    compression_observed = (
-        group.pressure_evidence_ema >= KHOP_DEAD_END_MIN_PRESSURE_RATIO
+        or group.pressure_evidence_ema >= KHOP_DEAD_END_MIN_PRESSURE_RATIO
         or group.compression_evidence_ema
         >= KHOP_DEAD_END_MIN_CONTACT_COMPRESSION
     )
     local_dead_end = (
         group.forward_clearance <= KHOP_DEAD_END_CLEARANCE
-        and density_observed
-        and compression_observed
+        and crowding_observed
         and forward_speed <= KHOP_DEAD_END_MAX_SPEED
     )
     group.dead_end_dwell = (
