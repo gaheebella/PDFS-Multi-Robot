@@ -3,6 +3,76 @@
 Branch: `feature/rebuild-multi-junction-from-single`
 File: `pygame_simulator/Single_junction_sph_dfs_Multi_Hop.py`
 
+## START HERE — session handoff (continuing in a fresh session)
+
+This file is being read by a **new session** picking up from the last
+pushed commit on this branch. Everything below "START HERE" is the
+accumulated history from the prior session, kept as reference — read
+this section first for where things actually stand.
+
+### What's committed and safe
+Every code change described in this file (rounds 1-3 below) is already
+committed and pushed to `origin/feature/rebuild-multi-junction-from-single`.
+Latest commit: `b98b661 Fix physical Shepherd/Gatekeeper behavior from
+GUI feedback`. Nothing is sitting uncommitted.
+
+### What's NOT yet confirmed — do this first
+An **8000-step** headless run (see "Third round" below) confirmed the
+Leader-duplication bug is fixed and density stays sane (0.6-1.1x), but
+did **not** finish all 3 branches within that window. A **14000-step**
+extended run was started to confirm full 3-branch completion end-to-end,
+but the prior session ended before it finished -- its result was never
+seen. **First step in this session: re-run the verification** (the old
+background run, if still alive on the machine, is not something a fresh
+session can observe -- just start a new one):
+```
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=14000
+```
+Look for: three distinct Leader ids across `T_up`/`T_left`/`T_right`
+(never the same robot twice), density ratios staying roughly 0.5-1.2x
+(not spiking to 3-5x, which was the symptom of the Leader-duplication
+bug), all three branches reaching `Dead-end`/`Marker ... BLOCKING`, and
+a final `[Headless]` summary at `stage=COMPLETE` with `N/760` gathered
+at Base (N should be >= ~95%). If it still doesn't finish in 14000
+steps, that itself is a finding worth reporting back, not necessarily a
+crash -- the dead-end density thresholds were raised substantially this
+round (see round 3, item 4) and may just need more real time to trigger
+now, or may need re-tuning if they turn out unreachable in practice.
+
+**Also not yet done**: GUI visual re-confirmation of the 8 issues
+reported in round 3 below. All of that round's evidence so far is
+headless logs/numbers only -- nobody has looked at the actual rendered
+window since those fixes went in.
+
+### What to do after verification passes (already decided, don't re-ask)
+Apply normalization ideas from a swarm-distribution-as-environment-sensor
+paper the user shared, **scoped to normalization only** (both explicitly
+confirmed by the user in the prior session -- do not re-litigate):
+- Replace absolute robot-count thresholds (`NATURAL_SPREAD_ANOMALY_ROBOTS`
+  = 7, `KHOP_SPLIT_CLUSTER_MIN_SIZE`, `KHOP_SPLIT_MIN_GROUP_SIZE`, etc.)
+  with ratios normalized against the locally-observable robot count
+  (e.g. `khop_reachable_robot_count(leader, NATURAL_SPREAD_LOCAL_HOPS)`),
+  so behavior stays consistent as cap/witness-pool sizes change (this is
+  exactly the class of bug that caused the Leader-duplication issue: an
+  absolute threshold's meaning silently shifted when the root cap grew
+  from 29 to ~38 members this round).
+- **Explicitly out of scope for now** (user deferred this, don't build
+  it unprompted): a unified weighted composite score
+  `S_J(t) = w1*Ŵ + w2*σ_perp² + w3*V_perp + w4*R_branch` replacing the
+  current AND-gated multi-condition validation in
+  `validate_directional_cohorts`/`detect_persistent_non_corridor_motion`.
+  The existing local/multi-feature/time-accumulated design already
+  satisfies most of the paper's principles; only the normalization gap
+  was judged worth fixing immediately, given how much was already
+  in flight and unverified. Formal robustness testing (varying robot
+  count, corridor/branch width, Junction geometry, noise -- paper
+  section 7) was also identified as a gap but not scheduled.
+- If asked to continue past normalization, re-read the full paper-summary
+  message in the conversation this file cannot include verbatim -- ask
+  the user to re-paste it if starting genuinely fresh with no chat
+  history, since it's substantial (a full section-by-section mapping of
+  a distributed-sensing paper's principles onto this codebase).
+
 ## Status: RESOLVED
 
 The straight-through (UP) branch is now reliably discovered alongside the
