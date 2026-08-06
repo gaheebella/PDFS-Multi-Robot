@@ -17,27 +17,50 @@ Latest commit: `b98b661 Fix physical Shepherd/Gatekeeper behavior from
 GUI feedback`. Nothing is sitting uncommitted.
 
 ### What's NOT yet confirmed — do this first
-An **8000-step** headless run (see "Third round" below) confirmed the
-Leader-duplication bug is fixed and density stays sane (0.6-1.1x), but
-did **not** finish all 3 branches within that window. A **14000-step**
-extended run was started to confirm full 3-branch completion end-to-end,
-but the prior session ended before it finished -- its result was never
-seen. **First step in this session: re-run the verification** (the old
-background run, if still alive on the machine, is not something a fresh
-session can observe -- just start a new one):
+
+**UPDATE: the 14000-step run finished and found a real, confirmed bug.**
+Leader-duplication stays fixed (three distinct Leaders, density sane for
+`T_up`/`T_left`: 0.71-1.1x) and T_up/T_left both reach `Dead-end
+confirmed` -> `Marker BLOCKING` correctly. But **`T_right` (the last
+branch in queue) never reaches dead-end and appears genuinely stuck**:
+at frame 8000 it read `clearance=2.8, rho=0.61, P=0.0, contact=0.426,
+dead_end_dwell=0.0`; at frame 14000 (6000 frames / ~100s later) it read
+**the exact same numbers, unchanged**. `clearance=2.8` means the front
+is already sitting at the dead-end wall; `contact=0.426` alone would
+already satisfy `compression_observed` (>= `KHOP_DEAD_END_MIN_CONTACT_
+COMPRESSION` = 0.28). The blocker is `density_observed`:
+`KHOP_DEAD_END_DENSITY_RATIO` was raised to 0.70 this round (see round
+3, item 4), and T_right's local density appears to have hit a genuine
+steady state at 0.61 -- below threshold -- and is not climbing further
+no matter how long it waits.
+
+Likely cause (not yet root-caused): T_right is the **third and last**
+branch activated -- by the time it's `EXPLORING`, the other two branches
+already absorbed a large share of the swarm into their own Gatekeeping
+lines, and/or `KHOP_UNASSIGNED_FOLLOW_FORCE` still isn't reliably
+funneling enough of the remaining ~277+ un-arrived robots
+(`split-N=483` at that point, i.e. under two-thirds of 760 had even
+joined a stream) into a queue behind T_right's cap fast enough to build
+real density there. This may be branch-order-dependent (last branch
+starves) rather than a generic threshold problem -- worth checking
+whether T_right specifically has less corridor length or a smaller
+share of the swarm reaching it, or whether `KHOP_DEAD_END_DENSITY_RATIO`
+0.70 was simply too aggressive and should come down (e.g. to something
+between the old 0.25 and new 0.70 -- try ~0.45-0.55) while keeping the
+tightened pressure/contact-compression floors, which already proved
+sufficient on their own (T_up/T_left both actually triggered via
+contact compression, pressure was near-zero for both: 0.035 and 0.005).
+
+**First step in this session**: decide whether to (a) loosen
+`KHOP_DEAD_END_DENSITY_RATIO`, (b) investigate why the last-queued
+branch specifically starves of density, or (c) drop density from the
+AND and let pressure-OR-contact alone gate it (both already proved to
+correlate with genuine crowding in the T_up/T_left data) -- then re-run
+to confirm all three branches complete and the run reaches `stage=
+COMPLETE`:
 ```
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=14000
 ```
-Look for: three distinct Leader ids across `T_up`/`T_left`/`T_right`
-(never the same robot twice), density ratios staying roughly 0.5-1.2x
-(not spiking to 3-5x, which was the symptom of the Leader-duplication
-bug), all three branches reaching `Dead-end`/`Marker ... BLOCKING`, and
-a final `[Headless]` summary at `stage=COMPLETE` with `N/760` gathered
-at Base (N should be >= ~95%). If it still doesn't finish in 14000
-steps, that itself is a finding worth reporting back, not necessarily a
-crash -- the dead-end density thresholds were raised substantially this
-round (see round 3, item 4) and may just need more real time to trigger
-now, or may need re-tuning if they turn out unreachable in practice.
 
 **Also not yet done**: GUI visual re-confirmation of the 8 issues
 reported in round 3 below. All of that round's evidence so far is
