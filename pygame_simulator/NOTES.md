@@ -88,12 +88,61 @@ and the `CONTROLLED_SPREAD` block of `update_khop_capture_state`)
 ## How to test
 
 ```
-SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=3000
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python Single_junction_sph_dfs_Multi_Hop.py --headless-steps=7000
 ```
 (see the module docstring / top of file for all `--headless-*` /
-`--initial-leader-id=` CLI flags). Look for `valid-cohorts=3` and a
-`groups=[...]` list containing `T_up`, `T_left`, `T_right` all
-`GATEKEEPING` at `stage=COMPLETE` in the final `[Headless]` summary line.
+`--initial-leader-id=` CLI flags). Look for `valid-cohorts=3`, a
+`[K-hop] swarm gathered back at Base: N/760` line with N at or above
+~95%, and a final `[Headless]` summary with `stage=COMPLETE`,
+`command=KHOP_COMPLETE`, and all three groups (`T_up`, `T_left`,
+`T_right`) `RELEASED` (not `GATEKEEPING` — see below). 7000 steps is
+needed, not 3000: the walk back to Base after the last branch closes
+takes real time.
+
+## Second round of fixes: Shepherd physical formation + real return-to-base
+
+Found after watching the actual GUI run (not just headless logs).
+Status: **RESOLVED**, verified via a 7000-step headless run reaching
+`stage=COMPLETE` with 736/760 (96.8%) actually gathered at Base and all
+three groups `RELEASED`.
+
+1. **Shepherd cap shape.** `khop_cap_slot_offsets` built a tapered
+   three-row "crescent" centered on the Leader (its own comment called
+   it that), leaving both edges of the corridor uncovered — a real
+   robot line can't pass that off as a gate, fluid slips around the
+   tapered ends. Rewritten so every row spans the full sensed corridor
+   width evenly (spreads fewer robots wider rather than clustering at
+   center), with rows stacked straight behind one another instead of
+   tapering inward with depth.
+2. **Un-activated branches had no blocking force.** Only completed
+   `GATEKEEPING` groups got the physical Gatekeeper repulsion field;
+   a `FORMING`/`WAITING` (not-yet-its-turn) branch had a cap shape but
+   nothing stopping a foreign stream from drifting into it.
+   `compute_khop_gatekeeping_force` now applies the same repulsion to
+   any robot that is not a `FORMING`/`WAITING` group's own cap member.
+3. **Mission completion left the swarm wherever it stopped** (the
+   "awkward triangle" at the end) — `khop_state.stage` jumped straight
+   from all-branches-`BLOCKING` to `COMPLETE`/`DONE`, with every
+   Gatekeeper frozen at its branch mouth forever and everything else
+   just damped in place. Added a `RETURNING_TO_BASE` stage:
+   `release_khop_survivors_for_return` stands every remaining
+   Gatekeeper/Marker/stray Leader/Shepherd/Relay down to `NORMAL`,
+   `compute_khop_route_force` drives everyone home via
+   `direction_toward_base_path`, and completion now requires
+   `KHOP_RETURN_BASE_READY_RATIO` (95%) of the swarm actually inside
+   the Base rectangle for `KHOP_RETURN_BASE_DWELL` (0.5s) before
+   `COMPLETE` fires.
+   - Also required: `RETURNING_TO_BASE` needed the same **packed
+     equilibrium spacing + reduced pressure scale** the legacy
+     `RETURN_TO_BASE` phase used
+     (`RETURN_PACKED_EQUILIBRIUM_SCALE` / `RETURN_PACKING_PRESSURE_SCALE`,
+     applied in `adaptive_equilibrium_radius` and `compute_pressures`).
+     The Base rectangle physically cannot hold ~760 robots at ordinary
+     flow spacing — without compaction the ready ratio was unreachable
+     and a 6000-frame run just sat in `RETURNING_TO_BASE` forever with
+     Gatekeepers cosmetically stuck reporting `GATEKEEPING`. Fixed by
+     also setting `group.state = RELEASED` in
+     `release_khop_survivors_for_return`.
 
 ## Repo housekeeping
 
