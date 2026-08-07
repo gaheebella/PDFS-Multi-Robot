@@ -615,7 +615,13 @@ INITIAL_RELEASE_EXTRA_DAMPING = 6.0
 INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA = 0.12
 INITIAL_INGRESS_LANE_GAIN = 0.25
 INITIAL_INGRESS_LANE_MAX_FORCE = 5.0
-INITIAL_INGRESS_TARGET_Y = center_y + 10.0 * MAP_SCALE
+# Blind straight-ahead probe along the incoming corridor heading.  The target
+# lies beyond the Junction envelope, but it does not assert that an opening is
+# present; successful physical crossing is still required by the detector.
+INITIAL_INGRESS_TARGET_Y = (
+    center_y - half_width - 18.0 * MAP_SCALE
+)
+INITIAL_JUNCTION_PROBE_ROUTE_MULTIPLIER = 3.0
 INITIAL_INGRESS_BRAKE_DISTANCE = 52.0 * MAP_SCALE
 INITIAL_INGRESS_MIN_FORCE_SCALE = 0.10
 INITIAL_INGRESS_MAX_DT = 0.04
@@ -1055,15 +1061,18 @@ JUNCTION_LATERAL_EXPANSION_MIN = (4.5 * MAP_SCALE) ** 2
 JUNCTION_EXPANSION_DWELL_TIME = 0.14
 JUNCTION_COHORT_HALF_ANGLE = math.radians(38.0)
 JUNCTION_COHORT_MIN_SPEED = 1.2
-JUNCTION_COHORT_MIN_ROBOTS = 5
-JUNCTION_COHORT_MIN_FRACTION = 0.055
-JUNCTION_COHORT_MIN_TRAVEL = 7.0 * MAP_SCALE
-JUNCTION_COHORT_DWELL_TIME = 0.10
+JUNCTION_COHORT_MIN_ROBOTS = 8
+JUNCTION_COHORT_MIN_FRACTION = 0.045
+JUNCTION_COHORT_MIN_TRAVEL = 12.0 * MAP_SCALE
+JUNCTION_COHORT_MIN_BRANCH_DEPTH = 12.0 * MAP_SCALE
+JUNCTION_COHORT_DWELL_TIME = 0.22
 JUNCTION_MIN_VALID_COHORTS = 2
-JUNCTION_DISCOVERY_SETTLE_TIME = 0.18
+JUNCTION_DISCOVERY_SETTLE_TIME = 1.00
+JUNCTION_FRONT_BLOCK_MIN_CONTACTS = 4
+JUNCTION_FRONT_BLOCK_MIN_SPAN_RATIO = 0.80
 JUNCTION_PROBE_DEPTH = 24.0 * MAP_SCALE
 JUNCTION_PROBE_BARRIER_GAIN = 70.0 * MOTION_SPEED_MULTIPLIER
-JUNCTION_INFERENCE_POLICY_VERSION = "EMMONS_SEQUENTIAL_COHORT_V1"
+JUNCTION_INFERENCE_POLICY_VERSION = "LOCAL_CROSSING_DENSITY_COHORT_V2"
 
 # Junction-mouth Shepherd/Guard lifecycle.  Full-width guards are recruited
 # only after Junction confirmation, using a leader-rooted minimum K-hop set.
@@ -1149,7 +1158,11 @@ def get_robot_region(position: pygame.Vector2) -> str:
 def is_region_allowed(position: pygame.Vector2) -> bool:
     region = get_robot_region(position)
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        return region in {"BOTTOM", "JUNCTION"}
+        # Junction discovery is driven by free SPH probes.  Do not use the
+        # simulator's known branch rectangles as closed pre-discovery gates:
+        # a branch can only become a candidate after robots physically cross
+        # its mouth and sustain measurable travel inside it.
+        return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
     if phase in {
         SimulationPhase.EXPLORE_BRANCH,
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -2614,7 +2627,22 @@ def begin_junction_guard_formation(robots) -> None:
     global junction_guard_stable_dwell, junction_guard_status
     global distributed_consensus_branch
     release_junction_guard_roles(robots)
-    close_all_branch_gates()
+    # Only observed openings may be sealed.  Closing an undiscovered branch
+    # would leak the simulator's ground-truth map into the controller.
+    branch_gate_states.clear()
+    branch_gate_states.update({
+        branch: (
+            "CLOSED" if branch in detected_branch_candidates else "OPEN"
+        )
+        for branch in BRANCHES
+    })
+    preserve_consensus_at_anchor(junction_anchor)
+    print(
+        "[Gate] inferred mouths only: "
+        + ", ".join(
+            f"{branch}={branch_gate_states[branch]}" for branch in BRANCHES
+        )
+    )
     distributed_consensus_branch = None
     junction_guard_groups = {}
     junction_guard_formation_timer = 0.0
@@ -6111,7 +6139,12 @@ def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
         new_gate_states = {branch: "OPEN" for branch in BRANCHES}
     else:
         new_gate_states = {
-            branch: "OPEN" if branch == open_branch else "CLOSED"
+            branch: (
+                "OPEN"
+                if branch == open_branch
+                or branch not in detected_branch_candidates
+                else "CLOSED"
+            )
             for branch in BRANCHES
         }
     branch_gate_states.clear()
@@ -6553,11 +6586,21 @@ class SequentialJunctionInferenceTracker:
     cohort_travel: dict[str, float] = field(
         default_factory=lambda: {branch: 0.0 for branch in BRANCHES}
     )
+    cohort_depth: dict[str, float] = field(
+        default_factory=lambda: {branch: 0.0 for branch in BRANCHES}
+    )
     cohort_dwell: dict[str, float] = field(
         default_factory=lambda: {branch: 0.0 for branch in BRANCHES}
     )
     cohort_origins: dict[tuple[int, str], pygame.Vector2] = field(default_factory=dict)
+    cohort_member_ids: dict[str, set[int]] = field(
+        default_factory=lambda: {branch: set() for branch in BRANCHES}
+    )
     valid_branches: set[str] = field(default_factory=set)
+    discovery_dwell: float = 0.0
+    last_member_total: int = 0
+    forward_probe_status: str = "UNRESOLVED"
+    forward_contact_count: int = 0
     confirmed: bool = False
     confirmed_at: float = float("inf")
 
@@ -6572,9 +6615,15 @@ class SequentialJunctionInferenceTracker:
         self.sector_distribution = {}
         self.cohort_counts = {branch: 0 for branch in BRANCHES}
         self.cohort_travel = {branch: 0.0 for branch in BRANCHES}
+        self.cohort_depth = {branch: 0.0 for branch in BRANCHES}
         self.cohort_dwell = {branch: 0.0 for branch in BRANCHES}
         self.cohort_origins.clear()
+        self.cohort_member_ids = {branch: set() for branch in BRANCHES}
         self.valid_branches.clear()
+        self.discovery_dwell = 0.0
+        self.last_member_total = 0
+        self.forward_probe_status = "UNRESOLVED"
+        self.forward_contact_count = 0
         self.confirmed = False
         self.confirmed_at = float("inf")
 
@@ -6706,31 +6755,52 @@ class SequentialJunctionInferenceTracker:
         alignment_threshold = math.cos(JUNCTION_COHORT_HALF_ANGLE)
         for branch in BRANCHES:
             direction = BRANCH_DIRECTIONS[branch]
-            aligned = []
             maximum_travel = self.cohort_travel[branch]
+            maximum_depth = 0.0
             for robot in observed:
                 velocity = robot.observed_velocity
-                if (
-                    velocity.length() < JUNCTION_COHORT_MIN_SPEED
-                    or velocity.normalize().dot(direction)
-                    < alignment_threshold
-                ):
-                    continue
-                aligned.append(robot)
-                key = (robot.robot_id, branch)
-                origin = self.cohort_origins.setdefault(
-                    key,
-                    robot.position.copy(),
+                heading_aligned = (
+                    velocity.length() >= JUNCTION_COHORT_MIN_SPEED
+                    and velocity.normalize().dot(direction)
+                    >= alignment_threshold
                 )
+                key = (robot.robot_id, branch)
+                # Directional motion inside the Junction is not evidence that
+                # an opening exists.  Count the robot only after it has crossed
+                # the physical mouth and penetrated a non-trivial distance into
+                # that branch.  This prevents a handful of shallow probes from
+                # creating a false branch candidate.
+                if get_robot_region(robot.position) != branch:
+                    continue
+                # The travel origin is the first aligned pose *inside* this
+                # opening, never a pose in Base or the Junction.  Otherwise a
+                # straight-ahead robot would incorrectly count its entire
+                # incoming corridor journey as branch traversal.
+                if heading_aligned:
+                    self.cohort_origins.setdefault(
+                        key,
+                        robot.position.copy(),
+                    )
+                depth = branch_depth_from_junction(robot.position, branch)
+                maximum_depth = max(maximum_depth, depth)
+                if depth < JUNCTION_COHORT_MIN_BRANCH_DEPTH:
+                    continue
+                origin = self.cohort_origins.get(key)
+                if origin is None:
+                    continue
+                travel = (robot.position - origin).dot(direction)
                 maximum_travel = max(
                     maximum_travel,
-                    (robot.position - origin).dot(direction),
+                    travel,
                 )
-            self.cohort_counts[branch] = len(aligned)
+                if travel >= JUNCTION_COHORT_MIN_TRAVEL:
+                    self.cohort_member_ids[branch].add(robot.robot_id)
+            self.cohort_counts[branch] = len(self.cohort_member_ids[branch])
             self.cohort_travel[branch] = maximum_travel
-            fraction = len(aligned) / len(observed)
+            self.cohort_depth[branch] = maximum_depth
+            fraction = self.cohort_counts[branch] / len(observed)
             cohort_valid_now = (
-                len(aligned) >= JUNCTION_COHORT_MIN_ROBOTS
+                self.cohort_counts[branch] >= JUNCTION_COHORT_MIN_ROBOTS
                 and fraction >= JUNCTION_COHORT_MIN_FRACTION
                 and maximum_travel >= JUNCTION_COHORT_MIN_TRAVEL
             )
@@ -6739,13 +6809,90 @@ class SequentialJunctionInferenceTracker:
                 if cohort_valid_now
                 else max(0.0, self.cohort_dwell[branch] - dt)
             )
-            if self.cohort_dwell[branch] >= JUNCTION_COHORT_DWELL_TIME:
+            if (
+                self.cohort_dwell[branch] >= JUNCTION_COHORT_DWELL_TIME
+                and branch not in self.valid_branches
+            ):
                 self.valid_branches.add(branch)
+                print(
+                    f"[Branch Evidence] {branch} OPEN only after physical "
+                    f"crossing: unique={self.cohort_counts[branch]}, "
+                    f"depth={self.cohort_depth[branch]:.1f}, "
+                    f"travel={self.cohort_travel[branch]:.1f}, "
+                    f"dwell={self.cohort_dwell[branch]:.2f}"
+                )
 
+        forward_branch = max(
+            BRANCHES,
+            key=lambda branch: BRANCH_DIRECTIONS[branch].dot(
+                self.forward_direction
+            ),
+        )
+        lateral_axis = pygame.Vector2(
+            -self.forward_direction.y,
+            self.forward_direction.x,
+        )
+        front_contacts = [
+            point
+            for point in collision_points
+            if point.branch is None
+            and half_width * 0.75
+            <= (point.position - pygame.Vector2(center_x, center_y)).dot(
+                self.forward_direction
+            )
+            <= half_width * 1.25
+            and abs(
+                (point.position - pygame.Vector2(center_x, center_y)).dot(
+                    lateral_axis
+                )
+            )
+            <= half_width * 0.95
+        ]
+        self.forward_contact_count = len(front_contacts)
+        contact_span = (
+            max(
+                (point.position - pygame.Vector2(center_x, center_y)).dot(
+                    lateral_axis
+                )
+                for point in front_contacts
+            )
+            - min(
+                (point.position - pygame.Vector2(center_x, center_y)).dot(
+                    lateral_axis
+                )
+                for point in front_contacts
+            )
+            if len(front_contacts) >= 2
+            else 0.0
+        )
+        forward_blocked = (
+            len(front_contacts) >= JUNCTION_FRONT_BLOCK_MIN_CONTACTS
+            and contact_span
+            >= corridor_width * JUNCTION_FRONT_BLOCK_MIN_SPAN_RATIO
+        )
+        if forward_branch in self.valid_branches:
+            self.forward_probe_status = f"OPEN:{forward_branch}"
+        elif forward_blocked:
+            self.forward_probe_status = "BLOCKED_BY_CONTACT"
+        else:
+            self.forward_probe_status = "UNRESOLVED"
+
+        junction_signature = (
+            self.expansion_dwell >= JUNCTION_EXPANSION_DWELL_TIME
+            and len(self.valid_branches) >= JUNCTION_MIN_VALID_COHORTS
+            and self.forward_probe_status != "UNRESOLVED"
+        )
+        member_total = sum(self.cohort_counts.values())
+        new_crossing_evidence = member_total > self.last_member_total
+        self.last_member_total = member_total
+        if not junction_signature or new_crossing_evidence:
+            self.discovery_dwell = 0.0
+        else:
+            self.discovery_dwell += dt
         newly_confirmed = (
             not self.confirmed
-            and self.expansion_dwell >= JUNCTION_EXPANSION_DWELL_TIME
-            and len(self.valid_branches) >= JUNCTION_MIN_VALID_COHORTS
+            and junction_signature
+            and self.discovery_dwell >= JUNCTION_DISCOVERY_SETTLE_TIME
         )
         if newly_confirmed:
             self.confirmed = True
@@ -6759,11 +6906,14 @@ class SequentialJunctionInferenceTracker:
                 "sector_distribution": dict(self.sector_distribution),
                 "cohort_counts": dict(self.cohort_counts),
                 "cohort_travel": dict(self.cohort_travel),
+                "cohort_depth": dict(self.cohort_depth),
+                "forward_probe_status": self.forward_probe_status,
             })
             print(
                 "[Junction Inference] sequential expansion + cohorts: "
                 f"branches={sorted(self.valid_branches)}, "
-                f"variance-ratio={self.expansion_ratio:.2f}"
+                f"variance-ratio={self.expansion_ratio:.2f}, "
+                f"physical-depths={{{', '.join(f'{branch}:{self.cohort_depth[branch]:.1f}' for branch in sorted(self.valid_branches))}}}"
             )
         elif self.confirmed:
             detected_branch_candidates.update(self.valid_branches)
@@ -8651,7 +8801,7 @@ def compute_route_force(robot):
                 )
         else:
             y_distance = robot.position.y - INITIAL_INGRESS_TARGET_Y
-            if y_distance > 0.0:
+            if y_distance > 0.0 and region in {"BOTTOM", "JUNCTION"}:
                 scale = max(
                     INITIAL_INGRESS_MIN_FORCE_SCALE,
                     min(
@@ -8659,13 +8809,21 @@ def compute_route_force(robot):
                         y_distance / INITIAL_INGRESS_BRAKE_DISTANCE,
                     ),
                 )
-                force.y = -INITIAL_INGRESS_FORCE * scale
-            lane_error = robot.ingress_lane_x - robot.position.x
-            force.x = clamp(
-                INITIAL_INGRESS_LANE_GAIN * lane_error,
-                -INITIAL_INGRESS_LANE_MAX_FORCE,
-                INITIAL_INGRESS_LANE_MAX_FORCE,
-            )
+                route_multiplier = (
+                    INITIAL_JUNCTION_PROBE_ROUTE_MULTIPLIER
+                    if region == "JUNCTION"
+                    else 1.0
+                )
+                force.y = (
+                    -INITIAL_INGRESS_FORCE * scale * route_multiplier
+                )
+            if region == "BOTTOM":
+                lane_error = robot.ingress_lane_x - robot.position.x
+                force.x = clamp(
+                    INITIAL_INGRESS_LANE_GAIN * lane_error,
+                    -INITIAL_INGRESS_LANE_MAX_FORCE,
+                    INITIAL_INGRESS_LANE_MAX_FORCE,
+                )
     elif phase == SimulationPhase.FORM_JUNCTION_GUARDS:
         if region in BRANCHES:
             force = normalized_direction_toward(
@@ -10997,7 +11155,11 @@ while running:
             f"confirmed={junction_inference_tracker.confirmed} "
             f"n={junction_inference_tracker.observation_count} "
             f"lateral={junction_inference_tracker.expansion_ratio:.2f} "
-            f"dwell={junction_inference_tracker.expansion_dwell:.2f}"
+            f"dwell={junction_inference_tracker.expansion_dwell:.2f} "
+            f"discovery={junction_inference_tracker.discovery_dwell:.2f}/"
+            f"{JUNCTION_DISCOVERY_SETTLE_TIME:.2f} "
+            f"valid={sorted(junction_inference_tracker.valid_branches)} "
+            f"front={junction_inference_tracker.forward_probe_status}"
         ),
         (
             "Cohorts: "
