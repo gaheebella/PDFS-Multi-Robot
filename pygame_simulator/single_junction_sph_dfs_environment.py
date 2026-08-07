@@ -497,9 +497,12 @@ effective_branch_widths: dict[str, float] = {
     branch: 0.0 for branch in BRANCHES
 }
 junction_guard_groups: dict[str, list[int]] = {}
+junction_guard_frontier_depths: dict[str, float] = {}
 junction_guard_formation_timer = 0.0
 junction_guard_stable_dwell = 0.0
 junction_guard_status = "OPEN_FREE_DIFFUSION"
+frontier_line_branch: Optional[str] = None
+frontier_line_depth = 0.0
 
 # =========================================================
 # 4. Physics and control parameters
@@ -1081,14 +1084,21 @@ JUNCTION_GUARD_MIN_COUNT = 5
 JUNCTION_GUARD_MAX_COUNT = 11
 JUNCTION_GUARD_BRANCH_INSET = 5.0 * MAP_SCALE
 JUNCTION_GUARD_RECRUIT_RADIUS = 78.0 * MAP_SCALE
+JUNCTION_GUARD_FRONTIER_MARGIN = ROBOT_RADIUS * 2.5
+JUNCTION_GUARD_TERMINAL_DEPTH_EPSILON = ROBOT_RADIUS * 1.5
 JUNCTION_GUARD_MOVE_SPEED = 46.0 * MOTION_SPEED_MULTIPLIER
 JUNCTION_GUARD_POSITION_TOLERANCE = 3.0 * MAP_SCALE
 JUNCTION_GUARD_FORM_DWELL = 0.10
 JUNCTION_GUARD_FORM_TIMEOUT = 1.50
 JUNCTION_MINIMAL_GUARD_COUNT = 2
 JUNCTION_GUARD_MAX_HOPS = 4
-JUNCTION_GUARD_POLICY_VERSION = "POST_INFERENCE_FULL_GUARD_KHOP_V1"
+JUNCTION_GUARD_POLICY_VERSION = "BRANCH_TERMINAL_FRONTIER_KHOP_V2"
 FRONTIER_POLICY_VERSION = "LEADER_BIASED_DEFORMABLE_FRONTIER_V1"
+FRONTIER_LINE_ADVANCE_SPEED = 52.0 * MOTION_SPEED_MULTIPLIER
+FRONTIER_LINE_FORM_SPEED = 58.0 * MOTION_SPEED_MULTIPLIER
+FRONTIER_LINE_LEAD_GAP = 12.0 * MAP_SCALE
+FRONTIER_LINE_START_DEPTH = JUNCTION_GUARD_BRANCH_INSET
+FRONTIER_LINE_POLICY_VERSION = "PERSISTENT_CROSS_SECTION_SHEPHERD_V1"
 
 # Eguchi et al. integrate normalized command/observed speed discrepancy and
 # record the position when the threshold is crossed.  The constants below are
@@ -1478,6 +1488,11 @@ def get_saturation_rect(branch: str) -> pygame.Rect:
 
 def shepherd_curtain_active() -> bool:
     """Whether the continuous full-width Shepherd gate must be enforced."""
+    if phase == SimulationPhase.EXPLORE_BRANCH:
+        return (
+            frontier_line_branch == active_branch
+            and frontier_line_depth > 0.0
+        )
     return phase in {
         SimulationPhase.FORM_SHEPHERD_BOUNDARY,
         SimulationPhase.FILL_BEHIND_SHEPHERD,
@@ -1494,7 +1509,12 @@ def get_shepherd_curtain_depth(branch: str) -> float:
     the Junction so robots cannot slip around or through individual Shepherds.
     """
     depth = get_shepherd_boundary_depth(branch)
-    if phase == SimulationPhase.PRESSURE_PUSH:
+    if (
+        phase == SimulationPhase.EXPLORE_BRANCH
+        and frontier_line_branch == branch
+    ):
+        depth = frontier_line_depth
+    elif phase == SimulationPhase.PRESSURE_PUSH:
         travel = min(
             SHEPHERD_PISTON_MAX_TRAVEL,
             ramped_travel(
@@ -2072,6 +2092,51 @@ class Robot:
             self._record_motion()
             return
 
+        if (
+            self.role == "FRONTIER_SHEPHERD"
+            and phase == SimulationPhase.EXPLORE_BRANCH
+            and self.shepherd_anchor is not None
+            and self.shepherd_branch == frontier_line_branch
+        ):
+            # The selected entrance guard remains the same physical group for
+            # the whole branch.  It advances as a transverse line instead of
+            # dissolving into the NORMAL SPH body and being re-elected later.
+            target = shepherd_slot_position_at_depth(
+                self.shepherd_anchor,
+                self.shepherd_branch,
+                frontier_line_depth,
+            )
+            error = target - self.position
+            desired_velocity = pygame.Vector2()
+            if error.length_squared() > EPSILON:
+                desired_velocity = (
+                    error.normalize() * FRONTIER_LINE_FORM_SPEED
+                )
+            self.commanded_velocity = desired_velocity.copy()
+            step = min(error.length(), FRONTIER_LINE_FORM_SPEED * dt)
+            next_position = (
+                self.position + error.normalize() * step
+                if step > 0.0 and error.length_squared() > EPSILON
+                else self.position.copy()
+            )
+            next_position = limit_communication_proposed_position(
+                self,
+                next_position,
+                old_position,
+            )
+            if is_walkable(next_position, self.radius):
+                self.position = next_position
+            self.observed_velocity = (
+                self.position - old_position
+            ) / max(dt, EPSILON)
+            self.velocity = self.observed_velocity.copy()
+            self.acceleration.update(0.0, 0.0)
+            self.filtered_acceleration.update(0.0, 0.0)
+            update_indirect_contact_state(self, dt)
+            self.previous_position = old_position
+            self._record_motion()
+            return
+
         if self.role == "PRE_SHEPHERD" and self.shepherd_anchor is not None:
             error = self.shepherd_anchor - self.position
             step = SHEPHERD_FORM_SPEED * dt
@@ -2489,7 +2554,11 @@ def required_junction_guard_count(robots, branch: str) -> int:
     ))
 
 
-def build_junction_guard_slots(branch: str, count: int) -> list[pygame.Vector2]:
+def build_junction_guard_slots(
+    branch: str,
+    count: int,
+    frontier_depth: Optional[float] = None,
+) -> list[pygame.Vector2]:
     direction = BRANCH_DIRECTIONS[branch]
     normal = pygame.Vector2(-direction.y, direction.x)
     width = effective_branch_widths.get(branch, 0.0)
@@ -2503,11 +2572,51 @@ def build_junction_guard_slots(branch: str, count: int) -> list[pygame.Vector2]:
         -usable_half + 2.0 * usable_half * index / (count - 1)
         for index in range(count)
     ]
-    mouth_center = (
-        get_branch_entrance(branch)
-        + direction * JUNCTION_GUARD_BRANCH_INSET
+    line_depth = clamp(
+        (
+            JUNCTION_GUARD_BRANCH_INSET
+            if frontier_depth is None
+            else frontier_depth
+        ),
+        JUNCTION_GUARD_BRANCH_INSET,
+        BRANCH_LENGTHS[branch] - ROBOT_RADIUS * 1.1,
     )
+    mouth_center = get_branch_entrance(branch) + direction * line_depth
     return [mouth_center + normal * offset for offset in lateral_offsets]
+
+
+def observed_branch_frontier_depth(robots, branch: str) -> Optional[float]:
+    """Return the outer edge of the actually observed branch cohort.
+
+    No map-length-derived probe point is used.  The line is placed just beyond
+    the deepest NORMAL robot that physically crossed this branch mouth, so no
+    already-diffused robot is stranded on the far side of its Shepherd border.
+    """
+    depths = [
+        branch_depth_from_junction(robot.position, branch)
+        for robot in robots
+        if robot.role == "NORMAL"
+        and not robot.base_reserve
+        and get_robot_region(robot.position) == branch
+    ]
+    if not depths:
+        return None
+    return clamp(
+        max(depths) + JUNCTION_GUARD_FRONTIER_MARGIN,
+        JUNCTION_GUARD_BRANCH_INSET,
+        BRANCH_LENGTHS[branch] - ROBOT_RADIUS * 1.1,
+    )
+
+
+def outward_branch_neighbor_count(robot: "Robot", branch: str) -> int:
+    """Count locally connected peers that are measurably farther outward."""
+    own_depth = branch_depth_from_junction(robot.position, branch)
+    return sum(
+        get_robot_region(peer.position) == branch
+        and branch_depth_from_junction(peer.position, branch)
+        > own_depth + JUNCTION_GUARD_TERMINAL_DEPTH_EPSILON
+        for peer in robot.comm_neighbors
+    )
 
 
 def select_branch_guard_leader(
@@ -2515,7 +2624,6 @@ def select_branch_guard_leader(
     branch: str,
     available_ids: set[int],
 ) -> Optional["Robot"]:
-    entrance = get_branch_entrance(branch)
     direction = BRANCH_DIRECTIONS[branch]
     normal = pygame.Vector2(-direction.y, direction.x)
     candidates = [
@@ -2523,31 +2631,26 @@ def select_branch_guard_leader(
         for robot in robots
         if robot.robot_id in available_ids
         and robot.role == "NORMAL"
-        and robot.position.distance_to(entrance)
-        <= JUNCTION_GUARD_RECRUIT_RADIUS
+        and get_robot_region(robot.position) == branch
     ]
     if not candidates:
-        # Free diffusion can carry an entire cohort beyond the nominal mouth
-        # radius before the Junction is confirmed.  The branch still needs a
-        # physical entrance guard, so fall back to the closest available
-        # NORMAL robot instead of silently replacing that guard by a virtual
-        # seal or starting branch ordering with an uncovered mouth.
-        candidates = [
-            robot
-            for robot in robots
-            if robot.robot_id in available_ids and robot.role == "NORMAL"
-        ]
-    if not candidates:
         return None
+
+    # In the local communication graph a frontier terminal has no same-branch
+    # neighbour at a larger outward depth.  Select the deepest such terminal;
+    # global branch geometry is used only to express the robot's own odometry.
+    terminal_candidates = [
+        robot
+        for robot in candidates
+        if outward_branch_neighbor_count(robot, branch) == 0
+    ]
+    if terminal_candidates:
+        candidates = terminal_candidates
+    entrance = get_branch_entrance(branch)
     return min(
         candidates,
         key=lambda robot: (
-            -(
-                robot.observed_velocity.normalize().dot(direction)
-                if robot.observed_velocity.length_squared() > EPSILON
-                else 0.0
-            ),
-            -(robot.position - entrance).dot(direction),
+            -branch_depth_from_junction(robot.position, branch),
             abs((robot.position - entrance).dot(normal)),
             -len(robot.comm_neighbors),
             robot.robot_id,
@@ -2560,6 +2663,7 @@ def minimum_k_hop_guard_group(
     robots,
     available_ids: set[int],
     required_count: int,
+    branch: str,
 ) -> tuple[list["Robot"], int]:
     by_id = {robot.robot_id: robot for robot in robots}
     selected_ids = {leader.robot_id}
@@ -2575,6 +2679,7 @@ def minimum_k_hop_guard_group(
                     peer_id in available_ids
                     and peer_id not in selected_ids
                     and getattr(peer, "role", None) == "NORMAL"
+                    and get_robot_region(peer.position) == branch
                 ):
                     next_frontier.add(peer_id)
         selected_ids.update(next_frontier)
@@ -2589,6 +2694,7 @@ def minimum_k_hop_guard_group(
                 robot
                 for robot in robots
                 if robot.robot_id in available_ids and robot.role == "NORMAL"
+                and get_robot_region(robot.position) == branch
             ),
             key=lambda robot: (
                 leader.position.distance_squared_to(robot.position),
@@ -2608,6 +2714,7 @@ def minimum_k_hop_guard_group(
 
 
 def release_junction_guard_roles(robots) -> None:
+    global frontier_line_branch, frontier_line_depth
     for robot in robots:
         if robot.role not in {"JUNCTION_GUARD", "FRONTIER_SHEPHERD"}:
             continue
@@ -2616,14 +2723,20 @@ def release_junction_guard_roles(robots) -> None:
         robot.junction_guard_branch = None
         robot.junction_guard_hop = -1
         robot.is_branch_leader = False
+        robot.shepherd_anchor = None
+        robot.shepherd_origin = None
+        robot.shepherd_branch = None
         robot.velocity.update(0.0, 0.0)
         robot.acceleration.update(0.0, 0.0)
         robot.filtered_acceleration.update(0.0, 0.0)
+    frontier_line_branch = None
+    frontier_line_depth = 0.0
 
 
 def begin_junction_guard_formation(robots) -> None:
-    """Close inferred mouths and recruit a full guard at every unvisited one."""
+    """Form a full border at every observed branch cohort's outer frontier."""
     global junction_guard_groups, junction_guard_formation_timer
+    global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
     global distributed_consensus_branch
     release_junction_guard_roles(robots)
@@ -2645,6 +2758,7 @@ def begin_junction_guard_formation(robots) -> None:
     )
     distributed_consensus_branch = None
     junction_guard_groups = {}
+    junction_guard_frontier_depths = {}
     junction_guard_formation_timer = 0.0
     junction_guard_stable_dwell = 0.0
     available_ids = {
@@ -2660,6 +2774,10 @@ def begin_junction_guard_formation(robots) -> None:
         ):
             continue
         required_count = required_junction_guard_count(robots, branch)
+        frontier_depth = observed_branch_frontier_depth(robots, branch)
+        if frontier_depth is None:
+            unavailable.append(branch)
+            continue
         leader = select_branch_guard_leader(robots, branch, available_ids)
         if leader is None:
             unavailable.append(branch)
@@ -2669,8 +2787,13 @@ def begin_junction_guard_formation(robots) -> None:
             robots,
             available_ids,
             required_count,
+            branch,
         )
-        slots = build_junction_guard_slots(branch, len(candidates))
+        slots = build_junction_guard_slots(
+            branch,
+            len(candidates),
+            frontier_depth,
+        )
         assignment = assign_shepherd_slots(candidates, slots)
         if len(assignment) < JUNCTION_GUARD_MIN_COUNT:
             unavailable.append(branch)
@@ -2687,9 +2810,13 @@ def begin_junction_guard_formation(robots) -> None:
             branch_ids.append(robot.robot_id)
             available_ids.discard(robot.robot_id)
         junction_guard_groups[branch] = branch_ids
+        junction_guard_frontier_depths[branch] = frontier_depth
         print(
-            f"[Junction Guard] branch={branch}, full={len(branch_ids)}, "
-            f"leader={leader.robot_id}, k={selected_hop}"
+            f"[Branch Frontier Guard] branch={branch}, "
+            f"depth={frontier_depth:.1f}, full={len(branch_ids)}, "
+            f"terminal_leader={leader.robot_id}, "
+            f"outward_degree={outward_branch_neighbor_count(leader, branch)}, "
+            f"k={selected_hop}"
         )
     junction_guard_status = (
         "FULL_GUARD_UNAVAILABLE:" + ",".join(unavailable)
@@ -2716,41 +2843,129 @@ def junction_guards_formed(robots) -> bool:
 
 
 def commit_junction_guard_roles(robots, selected_branch: str) -> None:
-    """Open selected full guard as a deformable frontier; minimize the rest."""
-    global junction_guard_status
+    """Keep the selected full guard as one persistent moving Shepherd line."""
+    global junction_guard_status, frontier_line_branch, frontier_line_depth
     for branch, robot_ids in junction_guard_groups.items():
         branch_guards = [
             robot for robot in robots if robot.robot_id in robot_ids
         ]
         if branch == selected_branch:
-            for robot in branch_guards:
+            line_slots = build_shepherd_slots(branch, len(branch_guards))
+            assignment = assign_shepherd_slots(branch_guards, line_slots)
+            for robot, slot, _ in assignment:
                 robot.role = "FRONTIER_SHEPHERD"
                 robot.junction_guard_anchor = None
                 robot.junction_guard_branch = branch
+                robot.shepherd_anchor = slot.copy()
+                robot.shepherd_origin = slot.copy()
+                robot.shepherd_branch = branch
                 robot.velocity.update(0.0, 0.0)
                 robot.filtered_acceleration.update(0.0, 0.0)
+            frontier_line_branch = branch
+            frontier_line_depth = junction_guard_frontier_depths.get(
+                branch,
+                FRONTIER_LINE_START_DEPTH,
+            )
             continue
-        keep = sorted(
-            branch_guards,
-            key=lambda robot: (
-                not robot.is_branch_leader,
-                robot.robot_id,
-            ),
-        )[:JUNCTION_MINIMAL_GUARD_COUNT]
-        keep_ids = {robot.robot_id for robot in keep}
+        # The closed virtual valve now protects an unselected mouth.  Release
+        # the entire physical border so every robot can leave that branch and
+        # join the selected branch instead of remaining as wasted sentries.
         for robot in branch_guards:
-            if robot.robot_id in keep_ids:
-                continue
             robot.role = "NORMAL"
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_hop = -1
             robot.is_branch_leader = False
-    junction_guard_status = f"FRONTIER={selected_branch};MINIMAL_OTHERS"
-    print(
-        f"[Junction Guard] selected={selected_branch} -> FRONTIER_SHEPHERD; "
-        f"non-selected={JUNCTION_MINIMAL_GUARD_COUNT}/branch"
+            robot.shepherd_anchor = None
+            robot.shepherd_origin = None
+            robot.shepherd_branch = None
+            robot.velocity.update(0.0, 0.0)
+            robot.acceleration.update(0.0, 0.0)
+            robot.filtered_acceleration.update(0.0, 0.0)
+    junction_guard_status = (
+        f"FRONTIER={selected_branch};OTHERS_RETURN_TO_JUNCTION"
     )
+    print(
+        f"[Junction Guard] selected={selected_branch} -> persistent "
+        f"FRONTIER_SHEPHERD line; ids="
+        f"{[robot.robot_id for robot in get_frontier_shepherds(robots, selected_branch)]}; "
+        f"start-depth={frontier_line_depth:.1f}; "
+        "non-selected=released-to-NORMAL"
+    )
+
+
+def get_frontier_shepherds(robots, branch: Optional[str] = None):
+    return [
+        robot
+        for robot in robots
+        if robot.role == "FRONTIER_SHEPHERD"
+        and (branch is None or robot.shepherd_branch == branch)
+    ]
+
+
+def update_frontier_line_progress(robots, branch: str, dt: float) -> None:
+    """Advance the intact line only as fast as the NORMAL body can follow."""
+    global frontier_line_depth
+    frontiers = get_frontier_shepherds(robots, branch)
+    if not frontiers or frontier_line_branch != branch:
+        return
+    normal_depths = [
+        branch_depth_from_junction(robot.position, branch)
+        for robot in robots
+        if robot.role == "NORMAL"
+        and not robot.base_reserve
+        and get_robot_region(robot.position) == branch
+    ]
+    # At the mouth there may be no NORMAL center inside the branch yet because
+    # the line itself is the leading boundary.  Treat the Junction mouth as
+    # zero-depth support so the line opens exactly one lead gap; after that it
+    # can advance only when the NORMAL body follows.
+    supported_front = (
+        linear_quantile(normal_depths, 0.90)
+        if normal_depths
+        else 0.0
+    )
+    desired_depth = max(
+        frontier_line_depth,
+        min(
+            BRANCH_LENGTHS[branch],
+            supported_front + FRONTIER_LINE_LEAD_GAP,
+        ),
+    )
+    frontier_line_depth = min(
+        desired_depth,
+        frontier_line_depth + FRONTIER_LINE_ADVANCE_SPEED * dt,
+    )
+
+
+def promote_existing_frontier_line(robots, branch: str):
+    """Flatten the same moving frontier IDs into the return piston line."""
+    global frontier_line_branch, frontier_line_depth
+    frontiers = get_frontier_shepherds(robots, branch)
+    if not frontiers:
+        return []
+    slots = build_shepherd_slots(branch, len(frontiers))
+    assignment = assign_shepherd_slots(frontiers, slots)
+    if len(assignment) != len(frontiers):
+        return []
+    promoted = []
+    for robot, slot, _ in assignment:
+        robot.role = "SHEPHERD"
+        robot.shepherd_anchor = slot.copy()
+        robot.shepherd_origin = slot.copy()
+        robot.shepherd_branch = branch
+        robot.junction_guard_anchor = None
+        robot.velocity.update(0.0, 0.0)
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+        promoted.append(robot)
+    frontier_line_branch = None
+    frontier_line_depth = 0.0
+    print(
+        f"[Frontier -> Shepherd] retained original IDs="
+        f"{[robot.robot_id for robot in promoted]}; no re-election"
+    )
+    return promoted
 
 # =========================================================
 # 9. Robot creation and spatial hash
@@ -8758,6 +8973,23 @@ def compute_route_force(robot):
             hold_error * BASE_RESERVE_HOLD_GAIN,
             BASE_COMPRESSION_FORCE,
         )
+    # Once ordering selects one branch, all robots that diffused into the
+    # other branches leave through their own mouth first.  This local egress
+    # rule intentionally precedes command-connectivity gating: the released
+    # frontier robots already know they are on a non-selected branch and must
+    # not remain parked there as unused guards.
+    if (
+        phase == SimulationPhase.EXPLORE_BRANCH
+        and region in BRANCHES
+        and region != active_branch
+    ):
+        return (
+            normalized_direction_toward(
+                robot.position,
+                get_branch_entrance(region),
+            )
+            * OUTLET_FORCE
+        )
     independent = {
         SimulationPhase.MOVE_TO_JUNCTION,
         SimulationPhase.FORM_JUNCTION_GUARDS,
@@ -9863,6 +10095,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
+        update_frontier_line_progress(robots, active_branch, dt)
         dead_end_confirmed = dead_end_inference_tracker.update(
             robots,
             active_branch,
@@ -9894,19 +10127,15 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 enforce_pre_shepherd_curtain_for_swarm(robots)
             return
 
-        # The labelled end rectangle is used only as a safe role-capture area;
-        # it cannot trigger the transition.  Contact/density inference must
-        # first confirm that the whole frontier is persistently blocked.
-        if (
-            dead_end_confirmed
-            and capture_region_ready_for_shepherd(robots, active_branch)
-        ):
-            selected = select_adaptive_shepherds(
+        # Contact/density inference triggers a role transition of the same
+        # entrance-guard IDs.  Never discard that line and elect unrelated
+        # robots at the dead end.
+        if dead_end_confirmed:
+            selected = promote_existing_frontier_line(
                 robots,
                 active_branch,
-                spatial_grid,
             )
-            if len(selected) == adaptive_shepherd_count():
+            if selected:
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
                 shepherd_form_timer = 0.0
                 # Close a continuous full-width virtual gate immediately.  Any
@@ -9914,8 +10143,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 # its safe Junction side before the next physics frame.
                 enforce_shepherd_curtain_for_swarm(robots)
                 print(
-                    f"[Shepherd] capture-region election: branch={active_branch}, "
-                    f"count={len(selected)}"
+                    f"[Shepherd] original frontier line flattened at dead-end: "
+                    f"branch={active_branch}, count={len(selected)}"
                 )
 
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
@@ -10584,7 +10813,9 @@ def reset_dfs_state():
     global return_done_dwell, return_entry_stall_timer
     global return_last_bottom_count
     global junction_guard_groups, junction_guard_formation_timer
+    global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
+    global frontier_line_branch, frontier_line_depth
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = FIXED_BRANCH_ORDER[0]
@@ -10652,9 +10883,12 @@ def reset_dfs_state():
     return_entry_stall_timer = 0.0
     return_last_bottom_count = 0
     junction_guard_groups = {}
+    junction_guard_frontier_depths = {}
     junction_guard_formation_timer = 0.0
     junction_guard_stable_dwell = 0.0
     junction_guard_status = "OPEN_FREE_DIFFUSION"
+    frontier_line_branch = None
+    frontier_line_depth = 0.0
     saturation_tracker.reset()
     branch_continuity_tracker.reset()
     junction_consensus_tracker.reset()
@@ -11104,6 +11338,19 @@ while running:
         "Gates: " + " | ".join(
             f"{branch}={branch_gate_states[branch]}"
             for branch in BRANCHES
+        ),
+        (
+            f"Persistent frontier={FRONTIER_LINE_POLICY_VERSION} | "
+            f"branch={frontier_line_branch or '-'} "
+            f"depth={frontier_line_depth:.1f} "
+            f"ids={[robot.robot_id for robot in get_frontier_shepherds(robots)]}"
+        ),
+        (
+            "Observed guard frontiers: "
+            + " | ".join(
+                f"{branch}={junction_guard_frontier_depths.get(branch, 0.0):.1f}"
+                for branch in BRANCHES
+            )
         ),
         f"Order={' > '.join(branch_order_plan) if branch_order_plan else '-'}",
         (
