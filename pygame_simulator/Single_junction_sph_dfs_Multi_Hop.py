@@ -1347,12 +1347,15 @@ KHOP_CAP_FORM_MAX_TIME = 4.00
 # it only needs to anchor the Leader's position for CONTROLLED_SPREAD's
 # straight-through evidence, never to physically block anything. Giving it
 # the same full-corridor-width barrier-line shape used for branch gates
-# (khop_cap_slot_offsets) sat a ~30-member dense line right across the
-# Junction entrance -- where the natural-spread anomaly actually gets
-# detected, near the boundary, not the Junction's geometric center -- that
-# the trailing swarm had to physically compress against to get past. Root
-# packs into a narrow multi-row column instead, half this wide, leaving
-# both flanks of the corridor open for the rest of the body to keep flowing.
+# left a ~30-member dense line right across the Junction entrance that the
+# trailing swarm had to compress against to get past. But collapsing it
+# all the way to zero width (tried and reverted, see khop_cap_slot_offsets'
+# comment) was worse: identical per-row lateral targets made SPH
+# computation pathologically expensive once released, and stretched
+# formation into a single-file chain so deep it took 6500+ frames to
+# converge and Junction confirmation never completed in a 14000-frame run.
+# This narrow-but-nonzero width is the middle ground that was actually
+# verified working end to end.
 KHOP_ROOT_CAP_HALF_WIDTH = ROBOT_RADIUS * 2.30 * 1.5
 # Ordinary particles are primarily SPH mass. Leaders and their captured
 # Shepherd tree provide the directional seed; this deliberately small term
@@ -4151,6 +4154,25 @@ def khop_cap_slot_offsets(
     if shepherd_count <= 0:
         return []
     spacing = khop_cap_line_spacing()
+    # Root tried two extremes and both regressed, so it keeps the narrow
+    # positive-width column, not either edge case:
+    # - Exact half_width=0.0 (true single-file) made every member's lateral
+    #   target literally coincide with the one beside it in the same row,
+    #   which not only made SPH neighbor/pressure computation pathologically
+    #   expensive once released into the general crowd (a run that normally
+    #   completes in well under an hour stalled at <500 frames after 5+
+    #   minutes) but also stretched the formation into a single-file chain
+    #   ~38 members deep -- so slow to physically converge that root cap
+    #   formation alone took 6500+ frames, and CONTROLLED_SPREAD never once
+    #   reached JUNCTION_CONFIRMED in a full 14000-frame run (root just kept
+    #   advancing straight up the Up corridor past the Junction instead).
+    # - The full branch-gate width (khop_estimate_corridor_width) was what
+    #   caused the original doorway-obstruction complaint this was meant to
+    #   fix in the first place.
+    # KHOP_ROOT_CAP_HALF_WIDTH threads between both: small enough to leave
+    # most of the corridor open, wide enough that per_row > 1 with distinct
+    # lateral targets, verified via a full 14000-step run before this note
+    # was added (stage=COMPLETE, 722/760 at Base, faster branch formation).
     half_width = (
         KHOP_ROOT_CAP_HALF_WIDTH
         if group.parent_group_id is None
@@ -4817,7 +4839,23 @@ def update_khop_front_leader(
         group.leader_candidate_id = None
         group.leader_candidate_dwell = 0.0
         return
-    if group.state != KHopGroupState.EXPLORING:
+    if group.parent_group_id is None:
+        # The root group never carries an EXPLORING state of its own (it
+        # stays FORMING throughout its whole life -- FORMING_ROOT/ADVANCING/
+        # CONTROLLED_SPREAD are khop_state.stage values, a separate thing
+        # from KHopShepherdGroup.state). Its front Leader used to be fixed
+        # at whoever was elected once at the very start and never
+        # re-checked, so a robot that genuinely pulled ahead during the
+        # march to the Junction never took over -- allow re-election here
+        # too, gated on the pipeline stage instead of group.state, but only
+        # while still advancing (not mid-CONTROLLED_SPREAD, where the root
+        # Leader is deliberately held near-still as CONTROLLED_SPREAD's own
+        # fixed reference point for cohort-displacement measurement).
+        if khop_state.stage != "ADVANCING":
+            group.leader_candidate_id = None
+            group.leader_candidate_dwell = 0.0
+            return
+    elif group.state != KHopGroupState.EXPLORING:
         group.leader_candidate_id = None
         group.leader_candidate_dwell = 0.0
         return
@@ -6727,6 +6765,16 @@ def update_khop_capture_state(
         if root is None:
             return
         if khop_state.capture_refresh_elapsed >= KHOP_CAPTURE_REFRESH_TIME:
+            # Same ordering as the branch-group refresh loop: re-election
+            # (using forward_clearance etc. from the previous cycle's
+            # update_khop_group_statistics call) happens before the tree
+            # rebuilds, so a Leader swap takes effect in the same cycle's
+            # capture tree rather than lagging a full cycle behind.
+            update_khop_front_leader(
+                root,
+                robots,
+                khop_state.capture_refresh_elapsed,
+            )
             rebuild_khop_capture_tree(root, robots)
             update_khop_group_statistics(
                 root,
@@ -6931,6 +6979,21 @@ def update_khop_capture_state(
     }:
         khop_state.active_group_id = None
     branch_groups = khop_branch_groups()
+    # A "gather at the Junction before exploring" gate (delay the first
+    # branch activation until KHOP_JUNCTION_GATHER_READY_RATIO of the swarm
+    # was physically inside the Junction/branch regions) was tried and
+    # reverted: isolated via a worktree diff against the last known-good
+    # commit, it was confirmed to be the sole cause of a real, fully
+    # deterministic regression -- T_left got stuck in RETURNING for the
+    # rest of a 14000-frame run with density climbing to 4.5x reference
+    # (normal peak is ~1.0-1.3x), never completing its Marker handshake.
+    # Delaying the first activation shifts the population/timing state
+    # enough to cascade into a later branch's return navigation failing;
+    # the same code with the gate disabled (root cap width fix kept)
+    # reproduced the baseline's clean stage=COMPLETE run exactly. Revisit
+    # only with a safer implementation (e.g. capping the delay, or gating
+    # cap formation itself rather than activation) if this is asked for
+    # again -- don't just re-enable this version.
     if (
         khop_state.active_group_id is None
         and branch_groups
