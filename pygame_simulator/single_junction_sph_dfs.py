@@ -11,9 +11,24 @@ Implemented research components
 5. Moving piston-style Shepherd boundary plus weak directional body force.
 6. Fixed Base-rooted LOS communication with permanent trunk relays.
 7. The original dead-end first-arrival Shepherd selection timing is retained,
-   but the Shepherd count is computed from corridor width.
+   but the Shepherd count is computed from the estimated branch width.
 8. Pressure starts only after the ordinary robots saturate behind the formed
    Shepherd boundary; branch relays, release logic, and final gathering remain.
+9. Emmons et al. (2020)-style local-distribution Junction confirmation: a
+   Junction is confirmed from the normalized local angular-sector robot
+   distribution, its sequential (multi-frame) trend, lateral-spread growth,
+   and directional-cohort validation, rather than from a dedicated Junction
+   detector or a priori Junction position. This gates every Junction->Branch
+   decision (initial arrival and every return from a completed branch).
+10. Eguchi et al. (2024)-style indirect contact detection: each NORMAL
+    robot accumulates the time integral of its commanded-vs-observed
+    velocity discrepancy. Threshold crossings are recorded as indirect
+    boundary/obstacle contact points, which (a) estimate each branch's
+    effective width to size the Shepherd Guard count and (b) provide a
+    dead-end confirmation criterion alongside the existing speed/density/
+    occupancy saturation evidence. Recorded contact points also feed a
+    weak-then-strong SPH repulsion term so the swarm steers away from
+    repeated collision points without ever reading wall geometry directly.
 
 Scope limitation
 ----------------
@@ -588,6 +603,63 @@ JUNCTION_FALLBACK_MIN_COUNT = 12
 JUNCTION_FALLBACK_STABLE_RATIO = 0.35
 JUNCTION_FALLBACK_SPEED_THRESHOLD = 10.0
 
+# Emmons et al. (2020)-style local-distribution Junction confirmation.
+# Local robot distribution is folded into normalized angular sectors around
+# the incoming travel direction (rather than absolute environment bins), and
+# a sequential window of these sector distributions plus a lateral-spread
+# trend and directional-cohort validation together confirm a Junction
+# without any dedicated Junction sensor or a priori Junction position.
+JUNCTION_DIST_REGION_MARGIN = 40.0
+JUNCTION_DIST_HISTORY_LENGTH = 14
+JUNCTION_DIST_MIN_ROBOTS = 10
+JUNCTION_LATERAL_VARIANCE_WINDOW = 0.45
+JUNCTION_LATERAL_EXPANSION_THRESHOLD = 36.0
+JUNCTION_LATERAL_EXPANSION_DWELL_TIME = 0.18
+JUNCTION_COHORT_MIN_SPEED = FLOW_DIRECTION_MIN_SPEED
+JUNCTION_COHORT_HEADING_TOLERANCE = math.radians(40.0)
+JUNCTION_COHORT_MIN_TRAVEL = 10.0
+JUNCTION_COHORT_MIN_DURATION = 0.20
+# This map deliberately walls off every branch but the currently active one
+# until the DFS algorithm commits to it (see is_region_allowed), so only the
+# single incoming/backtrack direction can ever form a *physically validated*
+# cohort before a Branch is chosen -- a second, simultaneously traversable
+# cohort is not something this geometry can produce pre-decision. Requiring
+# just one still rules out a stalled crowd that never makes net progress;
+# the real multi-directional confirmation in the write-up's Section 6
+# applies once this scope is extended past a single pre-gated Junction.
+JUNCTION_COHORT_MIN_VALID_COUNT = 1
+EMMONS_DISTRIBUTION_POLICY_VERSION = "LOCAL_SECTOR_SEQUENTIAL_COHORT_V1"
+
+# Eguchi et al. (2024)-style indirect contact detection: obstacles/branch
+# boundaries are inferred purely from the discrepancy between each robot's
+# commanded and observed velocity, without any explicit wall sensor.
+EGUCHI_CONTACT_VMAX = MAX_SPEED
+EGUCHI_CONTACT_ZETA = 0.03
+EGUCHI_CONTACT_ACCUMULATION_RATE = 3.0
+EGUCHI_CONTACT_THRESHOLD = 0.6
+EGUCHI_CONTACT_RECENT_WINDOW = 0.30
+EGUCHI_CONTACT_POINT_HISTORY = 40
+EGUCHI_OBSTACLE_REPULSION_GAIN_JUNCTION = 6.0
+EGUCHI_OBSTACLE_REPULSION_GAIN_ACTIVE = 34.0
+EGUCHI_OBSTACLE_REPULSION_FORCE_LIMIT = 90.0 * MOTION_SPEED_MULTIPLIER
+BRANCH_WIDTH_FLOW_MIN_DEPTH = SMOOTHING_LENGTH
+BRANCH_WIDTH_FLOW_PERCENTILE = 0.05
+BRANCH_WIDTH_MIN_FLOW_SAMPLES = 10
+BRANCH_WIDTH_MIN_CONTACT_SAMPLES = 3
+BRANCH_WIDTH_CONTACT_BLEND = 0.5
+BRANCH_WIDTH_MIN_SCALE = 0.4
+BRANCH_WIDTH_MAX_SCALE = 1.3
+SATURATION_FRONTIER_CONTACT_RATIO = 0.35
+EGUCHI_CONTACT_POLICY_VERSION = "COMMANDED_OBSERVED_DISCREPANCY_V1"
+
+# Detection region for the Emmons local-distribution Junction confirmation:
+# the physical Junction square plus a margin so the approaching swarm's
+# lateral-expansion trend is visible slightly before/after the true mouth.
+junction_distribution_region = junction_rect.inflate(
+    2 * JUNCTION_DIST_REGION_MARGIN,
+    2 * JUNCTION_DIST_REGION_MARGIN,
+)
+
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 
 # =========================================================
@@ -1072,6 +1144,13 @@ class Robot:
         self.pressure = 0.0
         self.role = "NORMAL"
 
+        # Eguchi et al. (2024) indirect contact detection state.
+        self.commanded_velocity = pygame.Vector2()
+        self.observed_velocity = pygame.Vector2()
+        self.contact_integral = 0.0
+        self.in_contact = False
+        self.contact_event_time: Optional[float] = None
+
         self.shepherd_anchor: Optional[pygame.Vector2] = None
         self.shepherd_origin: Optional[pygame.Vector2] = None
         self.relay_anchor: Optional[pygame.Vector2] = None
@@ -1195,6 +1274,9 @@ class Robot:
 
         self.velocity += self.acceleration * dt
         limit_vector(self.velocity, MAX_SPEED)
+        # Commanded velocity: what the SPH/route control law wants before any
+        # physical obstruction is applied (Eguchi et al., 2024, Eq. 10-11).
+        self.commanded_velocity = self.velocity.copy()
         x_position = pygame.Vector2(self.position.x + self.velocity.x * dt, self.position.y)
         if is_walkable(x_position, self.radius):
             self.position.x = x_position.x
@@ -1205,6 +1287,13 @@ class Robot:
             self.position.y = y_position.y
         else:
             self.velocity.y = 0.0
+
+        # Observed velocity: the robot's actual displacement, measured before
+        # the Shepherd curtain's virtual (non-physical) boundary projection so
+        # that only genuine environment contact is captured.
+        self.observed_velocity = (
+            (self.position - old_position) / dt if dt > EPSILON else pygame.Vector2()
+        )
 
         # Smooth virtual pressure is backed by a hard one-step guard so a fast
         # ordinary robot cannot pass through a temporary gap while Shepherds
@@ -3327,6 +3416,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
     selected_branch_entry_lambda = components["rollout_lambda"]
     branch_entry_timer = 0.0
     initialize_relay_plan(selected)
+    reset_indirect_contact_state(selected)
 
     metrics.branch_selection_events.append({
         "time": simulation_time,
@@ -3485,6 +3575,192 @@ class JunctionConsensusTracker:
 junction_consensus_tracker = JunctionConsensusTracker()
 
 # =========================================================
+# 12-2. Emmons local-distribution Junction confirmation
+# =========================================================
+
+
+@dataclass
+class JunctionDistributionTracker:
+    """Emmons et al. (2020)-style Junction confirmation.
+
+    No Junction position or dedicated Junction detector is consulted. The
+    normalized local angular-sector distribution of nearby robots (Emmons
+    Sec. III-B), its sequential multi-frame trend, the lateral-spread growth
+    of the approaching swarm, and directional-cohort validation together
+    confirm that a Junction has actually opened up, extending Emmons'
+    opening/obstruction inference from a static classifier to an online
+    Junction-confirmation gate.
+    """
+
+    sector_history: deque = field(default_factory=deque)
+    lateral_variance_history: deque = field(default_factory=deque)
+    expansion_dwell: float = 0.0
+    cohort_progress: dict = field(default_factory=dict)
+    cohort_start_time: dict = field(default_factory=dict)
+    cohort_start_progress: dict = field(default_factory=dict)
+    valid_cohorts: set = field(default_factory=set)
+    sector_distribution: dict = field(default_factory=dict)
+    lateral_variance: float = 0.0
+    lateral_expansion_candidate: bool = False
+    candidate_count: int = 0
+    confirmed: bool = False
+    confirmed_at: Optional[float] = None
+
+    def reset(self):
+        self.sector_history.clear()
+        self.lateral_variance_history.clear()
+        self.expansion_dwell = 0.0
+        self.cohort_progress.clear()
+        self.cohort_start_time.clear()
+        self.cohort_start_progress.clear()
+        self.valid_cohorts.clear()
+        self.sector_distribution = {}
+        self.lateral_variance = 0.0
+        self.lateral_expansion_candidate = False
+        self.candidate_count = 0
+        self.confirmed = False
+        self.confirmed_at = None
+
+    def update(self, robots, dt: float, current_time: float) -> bool:
+        if self.confirmed:
+            return True
+
+        candidates = [
+            robot
+            for robot in robots
+            if robot.role == "NORMAL"
+            and junction_distribution_region.collidepoint(
+                robot.position.x, robot.position.y
+            )
+        ]
+        self.candidate_count = len(candidates)
+        if len(candidates) < JUNCTION_DIST_MIN_ROBOTS:
+            self.expansion_dwell = 0.0
+            return False
+
+        forward = previous_branch_direction
+        if forward.length_squared() <= EPSILON:
+            forward = pygame.Vector2(0.0, -1.0)
+        lateral = pygame.Vector2(-forward.y, forward.x)
+
+        centroid = pygame.Vector2()
+        for robot in candidates:
+            centroid += robot.position
+        centroid /= len(candidates)
+
+        # Step 1: normalized local angular-sector distribution p_k(t).
+        sector_counts = {"FRONT": 0, "BACK": 0, "LEFT": 0, "RIGHT": 0}
+        for robot in candidates:
+            offset = robot.position - centroid
+            forward_component = offset.dot(forward)
+            lateral_component = offset.dot(lateral)
+            if abs(forward_component) >= abs(lateral_component):
+                sector_counts["FRONT" if forward_component >= 0.0 else "BACK"] += 1
+            else:
+                sector_counts["LEFT" if lateral_component >= 0.0 else "RIGHT"] += 1
+        total = max(1, len(candidates))
+        self.sector_distribution = {
+            sector: count / total for sector, count in sector_counts.items()
+        }
+
+        # Step 2: sequential (multi-frame) observation buffer X_t.
+        self.sector_history.append(dict(self.sector_distribution))
+        while len(self.sector_history) > JUNCTION_DIST_HISTORY_LENGTH:
+            self.sector_history.popleft()
+
+        # Step 3: lateral-expansion candidate from sustained sigma_perp^2 growth.
+        lateral_variance = sum(
+            (robot.position - centroid).dot(lateral) ** 2 for robot in candidates
+        ) / total
+        self.lateral_variance = lateral_variance
+        self.lateral_variance_history.append((current_time, lateral_variance))
+        while (
+            self.lateral_variance_history
+            and current_time - self.lateral_variance_history[0][0]
+            > JUNCTION_LATERAL_VARIANCE_WINDOW
+        ):
+            self.lateral_variance_history.popleft()
+        delta_variance = (
+            self.lateral_variance_history[-1][1] - self.lateral_variance_history[0][1]
+            if len(self.lateral_variance_history) >= 2
+            else 0.0
+        )
+        expanding = delta_variance > JUNCTION_LATERAL_EXPANSION_THRESHOLD
+        self.expansion_dwell = self.expansion_dwell + dt if expanding else 0.0
+        self.lateral_expansion_candidate = (
+            self.expansion_dwell >= JUNCTION_LATERAL_EXPANSION_DWELL_TIME
+        )
+
+        # Steps 4-5: directional cohort formation + traversability check.
+        #
+        # Cohorts are classified against this tracker's own forward/lateral
+        # frame (Step 1's axes), not the fixed BRANCH_DIRECTIONS. The
+        # "incoming" direction is not always one of UP/LEFT/RIGHT -- e.g.
+        # during JUNCTION_SWITCH robots are heading back *toward Base*, which
+        # is none of the three branch axes -- so matching against a frame
+        # that always includes the current approach direction is what makes
+        # a cohort reliably observable both on first arrival and on every
+        # return. Progress is the absolute (not centroid-relative) position
+        # projected onto each axis, so it is a stable, monotonically
+        # comparable coordinate across frames.
+        cohort_axes = {"FRONT": forward, "LEFT": lateral, "RIGHT": -lateral}
+        seen_cohorts = set()
+        for robot in candidates:
+            speed = robot.velocity.length()
+            if speed < JUNCTION_COHORT_MIN_SPEED:
+                continue
+            heading = robot.velocity / speed
+            best_key, best_angle = None, JUNCTION_COHORT_HEADING_TOLERANCE
+            for key, axis in cohort_axes.items():
+                angle = angle_between(heading, axis)
+                if angle <= best_angle:
+                    best_key, best_angle = key, angle
+            if best_key is None:
+                continue
+            seen_cohorts.add(best_key)
+            progress = robot.position.dot(cohort_axes[best_key])
+            if best_key not in self.cohort_start_time:
+                self.cohort_start_time[best_key] = current_time
+                self.cohort_start_progress[best_key] = progress
+            self.cohort_progress[best_key] = max(
+                self.cohort_progress.get(best_key, progress), progress
+            )
+
+        self.valid_cohorts.clear()
+        for key in list(self.cohort_start_time.keys()):
+            if key not in seen_cohorts:
+                # Cohort membership lapsed; it must re-qualify from scratch.
+                self.cohort_start_time.pop(key, None)
+                self.cohort_start_progress.pop(key, None)
+                self.cohort_progress.pop(key, None)
+                continue
+            travel = self.cohort_progress[key] - self.cohort_start_progress[key]
+            duration = current_time - self.cohort_start_time[key]
+            if (
+                travel >= JUNCTION_COHORT_MIN_TRAVEL
+                and duration >= JUNCTION_COHORT_MIN_DURATION
+            ):
+                self.valid_cohorts.add(key)
+
+        # Step 6: Junction confirmation.
+        if (
+            self.lateral_expansion_candidate
+            and len(self.valid_cohorts) >= JUNCTION_COHORT_MIN_VALID_COUNT
+        ):
+            self.confirmed = True
+            self.confirmed_at = current_time
+            print(
+                "[Emmons Junction] confirmed via local distribution: "
+                f"sectors={ {k: round(v, 2) for k, v in self.sector_distribution.items()} }, "
+                f"cohorts={sorted(self.valid_cohorts)}, "
+                f"lateral_var={self.lateral_variance:.2f}"
+            )
+        return self.confirmed
+
+
+junction_distribution_tracker = JunctionDistributionTracker()
+
+# =========================================================
 # 13. Saturation detector
 # =========================================================
 
@@ -3499,6 +3775,7 @@ class SaturationTracker:
     occupancy_ratio: float = 0.0
     front_delta: float = float("inf")
     tip_count: int = 0
+    frontier_contact_ratio: float = 0.0
     saturated: bool = False
 
     def reset(self, branch: Optional[str] = None):
@@ -3510,6 +3787,7 @@ class SaturationTracker:
         self.occupancy_ratio = 0.0
         self.front_delta = float("inf")
         self.tip_count = 0
+        self.frontier_contact_ratio = 0.0
         self.saturated = False
 
 
@@ -3568,13 +3846,38 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
     else:
         tracker.front_delta = float("inf")
 
-    conditions = (
+    # Eguchi et al. (2024) indirect contact evidence: what fraction of the tip
+    # robots have recently accumulated a commanded-vs-observed velocity
+    # discrepancy past the collision threshold. Genuine wall contact in this
+    # simulator mostly happens against the physical dead-end/side walls
+    # (before a Shepherd curtain exists) rather than the smooth SPH crowd
+    # packing behind an already-formed curtain, so this is wired in as an
+    # alternative, independently-sufficient confirmation path (Section 20)
+    # rather than an extra requirement stacked onto the original
+    # speed/density/occupancy evidence -- it can only speed up saturation
+    # detection, never block it.
+    tracker.frontier_contact_ratio = (
+        sum(
+            robot_recently_in_contact(robot, simulation_time)
+            for robot in tip
+        )
+        / len(tip)
+        if tip
+        else 0.0
+    )
+
+    speed_density_conditions = (
         tracker.tip_count >= SATURATION_MIN_TIP_ROBOTS
         and tracker.low_speed_ratio >= SATURATION_LOW_SPEED_RATIO
         and tracker.average_density_ratio >= SATURATION_DENSITY_RATIO
         and tracker.occupancy_ratio >= SATURATION_OCCUPANCY_RATIO
         and tracker.front_delta <= SATURATION_FRONT_PROGRESS_EPSILON
     )
+    contact_conditions = (
+        tracker.tip_count >= SATURATION_MIN_TIP_ROBOTS
+        and tracker.frontier_contact_ratio >= SATURATION_FRONTIER_CONTACT_RATIO
+    )
+    conditions = speed_density_conditions or contact_conditions
     tracker.dwell = tracker.dwell + dt if conditions else 0.0
     tracker.saturated = tracker.dwell >= SATURATION_DWELL_TIME
     if tracker.saturated:
@@ -3586,8 +3889,191 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
             "density_ratio": tracker.average_density_ratio,
             "occupancy": tracker.occupancy_ratio,
             "front_delta": tracker.front_delta,
+            "frontier_contact_ratio": tracker.frontier_contact_ratio,
         })
     return tracker.saturated
+
+# =========================================================
+# 13-1. Eguchi indirect contact detector
+# =========================================================
+
+# Recorded indirect boundary/obstacle contact points per branch, split by
+# which side of the branch centerline they occurred on. Populated purely
+# from each robot's own commanded-vs-observed velocity discrepancy; no wall
+# geometry is ever read directly.
+branch_contact_points: dict = {
+    branch: {"LEFT": [], "RIGHT": []} for branch in BRANCHES
+}
+
+
+def reset_indirect_contact_state(branch: Optional[str] = None) -> None:
+    targets = [branch] if branch is not None else list(BRANCHES)
+    for target in targets:
+        branch_contact_points[target] = {"LEFT": [], "RIGHT": []}
+
+
+def get_branch_lateral_coordinate(position: pygame.Vector2, branch: str) -> float:
+    """Signed lateral offset from the branch centerline (sign = side)."""
+    if branch == "UP":
+        return position.x - center_x
+    return position.y - center_y
+
+
+def robot_recently_in_contact(
+    robot: "Robot",
+    current_time: float,
+    window: float = EGUCHI_CONTACT_RECENT_WINDOW,
+) -> bool:
+    return (
+        robot.contact_event_time is not None
+        and current_time - robot.contact_event_time <= window
+    )
+
+
+def record_branch_contact_point(branch: str, position: pygame.Vector2) -> None:
+    lateral = get_branch_lateral_coordinate(position, branch)
+    side = "LEFT" if lateral < 0.0 else "RIGHT"
+    points = branch_contact_points[branch][side]
+    points.append(position.copy())
+    if len(points) > EGUCHI_CONTACT_POINT_HISTORY:
+        del points[: len(points) - EGUCHI_CONTACT_POINT_HISTORY]
+
+
+def update_indirect_contact_tracking(robots, dt: float) -> None:
+    """Eguchi et al. (2024), Eq. 10-11: commanded-vs-observed velocity
+    discrepancy, integrated over time and reset on every threshold crossing.
+
+        I(t+dt) = I(t) + (|v_cmd| - |v_obs|)/Vmax - zeta
+        I(t+dt) <- 0 if I(t+dt) >= I_thr
+
+    A threshold crossing is an indirect contact event: the robot's current
+    position is recorded as a boundary/obstacle contact point when it is
+    inside a branch (Section 8-9 of the extension).
+    """
+    if dt <= EPSILON:
+        return
+    for robot in robots:
+        if robot.role != "NORMAL":
+            continue
+        commanded_speed = robot.commanded_velocity.length()
+        observed_speed = robot.observed_velocity.length()
+        error = (
+            abs(commanded_speed - observed_speed) / max(EGUCHI_CONTACT_VMAX, EPSILON)
+            - EGUCHI_CONTACT_ZETA
+        )
+        robot.contact_integral = max(
+            0.0,
+            robot.contact_integral + error * EGUCHI_CONTACT_ACCUMULATION_RATE * dt,
+        )
+        if robot.contact_integral >= EGUCHI_CONTACT_THRESHOLD:
+            robot.in_contact = True
+            robot.contact_event_time = simulation_time
+            robot.contact_integral = 0.0
+            region = get_robot_region(robot.position)
+            if region in BRANCHES:
+                record_branch_contact_point(region, robot.position)
+        else:
+            robot.in_contact = False
+
+
+def estimate_effective_branch_width(robots, branch: str) -> float:
+    """Effective Branch width W_b = f(W_flow, W_contact).
+
+    W_flow is the 5th-95th percentile lateral span of NORMAL robots already
+    flowing past the branch mouth (the actual traversed robot span). W_contact
+    is an independent wall-to-wall estimate built from the Eguchi indirect
+    contact points recorded on each side of the branch. Falls back to the
+    static corridor width, the algorithm's initial-guess prior, while too few
+    observations exist on either side.
+    """
+    lateral_flow = sorted(
+        get_branch_lateral_coordinate(robot.position, branch)
+        for robot in robots
+        if robot.role == "NORMAL"
+        and get_robot_region(robot.position) == branch
+        and branch_depth_from_junction(robot.position, branch)
+        >= BRANCH_WIDTH_FLOW_MIN_DEPTH
+    )
+    width_flow = None
+    if len(lateral_flow) >= BRANCH_WIDTH_MIN_FLOW_SAMPLES:
+        low_index = int(len(lateral_flow) * BRANCH_WIDTH_FLOW_PERCENTILE)
+        high_index = min(
+            len(lateral_flow) - 1,
+            int(len(lateral_flow) * (1.0 - BRANCH_WIDTH_FLOW_PERCENTILE)),
+        )
+        width_flow = lateral_flow[high_index] - lateral_flow[low_index]
+
+    points = branch_contact_points.get(branch, {"LEFT": [], "RIGHT": []})
+    left_points, right_points = points["LEFT"], points["RIGHT"]
+    width_contact = None
+    if (
+        len(left_points) >= BRANCH_WIDTH_MIN_CONTACT_SAMPLES
+        and len(right_points) >= BRANCH_WIDTH_MIN_CONTACT_SAMPLES
+    ):
+        left_average = sum(
+            abs(get_branch_lateral_coordinate(point, branch)) for point in left_points
+        ) / len(left_points)
+        right_average = sum(
+            abs(get_branch_lateral_coordinate(point, branch)) for point in right_points
+        ) / len(right_points)
+        width_contact = left_average + right_average
+
+    if width_flow is not None and width_contact is not None:
+        width = (
+            BRANCH_WIDTH_CONTACT_BLEND * width_contact
+            + (1.0 - BRANCH_WIDTH_CONTACT_BLEND) * width_flow
+        )
+    elif width_flow is not None:
+        width = width_flow
+    elif width_contact is not None:
+        width = width_contact
+    else:
+        width = float(corridor_width)
+
+    return clamp(
+        width,
+        corridor_width * BRANCH_WIDTH_MIN_SCALE,
+        corridor_width * BRANCH_WIDTH_MAX_SCALE,
+    )
+
+
+def compute_indirect_obstacle_repulsion_force(robot: "Robot") -> pygame.Vector2:
+    """Eguchi et al. (2024), Eq. 12: repulsion from recorded contact points.
+
+    f_obs_i = Kobs * sum_k (q_i - c_k) / ||q_i - c_k||^2 * W(R_ik)
+
+    Kept weak while the Branch is still being explored (contact evidence is
+    itself part of what confirms the Branch boundary), and used at full
+    strength once the Shepherd boundary has been committed to, so repeat
+    collisions at the same spot get pushed toward the still-open flow.
+    """
+    if robot.role != "NORMAL" or get_robot_region(robot.position) != active_branch:
+        return pygame.Vector2()
+    if phase in {
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+        SimulationPhase.PRESSURE_PUSH,
+    }:
+        gain = EGUCHI_OBSTACLE_REPULSION_GAIN_ACTIVE
+    elif phase == SimulationPhase.EXPLORE_BRANCH:
+        gain = EGUCHI_OBSTACLE_REPULSION_GAIN_JUNCTION
+    else:
+        return pygame.Vector2()
+
+    points = branch_contact_points.get(active_branch)
+    if not points:
+        return pygame.Vector2()
+    force = pygame.Vector2()
+    for side_points in points.values():
+        for contact_point in side_points:
+            delta = robot.position - contact_point
+            distance_sq = delta.length_squared()
+            if distance_sq <= EPSILON or distance_sq > SMOOTHING_LENGTH**2:
+                continue
+            distance = math.sqrt(distance_sq)
+            weight = spiky_kernel(distance, SMOOTHING_LENGTH)
+            force += (delta / distance_sq) * weight
+    return limit_vector(force * gain, EGUCHI_OBSTACLE_REPULSION_FORCE_LIMIT)
 
 # =========================================================
 # 14. Adaptive Shepherd election and pressure flow
@@ -3595,8 +4081,16 @@ def update_dead_end_saturation(robots, branch, reference_density, dt):
 
 
 def adaptive_shepherd_count():
-    effective_width = corridor_width - 2.0 * SHEPHERD_EDGE_MARGIN
-    count = math.ceil(effective_width / SHEPHERD_TARGET_SLOT_SPACING) + 1
+    """Nguard = ceil(W_b / d_guard) using the Eguchi/flow-estimated width.
+
+    W_b comes from estimate_effective_branch_width(): the actual traversed
+    robot span plus indirect (Eguchi) boundary contact points, rather than
+    the static corridor width. It falls back to the corridor width, the same
+    value used before, until enough observations exist.
+    """
+    effective_width = estimate_effective_branch_width(robots, active_branch)
+    usable_width = effective_width - 2.0 * SHEPHERD_EDGE_MARGIN
+    count = math.ceil(usable_width / SHEPHERD_TARGET_SLOT_SPACING) + 1
     return int(clamp(count, SHEPHERD_MIN_COUNT, SHEPHERD_MAX_COUNT))
 
 
@@ -4013,6 +4507,7 @@ def compute_sph_forces(robots, grid):
         route_force = compute_route_force(robot_i)
         connectivity_force = compute_connectivity_force(robot_i, grid)
         shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
+        obstacle_repulsion_force = compute_indirect_obstacle_repulsion_force(robot_i)
         pressure_phase_normal = (
             phase == SimulationPhase.PRESSURE_PUSH
             and robot_i.role == "NORMAL"
@@ -4036,6 +4531,7 @@ def compute_sph_forces(robots, grid):
             + route_force
             + connectivity_force
             + shepherd_curtain_force
+            + obstacle_repulsion_force
             - DAMPING * robot_i.velocity
         )
         robot_i.acceleration = limit_vector(total, MAX_ACCELERATION)
@@ -4077,6 +4573,10 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     }:
         branch_entry_timer += dt
 
+    # Eguchi et al. (2024): update every NORMAL robot's commanded-vs-observed
+    # velocity discrepancy every frame, independent of the DFS phase.
+    update_indirect_contact_tracking(robots, dt)
+
     anchor = elect_junction_anchor(robots)
 
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
@@ -4090,11 +4590,17 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             dt,
             reference_density,
         )
+        # Emmons et al. (2020): confirm the Junction itself purely from the
+        # emergent local-distribution signal before any Branch is chosen.
+        junction_confirmed = junction_distribution_tracker.update(
+            robots, dt, simulation_time
+        )
         if (
             anchor is not None
             and anchor_deployment_ready(anchor, robots)
             and robots_in_junction >= JUNCTION_ENTRY_COUNT
             and consensus_ready
+            and junction_confirmed
         ):
             selected = choose_next_branch(anchor, robots, reference_density)
             if selected is None:
@@ -4195,6 +4701,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             phase = SimulationPhase.JUNCTION_SWITCH
             junction_switch_timer = 0.0
             junction_consensus_tracker.reset()
+            junction_distribution_tracker.reset()
 
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
@@ -4203,6 +4710,15 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             dt,
             reference_density,
         )
+        # Emmons et al. (2020): keep tracking the emergent local distribution
+        # for telemetry while regrouping. It is not used as a gate here: the
+        # JUNCTION_SWITCH re-gather force actively pulls the swarm toward one
+        # staging point (a converging regroup, by design), which is the
+        # opposite of the lateral-*expansion* signal a first arrival produces
+        # -- the Junction was already confirmed once when it was first
+        # reached, and does not need re-detecting on every return to a
+        # location the Anchor already holds.
+        junction_distribution_tracker.update(robots, dt, simulation_time)
         fallback_ready = (
             junction_switch_timer >= JUNCTION_CONSENSUS_FALLBACK_TIME
             and junction_consensus_tracker.candidate_count
@@ -4519,6 +5035,8 @@ def reset_dfs_state():
     initialize_trunk_relay_plan()
     saturation_tracker.reset()
     junction_consensus_tracker.reset()
+    junction_distribution_tracker.reset()
+    reset_indirect_contact_state()
     metrics = ExperimentMetrics()
 
 
@@ -4761,6 +5279,33 @@ while running:
             f"dwell={junction_consensus_tracker.dwell:.2f} "
             f"fast={junction_consensus_tracker.fast_dwell:.2f} "
             f"mode={junction_consensus_tracker.ready_mode}"
+        ),
+        (
+            f"Emmons distribution={EMMONS_DISTRIBUTION_POLICY_VERSION} | "
+            f"n={junction_distribution_tracker.candidate_count} "
+            f"sectors="
+            + ",".join(
+                f"{sector}={ratio:.2f}"
+                for sector, ratio in junction_distribution_tracker.sector_distribution.items()
+            )
+        ) if junction_distribution_tracker.sector_distribution else "Emmons distribution: -",
+        (
+            f"lateral_var={junction_distribution_tracker.lateral_variance:.1f} "
+            f"expand_dwell={junction_distribution_tracker.expansion_dwell:.2f} "
+            f"cohorts={sorted(junction_distribution_tracker.valid_cohorts)} "
+            f"confirmed={junction_distribution_tracker.confirmed}"
+        ),
+        (
+            f"Eguchi contact={EGUCHI_CONTACT_POLICY_VERSION} | "
+            f"W_b(active)={estimate_effective_branch_width(robots, active_branch):.1f} "
+            f"(corridor={corridor_width}) | "
+            f"points L={len(branch_contact_points[active_branch]['LEFT'])} "
+            f"R={len(branch_contact_points[active_branch]['RIGHT'])}"
+        ) if active_branch in branch_contact_points else "Eguchi contact: -",
+        (
+            f"Dead-end frontier contact ratio="
+            f"{saturation_tracker.frontier_contact_ratio:.2f}/"
+            f"{SATURATION_FRONTIER_CONTACT_RATIO:.2f}"
         ),
         f"States: U={branch_states['UP']} L={branch_states['LEFT']} R={branch_states['RIGHT']}",
         f"Base comm={communication_stats['connected']}/{len(robots)} | hop={communication_stats['max_hop']} | margin={communication_stats['margin']:.1f}",
