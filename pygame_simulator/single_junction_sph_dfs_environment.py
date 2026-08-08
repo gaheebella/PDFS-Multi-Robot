@@ -503,6 +503,7 @@ junction_guard_stable_dwell = 0.0
 junction_guard_status = "OPEN_FREE_DIFFUSION"
 frontier_line_branch: Optional[str] = None
 frontier_line_depth = 0.0
+observed_dead_end_depths: dict[str, float] = {}
 
 # =========================================================
 # 4. Physics and control parameters
@@ -1097,6 +1098,7 @@ FRONTIER_POLICY_VERSION = "LEADER_BIASED_DEFORMABLE_FRONTIER_V1"
 FRONTIER_LINE_ADVANCE_SPEED = 52.0 * MOTION_SPEED_MULTIPLIER
 FRONTIER_LINE_FORM_SPEED = 58.0 * MOTION_SPEED_MULTIPLIER
 FRONTIER_LINE_LEAD_GAP = 12.0 * MAP_SCALE
+FRONTIER_LINE_SUPPORT_QUANTILE = 0.98
 FRONTIER_LINE_START_DEPTH = JUNCTION_GUARD_BRANCH_INSET
 FRONTIER_LINE_POLICY_VERSION = "PERSISTENT_CROSS_SECTION_SHEPHERD_V1"
 
@@ -1135,7 +1137,11 @@ DEAD_END_FORWARD_SPEED_THRESHOLD = 8.0
 DEAD_END_DENSITY_RATIO = 0.55
 DEAD_END_LATERAL_ESCAPE_RATIO = 0.45
 DEAD_END_CONFIRM_DWELL = 0.16
-DEAD_END_INFERENCE_POLICY_VERSION = "FRONTIER_CONTACT_DENSITY_V1"
+DEAD_END_SHEPHERD_DIRECT_CONTACT_RATIO = 0.60
+DEAD_END_SHEPHERD_CONTACT_SPAN_RATIO = 0.55
+DEAD_END_FORWARD_BUMPER_MEMORY = 0.30
+DEAD_END_FORWARD_BUMPER_PROBE = ROBOT_RADIUS * 0.85
+DEAD_END_INFERENCE_POLICY_VERSION = "SHEPHERD_FORWARD_BUMPER_SPAN_V3"
 
 CELL_SIZE = max(SMOOTHING_LENGTH, VIRTUAL_PRESSURE_RADIUS, COMM_RANGE)
 SPH_CELL_SIZE = SMOOTHING_LENGTH
@@ -1458,6 +1464,9 @@ def branch_point_at_depth(branch: str, depth: float) -> pygame.Vector2:
 
 
 def get_shepherd_boundary_depth(branch: str) -> float:
+    observed_depth = observed_dead_end_depths.get(branch)
+    if observed_depth is not None:
+        return max(0.0, observed_depth)
     return max(0.0, BRANCH_LENGTHS[branch] - SHEPHERD_BOUNDARY_WALL_CLEARANCE)
 
 
@@ -1953,6 +1962,7 @@ class Robot:
         self.tracking_error_integral = 0.0
         self.contact_detected = False
         self.last_contact_time = float("-inf")
+        self.last_forward_obstacle_contact_time = float("-inf")
         self.latest_contact_point: Optional[pygame.Vector2] = None
         self.role = "NORMAL"
 
@@ -2106,6 +2116,16 @@ class Robot:
                 self.shepherd_branch,
                 frontier_line_depth,
             )
+            # Local forward bumper/proximity probe.  A communication guard or
+            # NORMAL pressure can stop the robot without making this probe
+            # positive; only the physical map mask immediately ahead does.
+            outward = BRANCH_DIRECTIONS[self.shepherd_branch]
+            forward_probe = (
+                self.position
+                + outward * DEAD_END_FORWARD_BUMPER_PROBE
+            )
+            if not is_walkable(forward_probe, self.radius):
+                self.last_forward_obstacle_contact_time = simulation_time
             error = target - self.position
             desired_velocity = pygame.Vector2()
             if error.length_squared() > EPSILON:
@@ -2921,30 +2941,39 @@ def update_frontier_line_progress(robots, branch: str, dt: float) -> None:
     # zero-depth support so the line opens exactly one lead gap; after that it
     # can advance only when the NORMAL body follows.
     supported_front = (
-        linear_quantile(normal_depths, 0.90)
+        linear_quantile(
+            normal_depths,
+            FRONTIER_LINE_SUPPORT_QUANTILE,
+        )
         if normal_depths
         else 0.0
     )
-    desired_depth = max(
-        frontier_line_depth,
-        min(
-            BRANCH_LENGTHS[branch],
-            supported_front + FRONTIER_LINE_LEAD_GAP,
-        ),
-    )
+    supported_target = supported_front + FRONTIER_LINE_LEAD_GAP
+    observed_limit = observed_dead_end_depths.get(branch)
+    if observed_limit is not None:
+        supported_target = min(supported_target, observed_limit)
+    desired_depth = max(frontier_line_depth, supported_target)
     frontier_line_depth = min(
         desired_depth,
         frontier_line_depth + FRONTIER_LINE_ADVANCE_SPEED * dt,
     )
 
 
-def promote_existing_frontier_line(robots, branch: str):
+def promote_existing_frontier_line(
+    robots,
+    branch: str,
+    observed_boundary_depth: Optional[float] = None,
+):
     """Flatten the same moving frontier IDs into the return piston line."""
     global frontier_line_branch, frontier_line_depth
     frontiers = get_frontier_shepherds(robots, branch)
     if not frontiers:
         return []
-    slots = build_shepherd_slots(branch, len(frontiers))
+    slots = build_shepherd_slots(
+        branch,
+        len(frontiers),
+        observed_boundary_depth,
+    )
     assignment = assign_shepherd_slots(frontiers, slots)
     if len(assignment) != len(frontiers):
         return []
@@ -7153,6 +7182,10 @@ class DeadEndInferenceTracker:
     mean_forward_speed: float = 0.0
     mean_density_ratio: float = 0.0
     lateral_escape_ratio: float = 0.0
+    shepherd_direct_contact_ratio: float = 0.0
+    shepherd_contact_span_ratio: float = 0.0
+    shepherd_mean_forward_speed: float = 0.0
+    confirmed_depth: float = 0.0
     confirmed: bool = False
 
     def reset(self, branch: Optional[str] = None):
@@ -7164,9 +7197,14 @@ class DeadEndInferenceTracker:
         self.mean_forward_speed = 0.0
         self.mean_density_ratio = 0.0
         self.lateral_escape_ratio = 0.0
+        self.shepherd_direct_contact_ratio = 0.0
+        self.shepherd_contact_span_ratio = 0.0
+        self.shepherd_mean_forward_speed = 0.0
+        self.confirmed_depth = 0.0
         self.confirmed = False
 
     def update(self, robots, branch: str, reference_density: float, dt: float) -> bool:
+        global observed_dead_end_depths
         if self.branch != branch:
             self.reset(branch)
         branch_robots = [
@@ -7217,12 +7255,46 @@ class DeadEndInferenceTracker:
             > DEAD_END_FORWARD_SPEED_THRESHOLD
             for robot in frontier
         ) / len(frontier)
+        frontier_shepherds = get_frontier_shepherds(robots, branch)
+        directly_contacting_shepherds = [
+            robot
+            for robot in frontier_shepherds
+            if simulation_time - robot.last_forward_obstacle_contact_time
+            <= DEAD_END_FORWARD_BUMPER_MEMORY
+        ]
+        self.shepherd_direct_contact_ratio = (
+            len(directly_contacting_shepherds)
+            / max(len(frontier_shepherds), 1)
+        )
+        self.shepherd_mean_forward_speed = (
+            sum(
+                max(0.0, robot.observed_velocity.dot(direction))
+                for robot in frontier_shepherds
+            )
+            / max(len(frontier_shepherds), 1)
+        )
+        contact_lateral_coordinates = [
+            (robot.position - get_branch_entrance(branch)).dot(lateral)
+            for robot in directly_contacting_shepherds
+        ]
+        contact_span = (
+            max(contact_lateral_coordinates) - min(contact_lateral_coordinates)
+            if len(contact_lateral_coordinates) >= 2
+            else 0.0
+        )
+        self.shepherd_contact_span_ratio = clamp(
+            contact_span / max(corridor_width, EPSILON),
+            0.0,
+            1.0,
+        )
         conditions = (
-            self.leader_contact >= DEAD_END_LEADER_CONTACT_THRESHOLD
-            and self.mean_contact >= DEAD_END_MEAN_CONTACT_THRESHOLD
-            and self.mean_forward_speed <= DEAD_END_FORWARD_SPEED_THRESHOLD
-            and self.mean_density_ratio >= DEAD_END_DENSITY_RATIO
-            and self.lateral_escape_ratio <= DEAD_END_LATERAL_ESCAPE_RATIO
+            len(frontier_shepherds) >= JUNCTION_GUARD_MIN_COUNT
+            and self.shepherd_direct_contact_ratio
+            >= DEAD_END_SHEPHERD_DIRECT_CONTACT_RATIO
+            and self.shepherd_contact_span_ratio
+            >= DEAD_END_SHEPHERD_CONTACT_SPAN_RATIO
+            and self.shepherd_mean_forward_speed
+            <= DEAD_END_FORWARD_SPEED_THRESHOLD
         )
         self.dwell = self.dwell + dt if conditions else max(0.0, self.dwell - dt)
         newly_confirmed = (
@@ -7231,6 +7303,22 @@ class DeadEndInferenceTracker:
         )
         if newly_confirmed:
             self.confirmed = True
+            # Store the contacted leader's measured displacement from the
+            # observed mouth.  This is the Shepherd boundary reference; the
+            # renderer's known branch length is not substituted here.
+            self.confirmed_depth = max(
+                0.0,
+                linear_quantile(
+                    [
+                        (robot.position - get_branch_entrance(branch)).dot(
+                            direction
+                        )
+                        for robot in directly_contacting_shepherds
+                    ],
+                    0.50,
+                ),
+            )
+            observed_dead_end_depths[branch] = self.confirmed_depth
             metrics.dead_end_events.append({
                 "time": simulation_time,
                 "branch": branch,
@@ -7240,12 +7328,26 @@ class DeadEndInferenceTracker:
                 "mean_forward_speed": self.mean_forward_speed,
                 "mean_density_ratio": self.mean_density_ratio,
                 "lateral_escape_ratio": self.lateral_escape_ratio,
+                "shepherd_direct_contact_ratio": (
+                    self.shepherd_direct_contact_ratio
+                ),
+                "shepherd_contact_span_ratio": (
+                    self.shepherd_contact_span_ratio
+                ),
+                "shepherd_mean_forward_speed": (
+                    self.shepherd_mean_forward_speed
+                ),
+                "observed_depth": self.confirmed_depth,
             })
             print(
                 f"[Dead-end Inference] branch={branch}, "
                 f"contact={self.mean_contact:.2f}, "
                 f"forward={self.mean_forward_speed:.2f}, "
-                f"rho={self.mean_density_ratio:.2f}"
+                f"rho={self.mean_density_ratio:.2f}, "
+                f"bumper={self.shepherd_direct_contact_ratio:.2f}, "
+                f"span={self.shepherd_contact_span_ratio:.2f}, "
+                f"shepherd_v={self.shepherd_mean_forward_speed:.2f}, "
+                f"observed_depth={self.confirmed_depth:.1f}"
             )
         return self.confirmed
 
@@ -7661,20 +7763,25 @@ def adaptive_shepherd_count():
     return int(clamp(count, SHEPHERD_MIN_COUNT, SHEPHERD_MAX_COUNT))
 
 
-def build_shepherd_slots(branch, count):
+def build_shepherd_slots(
+    branch,
+    count,
+    observed_boundary_depth: Optional[float] = None,
+):
     usable_half = half_width - SHEPHERD_EDGE_MARGIN
     lateral = [0.0] if count <= 1 else [
         -usable_half + 2.0 * usable_half * index / (count - 1)
         for index in range(count)
     ]
-    if branch == "UP":
-        y = center_y - half_width - normal_length + SHEPHERD_BOUNDARY_WALL_CLEARANCE
-        return [pygame.Vector2(center_x + value, y) for value in lateral]
-    if branch == "LEFT":
-        x = center_x - half_width - normal_length + SHEPHERD_BOUNDARY_WALL_CLEARANCE
-        return [pygame.Vector2(x, center_y + value) for value in lateral]
-    x = center_x + half_width + right_length - SHEPHERD_BOUNDARY_WALL_CLEARANCE
-    return [pygame.Vector2(x, center_y + value) for value in lateral]
+    boundary_depth = (
+        get_shepherd_boundary_depth(branch)
+        if observed_boundary_depth is None
+        else max(0.0, observed_boundary_depth)
+    )
+    direction = BRANCH_DIRECTIONS[branch]
+    center = get_branch_entrance(branch) + direction * boundary_depth
+    normal = pygame.Vector2(-direction.y, direction.x)
+    return [center + normal * value for value in lateral]
 
 
 def reset_shepherd_roles(robots):
@@ -10139,9 +10246,26 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         # entrance-guard IDs.  Never discard that line and elect unrelated
         # robots at the dead end.
         if dead_end_confirmed:
+            observed_depth = dead_end_inference_tracker.confirmed_depth
+            # The same frontier line keeps following the NORMAL front at its
+            # existing advance rate.  It may form the return piston only after
+            # physically reaching the locally contacted depth, so there is no
+            # map-directed sprint to a known terminal coordinate.
+            frontier_shepherds = get_frontier_shepherds(
+                robots,
+                active_branch,
+            )
+            physical_line_reached = bool(frontier_shepherds) and all(
+                branch_depth_from_junction(robot.position, active_branch)
+                >= observed_depth - JUNCTION_GUARD_POSITION_TOLERANCE
+                for robot in frontier_shepherds
+            )
+            if not physical_line_reached:
+                return
             selected = promote_existing_frontier_line(
                 robots,
                 active_branch,
+                observed_depth,
             )
             if selected:
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
@@ -10824,6 +10948,7 @@ def reset_dfs_state():
     global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
     global frontier_line_branch, frontier_line_depth
+    global observed_dead_end_depths
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = FIXED_BRANCH_ORDER[0]
@@ -10897,6 +11022,7 @@ def reset_dfs_state():
     junction_guard_status = "OPEN_FREE_DIFFUSION"
     frontier_line_branch = None
     frontier_line_depth = 0.0
+    observed_dead_end_depths = {}
     saturation_tracker.reset()
     branch_continuity_tracker.reset()
     junction_consensus_tracker.reset()
@@ -11436,6 +11562,10 @@ while running:
             f"v={dead_end_inference_tracker.mean_forward_speed:.1f} "
             f"rho={dead_end_inference_tracker.mean_density_ratio:.2f} "
             f"escape={dead_end_inference_tracker.lateral_escape_ratio:.2f} "
+            f"bumper={dead_end_inference_tracker.shepherd_direct_contact_ratio:.2f} "
+            f"span={dead_end_inference_tracker.shepherd_contact_span_ratio:.2f} "
+            f"shepherd-v={dead_end_inference_tracker.shepherd_mean_forward_speed:.1f} "
+            f"depth={dead_end_inference_tracker.confirmed_depth:.1f} "
             f"dwell={dead_end_inference_tracker.dwell:.2f} "
             f"confirmed={dead_end_inference_tracker.confirmed}"
         ),
