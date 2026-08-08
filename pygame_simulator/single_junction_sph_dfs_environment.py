@@ -6813,7 +6813,9 @@ class SequentialJunctionInferenceTracker:
     )
     valid_branches: set[str] = field(default_factory=set)
     discovery_dwell: float = 0.0
-    last_member_total: int = 0
+    last_valid_branch_signature: frozenset[str] = field(
+        default_factory=frozenset
+    )
     forward_probe_status: str = "UNRESOLVED"
     forward_contact_count: int = 0
     confirmed: bool = False
@@ -6836,7 +6838,7 @@ class SequentialJunctionInferenceTracker:
         self.cohort_member_ids = {branch: set() for branch in BRANCHES}
         self.valid_branches.clear()
         self.discovery_dwell = 0.0
-        self.last_member_total = 0
+        self.last_valid_branch_signature = frozenset()
         self.forward_probe_status = "UNRESOLVED"
         self.forward_contact_count = 0
         self.confirmed = False
@@ -7097,10 +7099,16 @@ class SequentialJunctionInferenceTracker:
             and len(self.valid_branches) >= JUNCTION_MIN_VALID_COHORTS
             and self.forward_probe_status != "UNRESOLVED"
         )
-        member_total = sum(self.cohort_counts.values())
-        new_crossing_evidence = member_total > self.last_member_total
-        self.last_member_total = member_total
-        if not junction_signature or new_crossing_evidence:
+        # Additional robots crossing an already validated opening strengthen
+        # existing evidence; they do not reveal a new environmental feature.
+        # Reset settling only when the inferred branch set itself changes or
+        # when the Junction distribution signature is genuinely lost.
+        valid_branch_signature = frozenset(self.valid_branches)
+        branch_set_changed = (
+            valid_branch_signature != self.last_valid_branch_signature
+        )
+        self.last_valid_branch_signature = valid_branch_signature
+        if not junction_signature or branch_set_changed:
             self.discovery_dwell = 0.0
         else:
             self.discovery_dwell += dt
