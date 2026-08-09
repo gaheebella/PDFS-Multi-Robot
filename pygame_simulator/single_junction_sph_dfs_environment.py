@@ -501,6 +501,13 @@ junction_guard_frontier_depths: dict[str, float] = {}
 junction_guard_formation_timer = 0.0
 junction_guard_stable_dwell = 0.0
 junction_guard_status = "OPEN_FREE_DIFFUSION"
+pending_branch_start: Optional[str] = None
+thick_mouth_guard_layers: dict[str, int] = {
+    branch: 0 for branch in BRANCHES
+}
+thick_mouth_guard_columns: dict[str, int] = {
+    branch: 0 for branch in BRANCHES
+}
 frontier_line_branch: Optional[str] = None
 frontier_line_depth = 0.0
 observed_dead_end_depths: dict[str, float] = {}
@@ -1008,7 +1015,8 @@ PROXY_ROLLOUT_MIN_PRIMARY = 6
 PROXY_CONTEXT_HOLD_GAIN = 3.2
 PROXY_CONTEXT_MAX_SPEED_SCALE = 0.28
 
-# Geodesic EDF guidance and smooth virtual valves at unselected branch mouths.
+# Geodesic EDF guidance. Runtime branch-mouth control is implemented by
+# physical JUNCTION_GUARD robots, not map-aware virtual valves/geofences.
 EDF_FINITE_EPSILON = 1e-6
 EDF_PROPULSION_POLICY_VERSION = "POST_RELEASE_BRANCH_CRUISE_EDF_V5"
 EDF_PRESSURE_COUPLING_GAIN = 36.0 * MOTION_SPEED_MULTIPLIER
@@ -1023,7 +1031,7 @@ TRANSFER_EDF_FORCE_MULTIPLIER = 1.25
 VIRTUAL_VALVE_RADIUS = 46.0 * MAP_SCALE
 VIRTUAL_VALVE_GAIN = 92.0
 FINAL_RETURN_VALVE_GAIN_MULTIPLIER = 4.0
-FINAL_GATE_POLICY_VERSION = "ONE_WAY_RETURN_SEAL_V1"
+FINAL_GATE_POLICY_VERSION = "PHYSICAL_GUARD_NO_GEOFENCE_V1"
 
 # Centralized sampled-data approximation of HydroSwarm's local stability
 # consensus. A dual-threshold readiness rule shortens Junction waiting while
@@ -1093,7 +1101,25 @@ JUNCTION_GUARD_FORM_DWELL = 0.10
 JUNCTION_GUARD_FORM_TIMEOUT = 1.50
 JUNCTION_MINIMAL_GUARD_COUNT = 2
 JUNCTION_GUARD_MAX_HOPS = 4
-JUNCTION_GUARD_POLICY_VERSION = "BRANCH_TERMINAL_FRONTIER_KHOP_V2"
+JUNCTION_GUARD_POLICY_VERSION = "PERSISTENT_PHYSICAL_MOUTH_GUARD_V1"
+PHYSICAL_GUARD_INFLUENCE_RADIUS = max(
+    JUNCTION_GUARD_COVERAGE * 0.78,
+    SAFE_RADIUS * 1.15,
+)
+PHYSICAL_GUARD_INWARD_GAIN = 118.0 * MOTION_SPEED_MULTIPLIER
+PHYSICAL_GUARD_LATERAL_GAIN = 32.0 * MOTION_SPEED_MULTIPLIER
+PHYSICAL_GUARD_FORCE_LIMIT = 105.0 * MOTION_SPEED_MULTIPLIER
+THICK_MOUTH_GUARD_POLICY_VERSION = "ADAPTIVE_KHOP_LAYERED_MOUTH_WALL_V1"
+THICK_MOUTH_GUARD_MIN_LAYERS = 2
+THICK_MOUTH_GUARD_MAX_LAYERS = JUNCTION_GUARD_MAX_HOPS
+THICK_MOUTH_GUARD_LAYER_SPACING = max(
+    SAFE_RADIUS * 1.10,
+    ROBOT_RADIUS * 2.25,
+)
+THICK_MOUTH_GUARD_FORM_DWELL = 0.18
+THICK_MOUTH_GUARD_FORM_TIMEOUT = 4.0
+THICK_MOUTH_GUARD_LARGE_SWARM_SIZE = 400
+THICK_MOUTH_GUARD_VERY_LARGE_SWARM_SIZE = 900
 FRONTIER_POLICY_VERSION = "LEADER_BIASED_DEFORMABLE_FRONTIER_V1"
 FRONTIER_LINE_ADVANCE_SPEED = 52.0 * MOTION_SPEED_MULTIPLIER
 FRONTIER_LINE_FORM_SPEED = 58.0 * MOTION_SPEED_MULTIPLIER
@@ -1172,33 +1198,14 @@ def get_robot_region(position: pygame.Vector2) -> str:
 
 
 def is_region_allowed(position: pygame.Vector2) -> bool:
+    """Accept every physical corridor independently of logical gate state.
+
+    ``branch_gate_states`` is a distributed command state, not a simulator
+    geofence. Only actual environment walls and locally sensed guard robots
+    may affect locomotion.
+    """
     region = get_robot_region(position)
-    if phase == SimulationPhase.MOVE_TO_JUNCTION:
-        # Junction discovery is driven by free SPH probes.  Do not use the
-        # simulator's known branch rectangles as closed pre-discovery gates:
-        # a branch can only become a candidate after robots physically cross
-        # its mouth and sustain measurable travel inside it.
-        return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
-    if phase in {
-        SimulationPhase.EXPLORE_BRANCH,
-        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-        SimulationPhase.FILL_BEHIND_SHEPHERD,
-        SimulationPhase.PRESSURE_PUSH,
-        SimulationPhase.FLOW_BACKTRACK,
-        SimulationPhase.JUNCTION_SWITCH,
-    }:
-        return (
-            region in {"BOTTOM", "JUNCTION"}
-            or branch_gate_states.get(region) == "OPEN"
-        )
-    if phase in {
-        SimulationPhase.FINAL_JUNCTION_GATHER,
-        SimulationPhase.RETURN_TO_BASE,
-    }:
-        return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
-    if phase == SimulationPhase.DONE:
-        return region in {"BOTTOM", "JUNCTION"}
-    return region != "OUTSIDE"
+    return region in {"BOTTOM", "JUNCTION", "UP", "LEFT", "RIGHT"}
 
 
 def is_walkable(position: pygame.Vector2, radius: float) -> bool:
@@ -1253,28 +1260,8 @@ def constrain_final_return_gate_crossing(
     robot: "Robot",
     old_position: pygame.Vector2,
 ) -> None:
-    """One-way hard gate: branch stragglers may exit, nobody may re-enter."""
-    if phase not in {
-        SimulationPhase.FINAL_JUNCTION_GATHER,
-        SimulationPhase.RETURN_TO_BASE,
-    }:
-        return
-    old_region = get_robot_region(old_position)
-    new_region = get_robot_region(robot.position)
-    if (
-        old_region not in {"JUNCTION", "BOTTOM"}
-        or new_region not in BRANCHES
-        or branch_gate_states.get(new_region) != "CLOSED"
-    ):
-        return
-
-    robot.position = old_position.copy()
-    outward_direction = BRANCH_DIRECTIONS[new_region]
-    outward_speed = robot.velocity.dot(outward_direction)
-    if outward_speed > 0.0:
-        robot.velocity -= outward_direction * outward_speed
-    robot.acceleration.update(0.0, 0.0)
-    robot.filtered_acceleration.update(0.0, 0.0)
+    """Compatibility no-op: final return has no map-aware one-way gate."""
+    return
 
 
 def wall_collision_velocity(component: float) -> float:
@@ -1972,6 +1959,8 @@ class Robot:
         self.junction_guard_anchor: Optional[pygame.Vector2] = None
         self.junction_guard_branch: Optional[str] = None
         self.junction_guard_hop = -1
+        self.junction_guard_parent_id: Optional[int] = None
+        self.junction_guard_layer = -1
         self.is_branch_leader = False
         self.relay_anchor: Optional[pygame.Vector2] = None
         self.relay_index = -1
@@ -2733,6 +2722,177 @@ def minimum_k_hop_guard_group(
     return candidates, selected_hop
 
 
+def required_thick_mouth_guard_layers(
+    robots,
+    branch: str,
+    column_count: int,
+) -> int:
+    """Choose 2--4 physical layers from locally arriving pressure mass."""
+    entrance = get_branch_entrance(branch)
+    nearby_normals = [
+        robot
+        for robot in robots
+        if robot.role == "NORMAL"
+        and not robot.base_reserve
+        and get_robot_region(robot.position) in {"JUNCTION", branch}
+        and robot.position.distance_to(entrance)
+        <= JUNCTION_GUARD_RECRUIT_RADIUS
+    ]
+    mean_density_ratio = (
+        sum(robot.density_ratio for robot in nearby_normals)
+        / max(len(nearby_normals), 1)
+    )
+    layers = THICK_MOUTH_GUARD_MIN_LAYERS
+    if (
+        len(robots) >= THICK_MOUTH_GUARD_LARGE_SWARM_SIZE
+        or len(nearby_normals) >= column_count * 3
+        or mean_density_ratio >= 1.15
+    ):
+        layers += 1
+    if (
+        len(robots) >= THICK_MOUTH_GUARD_VERY_LARGE_SWARM_SIZE
+        or (
+            len(nearby_normals) >= column_count * 6
+            and mean_density_ratio >= 1.30
+        )
+    ):
+        layers += 1
+    return int(clamp(
+        layers,
+        THICK_MOUTH_GUARD_MIN_LAYERS,
+        THICK_MOUTH_GUARD_MAX_LAYERS,
+    ))
+
+
+def expand_k_hop_mouth_guard_group(
+    seed_guards,
+    robots,
+    branch: str,
+    target_count: int,
+):
+    """Grow an existing frontier guard into a bounded K-hop mouth wall."""
+    if not seed_guards:
+        return []
+    entrance = get_branch_entrance(branch)
+    selected = {robot.robot_id: robot for robot in seed_guards}
+    leader = next(
+        (robot for robot in seed_guards if robot.is_branch_leader),
+        seed_guards[0],
+    )
+    leader.junction_guard_parent_id = None
+    leader.junction_guard_hop = 0
+    for robot in seed_guards:
+        if robot is leader:
+            continue
+        robot.junction_guard_parent_id = leader.robot_id
+        robot.junction_guard_hop = max(1, robot.junction_guard_hop)
+
+    frontier = list(seed_guards)
+    for hop in range(1, JUNCTION_GUARD_MAX_HOPS + 1):
+        if len(selected) >= target_count or not frontier:
+            break
+        candidate_parents: dict[int, tuple["Robot", "Robot"]] = {}
+        for parent in frontier:
+            for peer in parent.comm_neighbors:
+                peer_id = getattr(peer, "robot_id", -1)
+                if peer_id < 0 or peer_id in selected:
+                    continue
+                if (
+                    getattr(peer, "role", None) != "NORMAL"
+                    or getattr(peer, "base_reserve", False)
+                ):
+                    continue
+                region = get_robot_region(peer.position)
+                if not (
+                    region == branch
+                    or (
+                        region == "JUNCTION"
+                        and peer.position.distance_to(entrance)
+                        <= JUNCTION_GUARD_RECRUIT_RADIUS
+                    )
+                ):
+                    continue
+                previous = candidate_parents.get(peer_id)
+                if (
+                    previous is None
+                    or parent.position.distance_squared_to(peer.position)
+                    < previous[0].position.distance_squared_to(peer.position)
+                ):
+                    candidate_parents[peer_id] = (parent, peer)
+        ordered = sorted(
+            candidate_parents.values(),
+            key=lambda item: (
+                0 if get_robot_region(item[1].position) == branch else 1,
+                item[1].position.distance_squared_to(entrance),
+                item[1].robot_id,
+            ),
+        )
+        next_frontier = []
+        for parent, peer in ordered[:max(0, target_count - len(selected))]:
+            peer.junction_guard_parent_id = parent.robot_id
+            peer.junction_guard_hop = min(
+                JUNCTION_GUARD_MAX_HOPS,
+                max(0, parent.junction_guard_hop) + 1,
+            )
+            selected[peer.robot_id] = peer
+            next_frontier.append(peer)
+        frontier = next_frontier
+
+    return list(selected.values())
+
+
+def build_thick_mouth_guard_slots(
+    branch: str,
+    count: int,
+    column_count: int,
+) -> list[pygame.Vector2]:
+    """Create full-width axial rows entirely on the Branch side of a mouth."""
+    slots = []
+    remaining = count
+    layer = 0
+    while remaining > 0:
+        row_count = min(column_count, remaining)
+        depth = (
+            JUNCTION_GUARD_BRANCH_INSET
+            + layer * THICK_MOUTH_GUARD_LAYER_SPACING
+        )
+        slots.extend(build_junction_guard_slots(branch, row_count, depth))
+        remaining -= row_count
+        layer += 1
+    return slots
+
+
+def thick_mouth_guards_formed(robots, selected_branch: str) -> bool:
+    protected_branches = [
+        branch
+        for branch in junction_guard_groups
+        if branch != selected_branch
+        and branch_states.get(branch) == "UNVISITED"
+    ]
+    if not protected_branches:
+        return True
+    for branch in protected_branches:
+        guards = [
+            robot
+            for robot in robots
+            if robot.role == "JUNCTION_GUARD"
+            and robot.junction_guard_branch == branch
+        ]
+        if (
+            not guards
+            or thick_mouth_guard_layers.get(branch, 0)
+            < THICK_MOUTH_GUARD_MIN_LAYERS
+            or any(
+                robot.junction_guard_anchor is None
+                or robot.position.distance_to(robot.junction_guard_anchor)
+                > JUNCTION_GUARD_POSITION_TOLERANCE
+                for robot in guards
+            )
+        ):
+            return False
+    return True
+
+
 def release_junction_guard_roles(robots) -> None:
     global frontier_line_branch, frontier_line_depth
     for robot in robots:
@@ -2742,6 +2902,8 @@ def release_junction_guard_roles(robots) -> None:
         robot.junction_guard_anchor = None
         robot.junction_guard_branch = None
         robot.junction_guard_hop = -1
+        robot.junction_guard_parent_id = None
+        robot.junction_guard_layer = -1
         robot.is_branch_leader = False
         robot.shepherd_anchor = None
         robot.shepherd_origin = None
@@ -2759,6 +2921,7 @@ def begin_junction_guard_formation(robots) -> None:
     global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
     global distributed_consensus_branch
+    global pending_branch_start
     release_junction_guard_roles(robots)
     # Only observed openings may be sealed.  Closing an undiscovered branch
     # would leak the simulator's ground-truth map into the controller.
@@ -2781,6 +2944,10 @@ def begin_junction_guard_formation(robots) -> None:
     junction_guard_frontier_depths = {}
     junction_guard_formation_timer = 0.0
     junction_guard_stable_dwell = 0.0
+    pending_branch_start = None
+    for branch in BRANCHES:
+        thick_mouth_guard_layers[branch] = 0
+        thick_mouth_guard_columns[branch] = 0
     available_ids = {
         robot.robot_id
         for robot in robots
@@ -2824,6 +2991,10 @@ def begin_junction_guard_formation(robots) -> None:
             robot.junction_guard_anchor = slot.copy()
             robot.junction_guard_branch = branch
             robot.junction_guard_hop = selected_hop
+            robot.junction_guard_parent_id = (
+                None if robot is leader else leader.robot_id
+            )
+            robot.junction_guard_layer = 0
             robot.is_branch_leader = robot is leader
             robot.velocity.update(0.0, 0.0)
             robot.filtered_acceleration.update(0.0, 0.0)
@@ -2863,7 +3034,7 @@ def junction_guards_formed(robots) -> bool:
 
 
 def commit_junction_guard_roles(robots, selected_branch: str) -> None:
-    """Keep the selected full guard as one persistent moving Shepherd line."""
+    """Advance the selected line and thicken every unselected mouth guard."""
     global junction_guard_status, frontier_line_branch, frontier_line_depth
     for branch, robot_ids in junction_guard_groups.items():
         branch_guards = [
@@ -2876,6 +3047,8 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
                 robot.role = "FRONTIER_SHEPHERD"
                 robot.junction_guard_anchor = None
                 robot.junction_guard_branch = branch
+                robot.junction_guard_parent_id = None
+                robot.junction_guard_layer = 0
                 robot.shepherd_anchor = slot.copy()
                 robot.shepherd_origin = slot.copy()
                 robot.shepherd_branch = branch
@@ -2886,31 +3059,80 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
                 branch,
                 FRONTIER_LINE_START_DEPTH,
             )
+            thick_mouth_guard_layers[branch] = 0
+            thick_mouth_guard_columns[branch] = 0
             continue
-        # The closed virtual valve now protects an unselected mouth.  Release
-        # the entire physical border so every robot can leave that branch and
-        # join the selected branch instead of remaining as wasted sentries.
-        for robot in branch_guards:
-            robot.role = "NORMAL"
-            robot.junction_guard_anchor = None
-            robot.junction_guard_branch = None
-            robot.junction_guard_hop = -1
-            robot.is_branch_leader = False
+        # The original frontier line becomes the seed of a bounded K-hop
+        # cohort.  Extra NORMAL peers form axial rows behind the full-width
+        # mouth line, so high SPH pressure is resisted by physical depth and
+        # redundant communication rather than by a virtual geofence.
+        column_count = max(
+            JUNCTION_GUARD_MIN_COUNT,
+            len(branch_guards),
+        )
+        desired_layers = required_thick_mouth_guard_layers(
+            robots,
+            branch,
+            column_count,
+        )
+        target_count = column_count * desired_layers
+        expanded_guards = expand_k_hop_mouth_guard_group(
+            branch_guards,
+            robots,
+            branch,
+            target_count,
+        )
+        actual_layers = math.ceil(
+            len(expanded_guards) / max(column_count, 1)
+        )
+        mouth_slots = build_thick_mouth_guard_slots(
+            branch,
+            len(expanded_guards),
+            column_count,
+        )
+        assignment = assign_shepherd_slots(expanded_guards, mouth_slots)
+        leader = next(
+            (robot for robot in branch_guards if robot.is_branch_leader),
+            branch_guards[0],
+        )
+        branch_ids = []
+        for robot, slot, _ in assignment:
+            robot.role = "JUNCTION_GUARD"
+            robot.junction_guard_anchor = slot.copy()
+            robot.junction_guard_branch = branch
+            robot.junction_guard_layer = int(round(
+                (
+                    branch_depth_from_junction(slot, branch)
+                    - JUNCTION_GUARD_BRANCH_INSET
+                )
+                / max(THICK_MOUTH_GUARD_LAYER_SPACING, EPSILON)
+            ))
+            robot.is_branch_leader = robot is leader
             robot.shepherd_anchor = None
             robot.shepherd_origin = None
             robot.shepherd_branch = None
             robot.velocity.update(0.0, 0.0)
             robot.acceleration.update(0.0, 0.0)
             robot.filtered_acceleration.update(0.0, 0.0)
+            branch_ids.append(robot.robot_id)
+        junction_guard_groups[branch] = branch_ids
+        thick_mouth_guard_columns[branch] = column_count
+        thick_mouth_guard_layers[branch] = actual_layers
+        print(
+            f"[Thick Mouth Guard] branch={branch}, "
+            f"columns={column_count}, layers={actual_layers}/"
+            f"{desired_layers}, robots={len(branch_ids)}/{target_count}, "
+            f"k<={JUNCTION_GUARD_MAX_HOPS}"
+        )
     junction_guard_status = (
-        f"FRONTIER={selected_branch};OTHERS_RETURN_TO_JUNCTION"
+        f"FRONTIER={selected_branch};OTHERS=FORMING_THICK_KHOP_WALLS"
     )
     print(
         f"[Junction Guard] selected={selected_branch} -> persistent "
         f"FRONTIER_SHEPHERD line; ids="
         f"{[robot.robot_id for robot in get_frontier_shepherds(robots, selected_branch)]}; "
         f"start-depth={frontier_line_depth:.1f}; "
-        "non-selected=released-to-NORMAL"
+        "non-selected=recruited-as-thick-khop-mouth-walls"
     )
 
 
@@ -5303,44 +5525,8 @@ def compute_pressure_coupled_edf_force(
 
 
 def compute_virtual_valve_force(robot: "Robot") -> pygame.Vector2:
-    """Smooth virtual-particle barrier at every unselected branch mouth."""
-    if phase not in {
-        SimulationPhase.FORM_JUNCTION_GUARDS,
-        SimulationPhase.EXPLORE_BRANCH,
-        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-        SimulationPhase.FILL_BEHIND_SHEPHERD,
-        SimulationPhase.PRESSURE_PUSH,
-        SimulationPhase.FLOW_BACKTRACK,
-        SimulationPhase.FINAL_JUNCTION_GATHER,
-        SimulationPhase.RETURN_TO_BASE,
-    }:
-        return pygame.Vector2()
-    if get_robot_region(robot.position) != "JUNCTION":
-        return pygame.Vector2()
-
-    force = pygame.Vector2()
-    junction_center = pygame.Vector2(center_x, center_y)
-    for branch in BRANCHES:
-        if branch_gate_states.get(branch) != "CLOSED":
-            continue
-        entrance = get_branch_entrance(branch)
-        distance = robot.position.distance_to(entrance)
-        if distance >= VIRTUAL_VALVE_RADIUS:
-            continue
-        inward = junction_center - entrance
-        if inward.length_squared() <= EPSILON:
-            continue
-        ratio = 1.0 - distance / VIRTUAL_VALVE_RADIUS
-        gain = VIRTUAL_VALVE_GAIN * (
-            FINAL_RETURN_VALVE_GAIN_MULTIPLIER
-            if phase in {
-                SimulationPhase.FINAL_JUNCTION_GATHER,
-                SimulationPhase.RETURN_TO_BASE,
-            }
-            else 1.0
-        )
-        force += inward.normalize() * gain * ratio**2
-    return force
+    """Compatibility no-op: runtime valves are physical robot formations."""
+    return pygame.Vector2()
 
 def get_branch_ordering_robots(robots) -> list["Robot"]:
     """Return mobile Base-connected mass used by the branch-ordering layer."""
@@ -7795,6 +7981,8 @@ def reset_shepherd_roles(robots):
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_hop = -1
+            robot.junction_guard_parent_id = None
+            robot.junction_guard_layer = -1
             robot.is_branch_leader = False
 
 
@@ -7823,6 +8011,8 @@ def release_transient_roles_for_final_return(robots):
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_hop = -1
+            robot.junction_guard_parent_id = None
+            robot.junction_guard_layer = -1
             robot.is_branch_leader = False
             robot.transfer_target = None
             robot.velocity.update(0.0, 0.0)
@@ -9088,15 +9278,20 @@ def compute_route_force(robot):
             hold_error * BASE_RESERVE_HOLD_GAIN,
             BASE_COMPRESSION_FORCE,
         )
-    # Once ordering selects one branch, all robots that diffused into the
-    # other branches leave through their own mouth first.  This local egress
-    # rule intentionally precedes command-connectivity gating: the released
-    # frontier robots already know they are on a non-selected branch and must
-    # not remain parked there as unused guards.
+    # Once ordering selects one branch, NORMAL robots in another branch retain
+    # their locally learned inward heading. The physical mouth guard reinforces
+    # this command at close range and keeps the communication chain present.
     if (
-        phase == SimulationPhase.EXPLORE_BRANCH
+        phase in {
+            SimulationPhase.EXPLORE_BRANCH,
+            SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+            SimulationPhase.FILL_BEHIND_SHEPHERD,
+            SimulationPhase.PRESSURE_PUSH,
+            SimulationPhase.FLOW_BACKTRACK,
+        }
         and region in BRANCHES
         and region != active_branch
+        and robot.role == "NORMAL"
     ):
         return (
             normalized_direction_toward(
@@ -9438,7 +9633,6 @@ def compute_route_force(robot):
             lane_error = robot.ingress_lane_x - robot.position.x
             force.x = clamp(RETURN_LANE_GAIN * lane_error, -RETURN_LANE_MAX_FORCE, RETURN_LANE_MAX_FORCE)
 
-    force += compute_virtual_valve_force(robot)
     force += compute_backtrack_bridge_force(robot)
 
     cohort_phase = phase in {
@@ -9698,6 +9892,7 @@ def compute_sph_forces(
         viscoelastic_force = pygame.Vector2()
         compression_release_force = pygame.Vector2()
         repulsion_force = pygame.Vector2()
+        physical_guard_force = pygame.Vector2()
         virtual_force = pygame.Vector2()
         contact_obstacle_force = pygame.Vector2()
         cohesion_force = pygame.Vector2()
@@ -9910,6 +10105,40 @@ def compute_sph_forces(
                     * (r_ij / distance)
                 )
 
+            # A JUNCTION_GUARD communicates only its branch-facing orientation.
+            # A nearby NORMAL uses that local message and relative position to
+            # move toward the Junction. Overlapping influence disks across the
+            # physical line replace the old map-aware virtual wall and also
+            # recover robots remaining on the outer side of the line.
+            if (
+                robot_i.role == "NORMAL"
+                and robot_j.role == "JUNCTION_GUARD"
+                and robot_j.junction_guard_branch in BRANCHES
+                and distance < PHYSICAL_GUARD_INFLUENCE_RADIUS
+            ):
+                ratio = (
+                    1.0
+                    - distance / PHYSICAL_GUARD_INFLUENCE_RADIUS
+                )
+                branch_direction = BRANCH_DIRECTIONS[
+                    robot_j.junction_guard_branch
+                ]
+                inward = -branch_direction
+                lateral = pygame.Vector2(
+                    -branch_direction.y,
+                    branch_direction.x,
+                )
+                lateral_sign = (
+                    1.0 if r_ij.dot(lateral) >= 0.0 else -1.0
+                )
+                physical_guard_force += (
+                    inward * PHYSICAL_GUARD_INWARD_GAIN * ratio**2
+                    + lateral
+                    * lateral_sign
+                    * PHYSICAL_GUARD_LATERAL_GAIN
+                    * ratio**2
+                )
+
         release_active = initial_pressure_release_active()
         pressure_force_limit = (
             INITIAL_RELEASE_PRESSURE_FORCE_LIMIT
@@ -9928,6 +10157,10 @@ def compute_sph_forces(
         limit_vector(
             virtual_force,
             SHEPHERD_VIRTUAL_FORCE_LIMIT,
+        )
+        limit_vector(
+            physical_guard_force,
+            PHYSICAL_GUARD_FORCE_LIMIT,
         )
         route_force = compute_route_force(robot_i)
         connectivity_force = compute_connectivity_force(
@@ -10007,6 +10240,7 @@ def compute_sph_forces(
             + viscoelastic_force
             + compression_release_force
             + repulsion_force
+            + physical_guard_force
             + virtual_force
             + contact_obstacle_force
             + cohesion_force
@@ -10127,6 +10361,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global draining_branch
     global junction_guard_formation_timer, junction_guard_stable_dwell
     global junction_guard_status
+    global pending_branch_start
 
     update_draining_branch_gate(robots)
     update_anchor_entry_records(robots, simulation_time)
@@ -10159,6 +10394,50 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.FORM_JUNCTION_GUARDS:
         junction_guard_formation_timer += dt
+        if pending_branch_start is not None:
+            thick_walls_ready = thick_mouth_guards_formed(
+                robots,
+                pending_branch_start,
+            )
+            junction_guard_stable_dwell = (
+                junction_guard_stable_dwell + dt
+                if thick_walls_ready
+                else 0.0
+            )
+            if (
+                junction_guard_formation_timer
+                >= THICK_MOUTH_GUARD_FORM_TIMEOUT
+                and not thick_walls_ready
+                and not junction_guard_status.startswith("WAITING_FOR_THICK")
+            ):
+                junction_guard_status = "WAITING_FOR_THICK_KHOP_MOUTH_WALLS"
+                print(
+                    "[Thick Mouth Guard] formation is slow; selected Branch "
+                    "flow remains paused until every physical wall is ready"
+                )
+            if (
+                junction_guard_stable_dwell
+                < THICK_MOUTH_GUARD_FORM_DWELL
+            ):
+                return
+            selected = pending_branch_start
+            pending_branch_start = None
+            junction_guard_status = (
+                f"FRONTIER={selected};OTHERS=THICK_KHOP_WALLS_READY"
+            )
+            saturation_tracker.reset(selected)
+            dead_end_inference_tracker.reset(selected)
+            junction_consensus_tracker.reset()
+            phase = SimulationPhase.EXPLORE_BRANCH
+            metrics.branch_events.append({
+                "branch": selected,
+                "started_at": simulation_time,
+            })
+            print(
+                f"[Thick Mouth Guard] all unselected walls ready; "
+                f"starting {selected} exploration"
+            )
+            return
         formed = junction_guards_formed(robots)
         junction_guard_stable_dwell = (
             junction_guard_stable_dwell + dt if formed else 0.0
@@ -10202,11 +10481,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 begin_final_gather()
             else:
                 commit_junction_guard_roles(robots, selected)
-                saturation_tracker.reset(selected)
-                dead_end_inference_tracker.reset(selected)
-                junction_consensus_tracker.reset()
-                phase = SimulationPhase.EXPLORE_BRANCH
-                metrics.branch_events.append({"branch": selected, "started_at": simulation_time})
+                pending_branch_start = selected
+                junction_guard_formation_timer = 0.0
+                junction_guard_stable_dwell = 0.0
+                # Stay in FORM_JUNCTION_GUARDS: all added K-hop layers must
+                # physically reach their mouth slots before selected flow is
+                # allowed to start.
+                return
 
     elif phase == SimulationPhase.EXPLORE_BRANCH:
         update_relay_deployment(robots, dt)
@@ -10947,6 +11228,8 @@ def reset_dfs_state():
     global junction_guard_groups, junction_guard_formation_timer
     global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
+    global pending_branch_start
+    global thick_mouth_guard_layers, thick_mouth_guard_columns
     global frontier_line_branch, frontier_line_depth
     global observed_dead_end_depths
     global metrics
@@ -11020,6 +11303,9 @@ def reset_dfs_state():
     junction_guard_formation_timer = 0.0
     junction_guard_stable_dwell = 0.0
     junction_guard_status = "OPEN_FREE_DIFFUSION"
+    pending_branch_start = None
+    thick_mouth_guard_layers = {branch: 0 for branch in BRANCHES}
+    thick_mouth_guard_columns = {branch: 0 for branch in BRANCHES}
     frontier_line_branch = None
     frontier_line_depth = 0.0
     observed_dead_end_depths = {}
@@ -11469,9 +11755,26 @@ while running:
             f"mode={saturation_tracker.recognition_mode} "
             f"ready={saturation_tracker.saturated}"
         ),
-        "Gates: " + " | ".join(
+        "Gate commands (no geofence): " + " | ".join(
             f"{branch}={branch_gate_states[branch]}"
             for branch in BRANCHES
+        ),
+        (
+            "Physical mouth guards: "
+            + " | ".join(
+                f"{branch}="
+                f"{sum(robot.role == 'JUNCTION_GUARD' and robot.junction_guard_branch == branch for robot in robots)}"
+                for branch in BRANCHES
+            )
+        ),
+        (
+            f"Thick K-hop walls={THICK_MOUTH_GUARD_POLICY_VERSION} | "
+            f"pending={pending_branch_start or '-'} | "
+            + " | ".join(
+                f"{branch}={thick_mouth_guard_layers.get(branch, 0)}L/"
+                f"{thick_mouth_guard_columns.get(branch, 0)}C"
+                for branch in BRANCHES
+            )
         ),
         (
             f"Persistent frontier={FRONTIER_LINE_POLICY_VERSION} | "

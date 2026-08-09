@@ -12,3 +12,9 @@ robot_ws/log/
 *.save
 *follower_node_backup.py
 pygame_simulator/sph_dfs_experiment_summary.csv
+
+# Local SPH-DFS experiment artifacts and safety snapshots
+pygame_simulator/.venv-sph-dfs/
+pygame_simulator/*.pre_*.py
+pygame_simulator/*.with_*.py
+pygame_simulator/*.bak-*
