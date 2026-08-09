@@ -30,7 +30,9 @@ This document records the current reproducible state of
 4. A minimum K-hop group first forms a full-width line at each observed branch
    frontier.
 5. NORMAL peer consensus selects the next unvisited branch.
-6. The selected line becomes the persistent moving `FRONTIER_SHEPHERD` group.
+6. The selected mouth recruits enough connected robots to form a dense
+   full-width `FRONTIER_SHEPHERD` line. Slot spacing is kept below the local
+   `SAFE_RADIUS`; the current corridor produces 17 moving Shepherds.
 7. Every unselected branch recruits additional connected NORMAL robots up to
    four hops and forms a two-to-four-layer physical wall on the branch side of
    its mouth.
@@ -38,9 +40,10 @@ This document records the current reproducible state of
    assigned position and stable for the configured dwell time.
 9. At the selected dead end, multiple frontier Shepherds must directly contact
    the boundary across a sufficient lateral span while forward speed remains
-   low. Only then can the same Shepherd IDs form the return piston.
-10. Pressure-driven backtracking returns the swarm to the Junction. Guards are
-    rebuilt before selecting the next branch.
+   low. The same dense Shepherd IDs then form the return piston.
+10. Pressure-driven backtracking returns the swarm to the Junction. Thick walls
+    at still-unvisited branches retain the same robot IDs, anchors, column
+    count, and layer count; they are not collapsed and rebuilt between visits.
 11. After every branch is visited, temporary roles are released and the swarm
     returns to Base.
 
@@ -77,15 +80,19 @@ The current policy is `ADAPTIVE_KHOP_LAYERED_MOUTH_WALL_V1`:
 - Additional NORMAL robots are recruited through the communication graph, up
   to `JUNCTION_GUARD_MAX_HOPS = 4`.
 - Slots form full-width axial rows entirely on the branch side of the mouth.
+- Once a valid unvisited wall is formed, it persists across branch switches and
+  is never recomputed to a smaller width.
+- When that branch is selected, the moving cross-section is replenished to the
+  width/Safe-radius target instead of falling back to five robots.
 - Exploration begins only after `wall_ready` remains true for the formation
   dwell time.
 
 Observed validation configurations:
 
-| Swarm size | Initial line | Thick unselected wall | Result |
+| Swarm size | Moving selected line | Thick unselected wall | Result |
 |---:|---:|---:|---|
-| 160 | 5--6 robots | 5 columns x 3 layers = 15 per closed branch | Exploration, dead-end inference, and backtracking completed |
-| 680 | 9 robots | 9 columns x 3 layers = 27 per closed branch | Both unselected walls formed before selected flow started |
+| 160 | 17 robots | 5 columns x 3 layers = 15 per unselected branch | UP and RIGHT exploration, contact-confirmed dead-end inference, and backtracking completed with the same 17 IDs |
+| 680 | width/Safe-radius target (17 in the current corridor) | observed 8--9 columns x 3 layers = 24--27 per unselected branch | Thick walls form before selected flow; a 72-second post-change smoke run completed without errors but did not reach a full branch switch at the lower FPS |
 
 ## Dead-end inference
 
@@ -129,6 +136,21 @@ Recommended next changes should be isolated and validated one at a time:
 - Windows, Linux, or macOS with an SDL-compatible display
 
 No external map, image, or data asset is required for the single-file simulator.
+
+## Continue on another local machine
+
+Until Draft PR #1 is merged into `main`, use the published working branch:
+
+```powershell
+git clone https://github.com/gaheebella/PDFS-Multi-Robot.git
+cd PDFS-Multi-Robot
+git switch claude/pygame-simulator-review-aj16vc
+powershell -ExecutionPolicy Bypass -File .\pygame_simulator\run_single_junction_sph_dfs.ps1
+```
+
+Detailed system state, problem/root-cause/fix history, validation evidence, and
+next-work checklist are recorded in
+[`SYSTEM_PROBLEM_SOLUTION_LOG.md`](SYSTEM_PROBLEM_SOLUTION_LOG.md).
 
 ## Quick start on Windows
 
