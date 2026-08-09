@@ -759,9 +759,11 @@ JUNCTION_TAIL_EQUILIBRIUM_SCALE = 1.42
 SHEPHERD_FILL_COMPRESSION_PRESSURE_SCALE = 0.22
 SHEPHERD_FILL_FORCE_MULTIPLIER = 3.6
 SHEPHERD_MIN_COUNT = 5
-SHEPHERD_MAX_COUNT = 14
+SHEPHERD_MAX_COUNT = 22
 SHEPHERD_EDGE_MARGIN = 12.0 * MAP_SCALE
-SHEPHERD_TARGET_SLOT_SPACING = 12.5 * MAP_SCALE
+# Keep adjacent physical Shepherd influence zones overlapping. This produces a
+# genuinely dense cross-section instead of relying on a five-robot fallback.
+SHEPHERD_TARGET_SLOT_SPACING = SAFE_RADIUS * 0.85
 
 SHEPHERD_FORM_SPEED = 50.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_RELEASE_SPEED = 32.0 * MOTION_SPEED_MULTIPLIER
@@ -2916,14 +2918,81 @@ def release_junction_guard_roles(robots) -> None:
 
 
 def begin_junction_guard_formation(robots) -> None:
-    """Form a full border at every observed branch cohort's outer frontier."""
+    """Form or preserve physical borders at observed branch frontiers.
+
+    A mouth wall is a physical state, not a transient planning artifact. Once
+    an unvisited branch has a valid thick K-hop wall, keep the same robots and
+    anchors across branch switches. Only the branch selected for exploration
+    is released later by ``commit_junction_guard_roles``.
+    """
     global junction_guard_groups, junction_guard_formation_timer
     global junction_guard_frontier_depths
     global junction_guard_stable_dwell, junction_guard_status
     global distributed_consensus_branch
     global pending_branch_start
-    release_junction_guard_roles(robots)
-    # Only observed openings may be sealed.  Closing an undiscovered branch
+    global frontier_line_branch, frontier_line_depth
+
+    # Preserve already-formed walls for branches that are still unvisited.
+    # Releasing every guard here made a 3-layer wall collapse to a 1-layer
+    # frontier and be re-estimated with a smaller column count on each switch.
+    previous_groups = {
+        branch: list(robot_ids)
+        for branch, robot_ids in junction_guard_groups.items()
+    }
+    previous_layers = dict(thick_mouth_guard_layers)
+    previous_columns = dict(thick_mouth_guard_columns)
+    previous_depths = dict(junction_guard_frontier_depths)
+    preserved_groups: dict[str, list[int]] = {}
+    preserved_ids: set[int] = set()
+
+    for branch, robot_ids in previous_groups.items():
+        if (
+            branch not in detected_branch_candidates
+            or branch_states.get(branch) != "UNVISITED"
+        ):
+            continue
+        branch_guards = [
+            robot
+            for robot in robots
+            if robot.robot_id in robot_ids
+            and robot.role == "JUNCTION_GUARD"
+            and robot.junction_guard_branch == branch
+            and robot.junction_guard_anchor is not None
+        ]
+        wall_is_valid = (
+            len(branch_guards) >= JUNCTION_GUARD_MIN_COUNT
+            and previous_layers.get(branch, 0)
+            >= THICK_MOUTH_GUARD_MIN_LAYERS
+            and previous_columns.get(branch, 0) > 0
+        )
+        if wall_is_valid:
+            preserved_groups[branch] = [robot.robot_id for robot in branch_guards]
+            preserved_ids.update(preserved_groups[branch])
+
+    # Release only stale/selected transient roles. Valid unvisited walls stay
+    # fixed in place and remain physical gatekeepers during the next transfer.
+    for robot in robots:
+        if robot.role == "JUNCTION_GUARD" and robot.robot_id in preserved_ids:
+            continue
+        if robot.role not in {"JUNCTION_GUARD", "FRONTIER_SHEPHERD"}:
+            continue
+        robot.role = "NORMAL"
+        robot.junction_guard_anchor = None
+        robot.junction_guard_branch = None
+        robot.junction_guard_hop = -1
+        robot.junction_guard_parent_id = None
+        robot.junction_guard_layer = -1
+        robot.is_branch_leader = False
+        robot.shepherd_anchor = None
+        robot.shepherd_origin = None
+        robot.shepherd_branch = None
+        robot.velocity.update(0.0, 0.0)
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+
+    frontier_line_branch = None
+    frontier_line_depth = 0.0
+    # Only observed openings may be sealed. Closing an undiscovered branch
     # would leak the simulator's ground-truth map into the controller.
     branch_gate_states.clear()
     branch_gate_states.update({
@@ -2940,14 +3009,19 @@ def begin_junction_guard_formation(robots) -> None:
         )
     )
     distributed_consensus_branch = None
-    junction_guard_groups = {}
-    junction_guard_frontier_depths = {}
+    junction_guard_groups = preserved_groups
+    junction_guard_frontier_depths = {
+        branch: previous_depths[branch]
+        for branch in preserved_groups
+        if branch in previous_depths
+    }
     junction_guard_formation_timer = 0.0
     junction_guard_stable_dwell = 0.0
     pending_branch_start = None
     for branch in BRANCHES:
-        thick_mouth_guard_layers[branch] = 0
-        thick_mouth_guard_columns[branch] = 0
+        if branch not in preserved_groups:
+            thick_mouth_guard_layers[branch] = 0
+            thick_mouth_guard_columns[branch] = 0
     available_ids = {
         robot.robot_id
         for robot in robots
@@ -2959,6 +3033,11 @@ def begin_junction_guard_formation(robots) -> None:
             branch not in detected_branch_candidates
             or branch_states.get(branch) != "UNVISITED"
         ):
+            continue
+        if branch in preserved_groups:
+            # This wall has already been physically formed. Do not re-elect
+            # its leader or recompute its width during a branch switch.
+            available_ids.difference_update(preserved_groups[branch])
             continue
         required_count = required_junction_guard_count(robots, branch)
         frontier_depth = observed_branch_frontier_depth(robots, branch)
@@ -3012,9 +3091,13 @@ def begin_junction_guard_formation(robots) -> None:
     junction_guard_status = (
         "FULL_GUARD_UNAVAILABLE:" + ",".join(unavailable)
         if unavailable
-        else "FORMING_FULL_GUARDS"
+        else (
+            "FORMING_FULL_GUARDS;PRESERVED="
+            + ",".join(sorted(preserved_groups))
+            if preserved_groups
+            else "FORMING_FULL_GUARDS"
+        )
     )
-
 
 def junction_guards_formed(robots) -> bool:
     guards = [robot for robot in robots if robot.role == "JUNCTION_GUARD"]
@@ -3041,8 +3124,77 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
             robot for robot in robots if robot.robot_id in robot_ids
         ]
         if branch == selected_branch:
-            line_slots = build_shepherd_slots(branch, len(branch_guards))
-            assignment = assign_shepherd_slots(branch_guards, line_slots)
+            # A preserved mouth wall can contain several complete axial rows.
+            # Only its deepest (outward-most) cross-section becomes the moving
+            # frontier. The support rows become NORMAL and join exploration.
+            stored_columns = thick_mouth_guard_columns.get(branch, 0)
+            seed_columns = (
+                stored_columns if stored_columns > 0 else len(branch_guards)
+            )
+            column_count = int(clamp(
+                max(adaptive_shepherd_count(), seed_columns),
+                JUNCTION_GUARD_MIN_COUNT,
+                SHEPHERD_MAX_COUNT,
+            ))
+            # Recruit any missing cross-section members from the leader-rooted
+            # K-hop neighbourhood before opening this mouth. The same dense
+            # physical line is retained through exploration and backtracking.
+            expanded_frontier_pool = expand_k_hop_mouth_guard_group(
+                branch_guards,
+                robots,
+                branch,
+                column_count,
+            )
+            if expanded_frontier_pool:
+                branch_guards = expanded_frontier_pool
+            deepest_layer = max(
+                (robot.junction_guard_layer for robot in branch_guards),
+                default=0,
+            )
+            frontier_guards = [
+                robot
+                for robot in branch_guards
+                if robot.junction_guard_layer == deepest_layer
+            ]
+            if len(frontier_guards) < column_count:
+                frontier_ids = {robot.robot_id for robot in frontier_guards}
+                supplements = sorted(
+                    (
+                        robot
+                        for robot in branch_guards
+                        if robot.robot_id not in frontier_ids
+                    ),
+                    key=lambda robot: (
+                        -robot.junction_guard_layer,
+                        robot.robot_id,
+                    ),
+                )
+                frontier_guards.extend(
+                    supplements[:max(0, column_count - len(frontier_guards))]
+                )
+            elif len(frontier_guards) > column_count:
+                frontier_guards = frontier_guards[:column_count]
+
+            frontier_ids = {robot.robot_id for robot in frontier_guards}
+            for robot in branch_guards:
+                if robot.robot_id in frontier_ids:
+                    continue
+                robot.role = "NORMAL"
+                robot.junction_guard_anchor = None
+                robot.junction_guard_branch = None
+                robot.junction_guard_hop = -1
+                robot.junction_guard_parent_id = None
+                robot.junction_guard_layer = -1
+                robot.is_branch_leader = False
+                robot.shepherd_anchor = None
+                robot.shepherd_origin = None
+                robot.shepherd_branch = None
+                robot.velocity.update(0.0, 0.0)
+                robot.acceleration.update(0.0, 0.0)
+                robot.filtered_acceleration.update(0.0, 0.0)
+
+            line_slots = build_shepherd_slots(branch, len(frontier_guards))
+            assignment = assign_shepherd_slots(frontier_guards, line_slots)
             for robot, slot, _ in assignment:
                 robot.role = "FRONTIER_SHEPHERD"
                 robot.junction_guard_anchor = None
@@ -3054,6 +3206,9 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
                 robot.shepherd_branch = branch
                 robot.velocity.update(0.0, 0.0)
                 robot.filtered_acceleration.update(0.0, 0.0)
+            junction_guard_groups[branch] = [
+                robot.robot_id for robot in frontier_guards
+            ]
             frontier_line_branch = branch
             frontier_line_depth = junction_guard_frontier_depths.get(
                 branch,
@@ -3061,6 +3216,28 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
             )
             thick_mouth_guard_layers[branch] = 0
             thick_mouth_guard_columns[branch] = 0
+            continue
+        existing_layers = thick_mouth_guard_layers.get(branch, 0)
+        existing_columns = thick_mouth_guard_columns.get(branch, 0)
+        existing_wall_is_valid = (
+            existing_layers >= THICK_MOUTH_GUARD_MIN_LAYERS
+            and existing_columns >= JUNCTION_GUARD_MIN_COUNT
+            and len(branch_guards)
+            >= THICK_MOUTH_GUARD_MIN_LAYERS * existing_columns
+            and all(
+                robot.role == "JUNCTION_GUARD"
+                and robot.junction_guard_anchor is not None
+                for robot in branch_guards
+            )
+        )
+        if existing_wall_is_valid:
+            # Keep an already formed wall unchanged until this branch itself
+            # becomes selected. Do not re-estimate width or recruit a new row.
+            print(
+                f"[Thick Mouth Guard] preserved branch={branch}, "
+                f"columns={existing_columns}, layers={existing_layers}, "
+                f"robots={len(branch_guards)}"
+            )
             continue
         # The original frontier line becomes the seed of a bounded K-hop
         # cohort.  Extra NORMAL peers form axial rows behind the full-width
@@ -11466,7 +11643,8 @@ while running:
     draw_branch_colour_fields(screen)
     pygame.draw.polygon(screen, WALL_COLOR, cross_points, width=2)
     draw_branch_gates(screen)
-    draw_collision_points(screen)
+    # Eguchi contact points remain internal inference data; do not leave
+    # persistent magenta robot/contact traces on the environment view.
 
     if show_regions:
         draw_proxy_partition(screen)
