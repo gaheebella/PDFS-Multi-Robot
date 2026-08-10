@@ -701,9 +701,7 @@ PEBBLE_CROSSING_MIN_RETURN_SPEED = 1.0
 PEBBLE_FLOW_LOG_INTERVAL = 1.0
 PEBBLE_INGRESS_MIN_OBSERVED_TRAVEL = ROBOT_RADIUS * 2.0
 PEBBLE_INGRESS_DIRECTION_FILTER_ALPHA = 0.25
-PEBBLE_FLOW_GUIDANCE_ENABLED = (
-    os.environ.get("SPH_DFS_PEBBLE_FLOW_GUIDANCE", "1") != "0"
-)
+PEBBLE_INGRESS_COHORT_MIN_TRAVEL = corridor_width * 1.05
 
 # Dead-end saturation
 SATURATION_MIN_TIP_ROBOTS = 18
@@ -2032,6 +2030,7 @@ class Robot:
         self.local_branch_uid_by_key: dict[str, str] = {}
         self.local_ingress_tangents: dict[str, pygame.Vector2] = {}
         self.local_branch_ingress_points: dict[str, pygame.Vector2] = {}
+        self.local_ingress_observed_travel: dict[str, float] = {}
         self.local_return_mouth_crossings: dict[str, pygame.Vector2] = {}
         self.known_pebble_flow_states: dict[str, PebbleFlowState] = {}
         self.pebble_anchor: Optional[pygame.Vector2] = None
@@ -4962,8 +4961,13 @@ def update_local_ingress_tangents(robots) -> None:
         if mouth_observation is None:
             robot.local_branch_ingress_points[branch] = robot.position.copy()
             robot.local_ingress_tangents[branch] = velocity.normalize()
+            robot.local_ingress_observed_travel[branch] = 0.0
             continue
         outbound_displacement = robot.position - mouth_observation
+        robot.local_ingress_observed_travel[branch] = max(
+            robot.local_ingress_observed_travel.get(branch, 0.0),
+            outbound_displacement.length(),
+        )
         if (
             outbound_displacement.length()
             < PEBBLE_INGRESS_MIN_OBSERVED_TRAVEL
@@ -4984,6 +4988,50 @@ def update_local_ingress_tangents(robots) -> None:
         )
         if filtered.length_squared() > EPSILON:
             robot.local_ingress_tangents[branch] = filtered.normalize()
+
+
+def locally_consensed_ingress_direction(
+    marker: "Robot",
+    branch: str,
+) -> Optional[pygame.Vector2]:
+    """Fuse only one-hop cohort trajectories that actually travelled outward."""
+    sources = [marker] + [
+        neighbor for neighbor in marker.comm_neighbors
+        if getattr(neighbor, "robot_id", -1) >= 0
+    ]
+    observations = []
+    for source in sources:
+        tangent = getattr(source, "local_ingress_tangents", {}).get(branch)
+        travel = getattr(source, "local_ingress_observed_travel", {}).get(
+            branch,
+            0.0,
+        )
+        if (
+            tangent is None
+            or tangent.length_squared() <= EPSILON
+            or travel < PEBBLE_INGRESS_COHORT_MIN_TRAVEL
+        ):
+            continue
+        observations.append((tangent.normalize(), travel))
+    if not observations:
+        return None
+    reference, _ = max(observations, key=lambda item: item[1])
+    consensus = pygame.Vector2()
+    total_weight = 0.0
+    for tangent, travel in observations:
+        # Opposing samples are stale return trajectories, not ingress votes.
+        if tangent.dot(reference) <= 0.0:
+            continue
+        weight = clamp(
+            travel / max(PEBBLE_INGRESS_COHORT_MIN_TRAVEL, EPSILON),
+            1.0,
+            4.0,
+        )
+        consensus += tangent * weight
+        total_weight += weight
+    if total_weight <= EPSILON or consensus.length_squared() <= EPSILON:
+        return reference.copy()
+    return (consensus / total_weight).normalize()
 
 
 def maybe_stage_pebble_at_return_crossing(
@@ -5024,6 +5072,14 @@ def maybe_stage_pebble_at_return_crossing(
         and return_speed >= PEBBLE_CROSSING_MIN_RETURN_SPEED
     ):
         return False
+    consensus_ingress = locally_consensed_ingress_direction(
+        robot,
+        active_branch,
+    )
+    if consensus_ingress is None:
+        return False
+    ingress = consensus_ingress
+    return_direction = -ingress
 
     robot.local_return_mouth_crossings[active_branch] = robot.position.copy()
     robot.role = "PEBBLE"
@@ -5084,8 +5140,8 @@ def stage_pebble_from_returned_shepherd_line(
             robot.robot_id,
         ),
     )
-    ingress = pebble.local_ingress_tangents[branch]
-    if ingress.length_squared() <= EPSILON:
+    ingress = locally_consensed_ingress_direction(pebble, branch)
+    if ingress is None or ingress.length_squared() <= EPSILON:
         return None
     ingress = ingress.normalize()
     pebble.local_return_mouth_crossings[branch] = pebble.position.copy()
@@ -5143,6 +5199,8 @@ def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
             if robot.role == "NORMAL"
             and branch in robot.local_ingress_tangents
             and branch in robot.local_branch_ingress_points
+            and robot.local_ingress_observed_travel.get(branch, 0.0)
+            >= PEBBLE_INGRESS_COHORT_MIN_TRAVEL
         ]
         pebble = min(
             candidates,
@@ -5156,7 +5214,9 @@ def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
         )
         if pebble is None:
             return None
-        ingress = pebble.local_ingress_tangents[branch]
+        ingress = locally_consensed_ingress_direction(pebble, branch)
+        if ingress is None:
+            ingress = pebble.local_ingress_tangents[branch]
         if ingress.length_squared() <= EPSILON:
             return None
         ingress = ingress.normalize()
@@ -9536,7 +9596,6 @@ def compute_pebble_flow_guidance(
     robot.last_pebble_guidance_branch_uid = None
     if (
         robot.role != "NORMAL"
-        or not PEBBLE_FLOW_GUIDANCE_ENABLED
         or not robot.known_pebble_flow_states
         or phase in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.DONE}
     ):
