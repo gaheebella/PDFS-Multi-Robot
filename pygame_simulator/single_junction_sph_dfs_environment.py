@@ -272,6 +272,10 @@ BRANCH_DIRECTIONS = {
     "LEFT": pygame.Vector2(-1.0, 0.0),
     "RIGHT": pygame.Vector2(1.0, 0.0),
 }
+# Research boundary: dynamic Branch UIDs reduce decision/memory dependence on
+# map labels, but this prototype is not fully localization-free. Functions
+# such as get_robot_region(), get_branch_entrance(), branch_depth_from_junction()
+# and the existing guard/EDF/Shepherd/relay geometry still use these fixtures.
 BRANCH_LENGTHS = {
     "UP": float(normal_length),
     "LEFT": float(normal_length),
@@ -304,6 +308,28 @@ class BranchEdge:
     target_node_id: Optional[str]
     direction: str
     length: float
+
+
+@dataclass
+class BranchDescriptor:
+    """Stable local identity for one physically observed outgoing cohort.
+
+    ``fixture_key`` is only an adapter into the current cross-map geometry.
+    Distributed DFS memory and decisions use ``uid``; the legacy
+    UP/LEFT/RIGHT key is consulted only by existing motion/physics code.
+    """
+
+    uid: str
+    junction_uid: str
+    fixture_key: Optional[str]
+    local_outgoing_direction: pygame.Vector2
+    local_return_direction: pygame.Vector2
+    observed_mouth_position: Optional[pygame.Vector2]
+    observed_width: float
+    visit_state: str = "UNVISITED"
+    leader_id: Optional[int] = None
+    cohort_member_ids: set[int] = field(default_factory=set)
+    discovered_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -409,9 +435,14 @@ def get_junction_state(junction_id: str = CURRENT_JUNCTION_ID) -> JunctionState:
 
 phase = SimulationPhase.MOVE_TO_JUNCTION
 active_branch = FIXED_BRANCH_ORDER[0]
+active_branch_uid: Optional[str] = None
 branch_states = get_junction_state().branch_states
+# DFS ordering is UID-based. Fixture order is retained separately only for
+# diagnostics that compare against the present cross-map.
 branch_order_plan: list[str] = []
+branch_fixture_order_plan: list[str] = []
 branch_gate_states = get_junction_state().gate_states
+# Despite the legacy variable name, this value is a BranchDescriptor UID.
 distributed_consensus_branch: Optional[str] = None
 transfer_branch: Optional[str] = None
 final_base_transfer_active = False
@@ -428,6 +459,13 @@ simulation_time = 0.0
 branch_completion_epoch = 0
 branch_dead_end_confirmed = {branch: False for branch in BRANCHES}
 branch_backflow_started = {branch: False for branch in BRANCHES}
+# No descriptor exists at startup. A UID is allocated only when local swarm
+# motion validates a directional outgoing cohort.
+branch_descriptors_by_uid: dict[str, BranchDescriptor] = {}
+fixture_key_to_branch_uid: dict[str, str] = {}
+branch_uid_to_fixture_key: dict[str, str] = {}
+branch_discovery_counter = 0
+# Compatibility mirror for older local-ingress and rendering paths.
 branch_local_uids: dict[str, str] = {}
 pebble_rx_logged: set[str] = set()
 pending_pebble_robot_ids: dict[str, int] = {}
@@ -480,6 +518,7 @@ last_proxy_cell_centers: dict[tuple[int, int], pygame.Vector2] = {}
 last_proxy_mass_stats: dict[str, dict] = {}
 last_proxy_robot_assignment: dict[int, str] = {}
 last_proxy_candidates: tuple[str, ...] = ()
+last_decision_candidate_uids: tuple[str, ...] = ()
 # Candidate-by-candidate virtual SPH rollout results from the latest Junction
 # decision.  They are display/logging data only and never alter real robots.
 last_flow_rollout_scores: dict[str, dict] = {}
@@ -2028,6 +2067,9 @@ class Robot:
         self.known_visited_branches: set[str] = set()
         self.known_visited_branch_uids: set[str] = set()
         self.local_branch_uid_by_key: dict[str, str] = {}
+        self.local_ingress_tangents_by_uid: dict[str, pygame.Vector2] = {}
+        self.local_branch_ingress_points_by_uid: dict[str, pygame.Vector2] = {}
+        self.local_ingress_observed_travel_by_uid: dict[str, float] = {}
         self.local_ingress_tangents: dict[str, pygame.Vector2] = {}
         self.local_branch_ingress_points: dict[str, pygame.Vector2] = {}
         self.local_ingress_observed_travel: dict[str, float] = {}
@@ -2978,7 +3020,6 @@ def begin_junction_guard_formation(robots) -> None:
     global distributed_consensus_branch
     global pending_branch_start
     global frontier_line_branch, frontier_line_depth
-    global branch_local_uids
 
     visited = observed_visited_branches(robots)
     # Preserve already-formed walls for branches that are still unvisited.
@@ -3097,12 +3138,18 @@ def begin_junction_guard_formation(robots) -> None:
         if leader is None:
             unavailable.append(branch)
             continue
-        branch_uid = branch_local_uids.setdefault(
-            branch,
-            f"cohort-{leader.robot_id:04d}",
+        branch_uid = branch_uid_for_fixture(branch)
+        if branch_uid is None:
+            # Guards never mint Branch identities. The directional cohort must
+            # have produced a descriptor before this fixture can be sealed.
+            unavailable.append(branch)
+            continue
+        descriptor = branch_descriptors_by_uid[branch_uid]
+        descriptor.leader_id = leader.robot_id
+        descriptor.observed_width = max(
+            descriptor.observed_width,
+            estimate_effective_branch_width(robots, branch),
         )
-        for robot in robots:
-            robot.local_branch_uid_by_key.setdefault(branch, branch_uid)
         candidates, selected_hop = minimum_k_hop_guard_group(
             leader,
             robots,
@@ -4033,12 +4080,8 @@ def propagate_local_visited_knowledge(robots) -> None:
             continue
         robot.known_pebble_flow_states.update(learned_states)
         robot.known_visited_branch_uids.update(learned_states)
-        uid_to_key = {
-            uid: key
-            for key, uid in robot.local_branch_uid_by_key.items()
-        }
         for branch_uid, state in learned_states.items():
-            branch = uid_to_key.get(branch_uid)
+            branch = branch_fixture_for_uid(branch_uid)
             if branch is None:
                 continue
             robot.known_visited_branches.add(branch)
@@ -4904,6 +4947,188 @@ def draw_relay_plan(surface, robots):
     for first, second in zip(nodes, nodes[1:]):
         pygame.draw.line(surface, RELAY_COLOR, first.position, second.position, width=2)
 
+
+def branch_uid_for_fixture(fixture_key: Optional[str]) -> Optional[str]:
+    """Translate a map fixture key at the physics/decision boundary."""
+    if fixture_key is None:
+        return None
+    return fixture_key_to_branch_uid.get(fixture_key)
+
+
+def branch_fixture_for_uid(branch_uid: Optional[str]) -> Optional[str]:
+    """Translate a dynamic UID only when legacy geometry needs a fixture."""
+    if branch_uid is None:
+        return None
+    descriptor = branch_descriptors_by_uid.get(branch_uid)
+    return descriptor.fixture_key if descriptor is not None else None
+
+
+def branch_identity_label(branch_uid: Optional[str]) -> str:
+    if branch_uid is None:
+        return "-"
+    fixture = branch_fixture_for_uid(branch_uid)
+    return f"{branch_uid} ({fixture})" if fixture is not None else branch_uid
+
+
+def discovered_branch_uids() -> set[str]:
+    return set(branch_descriptors_by_uid)
+
+
+def ordered_discovered_branch_uids() -> list[str]:
+    return [
+        descriptor.uid
+        for descriptor in sorted(
+            branch_descriptors_by_uid.values(),
+            key=lambda item: (item.discovered_at, item.uid),
+        )
+    ]
+
+
+def set_branch_descriptor_state(branch_uid: str, state: str) -> None:
+    """Update UID state first and mirror it into fixture compatibility state."""
+    descriptor = branch_descriptors_by_uid.get(branch_uid)
+    if descriptor is None:
+        return
+    previous = descriptor.visit_state
+    descriptor.visit_state = state
+    fixture = descriptor.fixture_key
+    if fixture is not None:
+        branch_states[fixture] = state
+    if previous != state:
+        print(
+            f"[BranchState] uid={branch_uid} fixture={fixture or '-'} "
+            f"{previous}->{state}"
+        )
+
+
+def register_discovered_branch(
+    robots,
+    fixture_key: str,
+    member_ids: set[int],
+    cohort_origins: dict[tuple[int, str], pygame.Vector2],
+) -> BranchDescriptor:
+    """Create/reassociate a UID from a physically validated local cohort."""
+    global branch_discovery_counter
+
+    members = [robot for robot in robots if robot.robot_id in member_ids]
+    origins = [
+        cohort_origins[(robot.robot_id, fixture_key)]
+        for robot in members
+        if (robot.robot_id, fixture_key) in cohort_origins
+    ]
+    mouth = (
+        sum(origins, pygame.Vector2()) / len(origins)
+        if origins
+        else None
+    )
+
+    measured_vectors: list[pygame.Vector2] = []
+    for robot in members:
+        origin = cohort_origins.get((robot.robot_id, fixture_key))
+        displacement = robot.position - origin if origin is not None else None
+        if displacement is not None and displacement.length_squared() > EPSILON:
+            measured_vectors.append(displacement.normalize())
+        velocity = robot.observed_velocity
+        if velocity.length_squared() > EPSILON:
+            measured_vectors.append(velocity.normalize())
+    measured_direction = sum(measured_vectors, pygame.Vector2())
+    if measured_direction.length_squared() > EPSILON:
+        measured_direction = measured_direction.normalize()
+    else:
+        # Temporary fixture adapter fallback: only used if a validated cohort
+        # has no usable velocity/trajectory sample in this discrete frame.
+        measured_direction = BRANCH_DIRECTIONS[fixture_key].copy()
+
+    lateral = pygame.Vector2(-measured_direction.y, measured_direction.x)
+    lateral_samples = [point.dot(lateral) for point in origins]
+    observed_width = (
+        max(lateral_samples) - min(lateral_samples)
+        if len(lateral_samples) >= 2
+        else 0.0
+    )
+    leader = max(
+        members,
+        key=lambda robot: (
+            (robot.position - mouth).dot(measured_direction)
+            if mouth is not None else 0.0,
+            -robot.robot_id,
+        ),
+        default=None,
+    )
+
+    existing_uid = fixture_key_to_branch_uid.get(fixture_key)
+    if existing_uid is None and mouth is not None:
+        # Direction/proximity matching supports stable re-observation even if
+        # a future fixture adapter is temporarily unavailable or renamed.
+        for candidate in branch_descriptors_by_uid.values():
+            if candidate.junction_uid != CURRENT_JUNCTION_ID:
+                continue
+            if candidate.fixture_key not in {None, fixture_key}:
+                continue
+            candidate_mouth = candidate.observed_mouth_position
+            if (
+                candidate_mouth is not None
+                and candidate.local_outgoing_direction.dot(measured_direction)
+                >= 0.90
+                and candidate_mouth.distance_to(mouth) <= corridor_width
+            ):
+                existing_uid = candidate.uid
+                break
+
+    if existing_uid is None:
+        existing_uid = f"{CURRENT_JUNCTION_ID}-B{branch_discovery_counter}"
+        branch_discovery_counter += 1
+        descriptor = BranchDescriptor(
+            uid=existing_uid,
+            junction_uid=CURRENT_JUNCTION_ID,
+            fixture_key=fixture_key,
+            local_outgoing_direction=measured_direction.copy(),
+            local_return_direction=-measured_direction,
+            observed_mouth_position=mouth.copy() if mouth is not None else None,
+            observed_width=observed_width,
+            leader_id=leader.robot_id if leader is not None else None,
+            cohort_member_ids=set(member_ids),
+            discovered_at=simulation_time,
+        )
+        branch_descriptors_by_uid[existing_uid] = descriptor
+        print(
+            f"[BranchDiscovery] uid={existing_uid} fixture={fixture_key} "
+            f"members={len(member_ids)} direction="
+            f"({measured_direction.x:.3f},{measured_direction.y:.3f}) "
+            f"width={observed_width:.1f}"
+        )
+    else:
+        descriptor = branch_descriptors_by_uid[existing_uid]
+        descriptor.fixture_key = fixture_key
+        descriptor.local_outgoing_direction = measured_direction.copy()
+        descriptor.local_return_direction = -measured_direction
+        if mouth is not None:
+            descriptor.observed_mouth_position = mouth.copy()
+        descriptor.observed_width = max(descriptor.observed_width, observed_width)
+        descriptor.cohort_member_ids.update(member_ids)
+        if descriptor.leader_id is None and leader is not None:
+            descriptor.leader_id = leader.robot_id
+
+    fixture_key_to_branch_uid[fixture_key] = existing_uid
+    branch_uid_to_fixture_key[existing_uid] = fixture_key
+    branch_local_uids[fixture_key] = existing_uid
+    for robot in robots:
+        robot.local_branch_uid_by_key[fixture_key] = existing_uid
+        if fixture_key in robot.local_ingress_tangents:
+            robot.local_ingress_tangents_by_uid[existing_uid] = (
+                robot.local_ingress_tangents[fixture_key].copy()
+            )
+        if fixture_key in robot.local_branch_ingress_points:
+            robot.local_branch_ingress_points_by_uid[existing_uid] = (
+                robot.local_branch_ingress_points[fixture_key].copy()
+            )
+        if fixture_key in robot.local_ingress_observed_travel:
+            robot.local_ingress_observed_travel_by_uid[existing_uid] = (
+                robot.local_ingress_observed_travel[fixture_key]
+            )
+    return descriptor
+
+
 def record_distributed_consensus(
     selected_branch: Optional[str] = None,
     clear_selection: bool = False,
@@ -4933,6 +5158,7 @@ def get_pebbles(robots) -> list["Robot"]:
 
 
 def observed_visited_branches(robots) -> set[str]:
+    """Compatibility fixture view of UID-based Pebble observations."""
     return {
         pebble.pebble_branch_key
         for pebble in get_pebbles(robots)
@@ -4941,9 +5167,34 @@ def observed_visited_branches(robots) -> set[str]:
     }
 
 
+def observed_visited_branch_uids(robots) -> set[str]:
+    """Primary distributed VISITED facts, keyed by dynamic Branch UID."""
+    return {
+        pebble.pebble_branch_uid
+        for pebble in get_pebbles(robots)
+        if pebble.pebble_state == "VISITED"
+        and pebble.pebble_branch_uid is not None
+    }
+
+
 def return_mobile_target_count(robots) -> int:
     """All non-marker robots must return; persistent Pebbles stay in place."""
     return len(robots) - len(get_pebbles(robots))
+
+
+def mirror_local_ingress_observation_to_uid(robot: "Robot", branch: str) -> None:
+    branch_uid = branch_uid_for_fixture(branch)
+    if branch_uid is None:
+        return
+    tangent = robot.local_ingress_tangents.get(branch)
+    mouth = robot.local_branch_ingress_points.get(branch)
+    if tangent is not None:
+        robot.local_ingress_tangents_by_uid[branch_uid] = tangent.copy()
+    if mouth is not None:
+        robot.local_branch_ingress_points_by_uid[branch_uid] = mouth.copy()
+    robot.local_ingress_observed_travel_by_uid[branch_uid] = (
+        robot.local_ingress_observed_travel.get(branch, 0.0)
+    )
 
 
 def update_local_ingress_tangents(robots) -> None:
@@ -4962,6 +5213,7 @@ def update_local_ingress_tangents(robots) -> None:
             robot.local_branch_ingress_points[branch] = robot.position.copy()
             robot.local_ingress_tangents[branch] = velocity.normalize()
             robot.local_ingress_observed_travel[branch] = 0.0
+            mirror_local_ingress_observation_to_uid(robot, branch)
             continue
         outbound_displacement = robot.position - mouth_observation
         robot.local_ingress_observed_travel[branch] = max(
@@ -4973,11 +5225,13 @@ def update_local_ingress_tangents(robots) -> None:
             < PEBBLE_INGRESS_MIN_OBSERVED_TRAVEL
             or velocity.dot(outbound_displacement) <= 0.0
         ):
+            mirror_local_ingress_observation_to_uid(robot, branch)
             continue
         observed_tangent = outbound_displacement.normalize()
         previous_tangent = robot.local_ingress_tangents.get(branch)
         if previous_tangent is None or previous_tangent.length_squared() <= EPSILON:
             robot.local_ingress_tangents[branch] = observed_tangent
+            mirror_local_ingress_observation_to_uid(robot, branch)
             continue
         if previous_tangent.dot(observed_tangent) < 0.0:
             previous_tangent = -previous_tangent
@@ -4988,6 +5242,7 @@ def update_local_ingress_tangents(robots) -> None:
         )
         if filtered.length_squared() > EPSILON:
             robot.local_ingress_tangents[branch] = filtered.normalize()
+        mirror_local_ingress_observation_to_uid(robot, branch)
 
 
 def locally_consensed_ingress_direction(
@@ -5046,10 +5301,13 @@ def maybe_stage_pebble_at_return_crossing(
     confirmed.
     """
     global pending_pebble_robot_ids
+    branch_uid = active_branch_uid or branch_uid_for_fixture(active_branch)
+    descriptor = branch_descriptors_by_uid.get(branch_uid)
     if (
         phase != SimulationPhase.FLOW_BACKTRACK
         or robot.role != "NORMAL"
-        or branch_states.get(active_branch) != "ACTIVE"
+        or descriptor is None
+        or descriptor.visit_state != "ACTIVE"
         or active_branch in pending_pebble_robot_ids
     ):
         return False
@@ -5084,10 +5342,7 @@ def maybe_stage_pebble_at_return_crossing(
     robot.local_return_mouth_crossings[active_branch] = robot.position.copy()
     robot.role = "PEBBLE"
     robot.pebble_anchor = robot.position.copy()
-    robot.pebble_branch_uid = branch_local_uids.get(
-        active_branch,
-        f"cohort-{robot.robot_id:04d}",
-    )
+    robot.pebble_branch_uid = branch_uid
     robot.pebble_branch_key = active_branch
     robot.pebble_state = "PENDING_RETURN_CONFIRMATION"
     robot.pebble_ingress_direction_local = ingress.copy()
@@ -5111,6 +5366,9 @@ def stage_pebble_from_returned_shepherd_line(
 ) -> Optional["Robot"]:
     """Use an actually returned Shepherd when completion follows immediately."""
     global pending_pebble_robot_ids
+    branch_uid = branch_uid_for_fixture(branch)
+    if branch_uid is None:
+        return None
     if branch in pending_pebble_robot_ids:
         return next(
             (
@@ -5147,10 +5405,7 @@ def stage_pebble_from_returned_shepherd_line(
     pebble.local_return_mouth_crossings[branch] = pebble.position.copy()
     pebble.role = "PEBBLE"
     pebble.pebble_anchor = pebble.position.copy()
-    pebble.pebble_branch_uid = branch_local_uids.get(
-        branch,
-        f"cohort-{pebble.robot_id:04d}",
-    )
+    pebble.pebble_branch_uid = branch_uid
     pebble.pebble_branch_key = branch
     pebble.pebble_state = "PENDING_RETURN_CONFIRMATION"
     pebble.pebble_ingress_direction_local = ingress.copy()
@@ -5171,13 +5426,17 @@ def stage_pebble_from_returned_shepherd_line(
     return pebble
 
 
-def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
-    """Promote a mouth-crossing marker after Branch completion evidence."""
+def create_branch_pebble(robots, branch_uid: str) -> Optional["Robot"]:
+    """Promote a marker by UID; adapt to fixture only for local geometry."""
     global branch_completion_epoch, pending_pebble_robot_ids
-    if branch in observed_visited_branches(robots):
+    descriptor = branch_descriptors_by_uid.get(branch_uid)
+    branch = branch_fixture_for_uid(branch_uid)
+    if descriptor is None or branch is None:
+        return None
+    if branch_uid in observed_visited_branch_uids(robots):
         return next(
             pebble for pebble in get_pebbles(robots)
-            if pebble.pebble_branch_key == branch
+            if pebble.pebble_branch_uid == branch_uid
         )
     pending_id = pending_pebble_robot_ids.get(branch)
     pebble = next(
@@ -5222,10 +5481,7 @@ def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
         ingress = ingress.normalize()
         pebble.role = "PEBBLE"
         pebble.pebble_anchor = pebble.position.copy()
-        pebble.pebble_branch_uid = branch_local_uids.get(
-            branch,
-            f"cohort-{pebble.robot_id:04d}",
-        )
+        pebble.pebble_branch_uid = branch_uid
         pebble.pebble_branch_key = branch
         pebble.pebble_ingress_direction_local = ingress.copy()
         pebble.pebble_return_direction_local = -ingress
@@ -5245,24 +5501,28 @@ def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
         return None
     ingress = ingress.normalize()
     return_direction = return_direction.normalize()
+    descriptor.local_outgoing_direction = ingress.copy()
+    descriptor.local_return_direction = return_direction.copy()
+    if pebble.pebble_anchor is not None:
+        descriptor.observed_mouth_position = pebble.pebble_anchor.copy()
     branch_completion_epoch += 1
     pebble.pebble_state = "VISITED"
     pebble.pebble_ingress_direction_local = ingress.copy()
     pebble.pebble_return_direction_local = return_direction.copy()
     pebble.pebble_completion_epoch = branch_completion_epoch
     pebble.known_visited_branches.add(branch)
-    pebble.known_visited_branch_uids.add(pebble.pebble_branch_uid)
+    pebble.known_visited_branch_uids.add(branch_uid)
     state = pebble_flow_state_from_marker(pebble)
     if state is not None:
         pebble.known_pebble_flow_states[state.branch_uid] = state
     pebble.velocity.update(0.0, 0.0)
     pebble.acceleration.update(0.0, 0.0)
     print(
-        f"[Pebble] branch={pebble.pebble_branch_uid} robot={pebble.robot_id} "
+        f"[Pebble] uid={branch_uid} fixture={branch} robot={pebble.robot_id} "
         "created state=VISITED"
     )
     print(
-        f"[Pebble] branch={pebble.pebble_branch_uid} ingress_bearing="
+        f"[Pebble] uid={branch_uid} fixture={branch} ingress_bearing="
         f"({ingress.x:.3f},{ingress.y:.3f}) return_bearing="
         f"({return_direction.x:.3f},{return_direction.y:.3f}) "
         f"epoch={branch_completion_epoch}"
@@ -6662,7 +6922,8 @@ def prepare_branch_candidate_scores(robots, reference_density: float) -> list[st
     """Evaluate only inferred, unvisited local openings with a short SPH rollout."""
     global last_proxy_partition, last_proxy_cell_centers
     global last_proxy_mass_stats, last_proxy_robot_assignment
-    global last_proxy_candidates, last_flow_rollout_scores
+    global last_proxy_candidates, last_decision_candidate_uids
+    global last_flow_rollout_scores
 
     local_voters = [
         robot for robot in robots
@@ -6674,33 +6935,41 @@ def prepare_branch_candidate_scores(robots, reference_density: float) -> list[st
         DISTRIBUTED_VOTE_MIN_ROBOTS,
         math.ceil(len(local_voters) * DISTRIBUTED_VOTE_QUORUM_RATIO),
     )
-    quorum_visited = {
-        branch for branch in BRANCHES
+    quorum_visited_uids = {
+        branch_uid for branch_uid in discovered_branch_uids()
         if sum(
-            branch in robot.known_visited_branches
+            branch_uid in robot.known_visited_branch_uids
             for robot in local_voters
         ) >= knowledge_quorum
     }
-    candidates = [
-        branch
-        for branch in FIXED_BRANCH_ORDER
-        if branch in detected_branch_candidates
-        and branch not in quorum_visited
+    candidate_uids = [
+        branch_uid
+        for branch_uid in ordered_discovered_branch_uids()
+        if branch_fixture_for_uid(branch_uid) in detected_branch_candidates
+        and branch_uid not in quorum_visited_uids
     ]
-    signature = tuple(candidates)
-    if signature != last_proxy_candidates:
-        for branch in sorted(quorum_visited & detected_branch_candidates):
+    candidates = [
+        branch_fixture_for_uid(branch_uid) for branch_uid in candidate_uids
+    ]
+    candidates = [branch for branch in candidates if branch is not None]
+    uid_signature = tuple(candidate_uids)
+    fixture_signature = tuple(candidates)
+    if uid_signature != last_decision_candidate_uids:
+        for branch_uid in sorted(quorum_visited_uids & discovered_branch_uids()):
             print(
-                "[Vote] excluded visited branch="
-                f"{branch_local_uids.get(branch, branch)}"
+                f"[VoteExclude] uid={branch_uid} "
+                f"fixture={branch_fixture_for_uid(branch_uid) or '-'} "
+                "reason=visited-quorum"
             )
     if (
-        signature == last_proxy_candidates
+        fixture_signature == last_proxy_candidates
+        and uid_signature == last_decision_candidate_uids
         and all(branch in last_flow_rollout_scores for branch in candidates)
     ):
-        return candidates
+        return candidate_uids
     if not candidates:
         last_proxy_candidates = ()
+        last_decision_candidate_uids = ()
         last_flow_rollout_scores = {}
         return []
 
@@ -6735,9 +7004,10 @@ def prepare_branch_candidate_scores(robots, reference_density: float) -> list[st
     last_proxy_cell_centers = centers
     last_proxy_mass_stats = mass_stats
     last_proxy_robot_assignment = robot_assignment
-    last_proxy_candidates = signature
+    last_proxy_candidates = fixture_signature
+    last_decision_candidate_uids = uid_signature
     last_flow_rollout_scores = scores
-    return candidates
+    return candidate_uids
 
 
 def update_distributed_branch_consensus(
@@ -6752,8 +7022,8 @@ def update_distributed_branch_consensus(
         < JUNCTION_DISCOVERY_SETTLE_TIME
     ):
         return None
-    candidates = prepare_branch_candidate_scores(robots, reference_density)
-    if not candidates:
+    candidate_uids = prepare_branch_candidate_scores(robots, reference_density)
+    if not candidate_uids:
         return None
     voters = [
         robot
@@ -6765,34 +7035,32 @@ def update_distributed_branch_consensus(
     if len(voters) < DISTRIBUTED_VOTE_MIN_ROBOTS:
         return None
 
-    locally_excluded = set().union(
-        *(robot.known_visited_branches for robot in voters)
+    locally_excluded_uids = set().union(
+        *(robot.known_visited_branch_uids for robot in voters)
     )
-    for branch in sorted(locally_excluded & set(candidates)):
-        uid = next(
-            (
-                robot.local_branch_uid_by_key.get(branch)
-                for robot in voters
-                if robot.local_branch_uid_by_key.get(branch) is not None
-            ),
-            branch,
+    for branch_uid in sorted(locally_excluded_uids & set(candidate_uids)):
+        print(
+            f"[VoteExclude] uid={branch_uid} "
+            f"fixture={branch_fixture_for_uid(branch_uid) or '-'} "
+            "reason=local-pebble"
         )
-        print(f"[Vote] excluded visited branch={uid}")
 
     for robot in voters:
         local_candidates = [
-            branch
-            for branch in candidates
-            if branch not in robot.known_visited_branches
+            branch_uid
+            for branch_uid in candidate_uids
+            if branch_uid not in robot.known_visited_branch_uids
         ]
         if not local_candidates:
             robot.branch_vote = None
             continue
         preferred = min(
             local_candidates,
-            key=lambda branch: (
-                last_flow_rollout_scores[branch]["cost"],
-                FIXED_BRANCH_ORDER.index(branch),
+            key=lambda branch_uid: (
+                last_flow_rollout_scores[
+                    branch_fixture_for_uid(branch_uid)
+                ]["cost"],
+                candidate_uids.index(branch_uid),
             ),
         )
         local_peers = [
@@ -6809,15 +7077,17 @@ def update_distributed_branch_consensus(
             if peer.branch_vote in local_candidates
         ]
         counts = {
-            branch: peer_votes.count(branch)
-            for branch in local_candidates
+            branch_uid: peer_votes.count(branch_uid)
+            for branch_uid in local_candidates
         }
         counts[preferred] = counts.get(preferred, 0) + 1
         robot.branch_vote = max(
             counts,
-            key=lambda branch: (
-                counts[branch],
-                -last_flow_rollout_scores[branch]["cost"],
+            key=lambda branch_uid: (
+                counts[branch_uid],
+                -last_flow_rollout_scores[
+                    branch_fixture_for_uid(branch_uid)
+                ]["cost"],
             ),
         )
         robot.branch_vote_confidence = (
@@ -6825,14 +7095,23 @@ def update_distributed_branch_consensus(
         )
 
     vote_counts = {
-        branch: sum(robot.branch_vote == branch for robot in voters)
-        for branch in candidates
+        branch_uid: sum(robot.branch_vote == branch_uid for robot in voters)
+        for branch_uid in candidate_uids
     }
+    print(
+        "[BranchVote] "
+        + ", ".join(
+            f"{branch_identity_label(uid)}={vote_counts[uid]}"
+            for uid in candidate_uids
+        )
+    )
     selected = max(
-        candidates,
-        key=lambda branch: (
-            vote_counts[branch],
-            -last_flow_rollout_scores[branch]["cost"],
+        candidate_uids,
+        key=lambda branch_uid: (
+            vote_counts[branch_uid],
+            -last_flow_rollout_scores[
+                branch_fixture_for_uid(branch_uid)
+            ]["cost"],
         ),
     )
     quorum = max(
@@ -6845,18 +7124,21 @@ def update_distributed_branch_consensus(
     distributed_consensus_branch = selected
     for robot in voters:
         robot.distributed_branch_decision = selected
-    selected_uid = branch_local_uids.get(selected, selected)
-    candidate_uids = [branch_local_uids.get(branch, branch) for branch in candidates]
+    selected_fixture = branch_fixture_for_uid(selected)
     print(
-        f"[Consensus] selected={selected_uid} candidates={candidate_uids} "
+        f"[Consensus] selected={branch_identity_label(selected)} "
+        f"candidates={[branch_identity_label(uid) for uid in candidate_uids]} "
         f"votes={vote_counts[selected]}/{len(voters)}, "
-        f"local-cost={last_flow_rollout_scores[selected]['cost']:.3f}"
+        f"local-cost={last_flow_rollout_scores[selected_fixture]['cost']:.3f}"
     )
     return selected
 
 
-def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
-    """Apply the branch-mouth state agreed by the NORMAL peer consensus."""
+def apply_consensus_branch_gates(
+    open_branch: Optional[str],
+    selected_uid: Optional[str] = None,
+) -> None:
+    """Adapt UID consensus to the fixture-keyed physical mouth gates."""
     new_gate_states: dict[str, str]
     if open_branch is None:
         new_gate_states = {branch: "OPEN" for branch in BRANCHES}
@@ -6873,7 +7155,7 @@ def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
     branch_gate_states.clear()
     branch_gate_states.update(new_gate_states)
     record_distributed_consensus(
-        open_branch,
+        selected_uid,
         clear_selection=open_branch is None,
     )
     print(
@@ -7080,26 +7362,34 @@ def get_sequence_stage() -> int:
 
 
 def next_unvisited_transfer_branch(source: str, robots) -> Optional[str]:
-    visited = observed_visited_branches(robots)
-    candidates = [
-        branch
-        for branch in detected_branch_candidates
-        if branch != source and branch not in visited
+    """Return a fixture adapter selected from UID-based DFS memory."""
+    source_uid = branch_uid_for_fixture(source)
+    visited_uids = observed_visited_branch_uids(robots)
+    candidate_uids = [
+        branch_uid
+        for branch_uid in ordered_discovered_branch_uids()
+        if branch_uid != source_uid
+        and branch_uid not in visited_uids
+        and branch_fixture_for_uid(branch_uid) in detected_branch_candidates
     ]
-    if not candidates:
+    if not candidate_uids:
         return None
-    return min(
-        candidates,
-        key=lambda branch: (
-            last_flow_rollout_scores.get(branch, {}).get("cost", float("inf")),
-            FIXED_BRANCH_ORDER.index(branch),
+    selected_uid = min(
+        candidate_uids,
+        key=lambda branch_uid: (
+            last_flow_rollout_scores.get(
+                branch_fixture_for_uid(branch_uid), {}
+            ).get("cost", float("inf")),
+            candidate_uids.index(branch_uid),
         ),
     )
+    return branch_fixture_for_uid(selected_uid)
 
 
 def choose_next_branch(robots, reference_density: float):
     """Commit the branch selected by peer consensus over local rollout costs."""
-    global active_branch, previous_branch_direction, branch_order_plan
+    global active_branch, active_branch_uid, previous_branch_direction
+    global branch_order_plan, branch_fixture_order_plan
     global last_proxy_partition, last_proxy_cell_centers
     global last_proxy_mass_stats, last_proxy_robot_assignment
     global last_proxy_candidates
@@ -7108,29 +7398,34 @@ def choose_next_branch(robots, reference_density: float):
     global effective_branch_widths
     global selected_branch_entry_lambda, branch_entry_timer
 
-    selected = distributed_consensus_branch
+    selected_uid = distributed_consensus_branch
+    selected = branch_fixture_for_uid(selected_uid)
     if (
-        selected is None
+        selected_uid is None
+        or selected is None
         or selected not in detected_branch_candidates
-        or selected in observed_visited_branches(robots)
+        or selected_uid in observed_visited_branch_uids(robots)
     ):
         return None
 
     if not branch_is_feasible(selected, robots):
         print(
-            f"[DFS] warning: inferred branch {selected} did not pass resource "
+            f"[DFS] warning: inferred branch "
+            f"{branch_identity_label(selected_uid)} did not pass resource "
             "feasibility; preserving peer consensus"
         )
 
-    branch_states[selected] = "ACTIVE"
+    set_branch_descriptor_state(selected_uid, "ACTIVE")
     for robot in robots:
         if robot.role == "NORMAL":
             robot.local_branch_states[selected] = "ACTIVE"
-            robot.distributed_branch_decision = selected
-    apply_consensus_branch_gates(selected)
-    record_distributed_consensus(selected)
+            robot.distributed_branch_decision = selected_uid
+    apply_consensus_branch_gates(selected, selected_uid)
+    record_distributed_consensus(selected_uid)
     active_branch = selected
-    branch_order_plan.append(selected)
+    active_branch_uid = selected_uid
+    branch_order_plan.append(selected_uid)
+    branch_fixture_order_plan.append(selected)
     selected_branch_entry_lambda, _ = rollout_stiffness_for_branch(
         selected,
         previous_branch_direction,
@@ -7144,7 +7439,8 @@ def choose_next_branch(robots, reference_density: float):
     )
     metrics.branch_selection_events.append({
         "time": simulation_time,
-        "selected": selected,
+        "selected": selected_uid,
+        "fixture": selected,
         "cost": selected_score["cost"],
         "max_structural_loss": max(
             (structural_loss(branch, robots) for branch in detected_branch_candidates),
@@ -7152,8 +7448,9 @@ def choose_next_branch(robots, reference_density: float):
         ),
         "components": dict(selected_score["components"]),
         "candidate_scores": {
-            branch: {
+            branch_uid_for_fixture(branch) or branch: {
                 "cost": data["cost"],
+                "fixture": branch,
                 "components": dict(data["components"]),
             }
             for branch, data in last_flow_rollout_scores.items()
@@ -7161,7 +7458,7 @@ def choose_next_branch(robots, reference_density: float):
     })
 
     print(
-        f"[DFS] local-cost selected={selected}, "
+        f"[DFS] local-cost selected={branch_identity_label(selected_uid)}, "
         f"cost={selected_score['cost']:.3f}, "
         f"entry_lambda={selected_branch_entry_lambda:.3f}"
     )
@@ -7169,27 +7466,37 @@ def choose_next_branch(robots, reference_density: float):
 
 def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
     global previous_branch_direction, distributed_consensus_branch
-    global last_proxy_candidates, last_flow_rollout_scores
+    global active_branch_uid
+    global last_proxy_candidates, last_decision_candidate_uids
+    global last_flow_rollout_scores
+    branch_uid = active_branch_uid or branch_uid_for_fixture(branch)
+    descriptor = branch_descriptors_by_uid.get(branch_uid)
     if not (
-        branch_states.get(branch) == "ACTIVE"
+        descriptor is not None
+        and descriptor.visit_state == "ACTIVE"
         and branch_dead_end_confirmed.get(branch, False)
         and branch_backflow_started.get(branch, False)
         and cohort_return_confirmed
     ):
         print(
-            f"[BranchComplete] rejected branch={branch} "
+            f"[BranchComplete] rejected "
+            f"branch={branch_identity_label(branch_uid)} "
             "missing ACTIVE/dead-end/backflow/return evidence"
         )
         return False
-    pebble = create_branch_pebble(robots, branch)
+    pebble = create_branch_pebble(robots, branch_uid)
     if pebble is None:
-        print(f"[BranchComplete] waiting for local Pebble candidate branch={branch}")
+        print(
+            "[BranchComplete] waiting for local Pebble candidate "
+            f"branch={branch_identity_label(branch_uid)}"
+        )
         return False
-    branch_states[branch] = "VISITED"
+    set_branch_descriptor_state(branch_uid, "VISITED")
     distributed_consensus_branch = None
+    active_branch_uid = None
     last_proxy_candidates = ()
+    last_decision_candidate_uids = ()
     last_flow_rollout_scores = {}
-    detected_branch_candidates = set()
     collision_points = deque(maxlen=CONTACT_POINT_MAX_COUNT)
     effective_branch_widths = {branch: 0.0 for branch in BRANCHES}
     for robot in robots:
@@ -7199,12 +7506,14 @@ def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
     record_distributed_consensus(clear_selection=True)
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
-    visited_count = len(observed_visited_branches(robots))
+    visited_count = len(observed_visited_branch_uids(robots))
     print(
-        "[BranchComplete] branch="
-        f"{pebble.pebble_branch_uid}"
+        f"[BranchComplete] uid={pebble.pebble_branch_uid} fixture={branch}"
     )
-    print(f"[JunctionComplete] visited={visited_count}/{len(detected_branch_candidates) or len(BRANCHES)}")
+    print(
+        f"[JunctionComplete] visited={visited_count}/"
+        f"{len(discovered_branch_uids()) or len(BRANCHES)}"
+    )
     return True
 
 
@@ -7533,8 +7842,15 @@ class SequentialJunctionInferenceTracker:
                 and branch not in self.valid_branches
             ):
                 self.valid_branches.add(branch)
+                descriptor = register_discovered_branch(
+                    robots,
+                    branch,
+                    self.cohort_member_ids[branch],
+                    self.cohort_origins,
+                )
                 print(
-                    f"[Branch Evidence] {branch} OPEN only after physical "
+                    f"[Branch Evidence] {descriptor.uid} ({branch}) OPEN "
+                    "only after physical "
                     f"crossing: unique={self.cohort_counts[branch]}, "
                     f"depth={self.cohort_depth[branch]:.1f}, "
                     f"travel={self.cohort_travel[branch]:.1f}, "
@@ -7626,6 +7942,7 @@ class SequentialJunctionInferenceTracker:
             metrics.junction_inference_events.append({
                 "time": simulation_time,
                 "branches": sorted(self.valid_branches),
+                "branch_uids": ordered_discovered_branch_uids(),
                 "expansion_ratio": self.expansion_ratio,
                 "lateral_variance": self.lateral_variance,
                 "sector_distribution": dict(self.sector_distribution),
@@ -7636,7 +7953,8 @@ class SequentialJunctionInferenceTracker:
             })
             print(
                 "[Junction Inference] sequential expansion + cohorts: "
-                f"branches={sorted(self.valid_branches)}, "
+                "branches="
+                f"{[branch_identity_label(uid) for uid in ordered_discovered_branch_uids()]}, "
                 f"variance-ratio={self.expansion_ratio:.2f}, "
                 f"physical-depths={{{', '.join(f'{branch}:{self.cohort_depth[branch]:.1f}' for branch in sorted(self.valid_branches))}}}"
             )
@@ -11338,7 +11656,9 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 )
             elif next_branch is not None:
                 reset_shepherd_roles(robots)
-                distributed_consensus_branch = next_branch
+                distributed_consensus_branch = branch_uid_for_fixture(
+                    next_branch
+                )
                 selected = choose_next_branch(
                     robots,
                     reference_density,
@@ -11384,8 +11704,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
-        discovered_children = set(junction_inference_tracker.valid_branches)
-        visited_children = observed_visited_branches(robots)
+        discovered_children = discovered_branch_uids()
+        visited_children = observed_visited_branch_uids(robots)
         if discovered_children and discovered_children <= visited_children:
             print(
                 f"[JunctionComplete] visited={len(visited_children)}/"
@@ -11774,7 +12094,8 @@ def draw_pre_shepherd_curtain(surface):
 
 
 def reset_dfs_state():
-    global phase, active_branch, branch_states, branch_order_plan
+    global phase, active_branch, active_branch_uid, branch_states
+    global branch_order_plan, branch_fixture_order_plan
     global branch_gate_states, distributed_consensus_branch, transfer_branch
     global final_base_transfer_active
     global transfer_path_max_gap, transfer_entrance_count
@@ -11787,6 +12108,8 @@ def reset_dfs_state():
     global junctions
     global branch_completion_epoch
     global branch_dead_end_confirmed, branch_backflow_started
+    global branch_descriptors_by_uid, fixture_key_to_branch_uid
+    global branch_uid_to_fixture_key, branch_discovery_counter
     global branch_local_uids
     global pebble_rx_logged
     global pending_pebble_robot_ids
@@ -11816,7 +12139,7 @@ def reset_dfs_state():
     global trunk_relay_slots, trunk_relay_deploy_cooldown, base_station
     global last_proxy_partition, last_proxy_cell_centers
     global last_proxy_mass_stats, last_proxy_robot_assignment
-    global last_proxy_candidates
+    global last_proxy_candidates, last_decision_candidate_uids
     global last_flow_rollout_scores
     global selected_branch_entry_lambda, branch_entry_timer
     global return_trunk_release_pending, return_trunk_retract_timer
@@ -11833,9 +12156,11 @@ def reset_dfs_state():
     global metrics
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = FIXED_BRANCH_ORDER[0]
+    active_branch_uid = None
     junctions = create_single_junction_registry()
     branch_states = get_junction_state().branch_states
     branch_order_plan = []
+    branch_fixture_order_plan = []
     branch_gate_states = get_junction_state().gate_states
     distributed_consensus_branch = None
     transfer_branch = None
@@ -11851,6 +12176,10 @@ def reset_dfs_state():
     branch_completion_epoch = 0
     branch_dead_end_confirmed = {branch: False for branch in BRANCHES}
     branch_backflow_started = {branch: False for branch in BRANCHES}
+    branch_descriptors_by_uid = {}
+    fixture_key_to_branch_uid = {}
+    branch_uid_to_fixture_key = {}
+    branch_discovery_counter = 0
     branch_local_uids = {}
     pebble_rx_logged = set()
     pending_pebble_robot_ids = {}
@@ -11895,6 +12224,7 @@ def reset_dfs_state():
     last_proxy_mass_stats = {}
     last_proxy_robot_assignment = {}
     last_proxy_candidates = ()
+    last_decision_candidate_uids = ()
     last_flow_rollout_scores = {}
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
     branch_entry_timer = 0.0
@@ -12324,9 +12654,9 @@ while running:
         (
             f"Pebble policy={PEBBLE_POLICY_VERSION} | "
             f"count={len(get_pebbles(robots))} | "
-            f"visited={len(observed_visited_branches(robots))}/"
-            f"{len(detected_branch_candidates) or len(BRANCHES)} | "
-            f"consensus={distributed_consensus_branch or '-'}"
+            f"visited-uids={sorted(observed_visited_branch_uids(robots))}/"
+            f"{len(discovered_branch_uids()) or len(BRANCHES)} | "
+            f"consensus={branch_identity_label(distributed_consensus_branch)}"
         ),
         (
             "Visited branch leakage: "
@@ -12351,9 +12681,18 @@ while running:
             f"Breadcrumb policy={BREADCRUMB_GUARD_POLICY_VERSION} | "
             "static NORMAL guards=0"
         ),
-        f"Branch={active_branch if phase not in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.RETURN_TO_BASE, SimulationPhase.DONE} else '-'}",
         (
-            f"Distributed decision=MOVE_{distributed_consensus_branch}"
+            f"Branch={branch_identity_label(active_branch_uid)}"
+            if phase not in {
+                SimulationPhase.MOVE_TO_JUNCTION,
+                SimulationPhase.RETURN_TO_BASE,
+                SimulationPhase.DONE,
+            }
+            else "Branch=-"
+        ),
+        (
+            "Distributed decision=MOVE_"
+            f"{branch_identity_label(distributed_consensus_branch)}"
             if distributed_consensus_branch
             else "Distributed decision=VOTING"
         ),
@@ -12437,7 +12776,37 @@ while running:
                 for branch in BRANCHES
             )
         ),
-        f"Order={' > '.join(branch_order_plan) if branch_order_plan else '-'}",
+        (
+            "Detected Branch UIDs: "
+            + (
+                " | ".join(
+                    f"{branch_identity_label(uid)}="
+                    f"{branch_descriptors_by_uid[uid].visit_state}"
+                    for uid in ordered_discovered_branch_uids()
+                )
+                if branch_descriptors_by_uid
+                else "-"
+            )
+        ),
+        (
+            "Pebble UIDs: "
+            + (
+                " | ".join(
+                    branch_identity_label(pebble.pebble_branch_uid)
+                    for pebble in get_pebbles(robots)
+                )
+                if get_pebbles(robots)
+                else "-"
+            )
+        ),
+        (
+            "Order="
+            + (
+                " > ".join(branch_identity_label(uid) for uid in branch_order_plan)
+                if branch_order_plan
+                else "-"
+            )
+        ),
         (
             "Last branch cost: "
             + (
@@ -12452,7 +12821,8 @@ while running:
         (
             "Proxy mass: "
             + " | ".join(
-                f"{branch} q={last_proxy_mass_stats.get(branch, {}).get('quota_fraction', 0.0):.2f} "
+                f"{branch_identity_label(branch_uid_for_fixture(branch))} "
+                f"q={last_proxy_mass_stats.get(branch, {}).get('quota_fraction', 0.0):.2f} "
                 f"m={last_proxy_mass_stats.get(branch, {}).get('actual_mass_fraction', 0.0):.2f}"
                 for branch in last_proxy_candidates
             )
@@ -12491,6 +12861,7 @@ while running:
             f"discovery={junction_inference_tracker.discovery_dwell:.2f}/"
             f"{JUNCTION_DISCOVERY_SETTLE_TIME:.2f} "
             f"valid={sorted(junction_inference_tracker.valid_branches)} "
+            f"uids={[branch_identity_label(uid) for uid in ordered_discovered_branch_uids()]} "
             f"front={junction_inference_tracker.forward_probe_status}"
         ),
         (
