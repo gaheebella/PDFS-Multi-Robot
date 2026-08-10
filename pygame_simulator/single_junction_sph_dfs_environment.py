@@ -6,8 +6,8 @@ Implemented research components
    sequentially to infer a Junction from lateral expansion and persistent,
    traversable directional cohorts.
 2. NORMAL-to-NORMAL local voting commits only branches discovered by the
-   emergent-distribution observer.  The elected Anchor stores and relays the
-   consensus; it does not decide on behalf of the swarm.
+   emergent-distribution observer. Completed children are remembered by
+   informational Pebbles at their locally observed entrances.
 3. Branch order is selected from locally observable transport, deformation,
    turn, contact, communication, guard, and short SPH-rollout costs.
 4. Eguchi-inspired command-observed velocity discrepancy is integrated per
@@ -79,10 +79,8 @@ SHEPHERD_COLOR = (106, 70, 150)
 JUNCTION_GUARD_COLOR = (202, 56, 72)
 FRONTIER_SHEPHERD_COLOR = (238, 132, 36)
 BRANCH_LEADER_RING_COLOR = (255, 220, 55)
-# High-luminance green makes the stationary Anchor immediately distinct from
-# the navy NORMAL swarm, purple Shepherds, and brown Breadcrumb relays.
-ANCHOR_COLOR = (20, 220, 90)
-ANCHOR_RING_COLOR = (0, 72, 34)
+PEBBLE_COLOR = (20, 220, 90)
+PEBBLE_RING_COLOR = (0, 72, 34)
 COMM_BRIDGE_COLOR = (0, 190, 215)
 COMM_BRIDGE_LINK_COLOR = (0, 154, 190)
 BASE_COLOR = (44, 72, 120)
@@ -159,24 +157,6 @@ junction_rect = pygame.Rect(
     corridor_width,
 )
 
-ANCHOR_REGION_SIZE = round(70 * MAP_SCALE)
-anchor_election_rect = pygame.Rect(
-    center_x - ANCHOR_REGION_SIZE // 2,
-    center_y - ANCHOR_REGION_SIZE // 2,
-    ANCHOR_REGION_SIZE,
-    ANCHOR_REGION_SIZE,
-)
-
-ANCHOR_PARK_POSITION = pygame.Vector2(
-    center_x - 25 * MAP_SCALE,
-    center_y - 25 * MAP_SCALE,
-)
-ANCHOR_PARK_SLOTS = (
-    pygame.Vector2(center_x - 25 * MAP_SCALE, center_y - 25 * MAP_SCALE),
-    pygame.Vector2(center_x + 25 * MAP_SCALE, center_y - 25 * MAP_SCALE),
-    pygame.Vector2(center_x - 25 * MAP_SCALE, center_y + 25 * MAP_SCALE),
-    pygame.Vector2(center_x + 25 * MAP_SCALE, center_y + 25 * MAP_SCALE),
-)
 # Fixed communication root. It remains at the lower entrance throughout exploration.
 BASE_POSITION = pygame.Vector2(
     center_x - 25 * MAP_SCALE,
@@ -326,20 +306,32 @@ class BranchEdge:
     length: float
 
 
+@dataclass(frozen=True)
+class PebbleFlowState:
+    """Immutable VISITED fact relayed through local robot communication."""
+
+    branch_uid: str
+    branch_key: Optional[str]
+    mouth_position: tuple[float, float]
+    ingress_direction_local: tuple[float, float]
+    return_direction_local: tuple[float, float]
+    completion_epoch: int
+
+
 @dataclass
 class JunctionState:
-    """All state owned by one Junction and its elected Anchor."""
+    """Simulation bookkeeping for one inferred Junction.
+
+    Mobile robots never consult this object to learn whether a child was
+    visited; that runtime knowledge comes from local Pebble messages.
+    """
 
     junction_id: str
     rect: pygame.Rect
-    anchor_region: pygame.Rect
-    anchor_slots: list[pygame.Vector2]
     branch_edges: dict[str, BranchEdge]
     branch_states: dict[str, str]
     gate_states: dict[str, str]
     selected_branch: Optional[str] = None
-    anchor_robot_id: Optional[int] = None
-    selected_anchor_position: Optional[pygame.Vector2] = None
     parent_junction_id: Optional[str] = None
     parent_edge_id: Optional[str] = None
     depth: int = 0
@@ -401,8 +393,6 @@ def create_single_junction_registry() -> dict[str, JunctionState]:
     state = JunctionState(
         junction_id=CURRENT_JUNCTION_ID,
         rect=junction_rect.copy(),
-        anchor_region=anchor_election_rect.copy(),
-        anchor_slots=[slot.copy() for slot in ANCHOR_PARK_SLOTS],
         branch_edges=branch_edges,
         branch_states={branch: "UNVISITED" for branch in BRANCHES},
         # All mouths are physically and logically OPEN during free diffusion.
@@ -413,9 +403,6 @@ def create_single_junction_registry() -> dict[str, JunctionState]:
 
 
 junctions = create_single_junction_registry()
-junction_anchors: dict[str, "Robot"] = {}
-
-
 def get_junction_state(junction_id: str = CURRENT_JUNCTION_ID) -> JunctionState:
     return junctions[junction_id]
 
@@ -437,8 +424,16 @@ branch_fill_current_count = 0
 branch_fill_deficit_control = 0.0
 previous_branch_direction = pygame.Vector2(0.0, -1.0)  # incoming from BASE
 
-junction_anchor: Optional["Robot"] = None
 simulation_time = 0.0
+branch_completion_epoch = 0
+branch_dead_end_confirmed = {branch: False for branch in BRANCHES}
+branch_backflow_started = {branch: False for branch in BRANCHES}
+branch_local_uids: dict[str, str] = {}
+pebble_rx_logged: set[str] = set()
+pending_pebble_robot_ids: dict[str, int] = {}
+pebble_flow_last_log_time = float("-inf")
+current_visited_branch_leakage = {branch: 0 for branch in BRANCHES}
+current_pebble_guidance_active_normals = 0
 junction_switch_timer = 0.0
 final_gather_timer = 0.0
 shepherd_form_timer = 0.0
@@ -685,23 +680,30 @@ LOCAL_COHESION_DENSITY_BOOST = 1.25
 LOCAL_COHESION_FORCE_LIMIT = 60.0
 
 JUNCTION_ENTRY_COUNT = 18
-ANCHOR_MOVE_SPEED = 42.0
-ANCHOR_POSITION_TOLERANCE = 2.5 * MAP_SCALE
 JUNCTION_SWITCH_COUNT = 18
 JUNCTION_SWITCH_DWELL_TIME = 0.25
-RETURN_BOTTOM_TARGET_COUNT = ROBOT_COUNT
 FINAL_GATHER_DWELL_TIME = 0.55
 
-# Minimum-cost multi-criteria Anchor election
-ANCHOR_ELECTION_MIN_CANDIDATES = 4
-ANCHOR_ELECTION_WAIT_TIME = 0.22
-ANCHOR_COST_WEIGHT_ARRIVAL = 0.25
-ANCHOR_COST_WEIGHT_PARKING = 0.25
-ANCHOR_COST_WEIGHT_OBSTRUCTION = 0.30
-ANCHOR_COST_WEIGHT_COMMUNICATION = 0.20
-ANCHOR_LOCAL_COMM_RANGE = 56.0 * MAP_SCALE
-ANCHOR_OBSTRUCTION_RADIUS = 18.0 * MAP_SCALE
-ANCHOR_POLICY_VERSION = "JUNCTION_SCOPED_MIN_COST_RELAY_V3"
+PEBBLE_POLICY_VERSION = "LOCAL_VISITED_MARKER_FLOW_V2"
+# Pebbles remain force-free markers. These gains only condition the NORMAL
+# decision-layer force (route + EDF); no SPH, collision, or connectivity term
+# is projected or attenuated.
+PEBBLE_GUIDANCE_RADIUS = corridor_width * 1.10
+PEBBLE_MOUTH_RADIUS = SMOOTHING_LENGTH * 1.60
+PEBBLE_BRANCH_LATERAL_MARGIN = SMOOTHING_LENGTH * 0.75
+PEBBLE_RECOVERY_FULL_DEPTH = SMOOTHING_LENGTH * 0.90
+PEBBLE_CAUTION_GAIN = 0.45
+PEBBLE_MOUTH_SUPPRESSION_GAIN = 0.45
+PEBBLE_PREVENTIVE_RETURN_FORCE = ROUTE_FORCE * 0.75
+PEBBLE_RECOVERY_GAIN = OUTLET_FORCE * 1.75
+PEBBLE_GUIDANCE_FORCE_LIMIT = ROUTE_FORCE * 2.50
+PEBBLE_CROSSING_MIN_RETURN_SPEED = 1.0
+PEBBLE_FLOW_LOG_INTERVAL = 1.0
+PEBBLE_INGRESS_MIN_OBSERVED_TRAVEL = ROBOT_RADIUS * 2.0
+PEBBLE_INGRESS_DIRECTION_FILTER_ALPHA = 0.25
+PEBBLE_FLOW_GUIDANCE_ENABLED = (
+    os.environ.get("SPH_DFS_PEBBLE_FLOW_GUIDANCE", "1") != "0"
+)
 
 # Dead-end saturation
 SATURATION_MIN_TIP_ROBOTS = 18
@@ -888,10 +890,6 @@ BACKTRACK_BRIDGE_DANGER_MARGIN = COMM_RANGE * 0.08
 BACKTRACK_BRIDGE_DEPLOY_DWELL = 0.12
 BACKTRACK_BRIDGE_RELEASE_DWELL = 0.80
 BACKTRACK_BRIDGE_POLICY_VERSION = "EVENT_TRIGGERED_ADAPTIVE_BRIDGE_V2"
-ANCHOR_LINK_WARNING_DISTANCE = COMM_SAFE_DISTANCE * 0.82
-ANCHOR_LINK_STOP_DISTANCE = COMM_RANGE * 0.90
-ANCHOR_MIN_DIRECT_NEIGHBORS = 1
-ANCHOR_READY_DIRECT_NEIGHBORS = 1
 
 # Permanent Base-to-Junction trunk relays
 TRUNK_RELAY_SPACING = 30.0 * MAP_SCALE
@@ -1037,7 +1035,7 @@ FINAL_GATE_POLICY_VERSION = "PHYSICAL_GUARD_NO_GEOFENCE_V1"
 
 # Centralized sampled-data approximation of HydroSwarm's local stability
 # consensus. A dual-threshold readiness rule shortens Junction waiting while
-# preserving the Base link, Anchor deployment, and minimum robot-count guards.
+# preserving the Base link and minimum robot-count guards.
 #
 # Normal path: a moderately stable group may switch after a short dwell.
 # Fast path: when enough robots have already gathered, a looser transient
@@ -1828,6 +1826,36 @@ class ExperimentMetrics:
     junction_inference_events: list[dict] = field(default_factory=list)
     contact_events: list[dict] = field(default_factory=list)
     dead_end_events: list[dict] = field(default_factory=list)
+    visited_branch_reentry_counts: dict[str, int] = field(
+        default_factory=lambda: {branch: 0 for branch in BRANCHES}
+    )
+    visited_branch_reentry_robot_ids: dict[str, set[int]] = field(
+        default_factory=lambda: {branch: set() for branch in BRANCHES}
+    )
+    visited_branch_max_inside: dict[str, int] = field(
+        default_factory=lambda: {branch: 0 for branch in BRANCHES}
+    )
+    visited_branch_robot_seconds: dict[str, float] = field(
+        default_factory=lambda: {branch: 0.0 for branch in BRANCHES}
+    )
+    exploration_leak_reentry_counts: dict[str, int] = field(
+        default_factory=lambda: {branch: 0 for branch in BRANCHES}
+    )
+    exploration_leak_reentry_robot_ids: dict[str, set[int]] = field(
+        default_factory=lambda: {branch: set() for branch in BRANCHES}
+    )
+    exploration_leak_max_inside: dict[str, int] = field(
+        default_factory=lambda: {branch: 0 for branch in BRANCHES}
+    )
+    exploration_leak_robot_seconds: dict[str, float] = field(
+        default_factory=lambda: {branch: 0.0 for branch in BRANCHES}
+    )
+    initialized_visited_uids: set[str] = field(default_factory=set)
+    pebble_guidance_activation_count: int = 0
+    pebble_recovery_success_count: int = 0
+    pebble_recovery_success_pairs: set[tuple[int, str]] = field(
+        default_factory=set
+    )
     saved: bool = False
 
 
@@ -1844,7 +1872,7 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
     relay_distance = sum(robot.distance_by_role.get("RELAY", 0.0) for robot in robots)
     trunk_relay_distance = sum(robot.distance_by_role.get("TRUNK_RELAY", 0.0) for robot in robots)
     shepherd_distance = sum(robot.distance_by_role.get("SHEPHERD", 0.0) for robot in robots)
-    anchor_distance = sum(robot.distance_by_role.get("ANCHOR", 0.0) for robot in robots)
+    pebble_distance = sum(robot.distance_by_role.get("PEBBLE", 0.0) for robot in robots)
     with output.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["metric", "value"])
@@ -1856,7 +1884,7 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         writer.writerow(["relay_distance", f"{relay_distance:.6f}"])
         writer.writerow(["trunk_relay_distance", f"{trunk_relay_distance:.6f}"])
         writer.writerow(["shepherd_distance", f"{shepherd_distance:.6f}"])
-        writer.writerow(["anchor_distance", f"{anchor_distance:.6f}"])
+        writer.writerow(["pebble_distance", f"{pebble_distance:.6f}"])
         writer.writerow([
             "disconnected_robot_seconds",
             f"{metrics.disconnected_robot_seconds:.6f}",
@@ -1897,10 +1925,42 @@ def save_experiment_logs(robots: list["Robot"], reason: str) -> Path:
         writer.writerow(["junction_inference_event_count", len(metrics.junction_inference_events)])
         writer.writerow(["indirect_contact_event_count", len(metrics.contact_events)])
         writer.writerow(["dead_end_inference_event_count", len(metrics.dead_end_events)])
+        writer.writerow([
+            "pebble_guidance_activation_count",
+            metrics.pebble_guidance_activation_count,
+        ])
+        writer.writerow([
+            "pebble_recovery_success_count",
+            metrics.pebble_recovery_success_count,
+        ])
         for branch in BRANCHES:
             writer.writerow([
                 f"effective_width_{branch.lower()}",
                 f"{effective_branch_widths.get(branch, 0.0):.6f}",
+            ])
+            writer.writerow([
+                f"visited_reentry_count_{branch.lower()}",
+                metrics.visited_branch_reentry_counts[branch],
+            ])
+            writer.writerow([
+                f"visited_max_inside_{branch.lower()}",
+                metrics.visited_branch_max_inside[branch],
+            ])
+            writer.writerow([
+                f"visited_robot_seconds_{branch.lower()}",
+                f"{metrics.visited_branch_robot_seconds[branch]:.6f}",
+            ])
+            writer.writerow([
+                f"exploration_leak_reentry_count_{branch.lower()}",
+                metrics.exploration_leak_reentry_counts[branch],
+            ])
+            writer.writerow([
+                f"exploration_leak_max_inside_{branch.lower()}",
+                metrics.exploration_leak_max_inside[branch],
+            ])
+            writer.writerow([
+                f"exploration_leak_robot_seconds_{branch.lower()}",
+                f"{metrics.exploration_leak_robot_seconds[branch]:.6f}",
             ])
     print(f"[Log] saved: {output}")
     return output
@@ -1966,10 +2026,28 @@ class Robot:
         self.is_branch_leader = False
         self.relay_anchor: Optional[pygame.Vector2] = None
         self.relay_index = -1
-        self.anchor_position: Optional[pygame.Vector2] = None
         self.local_branch_states = branch_states.copy()
-        self.selected_branch = None
-        self.branch_gate_states = {branch: "OPEN" for branch in BRANCHES}
+        self.known_visited_branches: set[str] = set()
+        self.known_visited_branch_uids: set[str] = set()
+        self.local_branch_uid_by_key: dict[str, str] = {}
+        self.local_ingress_tangents: dict[str, pygame.Vector2] = {}
+        self.local_branch_ingress_points: dict[str, pygame.Vector2] = {}
+        self.local_return_mouth_crossings: dict[str, pygame.Vector2] = {}
+        self.known_pebble_flow_states: dict[str, PebbleFlowState] = {}
+        self.pebble_anchor: Optional[pygame.Vector2] = None
+        self.pebble_branch_uid: Optional[str] = None
+        self.pebble_branch_key: Optional[str] = None
+        self.pebble_state: Optional[str] = None
+        self.pebble_ingress_direction_local: Optional[pygame.Vector2] = None
+        self.pebble_return_direction_local: Optional[pygame.Vector2] = None
+        self.pebble_completion_epoch = 0
+        self.last_pebble_guidance_force = 0.0
+        self.last_pebble_guidance_weight = 0.0
+        self.last_pebble_guidance_mode = "NONE"
+        self.last_pebble_guidance_branch_uid: Optional[str] = None
+        self.metric_pebble_guidance_active = False
+        self.metric_inside_visited_uids: set[str] = set()
+        self.metric_pebble_recovery_seen_uids: set[str] = set()
         self.branch_vote: Optional[str] = None
         self.branch_vote_confidence = 0.0
         self.distributed_branch_decision: Optional[str] = None
@@ -1977,27 +2055,10 @@ class Robot:
         self.base_reserve = False
         self.base_hold_position: Optional[pygame.Vector2] = None
         self.parent_branch = "BOTTOM"
-        self.current_junction_id: Optional[str] = None
-        self.anchor_junction_id: Optional[str] = None
         self.known_junction_states: dict[str, dict] = {}
         self.comm_bridge_target: Optional[pygame.Vector2] = None
         self.comm_bridge_index = -1
         self.comm_bridge_branch: Optional[str] = None
-
-        self.anchor_region_entry_time: Optional[float] = None
-        self.anchor_region_entry_times: dict[str, float] = {}
-        self.was_in_anchor_region = anchor_election_rect.collidepoint(x, y)
-        self.was_in_anchor_regions: dict[str, bool] = {
-            CURRENT_JUNCTION_ID: self.was_in_anchor_region
-        }
-        self.anchor_election_cost = float("inf")
-        self.anchor_candidate_position: Optional[pygame.Vector2] = None
-        self.anchor_cost_components = {
-            "arrival": 0.0,
-            "parking": 0.0,
-            "obstruction": 0.0,
-            "communication": 0.0,
-        }
 
         self.comm_neighbors: list[object] = []
         self.connected_to_base = False
@@ -2010,13 +2071,11 @@ class Robot:
         self.received_sequence = -1
         self.received_junction_id: Optional[str] = None
         self.received_state_sequence = -1
-        self.received_junction_id: Optional[str] = None
-        self.received_state_sequence = -1
 
         self.total_distance = 0.0
         self.distance_by_role = {
             "NORMAL": 0.0,
-            "ANCHOR": 0.0,
+            "PEBBLE": 0.0,
             "RELAY": 0.0,
             "TRUNK_RELAY": 0.0,
             "SHEPHERD": 0.0,
@@ -2031,21 +2090,8 @@ class Robot:
     def update(self, dt: float):
         old_position = self.position.copy()
 
-        if self.role == "ANCHOR" and self.anchor_position is not None:
-            error = self.anchor_position - self.position
-            if error.length_squared() > ANCHOR_POSITION_TOLERANCE**2:
-                scale = get_anchor_deployment_motion_scale(self)
-                step = ANCHOR_MOVE_SPEED * scale * dt
-                if step > 0.0:
-                    next_position = (
-                        self.anchor_position.copy()
-                        if error.length() <= step
-                        else self.position + error.normalize() * step
-                    )
-                    if is_walkable(next_position, self.radius):
-                        self.position = next_position
-            else:
-                self.position = self.anchor_position.copy()
+        if self.role == "PEBBLE" and self.pebble_anchor is not None:
+            self.position = self.pebble_anchor.copy()
             self.velocity.update(0.0, 0.0)
             self.acceleration.update(0.0, 0.0)
             self.previous_position = old_position
@@ -2266,6 +2312,7 @@ class Robot:
         self.observed_velocity = (
             self.position - old_position
         ) / max(dt, EPSILON)
+        maybe_stage_pebble_at_return_crossing(self, old_position)
         update_indirect_contact_state(self, dt)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
@@ -2273,8 +2320,8 @@ class Robot:
 
     def draw(self, surface, color_reference_density, show_density_color):
         x, y = round(self.position.x), round(self.position.y)
-        if self.role == "ANCHOR":
-            color = ANCHOR_COLOR
+        if self.role == "PEBBLE":
+            color = PEBBLE_COLOR
         elif self.role == "TRUNK_RELAY":
             color = TRUNK_RELAY_COLOR
         elif self.role == "RELAY":
@@ -2309,10 +2356,10 @@ class Robot:
         if self.role in {"RELAY", "TRUNK_RELAY"}:
             ring_color = TRUNK_RELAY_COLOR if self.role == "TRUNK_RELAY" else RELAY_COLOR
             pygame.draw.circle(surface, ring_color, (x, y), draw_radius + 2, width=1)
-        elif self.role == "ANCHOR":
+        elif self.role == "PEBBLE":
             pygame.draw.circle(
                 surface,
-                ANCHOR_RING_COLOR,
+                PEBBLE_RING_COLOR,
                 (x, y),
                 draw_radius + 3,
                 width=2,
@@ -2865,11 +2912,12 @@ def build_thick_mouth_guard_slots(
 
 
 def thick_mouth_guards_formed(robots, selected_branch: str) -> bool:
+    visited = observed_visited_branches(robots)
     protected_branches = [
         branch
         for branch in junction_guard_groups
         if branch != selected_branch
-        and branch_states.get(branch) == "UNVISITED"
+        and branch not in visited
     ]
     if not protected_branches:
         return True
@@ -2922,7 +2970,7 @@ def begin_junction_guard_formation(robots) -> None:
 
     A mouth wall is a physical state, not a transient planning artifact. Once
     an unvisited branch has a valid thick K-hop wall, keep the same robots and
-    anchors across branch switches. Only the branch selected for exploration
+    slot assignments across branch switches. Only the selected branch
     is released later by ``commit_junction_guard_roles``.
     """
     global junction_guard_groups, junction_guard_formation_timer
@@ -2931,7 +2979,9 @@ def begin_junction_guard_formation(robots) -> None:
     global distributed_consensus_branch
     global pending_branch_start
     global frontier_line_branch, frontier_line_depth
+    global branch_local_uids
 
+    visited = observed_visited_branches(robots)
     # Preserve already-formed walls for branches that are still unvisited.
     # Releasing every guard here made a 3-layer wall collapse to a 1-layer
     # frontier and be re-estimated with a smaller column count on each switch.
@@ -2948,7 +2998,7 @@ def begin_junction_guard_formation(robots) -> None:
     for branch, robot_ids in previous_groups.items():
         if (
             branch not in detected_branch_candidates
-            or branch_states.get(branch) != "UNVISITED"
+            or branch in visited
         ):
             continue
         branch_guards = [
@@ -3001,7 +3051,7 @@ def begin_junction_guard_formation(robots) -> None:
         )
         for branch in BRANCHES
     })
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     print(
         "[Gate] inferred mouths only: "
         + ", ".join(
@@ -3031,7 +3081,7 @@ def begin_junction_guard_formation(robots) -> None:
     for branch in FIXED_BRANCH_ORDER:
         if (
             branch not in detected_branch_candidates
-            or branch_states.get(branch) != "UNVISITED"
+            or branch in visited
         ):
             continue
         if branch in preserved_groups:
@@ -3048,6 +3098,12 @@ def begin_junction_guard_formation(robots) -> None:
         if leader is None:
             unavailable.append(branch)
             continue
+        branch_uid = branch_local_uids.setdefault(
+            branch,
+            f"cohort-{leader.robot_id:04d}",
+        )
+        for robot in robots:
+            robot.local_branch_uid_by_key.setdefault(branch, branch_uid)
         candidates, selected_hop = minimum_k_hop_guard_group(
             leader,
             robots,
@@ -3100,9 +3156,10 @@ def begin_junction_guard_formation(robots) -> None:
     )
 
 def junction_guards_formed(robots) -> bool:
+    visited = observed_visited_branches(robots)
     guards = [robot for robot in robots if robot.role == "JUNCTION_GUARD"]
     if not guards or any(
-        branch_states.get(branch) == "UNVISITED"
+        branch not in visited
         and branch in detected_branch_candidates
         and branch not in junction_guard_groups
         for branch in BRANCHES
@@ -3905,83 +3962,104 @@ def update_communication_neighbors(robots, grid):
     add_redundant_backtrack_bridge_links(robots, linked_pairs)
 
 
-def get_anchor_deployment_motion_scale(anchor):
-    if anchor is None or anchor.role != "ANCHOR":
-        return 0.0
-    # Anchor may only move while it remains connected to the fixed Base.
-    if not anchor.connected_to_base:
-        return 0.0
-    neighbors = [
-        neighbor for neighbor in anchor.comm_neighbors
-        if getattr(neighbor, "role", None) not in {"ANCHOR", "BASE"}
-    ]
-    if len(neighbors) < ANCHOR_MIN_DIRECT_NEIGHBORS:
-        return 0.0
-    nearest = min(anchor.position.distance_to(neighbor.position) for neighbor in neighbors)
-    if nearest <= ANCHOR_LINK_WARNING_DISTANCE:
-        return 1.0
-    if nearest >= ANCHOR_LINK_STOP_DISTANCE:
-        return 0.0
-    return clamp(
-        (ANCHOR_LINK_STOP_DISTANCE - nearest)
-        / (ANCHOR_LINK_STOP_DISTANCE - ANCHOR_LINK_WARNING_DISTANCE),
-        0.0,
-        1.0,
-    )
-
-
-def anchor_deployment_ready(anchor, robots):
-    if anchor is None or anchor.anchor_position is None:
-        return False
-    if anchor.position.distance_to(anchor.anchor_position) > ANCHOR_POSITION_TOLERANCE:
-        return False
-    if not anchor.connected_to_base or not trunk_plan_ready(robots):
-        return False
-    usable = [
-        neighbor
-        for neighbor in anchor.comm_neighbors
-        if getattr(neighbor, "role", None) not in {"ANCHOR", "BASE"}
-        and anchor.position.distance_to(neighbor.position) <= COMM_RANGE * 0.92
-    ]
-    return len(usable) >= ANCHOR_READY_DIRECT_NEIGHBORS
-
-
-def get_anchor_message(
-    anchor,
-    junction_id: str = CURRENT_JUNCTION_ID,
-):
+def get_distributed_message(junction_id: str = CURRENT_JUNCTION_ID):
     junction_state = get_junction_state(junction_id)
-    if anchor is None:
-        return (
-            junction_id,
-            junction_state.state_sequence,
-            distributed_consensus_branch,
-            (
-                f"DISTRIBUTED_{phase.name}"
-                if distributed_consensus_branch is not None
-                else "DISTRIBUTED_VOTING"
-            ),
-            branch_gate_states.copy(),
-        )
-    if not anchor.connected_to_base:
-        return (
-            junction_id,
-            junction_state.state_sequence,
-            None,
-            "WAIT_FOR_BASE_LINK",
-            None,
-        )
     return (
-        anchor.anchor_junction_id or junction_id,
+        junction_id,
         junction_state.state_sequence,
-        anchor.selected_branch,
-        phase.name,
-        anchor.branch_gate_states.copy(),
+        distributed_consensus_branch,
+        f"DISTRIBUTED_{phase.name}",
+        branch_gate_states.copy(),
     )
 
 
-def propagate_base_message(robots, anchor):
-    """Compute Base-rooted paths and mirror the NORMAL peer-consensus state.
+def pebble_flow_state_from_marker(
+    pebble: "Robot",
+) -> Optional[PebbleFlowState]:
+    """Create a relay-safe fact from one force-free VISITED marker."""
+    if (
+        pebble.pebble_state != "VISITED"
+        or not pebble.pebble_branch_uid
+        or pebble.pebble_anchor is None
+        or pebble.pebble_ingress_direction_local is None
+        or pebble.pebble_return_direction_local is None
+    ):
+        return None
+    ingress = pebble.pebble_ingress_direction_local
+    return_direction = pebble.pebble_return_direction_local
+    if (
+        ingress.length_squared() <= EPSILON
+        or return_direction.length_squared() <= EPSILON
+    ):
+        return None
+    ingress = ingress.normalize()
+    return_direction = return_direction.normalize()
+    return PebbleFlowState(
+        branch_uid=pebble.pebble_branch_uid,
+        branch_key=pebble.pebble_branch_key,
+        mouth_position=(pebble.pebble_anchor.x, pebble.pebble_anchor.y),
+        ingress_direction_local=(ingress.x, ingress.y),
+        return_direction_local=(return_direction.x, return_direction.y),
+        completion_epoch=pebble.pebble_completion_epoch,
+    )
+
+
+def propagate_local_visited_knowledge(robots) -> None:
+    """Exchange complete Pebble facts one local communication hop per frame."""
+    global pebble_rx_logged
+    snapshots = {
+        robot.robot_id: dict(robot.known_pebble_flow_states)
+        for robot in robots
+    }
+    for pebble in get_pebbles(robots):
+        state = pebble_flow_state_from_marker(pebble)
+        if state is not None:
+            snapshots[pebble.robot_id][state.branch_uid] = state
+    for robot in robots:
+        previous_uids = set(robot.known_pebble_flow_states)
+        learned_states = dict(robot.known_pebble_flow_states)
+        for neighbor in robot.comm_neighbors:
+            neighbor_id = getattr(neighbor, "robot_id", -1)
+            if neighbor_id < 0:
+                continue
+            for branch_uid, state in snapshots.get(neighbor_id, {}).items():
+                previous = learned_states.get(branch_uid)
+                if (
+                    previous is None
+                    or state.completion_epoch > previous.completion_epoch
+                ):
+                    learned_states[branch_uid] = state
+        newly_learned = set(learned_states) - previous_uids
+        if not learned_states:
+            continue
+        robot.known_pebble_flow_states.update(learned_states)
+        robot.known_visited_branch_uids.update(learned_states)
+        uid_to_key = {
+            uid: key
+            for key, uid in robot.local_branch_uid_by_key.items()
+        }
+        for branch_uid, state in learned_states.items():
+            branch = uid_to_key.get(branch_uid)
+            if branch is None:
+                continue
+            robot.known_visited_branches.add(branch)
+            robot.local_branch_states[branch] = "VISITED"
+            robot.branch_vote = None
+            if (
+                branch_uid in newly_learned
+                and branch_uid not in pebble_rx_logged
+            ):
+                pebble_rx_logged.add(branch_uid)
+                print(
+                    f"[PebbleRx] robot={robot.robot_id} learned VISITED "
+                    f"branch={branch_uid} ingress="
+                    f"({state.ingress_direction_local[0]:.3f},"
+                    f"{state.ingress_direction_local[1]:.3f})"
+                )
+
+
+def propagate_base_message(robots):
+    """Compute Base-rooted paths and observe the peer-consensus state.
 
     The Base is only a communication root/observer. It does not select a
     branch, assign roles, or issue motion commands.
@@ -4027,7 +4105,7 @@ def propagate_base_message(robots, anchor):
         selected_branch,
         command,
         gate_states,
-    ) = get_anchor_message(anchor)
+    ) = get_distributed_message()
     gate_signature = (
         tuple(sorted(gate_states.items()))
         if gate_states is not None
@@ -4069,24 +4147,15 @@ def propagate_base_message(robots, anchor):
     for robot in robots:
         if not robot.connected_to_base:
             continue
-        if anchor is None:
-            robot.received_branch = robot.distributed_branch_decision
-            robot.received_command = (
-                "PEER_CONSENSUS"
-                if robot.distributed_branch_decision is not None
-                else "LOCAL_VOTING"
-            )
-            robot.received_gate_states = (
-                branch_gate_states.copy()
-                if robot.distributed_branch_decision is not None
-                else None
-            )
-        else:
-            robot.received_branch = selected_branch
-            robot.received_command = command
-            robot.received_gate_states = (
-                gate_states.copy() if gate_states is not None else None
-            )
+        robot.received_branch = robot.distributed_branch_decision
+        robot.received_command = (
+            "PEER_CONSENSUS"
+            if robot.distributed_branch_decision is not None
+            else "LOCAL_VOTING"
+        )
+        robot.received_gate_states = (
+            gate_states.copy() if gate_states is not None else None
+        )
         robot.received_junction_id = message_junction_id
         robot.received_state_sequence = state_sequence
         robot.received_sequence = communication_sequence
@@ -4096,9 +4165,7 @@ def propagate_base_message(robots, anchor):
                     message_junction_id
                 ).state_epoch,
                 "sequence": state_sequence,
-                "branch_states": get_junction_state(
-                    message_junction_id
-                ).branch_states.copy(),
+                "branch_states": robot.local_branch_states.copy(),
                 "gate_states": gate_states.copy(),
                 "selected_branch": robot.received_branch,
             }
@@ -4106,7 +4173,8 @@ def propagate_base_message(robots, anchor):
 
 def update_communication_system(robots, grid):
     update_communication_neighbors(robots, grid)
-    propagate_base_message(robots, junction_anchor)
+    propagate_local_visited_knowledge(robots)
+    propagate_base_message(robots)
 
 
 def find_nearest_connected_robot(robot, grid):
@@ -4149,7 +4217,7 @@ def apply_communication_velocity_guard(robot, dt):
     if (
         not robot.connected_to_base
         or parent is None
-        or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}
+        or robot.role in {"PEBBLE", "RELAY", "TRUNK_RELAY"}
     ):
         return
     separation = robot.position - parent.position
@@ -4195,7 +4263,7 @@ def constrain_communication_parent_separation(robot, old_position):
     if (
         not robot.connected_to_base
         or parent is None
-        or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}
+        or robot.role in {"PEBBLE", "RELAY", "TRUNK_RELAY"}
     ):
         return
     bounded = limit_communication_proposed_position(
@@ -4220,7 +4288,7 @@ def constrain_communication_parent_separation(robot, old_position):
 
 
 def compute_connectivity_force(robot, grid):
-    if base_station is None or robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}:
+    if base_station is None or robot.role in {"PEBBLE", "RELAY", "TRUNK_RELAY"}:
         return pygame.Vector2()
     if robot.connected_to_base:
         parent = robot.comm_parent
@@ -4289,7 +4357,7 @@ def get_communication_stats(robots):
             "max_hop": 0,
             "direct": 0,
             "margin": 0.0,
-            "anchor_connected": False,
+            "pebble_connected": 0,
         }
     connected = [robot for robot in robots if robot.connected_to_base]
     margins = [
@@ -4303,7 +4371,9 @@ def get_communication_stats(robots):
         "max_hop": max((robot.comm_hop for robot in connected), default=0),
         "direct": len(base_station.comm_neighbors),
         "margin": min(margins) if margins else COMM_RANGE,
-        "anchor_connected": bool(junction_anchor and junction_anchor.connected_to_base),
+        "pebble_connected": sum(
+            pebble.connected_to_base for pebble in get_pebbles(robots)
+        ),
     }
 
 
@@ -4353,17 +4423,15 @@ def initialize_trunk_relay_plan():
 
 
 def trunk_path_progress(position):
-    junction_state = get_junction_state()
-    endpoint = (
-        junction_state.selected_anchor_position
-        if junction_state.selected_anchor_position is not None
-        else junction_state.anchor_slots[0]
-    )
-    vector = endpoint - BASE_POSITION
-    length = vector.length()
+    forward = junction_inference_tracker.forward_direction
+    if forward.length_squared() <= EPSILON:
+        forward = pygame.Vector2(0.0, -1.0)
+    else:
+        forward = forward.normalize()
+    length = base_length + corridor_width
     if length <= EPSILON:
         return 0.0
-    return clamp((position - BASE_POSITION).dot(vector / length), 0.0, length)
+    return clamp((position - BASE_POSITION).dot(forward), 0.0, length)
 
 
 def get_trunk_relays(robots):
@@ -4506,8 +4574,6 @@ def draw_trunk_relay_plan(surface, robots):
         pygame.draw.circle(surface, TRUNK_RELAY_COLOR, slot["position"], 3, width=1)
     nodes = [base_station] if base_station is not None else []
     nodes.extend(get_trunk_relays(robots))
-    if junction_anchor is not None:
-        nodes.append(junction_anchor)
     for first, second in zip(nodes, nodes[1:]):
         pygame.draw.line(surface, TRUNK_RELAY_COLOR, first.position, second.position, width=2)
 
@@ -4839,320 +4905,12 @@ def draw_relay_plan(surface, robots):
     for first, second in zip(nodes, nodes[1:]):
         pygame.draw.line(surface, RELAY_COLOR, first.position, second.position, width=2)
 
-# =========================================================
-# 12. Anchor election and cost-guided branch ordering
-# =========================================================
-
-
-def update_anchor_entry_records(robots, current_time):
-    for robot in robots:
-        robot.current_junction_id = None
-        for junction_id, junction_state in junctions.items():
-            inside_junction = junction_state.rect.collidepoint(
-                robot.position.x,
-                robot.position.y,
-            )
-            inside_anchor_region = junction_state.anchor_region.collidepoint(
-                robot.position.x,
-                robot.position.y,
-            )
-            was_inside = robot.was_in_anchor_regions.get(junction_id, False)
-            if inside_junction:
-                robot.current_junction_id = junction_id
-            if (
-                inside_anchor_region
-                and not was_inside
-                and junction_id not in robot.anchor_region_entry_times
-                and robot.role == "NORMAL"
-            ):
-                robot.anchor_region_entry_times[junction_id] = current_time
-                if junction_id == CURRENT_JUNCTION_ID:
-                    robot.anchor_region_entry_time = current_time
-            robot.was_in_anchor_regions[junction_id] = inside_anchor_region
-            if junction_id == CURRENT_JUNCTION_ID:
-                robot.was_in_anchor_region = inside_anchor_region
-
-
-def local_visible_neighbor_count(robot, robots):
-    count = 0
-    margin_sum = 0.0
-    for other in robots:
-        if other is robot or other.role == "ANCHOR":
-            continue
-        distance = robot.position.distance_to(other.position)
-        if distance <= ANCHOR_LOCAL_COMM_RANGE and has_line_of_sight(robot.position, other.position):
-            count += 1
-            margin_sum += ANCHOR_LOCAL_COMM_RANGE - distance
-    average_margin = margin_sum / count if count else 0.0
-    return count, average_margin
-
-
-def point_to_segment_distance(point, segment_start, segment_end):
-    """Return the shortest distance from *point* to a finite line segment."""
-    segment = segment_end - segment_start
-    length_squared = segment.length_squared()
-    if length_squared <= EPSILON:
-        return point.distance_to(segment_start)
-    projection = clamp(
-        (point - segment_start).dot(segment) / length_squared,
-        0.0,
-        1.0,
-    )
-    closest = segment_start + projection * segment
-    return point.distance_to(closest)
-
-
-def anchor_branch_flow_penalty(
-    park_position: pygame.Vector2,
-    selected_branch: Optional[str],
-    junction_state: JunctionState,
-) -> float:
-    """Penalize a slot lying on the open Branch side of the Junction."""
-    if selected_branch not in BRANCH_DIRECTIONS:
-        return 0.0
-    center = pygame.Vector2(junction_state.rect.center)
-    radial = park_position - center
-    if radial.length_squared() <= EPSILON:
-        return 1.0
-    alignment = radial.normalize().dot(BRANCH_DIRECTIONS[selected_branch])
-    return max(0.0, alignment)
-
-
-def anchor_movement_obstruction_cost(
-    candidate,
-    robots,
-    park_position: pygame.Vector2,
-    junction_state: JunctionState,
-):
-    """Estimate how much parking this candidate disrupts Junction flow.
-
-    The deployment corridor from the candidate to the fixed edge parking
-    position is treated as a swept path. NORMAL robots close to that corridor
-    contribute more cost, with an additional penalty for removing a robot from
-    a locally dense part of the fluid body.
-    """
-    corridor_load = 0.0
-    local_flow_load = 0.0
-    start = candidate.position
-    end = park_position
-    for other in robots:
-        if (
-            other is candidate
-            or other.role != "NORMAL"
-            or not junction_state.rect.collidepoint(
-                other.position.x,
-                other.position.y,
-            )
-        ):
-            continue
-
-        corridor_distance = point_to_segment_distance(
-            other.position,
-            start,
-            end,
-        )
-        if corridor_distance < ANCHOR_OBSTRUCTION_RADIUS:
-            corridor_load += (
-                1.0
-                - corridor_distance / ANCHOR_OBSTRUCTION_RADIUS
-            )
-
-        local_distance = candidate.position.distance_to(other.position)
-        if local_distance < ANCHOR_OBSTRUCTION_RADIUS:
-            local_flow_load += (
-                1.0
-                - local_distance / ANCHOR_OBSTRUCTION_RADIUS
-            )
-
-    branch_flow_load = anchor_branch_flow_penalty(
-        park_position,
-        distributed_consensus_branch,
-        junction_state,
-    )
-    return corridor_load + 0.5 * local_flow_load + 2.0 * branch_flow_load
-
-
-def normalized_minimum_cost(value, minimum, maximum):
-    """Map a raw metric to [0, 1], where the smallest value is best."""
-    if maximum - minimum <= EPSILON:
-        return 0.0
-    return clamp((value - minimum) / (maximum - minimum), 0.0, 1.0)
-
-
-def compute_anchor_candidate_costs(
-    candidates,
-    robots,
-    junction_state: JunctionState,
-):
-    if not candidates:
-        return
-
-    junction_id = junction_state.junction_id
-    entry_times = [
-        candidate.anchor_region_entry_times[junction_id]
-        for candidate in candidates
-    ]
-    min_time, max_time = min(entry_times), max(entry_times)
-
-    parking_distances = {
-        (candidate.robot_id, slot_index): candidate.position.distance_to(slot)
-        for candidate in candidates
-        for slot_index, slot in enumerate(junction_state.anchor_slots)
-    }
-    min_parking_distance = min(parking_distances.values(), default=0.0)
-    max_parking_distance = max(parking_distances.values(), default=0.0)
-
-    obstruction_loads = {
-        (candidate.robot_id, slot_index): anchor_movement_obstruction_cost(
-            candidate,
-            robots,
-            slot,
-            junction_state,
-        )
-        for candidate in candidates
-        for slot_index, slot in enumerate(junction_state.anchor_slots)
-    }
-    min_obstruction = min(obstruction_loads.values(), default=0.0)
-    max_obstruction = max(obstruction_loads.values(), default=0.0)
-
-    neighbor_info = {
-        candidate.robot_id: local_visible_neighbor_count(candidate, robots)
-        for candidate in candidates
-    }
-    max_neighbors = max((info[0] for info in neighbor_info.values()), default=1)
-    max_margin = max((info[1] for info in neighbor_info.values()), default=1.0)
-
-    for candidate in candidates:
-        arrival_cost = normalized_minimum_cost(
-            candidate.anchor_region_entry_times[junction_id],
-            min_time,
-            max_time,
-        )
-        neighbor_count, average_margin = neighbor_info[candidate.robot_id]
-        communication_quality = (
-            0.6 * neighbor_count / max(max_neighbors, 1)
-            + 0.4 * average_margin / max(max_margin, EPSILON)
-        )
-        communication_cost = 1.0 - clamp(
-            communication_quality,
-            0.0,
-            1.0,
-        )
-
-        slot_costs = []
-        for slot_index, slot in enumerate(junction_state.anchor_slots):
-            pair_key = (candidate.robot_id, slot_index)
-            parking_cost = normalized_minimum_cost(
-                parking_distances[pair_key],
-                min_parking_distance,
-                max_parking_distance,
-            )
-            obstruction_cost = normalized_minimum_cost(
-                obstruction_loads[pair_key],
-                min_obstruction,
-                max_obstruction,
-            )
-            components = {
-                "arrival": arrival_cost,
-                "parking": parking_cost,
-                "obstruction": obstruction_cost,
-                "communication": communication_cost,
-            }
-            total_cost = (
-                ANCHOR_COST_WEIGHT_ARRIVAL * arrival_cost
-                + ANCHOR_COST_WEIGHT_PARKING * parking_cost
-                + ANCHOR_COST_WEIGHT_OBSTRUCTION * obstruction_cost
-                + ANCHOR_COST_WEIGHT_COMMUNICATION * communication_cost
-            )
-            slot_costs.append(
-                (total_cost, slot_index, slot, components)
-            )
-
-        best_cost, _, best_slot, best_components = min(
-            slot_costs,
-            key=lambda item: (item[0], item[1]),
-        )
-        candidate.anchor_election_cost = best_cost
-        candidate.anchor_candidate_position = best_slot.copy()
-        candidate.anchor_cost_components = best_components
-
-
-def elect_junction_anchor(
-    robots,
-    junction_id: str = CURRENT_JUNCTION_ID,
-):
-    global junction_anchor
-    junction_state = get_junction_state(junction_id)
-    existing_anchor = junction_anchors.get(junction_id)
-    if existing_anchor is not None:
-        return existing_anchor
-    candidates = [
-        robot
-        for robot in robots
-        if (
-            robot.role == "NORMAL"
-            and junction_id in robot.anchor_region_entry_times
-            and junction_state.rect.collidepoint(
-                robot.position.x,
-                robot.position.y,
-            )
-        )
-    ]
-    if not candidates:
-        return None
-    first_entry = min(
-        candidate.anchor_region_entry_times[junction_id]
-        for candidate in candidates
-    )
-    if len(candidates) < ANCHOR_ELECTION_MIN_CANDIDATES and simulation_time - first_entry < ANCHOR_ELECTION_WAIT_TIME:
-        return None
-    compute_anchor_candidate_costs(candidates, robots, junction_state)
-    elected_anchor = min(
-        candidates,
-        key=lambda robot: (
-            robot.anchor_election_cost,
-            robot.anchor_region_entry_times[junction_id],
-            robot.robot_id,
-        ),
-    )
-    elected_anchor.role = "ANCHOR"
-    elected_anchor.anchor_junction_id = junction_id
-    elected_anchor.anchor_position = (
-        elected_anchor.anchor_candidate_position.copy()
-    )
-    elected_anchor.local_branch_states = junction_state.branch_states.copy()
-    elected_anchor.selected_branch = junction_state.selected_branch
-    elected_anchor.branch_gate_states = junction_state.gate_states.copy()
-    junction_state.anchor_robot_id = elected_anchor.robot_id
-    junction_state.selected_anchor_position = (
-        elected_anchor.anchor_position.copy()
-    )
-    junction_anchors[junction_id] = elected_anchor
-    if junction_id == CURRENT_JUNCTION_ID:
-        junction_anchor = elected_anchor
-    components = elected_anchor.anchor_cost_components
-    print(
-        f"[Anchor] junction={junction_id}, "
-        f"robot={elected_anchor.robot_id}, "
-        f"minimum_cost={elected_anchor.anchor_election_cost:.3f}, "
-        f"arrival={components['arrival']:.3f}, "
-        f"parking={components['parking']:.3f}, "
-        f"obstruction={components['obstruction']:.3f}, "
-        f"communication={components['communication']:.3f}, "
-        f"entry={elected_anchor.anchor_region_entry_times[junction_id]:.3f}, "
-        f"slot=({elected_anchor.anchor_position.x:.1f},"
-        f"{elected_anchor.anchor_position.y:.1f})"
-    )
-    return elected_anchor
-
-
-def preserve_consensus_at_anchor(
-    anchor: Optional["Robot"],
+def record_distributed_consensus(
     selected_branch: Optional[str] = None,
     clear_selection: bool = False,
     junction_id: str = CURRENT_JUNCTION_ID,
 ) -> None:
-    """Store a NORMAL peer-consensus result without making Anchor decide it."""
+    """Record consensus for diagnostics; robots retain their own local copy."""
     junction_state = get_junction_state(junction_id)
     effective_selection = (
         None
@@ -5169,28 +4927,287 @@ def preserve_consensus_at_anchor(
         effective_selection,
         simulation_time,
     )
-    if anchor is None or anchor.role != "ANCHOR":
-        return
-    anchor.local_branch_states = junction_state.branch_states.copy()
-    if clear_selection:
-        anchor.selected_branch = None
-        anchor.distributed_branch_decision = None
-    elif selected_branch is not None:
-        anchor.selected_branch = selected_branch
-        anchor.distributed_branch_decision = selected_branch
-    anchor.branch_gate_states = junction_state.gate_states.copy()
-    anchor.known_junction_states[junction_id] = {
-        "epoch": junction_state.state_epoch,
-        "sequence": junction_state.state_sequence,
-        "branch_states": junction_state.branch_states.copy(),
-        "gate_states": junction_state.gate_states.copy(),
-        "selected_branch": junction_state.selected_branch,
-        "selected_edge_id": junction_state.edge_id_for_branch(
-            junction_state.selected_branch
-        ) if junction_state.selected_branch is not None else None,
-        "parent_junction_id": junction_state.parent_junction_id,
-        "parent_edge_id": junction_state.parent_edge_id,
+
+
+def get_pebbles(robots) -> list["Robot"]:
+    return [robot for robot in robots if robot.role == "PEBBLE"]
+
+
+def observed_visited_branches(robots) -> set[str]:
+    return {
+        pebble.pebble_branch_key
+        for pebble in get_pebbles(robots)
+        if pebble.pebble_state == "VISITED"
+        and pebble.pebble_branch_key is not None
     }
+
+
+def return_mobile_target_count(robots) -> int:
+    """All non-marker robots must return; persistent Pebbles stay in place."""
+    return len(robots) - len(get_pebbles(robots))
+
+
+def update_local_ingress_tangents(robots) -> None:
+    """Estimate ingress from each robot's own mouth-to-outbound trajectory."""
+    for robot in robots:
+        if robot.role not in {"NORMAL", "FRONTIER_SHEPHERD"}:
+            continue
+        branch = get_robot_region(robot.position)
+        if branch not in BRANCHES:
+            continue
+        velocity = robot.observed_velocity
+        if velocity.length_squared() <= EPSILON:
+            continue
+        mouth_observation = robot.local_branch_ingress_points.get(branch)
+        if mouth_observation is None:
+            robot.local_branch_ingress_points[branch] = robot.position.copy()
+            robot.local_ingress_tangents[branch] = velocity.normalize()
+            continue
+        outbound_displacement = robot.position - mouth_observation
+        if (
+            outbound_displacement.length()
+            < PEBBLE_INGRESS_MIN_OBSERVED_TRAVEL
+            or velocity.dot(outbound_displacement) <= 0.0
+        ):
+            continue
+        observed_tangent = outbound_displacement.normalize()
+        previous_tangent = robot.local_ingress_tangents.get(branch)
+        if previous_tangent is None or previous_tangent.length_squared() <= EPSILON:
+            robot.local_ingress_tangents[branch] = observed_tangent
+            continue
+        if previous_tangent.dot(observed_tangent) < 0.0:
+            previous_tangent = -previous_tangent
+        filtered = (
+            previous_tangent.normalize()
+            * (1.0 - PEBBLE_INGRESS_DIRECTION_FILTER_ALPHA)
+            + observed_tangent * PEBBLE_INGRESS_DIRECTION_FILTER_ALPHA
+        )
+        if filtered.length_squared() > EPSILON:
+            robot.local_ingress_tangents[branch] = filtered.normalize()
+
+
+def maybe_stage_pebble_at_return_crossing(
+    robot: "Robot",
+    old_position: pygame.Vector2,
+) -> bool:
+    """Freeze one returning NORMAL at its observed mouth-plane crossing.
+
+    The plane is reconstructed from that robot's outbound observation. No
+    predefined entrance coordinate, teleport, or position projection is used.
+    The marker remains PENDING until the normal Branch-completion evidence is
+    confirmed.
+    """
+    global pending_pebble_robot_ids
+    if (
+        phase != SimulationPhase.FLOW_BACKTRACK
+        or robot.role != "NORMAL"
+        or branch_states.get(active_branch) != "ACTIVE"
+        or active_branch in pending_pebble_robot_ids
+    ):
+        return False
+    ingress = robot.local_ingress_tangents.get(active_branch)
+    mouth_observation = robot.local_branch_ingress_points.get(active_branch)
+    if (
+        ingress is None
+        or mouth_observation is None
+        or ingress.length_squared() <= EPSILON
+    ):
+        return False
+    ingress = ingress.normalize()
+    return_direction = -ingress
+    old_depth = (old_position - mouth_observation).dot(ingress)
+    new_depth = (robot.position - mouth_observation).dot(ingress)
+    return_speed = robot.observed_velocity.dot(return_direction)
+    if not (
+        old_depth > 0.0
+        and new_depth <= 0.0
+        and return_speed >= PEBBLE_CROSSING_MIN_RETURN_SPEED
+    ):
+        return False
+
+    robot.local_return_mouth_crossings[active_branch] = robot.position.copy()
+    robot.role = "PEBBLE"
+    robot.pebble_anchor = robot.position.copy()
+    robot.pebble_branch_uid = branch_local_uids.get(
+        active_branch,
+        f"cohort-{robot.robot_id:04d}",
+    )
+    robot.pebble_branch_key = active_branch
+    robot.pebble_state = "PENDING_RETURN_CONFIRMATION"
+    robot.pebble_ingress_direction_local = ingress.copy()
+    robot.pebble_return_direction_local = return_direction.copy()
+    robot.pebble_completion_epoch = 0
+    robot.transfer_target = None
+    robot.velocity.update(0.0, 0.0)
+    robot.acceleration.update(0.0, 0.0)
+    robot.filtered_acceleration.update(0.0, 0.0)
+    pending_pebble_robot_ids[active_branch] = robot.robot_id
+    print(
+        f"[Pebble] branch={robot.pebble_branch_uid} robot={robot.robot_id} "
+        "staged at observed return mouth crossing"
+    )
+    return True
+
+
+def stage_pebble_from_returned_shepherd_line(
+    robots,
+    branch: str,
+) -> Optional["Robot"]:
+    """Use an actually returned Shepherd when completion follows immediately."""
+    global pending_pebble_robot_ids
+    if branch in pending_pebble_robot_ids:
+        return next(
+            (
+                robot for robot in robots
+                if robot.robot_id == pending_pebble_robot_ids[branch]
+            ),
+            None,
+        )
+    candidates = [
+        robot for robot in robots
+        if robot.role == "SHEPHERD"
+        and robot.shepherd_branch == branch
+        and branch in robot.local_ingress_tangents
+        and branch in robot.local_branch_ingress_points
+        and robot.position.distance_to(
+            robot.local_branch_ingress_points[branch]
+        ) <= PEBBLE_MOUTH_RADIUS
+    ]
+    if not candidates:
+        return None
+    pebble = min(
+        candidates,
+        key=lambda robot: (
+            robot.position.distance_squared_to(
+                robot.local_branch_ingress_points[branch]
+            ),
+            robot.robot_id,
+        ),
+    )
+    ingress = pebble.local_ingress_tangents[branch]
+    if ingress.length_squared() <= EPSILON:
+        return None
+    ingress = ingress.normalize()
+    pebble.local_return_mouth_crossings[branch] = pebble.position.copy()
+    pebble.role = "PEBBLE"
+    pebble.pebble_anchor = pebble.position.copy()
+    pebble.pebble_branch_uid = branch_local_uids.get(
+        branch,
+        f"cohort-{pebble.robot_id:04d}",
+    )
+    pebble.pebble_branch_key = branch
+    pebble.pebble_state = "PENDING_RETURN_CONFIRMATION"
+    pebble.pebble_ingress_direction_local = ingress.copy()
+    pebble.pebble_return_direction_local = -ingress
+    pebble.pebble_completion_epoch = 0
+    pebble.shepherd_anchor = None
+    pebble.shepherd_origin = None
+    pebble.shepherd_branch = None
+    pebble.transfer_target = None
+    pebble.velocity.update(0.0, 0.0)
+    pebble.acceleration.update(0.0, 0.0)
+    pebble.filtered_acceleration.update(0.0, 0.0)
+    pending_pebble_robot_ids[branch] = pebble.robot_id
+    print(
+        f"[Pebble] branch={pebble.pebble_branch_uid} "
+        f"robot={pebble.robot_id} staged from returned Shepherd crossing"
+    )
+    return pebble
+
+
+def create_branch_pebble(robots, branch: str) -> Optional["Robot"]:
+    """Promote a mouth-crossing marker after Branch completion evidence."""
+    global branch_completion_epoch, pending_pebble_robot_ids
+    if branch in observed_visited_branches(robots):
+        return next(
+            pebble for pebble in get_pebbles(robots)
+            if pebble.pebble_branch_key == branch
+        )
+    pending_id = pending_pebble_robot_ids.get(branch)
+    pebble = next(
+        (
+            robot for robot in robots
+            if robot.robot_id == pending_id
+            and robot.role == "PEBBLE"
+            and robot.pebble_branch_key == branch
+        ),
+        None,
+    )
+    if pebble is None:
+        # Robust fallback for a cohort whose discrete trajectory did not cross
+        # its recorded plane during the sampled backflow. The selected robot
+        # is frozen where it physically stands; it is never moved to a map
+        # entrance coordinate.
+        candidates = [
+            robot for robot in robots
+            if robot.role == "NORMAL"
+            and branch in robot.local_ingress_tangents
+            and branch in robot.local_branch_ingress_points
+        ]
+        pebble = min(
+            candidates,
+            key=lambda robot: (
+                robot.position.distance_squared_to(
+                    robot.local_branch_ingress_points[branch]
+                ),
+                robot.robot_id,
+            ),
+            default=None,
+        )
+        if pebble is None:
+            return None
+        ingress = pebble.local_ingress_tangents[branch]
+        if ingress.length_squared() <= EPSILON:
+            return None
+        ingress = ingress.normalize()
+        pebble.role = "PEBBLE"
+        pebble.pebble_anchor = pebble.position.copy()
+        pebble.pebble_branch_uid = branch_local_uids.get(
+            branch,
+            f"cohort-{pebble.robot_id:04d}",
+        )
+        pebble.pebble_branch_key = branch
+        pebble.pebble_ingress_direction_local = ingress.copy()
+        pebble.pebble_return_direction_local = -ingress
+        pending_pebble_robot_ids[branch] = pebble.robot_id
+        print(
+            f"[Pebble] branch={pebble.pebble_branch_uid} "
+            f"robot={pebble.robot_id} fallback frozen at current local pose"
+        )
+    ingress = pebble.pebble_ingress_direction_local
+    return_direction = pebble.pebble_return_direction_local
+    if (
+        ingress is None
+        or return_direction is None
+        or ingress.length_squared() <= EPSILON
+        or return_direction.length_squared() <= EPSILON
+    ):
+        return None
+    ingress = ingress.normalize()
+    return_direction = return_direction.normalize()
+    branch_completion_epoch += 1
+    pebble.pebble_state = "VISITED"
+    pebble.pebble_ingress_direction_local = ingress.copy()
+    pebble.pebble_return_direction_local = return_direction.copy()
+    pebble.pebble_completion_epoch = branch_completion_epoch
+    pebble.known_visited_branches.add(branch)
+    pebble.known_visited_branch_uids.add(pebble.pebble_branch_uid)
+    state = pebble_flow_state_from_marker(pebble)
+    if state is not None:
+        pebble.known_pebble_flow_states[state.branch_uid] = state
+    pebble.velocity.update(0.0, 0.0)
+    pebble.acceleration.update(0.0, 0.0)
+    print(
+        f"[Pebble] branch={pebble.pebble_branch_uid} robot={pebble.robot_id} "
+        "created state=VISITED"
+    )
+    print(
+        f"[Pebble] branch={pebble.pebble_branch_uid} ingress_bearing="
+        f"({ingress.x:.3f},{ingress.y:.3f}) return_bearing="
+        f"({return_direction.x:.3f},{return_direction.y:.3f}) "
+        f"epoch={branch_completion_epoch}"
+    )
+    return pebble
 
 
 def reachable_nodes_without_branch(branch: str) -> set[str]:
@@ -5208,11 +5225,12 @@ def reachable_nodes_without_branch(branch: str) -> set[str]:
     return visited
 
 
-def structural_loss(branch: str) -> int:
+def structural_loss(branch: str, robots) -> int:
     reachable = reachable_nodes_without_branch(branch)
+    visited_branches = observed_visited_branches(robots)
     loss = 0
     for candidate in BRANCHES:
-        if branch_states[candidate] == "VISITED":
+        if candidate in visited_branches:
             continue
         if BRANCH_TARGET_NODE[candidate] not in reachable:
             loss += 1
@@ -6089,8 +6107,6 @@ def evaluate_rollout_communication_risk(
         relay.position.copy()
         for relay in get_trunk_relays(robots)
     )
-    if junction_anchor is not None:
-        fixed_positions.append(junction_anchor.position.copy())
 
     positions = fixed_positions + [particle.position.copy() for particle in particles]
     fixed_count = len(fixed_positions)
@@ -6560,7 +6576,7 @@ def branch_efficiency_cost(
         "observed_contact_risk": contact_risk,
         "effective_width": effective_width,
         "narrowness": narrowness,
-        "structural_loss": structural_loss(branch),
+        "structural_loss": structural_loss(branch, robots),
         "ordering_robot_count": len(ordering_robots),
         "regional_robot_count": len(region_robots),
     }
@@ -6588,13 +6604,36 @@ def prepare_branch_candidate_scores(robots, reference_density: float) -> list[st
     global last_proxy_mass_stats, last_proxy_robot_assignment
     global last_proxy_candidates, last_flow_rollout_scores
 
+    local_voters = [
+        robot for robot in robots
+        if robot.role == "NORMAL"
+        and robot.connected_to_base
+        and get_robot_region(robot.position) == "JUNCTION"
+    ]
+    knowledge_quorum = max(
+        DISTRIBUTED_VOTE_MIN_ROBOTS,
+        math.ceil(len(local_voters) * DISTRIBUTED_VOTE_QUORUM_RATIO),
+    )
+    quorum_visited = {
+        branch for branch in BRANCHES
+        if sum(
+            branch in robot.known_visited_branches
+            for robot in local_voters
+        ) >= knowledge_quorum
+    }
     candidates = [
         branch
         for branch in FIXED_BRANCH_ORDER
         if branch in detected_branch_candidates
-        and branch_states.get(branch) == "UNVISITED"
+        and branch not in quorum_visited
     ]
     signature = tuple(candidates)
+    if signature != last_proxy_candidates:
+        for branch in sorted(quorum_visited & detected_branch_candidates):
+            print(
+                "[Vote] excluded visited branch="
+                f"{branch_local_uids.get(branch, branch)}"
+            )
     if (
         signature == last_proxy_candidates
         and all(branch in last_flow_rollout_scores for branch in candidates)
@@ -6666,13 +6705,28 @@ def update_distributed_branch_consensus(
     if len(voters) < DISTRIBUTED_VOTE_MIN_ROBOTS:
         return None
 
+    locally_excluded = set().union(
+        *(robot.known_visited_branches for robot in voters)
+    )
+    for branch in sorted(locally_excluded & set(candidates)):
+        uid = next(
+            (
+                robot.local_branch_uid_by_key.get(branch)
+                for robot in voters
+                if robot.local_branch_uid_by_key.get(branch) is not None
+            ),
+            branch,
+        )
+        print(f"[Vote] excluded visited branch={uid}")
+
     for robot in voters:
         local_candidates = [
             branch
             for branch in candidates
-            if robot.local_branch_states.get(branch) == "UNVISITED"
+            if branch not in robot.known_visited_branches
         ]
         if not local_candidates:
+            robot.branch_vote = None
             continue
         preferred = min(
             local_candidates,
@@ -6731,8 +6785,10 @@ def update_distributed_branch_consensus(
     distributed_consensus_branch = selected
     for robot in voters:
         robot.distributed_branch_decision = selected
+    selected_uid = branch_local_uids.get(selected, selected)
+    candidate_uids = [branch_local_uids.get(branch, branch) for branch in candidates]
     print(
-        f"[Distributed Consensus] branch={selected}, "
+        f"[Consensus] selected={selected_uid} candidates={candidate_uids} "
         f"votes={vote_counts[selected]}/{len(voters)}, "
         f"local-cost={last_flow_rollout_scores[selected]['cost']:.3f}"
     )
@@ -6756,8 +6812,7 @@ def apply_consensus_branch_gates(open_branch: Optional[str]) -> None:
         }
     branch_gate_states.clear()
     branch_gate_states.update(new_gate_states)
-    preserve_consensus_at_anchor(
-        junction_anchor,
+    record_distributed_consensus(
         open_branch,
         clear_selection=open_branch is None,
     )
@@ -6789,7 +6844,7 @@ def begin_cross_branch_transfer(robots, source: str, target: str) -> None:
     }
     branch_gate_states.clear()
     branch_gate_states.update(new_gate_states)
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     for robot in robots:
         region = get_robot_region(robot.position)
         robot.transfer_target = (
@@ -6826,7 +6881,7 @@ def begin_guarded_return_to_junction(robots, source: str) -> None:
         branch: "OPEN" if branch == source else "CLOSED"
         for branch in BRANCHES
     })
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     for robot in robots:
         robot.transfer_target = None
     print(
@@ -6864,7 +6919,7 @@ def begin_final_base_transfer(robots, source: str) -> None:
     }
     branch_gate_states.clear()
     branch_gate_states.update(new_gate_states)
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     for robot in robots:
         robot.transfer_target = (
             "BOTTOM"
@@ -6874,7 +6929,9 @@ def begin_final_base_transfer(robots, source: str) -> None:
         )
     print(
         f"[Final Base Transfer] {source} -> BASE; "
-        "UP=CLOSED, RIGHT=CLOSED"
+        + ", ".join(
+            f"{branch}={branch_gate_states[branch]}" for branch in BRANCHES
+        )
     )
 
 
@@ -6883,7 +6940,7 @@ def close_all_branch_gates() -> None:
     branch_gate_states.update(
         {branch: "CLOSED" for branch in BRANCHES}
     )
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     print("[Gate] UP=CLOSED, LEFT=CLOSED, RIGHT=CLOSED")
 
 
@@ -6905,10 +6962,10 @@ def update_draining_branch_gate(robots) -> None:
     ]
     if remaining:
         branch_gate_states[branch] = "OPEN"
-        preserve_consensus_at_anchor(junction_anchor)
+        record_distributed_consensus()
         return
     branch_gate_states[branch] = "CLOSED"
-    preserve_consensus_at_anchor(junction_anchor)
+    record_distributed_consensus()
     draining_branch = None
     print(f"[Pipeline Drain] source gate closed: {branch}")
 
@@ -6962,11 +7019,12 @@ def get_sequence_stage() -> int:
     return 1
 
 
-def next_unvisited_transfer_branch(source: str) -> Optional[str]:
+def next_unvisited_transfer_branch(source: str, robots) -> Optional[str]:
+    visited = observed_visited_branches(robots)
     candidates = [
         branch
         for branch in detected_branch_candidates
-        if branch != source and branch_states.get(branch) == "UNVISITED"
+        if branch != source and branch not in visited
     ]
     if not candidates:
         return None
@@ -6979,7 +7037,7 @@ def next_unvisited_transfer_branch(source: str) -> Optional[str]:
     )
 
 
-def choose_next_branch(anchor, robots, reference_density: float):
+def choose_next_branch(robots, reference_density: float):
     """Commit the branch selected by peer consensus over local rollout costs."""
     global active_branch, previous_branch_direction, branch_order_plan
     global last_proxy_partition, last_proxy_cell_centers
@@ -6994,10 +7052,8 @@ def choose_next_branch(anchor, robots, reference_density: float):
     if (
         selected is None
         or selected not in detected_branch_candidates
-        or branch_states.get(selected) != "UNVISITED"
+        or selected in observed_visited_branches(robots)
     ):
-        if anchor is not None:
-            anchor.selected_branch = None
         return None
 
     if not branch_is_feasible(selected, robots):
@@ -7008,14 +7064,11 @@ def choose_next_branch(anchor, robots, reference_density: float):
 
     branch_states[selected] = "ACTIVE"
     for robot in robots:
-        robot.local_branch_states[selected] = "ACTIVE"
         if robot.role == "NORMAL":
+            robot.local_branch_states[selected] = "ACTIVE"
             robot.distributed_branch_decision = selected
-    if anchor is not None:
-        anchor.local_branch_states[selected] = "ACTIVE"
-        anchor.selected_branch = selected
     apply_consensus_branch_gates(selected)
-    preserve_consensus_at_anchor(anchor, selected)
+    record_distributed_consensus(selected)
     active_branch = selected
     branch_order_plan.append(selected)
     selected_branch_entry_lambda, _ = rollout_stiffness_for_branch(
@@ -7034,7 +7087,7 @@ def choose_next_branch(anchor, robots, reference_density: float):
         "selected": selected,
         "cost": selected_score["cost"],
         "max_structural_loss": max(
-            (structural_loss(branch) for branch in detected_branch_candidates),
+            (structural_loss(branch, robots) for branch in detected_branch_candidates),
             default=0,
         ),
         "components": dict(selected_score["components"]),
@@ -7054,47 +7107,45 @@ def choose_next_branch(anchor, robots, reference_density: float):
     )
     return selected
 
-def complete_active_branch(anchor, branch, robots):
+def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
     global previous_branch_direction, distributed_consensus_branch
+    global last_proxy_candidates, last_flow_rollout_scores
+    if not (
+        branch_states.get(branch) == "ACTIVE"
+        and branch_dead_end_confirmed.get(branch, False)
+        and branch_backflow_started.get(branch, False)
+        and cohort_return_confirmed
+    ):
+        print(
+            f"[BranchComplete] rejected branch={branch} "
+            "missing ACTIVE/dead-end/backflow/return evidence"
+        )
+        return False
+    pebble = create_branch_pebble(robots, branch)
+    if pebble is None:
+        print(f"[BranchComplete] waiting for local Pebble candidate branch={branch}")
+        return False
     branch_states[branch] = "VISITED"
     distributed_consensus_branch = None
+    last_proxy_candidates = ()
+    last_flow_rollout_scores = {}
     detected_branch_candidates = set()
     collision_points = deque(maxlen=CONTACT_POINT_MAX_COUNT)
     effective_branch_widths = {branch: 0.0 for branch in BRANCHES}
     for robot in robots:
-        robot.local_branch_states[branch] = "VISITED"
         robot.branch_vote = None
         robot.branch_vote_confidence = 0.0
         robot.distributed_branch_decision = None
-    if anchor is not None:
-        anchor.local_branch_states[branch] = "VISITED"
-        preserve_consensus_at_anchor(
-            anchor,
-            clear_selection=True,
-        )
+    record_distributed_consensus(clear_selection=True)
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
-    print(f"[DFS] completed={branch}")
-
-
-def release_anchor_for_final_return(anchor):
-    global junction_anchor
-    if anchor is None:
-        return
-    junction_id = anchor.anchor_junction_id or CURRENT_JUNCTION_ID
-    anchor.role = "NORMAL"
-    anchor.anchor_position = None
-    anchor.anchor_candidate_position = None
-    anchor.anchor_junction_id = None
-    anchor.selected_branch = None
-    anchor.distributed_branch_decision = None
-    anchor.velocity.update(0.0, 0.0)
-    junction_anchors.pop(junction_id, None)
-    junction_state = get_junction_state(junction_id)
-    junction_state.anchor_robot_id = None
-    junction_state.selected_anchor_position = None
-    if junction_id == CURRENT_JUNCTION_ID:
-        junction_anchor = None
+    visited_count = len(observed_visited_branches(robots))
+    print(
+        "[BranchComplete] branch="
+        f"{pebble.pebble_branch_uid}"
+    )
+    print(f"[JunctionComplete] visited={visited_count}/{len(detected_branch_candidates) or len(BRANCHES)}")
+    return True
 
 
 def begin_final_gather():
@@ -7111,7 +7162,7 @@ def begin_final_gather():
     print("[DFS] final gather")
 
 
-def begin_final_return(anchor, robots):
+def begin_final_return(robots):
     global phase, relay_slots, relay_motion_scale
     global return_trunk_release_pending, return_trunk_retract_timer, return_trunk_last_released_id, return_trunk_force_timer
     global return_done_dwell, return_entry_stall_timer
@@ -7120,7 +7171,6 @@ def begin_final_return(anchor, robots):
     relay_slots = []
     relay_motion_scale = 1.0
     close_all_branch_gates()
-    release_anchor_for_final_return(anchor)
     return_trunk_release_pending = True
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
@@ -8579,6 +8629,7 @@ def release_shepherd_line_at_junction(robots) -> int:
         return 0
 
     direction = get_backtrack_direction(active_branch)
+    stage_pebble_from_returned_shepherd_line(robots, active_branch)
     released = 0
     for robot in robots:
         if robot.role != "SHEPHERD":
@@ -8624,7 +8675,7 @@ def compute_densities(robots, grid):
     for robot_i in robots:
         density = self_contribution
         for robot_j in iter_physics_neighbor_candidates(robot_i, grid):
-            if robot_i is robot_j:
+            if robot_i is robot_j or robot_j.role == "PEBBLE":
                 continue
             distance_sq = robot_i.position.distance_squared_to(robot_j.position)
             if distance_sq <= h_sq:
@@ -9432,11 +9483,181 @@ def update_transfer_continuity_control(robots) -> None:
     )
 
 
+def pebble_flow_local_coordinates(
+    robot: "Robot",
+    state: PebbleFlowState,
+) -> tuple[float, float, float]:
+    """Return observed ingress depth, lateral offset, and marker distance."""
+    mouth = pygame.Vector2(state.mouth_position)
+    ingress = pygame.Vector2(state.ingress_direction_local)
+    if ingress.length_squared() <= EPSILON:
+        return 0.0, float("inf"), float("inf")
+    ingress = ingress.normalize()
+    lateral = pygame.Vector2(-ingress.y, ingress.x)
+    offset = robot.position - mouth
+    return (
+        offset.dot(ingress),
+        abs(offset.dot(lateral)),
+        offset.length(),
+    )
+
+
+def robot_is_inside_visited_flow(
+    robot: "Robot",
+    state: PebbleFlowState,
+) -> bool:
+    """Observer/control test using only a Pebble's locally measured frame."""
+    ingress_depth, lateral_offset, _ = pebble_flow_local_coordinates(
+        robot,
+        state,
+    )
+    return (
+        ingress_depth > 0.0
+        and lateral_offset
+        <= corridor_width + PEBBLE_BRANCH_LATERAL_MARGIN
+    )
+
+
+def compute_pebble_flow_guidance(
+    robot: "Robot",
+    decision_force: pygame.Vector2,
+) -> pygame.Vector2:
+    """Condition only route/EDF propulsion using locally relayed VISITED facts.
+
+    Near a completed mouth, positive propulsion along the observed ingress
+    tangent is smoothly attenuated and a weak return-bearing bias is added.
+    Once the robot has physically crossed the observed mouth plane, recovery
+    ramps up. Physical SPH, Kelvin-Voigt, cohesion, collision, and connectivity
+    forces never enter this function.
+    """
+    robot.last_pebble_guidance_force = 0.0
+    robot.last_pebble_guidance_weight = 0.0
+    robot.last_pebble_guidance_mode = "NONE"
+    robot.last_pebble_guidance_branch_uid = None
+    if (
+        robot.role != "NORMAL"
+        or not PEBBLE_FLOW_GUIDANCE_ENABLED
+        or not robot.known_pebble_flow_states
+        or phase in {SimulationPhase.MOVE_TO_JUNCTION, SimulationPhase.DONE}
+    ):
+        return decision_force
+
+    active_uid = (
+        robot.local_branch_uid_by_key.get(active_branch)
+        if branch_states.get(active_branch) == "ACTIVE"
+        else None
+    )
+    guided_force = decision_force.copy()
+    return_bias = pygame.Vector2()
+    strongest_weight = 0.0
+    strongest_mode = "NONE"
+    strongest_uid: Optional[str] = None
+
+    for branch_uid, state in sorted(
+        robot.known_pebble_flow_states.items()
+    ):
+        # A selected ACTIVE child is never conditioned by a stale/duplicate
+        # fact carrying that child's own locally assigned UID.
+        if active_uid is not None and branch_uid == active_uid:
+            continue
+        ingress = pygame.Vector2(state.ingress_direction_local)
+        return_direction = pygame.Vector2(state.return_direction_local)
+        if (
+            ingress.length_squared() <= EPSILON
+            or return_direction.length_squared() <= EPSILON
+        ):
+            continue
+        ingress = ingress.normalize()
+        return_direction = return_direction.normalize()
+        ingress_depth, lateral_offset, marker_distance = (
+            pebble_flow_local_coordinates(robot, state)
+        )
+        lateral_weight = 1.0 - smoothstep01(
+            (
+                lateral_offset - corridor_width
+            ) / max(PEBBLE_BRANCH_LATERAL_MARGIN, EPSILON)
+        )
+        if lateral_weight <= 0.0:
+            continue
+
+        inside_weight = (
+            smoothstep01(
+                ingress_depth
+                / max(PEBBLE_RECOVERY_FULL_DEPTH, EPSILON)
+            )
+            * lateral_weight
+            if ingress_depth > 0.0
+            else 0.0
+        )
+        proximity_weight = 1.0 - smoothstep01(
+            (
+                marker_distance - PEBBLE_MOUTH_RADIUS
+            )
+            / max(
+                PEBBLE_GUIDANCE_RADIUS - PEBBLE_MOUTH_RADIUS,
+                EPSILON,
+            )
+        )
+        proximity_weight = clamp(proximity_weight, 0.0, 1.0)
+        mouth_weight = 1.0 - smoothstep01(
+            marker_distance / max(PEBBLE_MOUTH_RADIUS, EPSILON)
+        )
+        preventive_weight = (
+            proximity_weight
+            * (
+                PEBBLE_CAUTION_GAIN
+                + PEBBLE_MOUTH_SUPPRESSION_GAIN * mouth_weight
+            )
+            * lateral_weight
+        )
+        attenuation = clamp(
+            max(preventive_weight, 0.95 * inside_weight),
+            0.0,
+            0.95,
+        )
+        positive_ingress = max(0.0, guided_force.dot(ingress))
+        if positive_ingress > EPSILON and attenuation > EPSILON:
+            guided_force -= ingress * positive_ingress * attenuation
+
+        if inside_weight > EPSILON:
+            mode = "RECOVERY"
+            weight = max(inside_weight, preventive_weight)
+            return_bias += return_direction * (
+                PEBBLE_RECOVERY_GAIN * inside_weight
+                + PEBBLE_PREVENTIVE_RETURN_FORCE * preventive_weight
+            )
+        elif preventive_weight > EPSILON:
+            mode = "JUNCTION_SUPPRESS"
+            weight = preventive_weight
+            # This is a bearing command, not radial repulsion: every receiver
+            # uses the same locally observed Branch-to-Junction direction.
+            return_bias += (
+                return_direction
+                * PEBBLE_PREVENTIVE_RETURN_FORCE
+                * preventive_weight
+            )
+        else:
+            continue
+        if weight > strongest_weight:
+            strongest_weight = weight
+            strongest_mode = mode
+            strongest_uid = branch_uid
+
+    return_bias = limit_vector(return_bias, PEBBLE_GUIDANCE_FORCE_LIMIT)
+    guided_force += return_bias
+    adjustment = guided_force - decision_force
+    robot.last_pebble_guidance_force = adjustment.length()
+    robot.last_pebble_guidance_weight = strongest_weight
+    robot.last_pebble_guidance_mode = strongest_mode
+    robot.last_pebble_guidance_branch_uid = strongest_uid
+    return guided_force
+
+
 def compute_route_force(robot):
     region = get_robot_region(robot.position)
     junction_target = pygame.Vector2(center_x, center_y)
     force = pygame.Vector2()
-    if robot.role in {"ANCHOR", "RELAY", "TRUNK_RELAY"}:
+    if robot.role in {"PEBBLE", "RELAY", "TRUNK_RELAY"}:
         return force
     if (
         robot.base_reserve
@@ -9477,31 +9698,6 @@ def compute_route_force(robot):
             )
             * OUTLET_FORCE
         )
-    independent = {
-        SimulationPhase.MOVE_TO_JUNCTION,
-        SimulationPhase.FORM_JUNCTION_GUARDS,
-        SimulationPhase.FINAL_JUNCTION_GATHER,
-        SimulationPhase.RETURN_TO_BASE,
-        SimulationPhase.DONE,
-    }
-    if phase not in independent and junction_anchor is not None:
-        if not robot.connected_to_base or robot.received_command != phase.name:
-            return force
-        if phase in {
-            SimulationPhase.EXPLORE_BRANCH,
-            SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-            SimulationPhase.FILL_BEHIND_SHEPHERD,
-            SimulationPhase.PRESSURE_PUSH,
-            SimulationPhase.FLOW_BACKTRACK,
-        }:
-            if robot.received_branch != active_branch:
-                return force
-            if (
-                robot.received_gate_states is None
-                or robot.received_gate_states.get(active_branch) != "OPEN"
-            ):
-                return force
-
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         if simulation_time < BASE_COMPRESSION_DURATION:
             compression = BASE_COMPRESSION_CENTER - robot.position
@@ -10037,7 +10233,7 @@ def compute_sph_forces(
     checked_pairs = set()
     for robot_i in robots:
         if robot_i.role in {
-            "ANCHOR",
+            "PEBBLE",
             "RELAY",
             "TRUNK_RELAY",
             "JUNCTION_GUARD",
@@ -10048,6 +10244,10 @@ def compute_sph_forces(
             robot_i.last_shepherd_force = 0.0
             robot_i.last_base_piston_force = 0.0
             robot_i.last_edf_force = 0.0
+            robot_i.last_pebble_guidance_force = 0.0
+            robot_i.last_pebble_guidance_weight = 0.0
+            robot_i.last_pebble_guidance_mode = "NONE"
+            robot_i.last_pebble_guidance_branch_uid = None
             continue
         if robot_i.role == "SHEPHERD" and phase in {
             SimulationPhase.FORM_SHEPHERD_BOUNDARY,
@@ -10062,6 +10262,10 @@ def compute_sph_forces(
             robot_i.last_shepherd_force = 0.0
             robot_i.last_base_piston_force = 0.0
             robot_i.last_edf_force = 0.0
+            robot_i.last_pebble_guidance_force = 0.0
+            robot_i.last_pebble_guidance_weight = 0.0
+            robot_i.last_pebble_guidance_mode = "NONE"
+            robot_i.last_pebble_guidance_branch_uid = None
             continue
 
         pressure_force = pygame.Vector2()
@@ -10115,7 +10319,7 @@ def compute_sph_forces(
                 )
 
         for robot_j in iter_physics_neighbor_candidates(robot_i, grid):
-            if robot_i is robot_j:
+            if robot_i is robot_j or robot_j.role == "PEBBLE":
                 continue
             pair = tuple(sorted((robot_i.robot_id, robot_j.robot_id)))
             r_ij = robot_i.position - robot_j.position
@@ -10411,6 +10615,10 @@ def compute_sph_forces(
         if neighbor_count < ISOLATION_NEIGHBOR_THRESHOLD and not pressure_phase_normal:
             boost = (ISOLATION_NEIGHBOR_THRESHOLD - neighbor_count) / ISOLATION_NEIGHBOR_THRESHOLD
             route_force *= 1.0 + ISOLATION_ROUTE_BOOST * boost
+        decision_guidance_force = compute_pebble_flow_guidance(
+            robot_i,
+            route_force + edf_force,
+        )
         total = (
             pressure_force
             + viscosity_force
@@ -10422,13 +10630,12 @@ def compute_sph_forces(
             + contact_obstacle_force
             + cohesion_force
             + gap_attraction_force
-            + route_force
+            + decision_guidance_force
             + connectivity_force
             + shepherd_curtain_force
             + pre_shepherd_curtain_force
             + initial_junction_wall_force
             + base_piston_force
-            + edf_force
             - (
                 DAMPING
                 + (
@@ -10493,16 +10700,156 @@ def count_branch_roles(robots, branch):
 
 
 def update_metrics_per_frame(robots, dt):
+    global current_visited_branch_leakage
+    global current_pebble_guidance_active_normals
+    global pebble_flow_last_log_time
     if base_station is not None:
         disconnected = sum(not robot.connected_to_base for robot in robots)
         metrics.disconnected_robot_seconds += disconnected * dt
+
+    visited_states: dict[str, PebbleFlowState] = {}
+    for pebble in get_pebbles(robots):
+        state = pebble_flow_state_from_marker(pebble)
+        if state is not None:
+            visited_states[state.branch_uid] = state
+    exploration_leak_phase = phase in {
+        SimulationPhase.JUNCTION_SWITCH,
+        SimulationPhase.FORM_JUNCTION_GUARDS,
+        SimulationPhase.EXPLORE_BRANCH,
+        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+        SimulationPhase.FILL_BEHIND_SHEPHERD,
+    }
+
+    leakage = {branch: 0 for branch in BRANCHES}
+    current_inside_by_robot: dict[int, set[str]] = {}
+    for robot in robots:
+        current_inside: set[str] = set()
+        if robot.role == "NORMAL":
+            for branch_uid, state in visited_states.items():
+                if robot_is_inside_visited_flow(robot, state):
+                    current_inside.add(branch_uid)
+                    if state.branch_key in leakage:
+                        leakage[state.branch_key] += 1
+        current_inside_by_robot[robot.robot_id] = current_inside
+
+    initialized_before = set(metrics.initialized_visited_uids)
+    for robot in robots:
+        current_inside = current_inside_by_robot[robot.robot_id]
+        if (
+            robot.last_pebble_guidance_mode == "RECOVERY"
+            and robot.last_pebble_guidance_branch_uid in current_inside
+        ):
+            robot.metric_pebble_recovery_seen_uids.add(
+                robot.last_pebble_guidance_branch_uid
+            )
+        entered = (
+            current_inside - robot.metric_inside_visited_uids
+        ) & initialized_before
+        for branch_uid in entered:
+            state = visited_states.get(branch_uid)
+            if state is not None and state.branch_key in BRANCHES:
+                branch = state.branch_key
+                metrics.visited_branch_reentry_robot_ids[branch].add(
+                    robot.robot_id
+                )
+                metrics.visited_branch_reentry_counts[branch] = len(
+                    metrics.visited_branch_reentry_robot_ids[branch]
+                )
+                if exploration_leak_phase:
+                    metrics.exploration_leak_reentry_robot_ids[branch].add(
+                        robot.robot_id
+                    )
+                    metrics.exploration_leak_reentry_counts[branch] = len(
+                        metrics.exploration_leak_reentry_robot_ids[branch]
+                    )
+        exited = robot.metric_inside_visited_uids - current_inside
+        for branch_uid in exited:
+            state = visited_states.get(branch_uid)
+            if state is None:
+                continue
+            ingress_depth, _, _ = pebble_flow_local_coordinates(robot, state)
+            if (
+                ingress_depth <= 0.0
+                and branch_uid in robot.metric_pebble_recovery_seen_uids
+            ):
+                metrics.pebble_recovery_success_pairs.add(
+                    (robot.robot_id, branch_uid)
+                )
+                metrics.pebble_recovery_success_count = len(
+                    metrics.pebble_recovery_success_pairs
+                )
+                robot.metric_pebble_recovery_seen_uids.discard(branch_uid)
+        robot.metric_inside_visited_uids = current_inside
+
+        guidance_active = robot.last_pebble_guidance_mode != "NONE"
+        if guidance_active and not robot.metric_pebble_guidance_active:
+            metrics.pebble_guidance_activation_count += 1
+        robot.metric_pebble_guidance_active = guidance_active
+
+    metrics.initialized_visited_uids.update(visited_states)
+    current_visited_branch_leakage = leakage
+    current_pebble_guidance_active_normals = sum(
+        robot.role == "NORMAL"
+        and robot.last_pebble_guidance_mode != "NONE"
+        for robot in robots
+    )
+    for branch in BRANCHES:
+        metrics.visited_branch_max_inside[branch] = max(
+            metrics.visited_branch_max_inside[branch],
+            leakage[branch],
+        )
+        metrics.visited_branch_robot_seconds[branch] += leakage[branch] * dt
+        if exploration_leak_phase:
+            metrics.exploration_leak_max_inside[branch] = max(
+                metrics.exploration_leak_max_inside[branch],
+                leakage[branch],
+            )
+            metrics.exploration_leak_robot_seconds[branch] += (
+                leakage[branch] * dt
+            )
+
+    if (
+        visited_states
+        and simulation_time - pebble_flow_last_log_time
+        >= PEBBLE_FLOW_LOG_INTERVAL
+    ):
+        pebble_flow_last_log_time = simulation_time
+        representative = max(
+            (
+                robot for robot in robots
+                if robot.role == "NORMAL"
+                and robot.last_pebble_guidance_mode != "NONE"
+            ),
+            key=lambda robot: robot.last_pebble_guidance_weight,
+            default=None,
+        )
+        if representative is not None:
+            print(
+                f"[PebbleFlow] robot={representative.robot_id} "
+                f"branch={representative.last_pebble_guidance_branch_uid} "
+                f"mode={representative.last_pebble_guidance_mode} "
+                f"weight={representative.last_pebble_guidance_weight:.2f} "
+                f"active_normals={current_pebble_guidance_active_normals}"
+            )
+        for state in visited_states.values():
+            branch = state.branch_key
+            if branch not in BRANCHES:
+                continue
+            print(
+                f"[PebbleLeak] branch={branch} "
+                f"normals_inside={leakage[branch]} "
+                f"max={metrics.visited_branch_max_inside[branch]} "
+                f"robot_s={metrics.visited_branch_robot_seconds[branch]:.2f}"
+            )
 
 
 def start_shepherd_pressure_push(robots, branch):
     """Start a prepared Shepherd piston without repeating the fill wait."""
     global phase, pressure_push_timer, flow_establish_timer
     global shepherd_flow_timer
-    next_branch = next_unvisited_transfer_branch(branch)
+    global branch_backflow_started
+    branch_backflow_started[branch] = True
+    next_branch = next_unvisited_transfer_branch(branch, robots)
     if next_branch is not None:
         begin_guarded_return_to_junction(robots, branch)
     else:
@@ -10541,7 +10888,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     global pending_branch_start
 
     update_draining_branch_gate(robots)
-    update_anchor_entry_records(robots, simulation_time)
+    update_local_ingress_tangents(robots)
     update_backtrack_bridge_guards(robots, dt)
 
     if phase in {
@@ -10552,16 +10899,10 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         branch_entry_timer += dt
     update_initial_release_flow_event(robots, dt)
 
-    # NORMAL robots decide first. The elected Anchor only stores and
-    # retransmits their consensus and gate state.
-    anchor = junction_anchor
-
     if phase == SimulationPhase.MOVE_TO_JUNCTION:
         update_relay_deployment(robots, dt)
         junction_confirmed = junction_inference_tracker.update(robots, dt)
         if junction_confirmed:
-            if anchor is None:
-                anchor = elect_junction_anchor(robots)
             begin_junction_guard_formation(robots)
             phase = SimulationPhase.FORM_JUNCTION_GUARDS
             print(
@@ -10644,13 +10985,8 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             reference_density,
         )
         if voted_branch is not None:
-            if anchor is None:
-                anchor = elect_junction_anchor(robots)
-            preserve_consensus_at_anchor(anchor, voted_branch)
-            if anchor is None or not anchor_deployment_ready(anchor, robots):
-                return
+            record_distributed_consensus(voted_branch)
             selected = choose_next_branch(
-                anchor,
                 robots,
                 reference_density,
             )
@@ -10704,6 +11040,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         # entrance-guard IDs.  Never discard that line and elect unrelated
         # robots at the dead end.
         if dead_end_confirmed:
+            branch_dead_end_confirmed[active_branch] = True
             observed_depth = dead_end_inference_tracker.confirmed_depth
             # The same frontier line keeps following the NORMAL front at its
             # existing advance rate.  It may form the return piston only after
@@ -10857,9 +11194,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         shepherd_flow_timer += dt
         release_shepherd_line_at_junction(robots)
         update_relay_retraction(robots, dt)
-        remaining = sum(get_robot_region(robot.position) == active_branch for robot in robots)
+        remaining = sum(
+            robot.role != "PEBBLE"
+            and get_robot_region(robot.position) == active_branch
+            for robot in robots
+        )
         in_junction = sum(
-            get_robot_region(robot.position) == "JUNCTION" and robot.role != "ANCHOR"
+            get_robot_region(robot.position) == "JUNCTION" and robot.role != "PEBBLE"
             for robot in robots
         )
         transferred_count = (
@@ -10921,11 +11262,16 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             next_branch = transfer_branch
             if pipeline_switch_ready and remaining > 0:
                 draining_branch = completed_branch
-            complete_active_branch(anchor, completed_branch, robots)
+            if not complete_active_branch(
+                completed_branch,
+                robots,
+                transfer_ready or base_transfer_ready or junction_ready,
+            ):
+                return
             if final_base_transfer_active:
                 reset_shepherd_roles(robots)
                 final_base_transfer_active = False
-                begin_final_return(anchor, robots)
+                begin_final_return(robots)
                 print(
                     f"[Final Base Transfer] completed "
                     f"{completed_branch} -> BASE; "
@@ -10935,7 +11281,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 reset_shepherd_roles(robots)
                 distributed_consensus_branch = next_branch
                 selected = choose_next_branch(
-                    anchor,
                     robots,
                     reference_density,
                 )
@@ -10943,7 +11288,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     finish_cross_branch_transfer(robots, selected)
                 if draining_branch is not None:
                     branch_gate_states[draining_branch] = "OPEN"
-                    preserve_consensus_at_anchor(anchor)
+                    record_distributed_consensus()
                 saturation_tracker.reset(selected)
                 dead_end_inference_tracker.reset(selected)
                 if (
@@ -10980,7 +11325,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.JUNCTION_SWITCH:
         junction_switch_timer += dt
-        if not any(state == "UNVISITED" for state in branch_states.values()):
+        discovered_children = set(junction_inference_tracker.valid_branches)
+        visited_children = observed_visited_branches(robots)
+        if discovered_children and discovered_children <= visited_children:
+            print(
+                f"[JunctionComplete] visited={len(visited_children)}/"
+                f"{len(discovered_children)}"
+            )
             begin_final_gather()
             return
         begin_junction_guard_formation(robots)
@@ -10991,7 +11342,11 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         )
 
     elif phase == SimulationPhase.FINAL_JUNCTION_GATHER:
-        stragglers = sum(get_robot_region(robot.position) in BRANCHES for robot in robots)
+        stragglers = sum(
+            robot.role != "PEBBLE"
+            and get_robot_region(robot.position) in BRANCHES
+            for robot in robots
+        )
         gather_ready = (
             stragglers == 0
             and not get_relays(robots)
@@ -11000,7 +11355,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         )
         final_gather_timer = final_gather_timer + dt if gather_ready else 0.0
         if final_gather_timer >= FINAL_GATHER_DWELL_TIME:
-            begin_final_return(anchor, robots)
+            begin_final_return(robots)
 
     elif phase == SimulationPhase.RETURN_TO_BASE:
         global return_trunk_last_released_id, return_trunk_force_timer
@@ -11016,7 +11371,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         connected_ratio = connected_count / max(len(robots), 1)
         special = sum(
             robot.role in {
-                "ANCHOR",
                 "RELAY",
                 "TRUNK_RELAY",
                 "SHEPHERD",
@@ -11061,7 +11415,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
         if in_bottom > return_last_bottom_count:
             return_last_bottom_count = in_bottom
             return_entry_stall_timer = 0.0
-        elif in_bottom < RETURN_BOTTOM_TARGET_COUNT:
+        elif in_bottom < return_mobile_target_count(robots):
             return_entry_stall_timer += dt
 
         if return_entry_stall_timer >= RETURN_ENTRY_RECOVERY_TIMEOUT:
@@ -11078,7 +11432,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 )
 
         done_ready = (
-            in_bottom >= RETURN_BOTTOM_TARGET_COUNT
+            in_bottom >= return_mobile_target_count(robots)
             and special == 0
             and not return_trunk_release_pending
         )
@@ -11142,7 +11496,7 @@ def draw_branch_colour_fields(surface):
 
 
 def draw_branch_gates(surface):
-    """Draw peer-consensus gates whose state is retained by the Anchor."""
+    """Draw the current peer-consensus gate commands."""
     gate_lines = {
         "UP": (
             (center_x - half_width + 3, center_y - half_width),
@@ -11370,8 +11724,16 @@ def reset_dfs_state():
     global branch_fill_target_count
     global branch_fill_current_count
     global branch_fill_deficit_control
-    global previous_branch_direction, junction_anchor, simulation_time
-    global junctions, junction_anchors
+    global previous_branch_direction, simulation_time
+    global junctions
+    global branch_completion_epoch
+    global branch_dead_end_confirmed, branch_backflow_started
+    global branch_local_uids
+    global pebble_rx_logged
+    global pending_pebble_robot_ids
+    global pebble_flow_last_log_time
+    global current_visited_branch_leakage
+    global current_pebble_guidance_active_normals
     global junction_switch_timer, final_gather_timer, shepherd_form_timer
     global pressure_push_timer, flow_establish_timer, communication_sequence
     global shepherd_flow_timer, shepherd_flow_start_depth
@@ -11413,7 +11775,6 @@ def reset_dfs_state():
     phase = SimulationPhase.MOVE_TO_JUNCTION
     active_branch = FIXED_BRANCH_ORDER[0]
     junctions = create_single_junction_registry()
-    junction_anchors = {}
     branch_states = get_junction_state().branch_states
     branch_order_plan = []
     branch_gate_states = get_junction_state().gate_states
@@ -11428,7 +11789,17 @@ def reset_dfs_state():
     branch_fill_current_count = 0
     branch_fill_deficit_control = 0.0
     previous_branch_direction = pygame.Vector2(0.0, -1.0)
-    junction_anchor = None
+    branch_completion_epoch = 0
+    branch_dead_end_confirmed = {branch: False for branch in BRANCHES}
+    branch_backflow_started = {branch: False for branch in BRANCHES}
+    branch_local_uids = {}
+    pebble_rx_logged = set()
+    pending_pebble_robot_ids = {}
+    pebble_flow_last_log_time = float("-inf")
+    current_visited_branch_leakage = {
+        branch: 0 for branch in BRANCHES
+    }
+    current_pebble_guidance_active_normals = 0
     simulation_time = 0.0
     junction_switch_timer = final_gather_timer = shepherd_form_timer = 0.0
     pressure_push_timer = flow_establish_timer = 0.0
@@ -11520,6 +11891,12 @@ robots, reference_density, color_reference_density = initialize_simulation()
 
 running = True
 paused = False
+headless_fast = os.environ.get("SPH_DFS_HEADLESS_FAST", "0") == "1"
+headless_max_frames = int(os.environ.get("SPH_DFS_MAX_FRAMES", "0"))
+headless_frame_dt = float(
+    os.environ.get("SPH_DFS_HEADLESS_DT", str(1.0 / FPS))
+)
+headless_frame_count = 0
 def wrap_hud_text(text: str, font_obj, max_width: int):
     """Wrap one HUD string to the width of the separate side panel."""
     words = text.split()
@@ -11586,7 +11963,28 @@ communication_frame_counter = 0
 
 
 while running:
-    raw_dt = max(clock.tick(FPS) / 1000.0, 1.0 / 240.0)
+    raw_dt = (
+        headless_frame_dt
+        if headless_fast
+        else max(clock.tick(FPS) / 1000.0, 1.0 / 240.0)
+    )
+    headless_frame_count += 1
+    if headless_fast and phase == SimulationPhase.DONE:
+        print(
+            f"[Headless] frames={headless_frame_count}, phase=DONE, "
+            f"pebbles={len(get_pebbles(robots))}, "
+            f"visited={sorted(observed_visited_branches(robots))}"
+        )
+        running = False
+        continue
+    if headless_max_frames and headless_frame_count > headless_max_frames:
+        print(
+            f"[Headless] frames={headless_max_frames}, phase={phase.name}, "
+            f"pebbles={len(get_pebbles(robots))}, "
+            f"visited={sorted(observed_visited_branches(robots))}"
+        )
+        running = False
+        continue
     frame_dt = min(
         raw_dt,
         INITIAL_INGRESS_MAX_DT if phase == SimulationPhase.MOVE_TO_JUNCTION else NORMAL_PHYSICS_MAX_DT,
@@ -11637,6 +12035,11 @@ while running:
         update_communication_system(robots, spatial_grid)
         compute_densities(robots, build_physics_grid(robots))
         compute_pressures(robots, reference_density)
+
+    # Headless verification exercises the identical physics/state/metrics
+    # path above; only rasterization and display presentation are skipped.
+    if headless_fast:
+        continue
 
     screen.fill(BACKGROUND_COLOR)
     pygame.draw.polygon(screen, FLOOR_COLOR, cross_points)
@@ -11783,7 +12186,8 @@ while running:
         for robot in robots
     )
     return_branch_robot_count = sum(
-        get_robot_region(robot.position) in BRANCHES
+        robot.role != "PEBBLE"
+        and get_robot_region(robot.position) in BRANCHES
         for robot in robots
     )
     return_bottom_count = sum(
@@ -11791,12 +12195,12 @@ while running:
         for robot in robots
     )
     return_junction_count = sum(
-        get_robot_region(robot.position) == "JUNCTION"
+        robot.role != "PEBBLE"
+        and get_robot_region(robot.position) == "JUNCTION"
         for robot in robots
     )
     return_special_count = sum(
         robot.role in {
-            "ANCHOR",
             "RELAY",
             "TRUNK_RELAY",
             "SHEPHERD",
@@ -11859,17 +12263,24 @@ while running:
             f"Junction voters={sum(robot.role == 'NORMAL' and get_robot_region(robot.position) == 'JUNCTION' for robot in robots)}"
         ),
         (
-            f"Anchor policy={ANCHOR_POLICY_VERSION} | "
-            + (
-                f"junction={junction_anchor.anchor_junction_id} "
-                f"id={junction_anchor.robot_id} "
-                f"cost={junction_anchor.anchor_election_cost:.3f} "
-                f"stored={junction_anchor.selected_branch or '-'} "
-                f"state-seq={get_junction_state().state_sequence} "
-                f"connected={junction_anchor.connected_to_base}"
-                if junction_anchor is not None
-                else "WAITING_FOR_JUNCTION_NORMAL"
+            f"Pebble policy={PEBBLE_POLICY_VERSION} | "
+            f"count={len(get_pebbles(robots))} | "
+            f"visited={len(observed_visited_branches(robots))}/"
+            f"{len(detected_branch_candidates) or len(BRANCHES)} | "
+            f"consensus={distributed_consensus_branch or '-'}"
+        ),
+        (
+            "Visited branch leakage: "
+            + " | ".join(
+                f"{branch}={current_visited_branch_leakage[branch]}"
+                for branch in BRANCHES
             )
+        ),
+        (
+            "Pebble guidance active normals="
+            f"{current_pebble_guidance_active_normals} | "
+            f"activations={metrics.pebble_guidance_activation_count} | "
+            f"recoveries={metrics.pebble_recovery_success_count}"
         ),
         (
             f"Fluid body={FLUID_BODY_POLICY_VERSION} | "
@@ -12161,7 +12572,8 @@ while running:
             f"branch robots={return_branch_robot_count}"
         ),
         (
-            f"Return status: B={return_bottom_count}/{len(robots)} "
+            f"Return status: B={return_bottom_count}/"
+            f"{return_mobile_target_count(robots)} "
             f"J={return_junction_count} "
             f"special={return_special_count} "
             f"pending-trunk={return_trunk_release_pending} "
