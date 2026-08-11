@@ -363,6 +363,13 @@ class BranchDescriptor:
     motion_frame_sample_count: int = 0
     motion_frame_angular_spread: float = math.pi
     motion_observed_width: float = 0.0
+    observed_flow_width: float = 0.0
+    observed_physical_width: float = 0.0
+    physical_width_confident: bool = False
+    physical_width_source: str = "UNOBSERVED"
+    physical_left_boundary_lateral: Optional[float] = None
+    physical_right_boundary_lateral: Optional[float] = None
+    physical_boundary_sample_count: int = 0
     discovered_at: float = 0.0
 
 
@@ -588,8 +595,13 @@ frontier_line_lateral_center = 0.0
 frontier_line_target_settled_ratio = 0.0
 frontier_line_current_span = 0.0
 frontier_line_target_span = 0.0
+frontier_line_physical_coverage_ratio = 0.0
+frontier_line_left_edge_gap = float("inf")
+frontier_line_right_edge_gap = float("inf")
+frontier_line_continuous = False
 frontier_line_row_ready = False
 frontier_line_last_diagnostic_time = float("-inf")
+frontier_dead_end_transition_last_log_time = float("-inf")
 observed_dead_end_depths: dict[str, float] = {}
 last_distributed_vote_counts: dict[str, int] = {}
 last_distributed_voter_count = 0
@@ -1213,11 +1225,6 @@ LOCAL_GUARD_LATERAL_RECRUIT_MARGIN = max(
     JUNCTION_GUARD_COVERAGE,
     SAFE_RADIUS,
 )
-LOCAL_GUARD_MIN_OBSERVED_WIDTH = max(
-    ROBOT_RADIUS * 4.0,
-    JUNCTION_GUARD_COVERAGE * (JUNCTION_GUARD_MIN_COUNT - 1),
-)
-LOCAL_GUARD_SLOT_SAFETY_MARGIN = ROBOT_RADIUS * 1.25
 LOCAL_GUARD_ORTHOGONAL_EPSILON = 1.0e-5
 JUNCTION_GUARD_MOVE_SPEED = 46.0 * MOTION_SPEED_MULTIPLIER
 JUNCTION_GUARD_POSITION_TOLERANCE = 3.0 * MAP_SCALE
@@ -1251,19 +1258,32 @@ FRONTIER_LINE_LEAD_GAP = 12.0 * MAP_SCALE
 FRONTIER_LINE_SUPPORT_QUANTILE = 0.98
 FRONTIER_LINE_START_DEPTH = JUNCTION_GUARD_BRANCH_INSET
 FRONTIER_LINE_TARGET_SETTLED_RATIO = 0.80
-FRONTIER_LINE_MIN_SPAN_RATIO = 0.82
+FRONTIER_LINE_MIN_SPAN_RATIO = 0.96
 FRONTIER_LINE_TARGET_TOLERANCE = max(
     JUNCTION_GUARD_POSITION_TOLERANCE,
     ROBOT_RADIUS * 1.25,
 )
-FRONTIER_LINE_WIDTH_SAFETY_MARGIN = ROBOT_RADIUS * 1.25
 FRONTIER_LINE_DRIFT_RESERVE = ROBOT_RADIUS * 1.50
+FRONTIER_LINE_EDGE_CLEARANCE = ROBOT_RADIUS * 0.25
+FRONTIER_LINE_MAX_EDGE_GAP = max(
+    FRONTIER_LINE_TARGET_TOLERANCE,
+    PHYSICAL_GUARD_INFLUENCE_RADIUS * 0.35,
+)
+FRONTIER_LINE_MAX_INTERNAL_GAP = PHYSICAL_GUARD_INFLUENCE_RADIUS * 1.35
 FRONTIER_LINE_CENTER_CORRECTION_SPEED = ROBOT_RADIUS * 0.75
 FRONTIER_LINE_CENTER_MIN_COHORT = 5
 FRONTIER_LINE_CENTER_WINDOW = SMOOTHING_LENGTH * 2.0
 FRONTIER_MOUTH_AXIS_MAX_FLOW_ANGLE = math.radians(25.0)
 FRONTIER_MOUTH_AXIS_MIN_ANISOTROPY = 1.35
-FRONTIER_LINE_POLICY_VERSION = "LOCKED_LOCAL_FRAME_ROW_READINESS_V2"
+LOCAL_PHYSICAL_WIDTH_PROBE_AXIAL = max(
+    JUNCTION_GUARD_BRANCH_INSET * 2.0,
+    ROBOT_RADIUS * 5.0,
+)
+LOCAL_PHYSICAL_WIDTH_PROBE_STEP = max(0.5, ROBOT_RADIUS * 0.50)
+LOCAL_PHYSICAL_WIDTH_MAX_PROBE_RANGE = JUNCTION_GUARD_RECRUIT_RADIUS
+LOCAL_PHYSICAL_WIDTH_CONTACT_AXIAL_WINDOW = 44.0 * MAP_SCALE
+LOCAL_PHYSICAL_WIDTH_MIN_SIDE_CONTACTS = 2
+FRONTIER_LINE_POLICY_VERSION = "LOCAL_PHYSICAL_WIDTH_HANDOFF_V3"
 
 # Eguchi et al. integrate normalized command/observed speed discrepancy and
 # record the position when the threshold is crossed.  The constants below are
@@ -2300,7 +2320,13 @@ class Robot:
 
         if (
             self.role == "FRONTIER_SHEPHERD"
-            and phase == SimulationPhase.EXPLORE_BRANCH
+            and (
+                phase == SimulationPhase.EXPLORE_BRANCH
+                or (
+                    phase == SimulationPhase.FORM_JUNCTION_GUARDS
+                    and pending_branch_start == self.shepherd_branch
+                )
+            )
             and self.shepherd_anchor is not None
             and self.shepherd_branch == frontier_line_branch
         ):
@@ -2316,7 +2342,7 @@ class Robot:
             # NORMAL pressure can stop the robot without making this probe
             # positive; only the physical map mask immediately ahead does.
             outward = frontier_shepherd_forward_direction(self)
-            if outward is not None:
+            if outward is not None and phase == SimulationPhase.EXPLORE_BRANCH:
                 forward_probe = (
                     self.position
                     + outward * DEAD_END_FORWARD_BUMPER_PROBE
@@ -2845,6 +2871,185 @@ def observed_branch_axial_depth(
     return max(0.0, branch_local_coordinates(position, descriptor)[0])
 
 
+def probe_local_boundary_center_limit(
+    descriptor: BranchDescriptor,
+    axial: float,
+    side: float,
+) -> Optional[float]:
+    """Probe one physical side wall along local n with a robot footprint.
+
+    This is the simulator equivalent of an edge robot extending laterally
+    until its local collision/proximity sensor reports a boundary.  The probe
+    reads neither a Branch label nor a fixture width.
+    """
+    if side not in {-1.0, 1.0}:
+        raise ValueError("physical mouth probe side must be -1 or +1")
+    if not is_walkable(
+        local_coordinates_to_world(descriptor, axial, 0.0),
+        ROBOT_RADIUS,
+    ):
+        return None
+    last_walkable = 0.0
+    distance = LOCAL_PHYSICAL_WIDTH_PROBE_STEP
+    while distance <= LOCAL_PHYSICAL_WIDTH_MAX_PROBE_RANGE:
+        candidate = local_coordinates_to_world(
+            descriptor,
+            axial,
+            side * distance,
+        )
+        if not is_walkable(candidate, ROBOT_RADIUS):
+            low = last_walkable
+            high = distance
+            for _ in range(14):
+                middle = 0.5 * (low + high)
+                middle_point = local_coordinates_to_world(
+                    descriptor,
+                    axial,
+                    side * middle,
+                )
+                if is_walkable(middle_point, ROBOT_RADIUS):
+                    low = middle
+                else:
+                    high = middle
+            return side * low
+        last_walkable = distance
+        distance += LOCAL_PHYSICAL_WIDTH_PROBE_STEP
+    return None
+
+
+def update_local_physical_mouth_width(
+    descriptor: BranchDescriptor,
+) -> bool:
+    """Separate cohort flow span from locally observed wall-to-wall width."""
+    if descriptor.physical_width_confident:
+        return True
+    if (
+        not descriptor.motion_frame_locked
+        or descriptor.observed_mouth_position is None
+    ):
+        return False
+
+    descriptor.observed_flow_width = max(
+        descriptor.observed_flow_width,
+        descriptor.motion_observed_width,
+        descriptor.observed_width,
+    )
+    contact_laterals = []
+    for point in collision_points:
+        if point.branch != descriptor.fixture_key:
+            continue
+        axial, lateral = branch_local_coordinates(point.position, descriptor)
+        if (
+            0.0 <= axial <= LOCAL_PHYSICAL_WIDTH_CONTACT_AXIAL_WINDOW
+            and abs(lateral) >= ROBOT_RADIUS * 2.0
+        ):
+            contact_laterals.append(lateral)
+    left_contacts = [value for value in contact_laterals if value < 0.0]
+    right_contacts = [value for value in contact_laterals if value > 0.0]
+
+    # Probe a short distance downstream so the Junction opening itself cannot
+    # be mistaken for an infinitely wide mouth.  Try a few local axial rows in
+    # case the robust mouth centre lies directly on a rounded corner.
+    probed_left = None
+    probed_right = None
+    for axial_scale in (1.0, 1.5, 2.0):
+        probe_axial = LOCAL_PHYSICAL_WIDTH_PROBE_AXIAL * axial_scale
+        left = probe_local_boundary_center_limit(
+            descriptor,
+            probe_axial,
+            -1.0,
+        )
+        right = probe_local_boundary_center_limit(
+            descriptor,
+            probe_axial,
+            1.0,
+        )
+        if left is not None and right is not None:
+            probed_left = left
+            probed_right = right
+            break
+    if probed_left is None or probed_right is None:
+        return False
+
+    contact_sides_ready = (
+        len(left_contacts) >= LOCAL_PHYSICAL_WIDTH_MIN_SIDE_CONTACTS
+        and len(right_contacts) >= LOCAL_PHYSICAL_WIDTH_MIN_SIDE_CONTACTS
+    )
+    left_center_limit = probed_left
+    right_center_limit = probed_right
+    source = "LOCAL_EDGE_CLEARANCE_PROBE"
+    if contact_sides_ready:
+        contact_left = linear_quantile(left_contacts, 0.50)
+        contact_right = linear_quantile(right_contacts, 0.50)
+        contact_tolerance = ROBOT_RADIUS * 4.0
+        if (
+            abs(contact_left - probed_left) <= contact_tolerance
+            and abs(contact_right - probed_right) <= contact_tolerance
+        ):
+            left_center_limit = 0.5 * (probed_left + contact_left)
+            right_center_limit = 0.5 * (probed_right + contact_right)
+            source = "EGUCHI_CONTACTS+LOCAL_EDGE_PROBE"
+
+    if right_center_limit - left_center_limit <= ROBOT_RADIUS * 4.0:
+        return False
+    lateral_midpoint = 0.5 * (left_center_limit + right_center_limit)
+    _, motion_n = descriptor_local_basis(descriptor)
+    descriptor.observed_mouth_position += (
+        motion_n * lateral_midpoint
+    )
+    left_center_limit -= lateral_midpoint
+    right_center_limit -= lateral_midpoint
+    descriptor.physical_left_boundary_lateral = (
+        left_center_limit - ROBOT_RADIUS
+    )
+    descriptor.physical_right_boundary_lateral = (
+        right_center_limit + ROBOT_RADIUS
+    )
+    descriptor.observed_physical_width = (
+        descriptor.physical_right_boundary_lateral
+        - descriptor.physical_left_boundary_lateral
+    )
+    descriptor.physical_width_confident = True
+    descriptor.physical_width_source = source
+    descriptor.physical_boundary_sample_count = (
+        len(left_contacts) + len(right_contacts) + 2
+    )
+    print(
+        f"[LocalPhysicalWidth] uid={descriptor.uid} source={source} "
+        f"flow={descriptor.observed_flow_width:.1f} "
+        f"physical={descriptor.observed_physical_width:.1f} "
+        f"left={descriptor.physical_left_boundary_lateral:.1f} "
+        f"right={descriptor.physical_right_boundary_lateral:.1f} "
+        f"samples={descriptor.physical_boundary_sample_count} "
+        "confident=True"
+    )
+    return True
+
+
+def local_physical_usable_half_width(
+    descriptor: BranchDescriptor,
+) -> float:
+    """Robot-centre half span shared by Guard and Frontier rows."""
+    if not descriptor.physical_width_confident:
+        return 0.0
+    return max(
+        0.0,
+        descriptor.observed_physical_width * 0.5
+        - ROBOT_RADIUS
+        - FRONTIER_LINE_EDGE_CLEARANCE,
+    )
+
+
+def local_frontier_shepherd_count(descriptor: BranchDescriptor) -> int:
+    usable_width = local_physical_usable_half_width(descriptor) * 2.0
+    return int(clamp(
+        math.ceil(usable_width / max(SHEPHERD_TARGET_SLOT_SPACING, EPSILON))
+        + 1,
+        SHEPHERD_MIN_COUNT,
+        SHEPHERD_MAX_COUNT,
+    ))
+
+
 def fit_slot_into_walkable_row(
     row_center: pygame.Vector2,
     slot: pygame.Vector2,
@@ -2903,15 +3108,12 @@ def frontier_shepherd_slot_target(
 
 
 def frontier_line_usable_half_width(descriptor: BranchDescriptor) -> float:
-    """Observed half-width after robot, safety, and drift-reserve margins."""
-    width = local_guard_observed_width(descriptor)
-    return max(
-        ROBOT_RADIUS * 2.0,
-        width * 0.5
-        - ROBOT_RADIUS
-        - FRONTIER_LINE_WIDTH_SAFETY_MARGIN
-        - FRONTIER_LINE_DRIFT_RESERVE,
-    )
+    """Use the same physical robot-centre span as the mouth Guard.
+
+    Drift reserve limits centre correction; it must not shorten the physical
+    row and create two side leaks.
+    """
+    return local_physical_usable_half_width(descriptor)
 
 
 def build_frontier_line_local_slots(
@@ -2999,22 +3201,19 @@ def log_local_guard_pending(branch_uid: str, reason: str) -> None:
 
 
 def local_guard_observed_width(descriptor: BranchDescriptor) -> float:
-    """Use observed width, with a label-free physical minimum if unavailable."""
-    width = (
-        descriptor.motion_observed_width
-        if descriptor.motion_frame_locked
-        and descriptor.motion_observed_width > ROBOT_RADIUS * 2.0
-        else descriptor.observed_width
-    )
-    if width > ROBOT_RADIUS * 2.0:
-        return width
+    """Return only a confident locally observed physical wall width."""
+    if (
+        descriptor.physical_width_confident
+        and descriptor.observed_physical_width > ROBOT_RADIUS * 2.0
+    ):
+        return descriptor.observed_physical_width
     if descriptor.uid not in local_guard_width_fallback_logged:
         local_guard_width_fallback_logged.add(descriptor.uid)
         print(
-            f"[LocalGuardFallback] uid={descriptor.uid} "
-            "reason=INSUFFICIENT_OBSERVED_WIDTH"
+            f"[LocalGuardPending] uid={descriptor.uid} "
+            "reason=PHYSICAL_WIDTH_UNCONFIRMED"
         )
-    return LOCAL_GUARD_MIN_OBSERVED_WIDTH
+    return 0.0
 
 
 def local_guard_tube_contains(
@@ -3031,9 +3230,11 @@ def local_guard_tube_contains(
 
 
 def required_junction_guard_count(descriptor: BranchDescriptor) -> int:
-    width = local_guard_observed_width(descriptor)
+    usable_width = local_physical_usable_half_width(descriptor) * 2.0
     return int(clamp(
-        math.ceil(width / max(JUNCTION_GUARD_COVERAGE, EPSILON)),
+        math.ceil(
+            usable_width / max(JUNCTION_GUARD_COVERAGE, EPSILON)
+        ) + 1,
         JUNCTION_GUARD_MIN_COUNT,
         JUNCTION_GUARD_MAX_COUNT,
     ))
@@ -3062,11 +3263,9 @@ def build_local_junction_guard_slots(
     if descriptor.observed_mouth_position is None:
         return []
     tangent, normal = descriptor_local_basis(descriptor)
-    width = local_guard_observed_width(descriptor)
-    usable_half = max(
-        ROBOT_RADIUS * 2.0,
-        width * 0.5 - ROBOT_RADIUS - LOCAL_GUARD_SLOT_SAFETY_MARGIN,
-    )
+    usable_half = local_physical_usable_half_width(descriptor)
+    if usable_half <= EPSILON:
+        return []
     lateral_offsets = [0.0] if count <= 1 else [
         -usable_half + 2.0 * usable_half * index / (count - 1)
         for index in range(count)
@@ -3391,6 +3590,12 @@ def run_diagonal_local_guard_synthetic_validation() -> None:
         local_return_direction=-tangent,
         observed_mouth_position=pygame.Vector2(100.0, 100.0),
         observed_width=60.0,
+        observed_flow_width=48.0,
+        observed_physical_width=60.0,
+        physical_width_confident=True,
+        physical_width_source="SYNTHETIC_LOCAL_BOUNDARIES",
+        physical_left_boundary_lateral=-30.0,
+        physical_right_boundary_lateral=30.0,
         cohort_member_ids=set(range(JUNCTION_COHORT_MIN_ROBOTS)),
     )
     slots = build_local_junction_guard_slots(descriptor, 5)
@@ -3415,6 +3620,11 @@ def run_diagonal_local_guard_synthetic_validation() -> None:
         direction_last_estimate=noisy_flow.copy(),
         direction_is_stable=True,
         direction_is_mature=True,
+        observed_physical_width=60.0,
+        physical_width_confident=True,
+        physical_width_source="SYNTHETIC_LOCAL_BOUNDARIES",
+        physical_left_boundary_lateral=-30.0,
+        physical_right_boundary_lateral=30.0,
     )
     sample_total = max(LOCAL_BRANCH_DIRECTION_MIN_SAMPLES + 2, 8)
     for index in range(sample_total):
@@ -3451,11 +3661,20 @@ def run_diagonal_local_guard_synthetic_validation() -> None:
         for left, right in zip(frontier_laterals, reversed(frontier_laterals))
     ):
         raise AssertionError("synthetic Frontier slots are not symmetric")
+    synthetic_usable_width = (
+        local_physical_usable_half_width(locked_descriptor) * 2.0
+    )
+    synthetic_coverage = (
+        max(frontier_laterals) - min(frontier_laterals)
+    ) / max(synthetic_usable_width, EPSILON)
+    if synthetic_coverage < 0.999:
+        raise AssertionError("synthetic Frontier does not cover physical width")
     print(
         "[LocalGuardSynthetic] diagonal=PASS "
         f"dot={local_t.dot(local_n):.3e} slots={len(slots)} "
         f"locked-dot={locked_t.dot(tangent):.6f} "
-        f"frontier-slots={len(frontier_slots)}"
+        f"frontier-slots={len(frontier_slots)} "
+        f"coverage={synthetic_coverage:.3f}"
     )
 
 
@@ -3607,7 +3826,11 @@ def begin_junction_guard_formation(robots) -> None:
     global frontier_line_lateral_center
     global frontier_line_target_settled_ratio
     global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous
     global frontier_line_row_ready, frontier_line_last_diagnostic_time
+    global frontier_dead_end_transition_last_log_time
 
     visited = observed_visited_branches(robots)
     # Preserve already-formed walls for branches that are still unvisited.
@@ -3676,8 +3899,13 @@ def begin_junction_guard_formation(robots) -> None:
     frontier_line_target_settled_ratio = 0.0
     frontier_line_current_span = 0.0
     frontier_line_target_span = 0.0
+    frontier_line_physical_coverage_ratio = 0.0
+    frontier_line_left_edge_gap = float("inf")
+    frontier_line_right_edge_gap = float("inf")
+    frontier_line_continuous = False
     frontier_line_row_ready = False
     frontier_line_last_diagnostic_time = float("-inf")
+    frontier_dead_end_transition_last_log_time = float("-inf")
     # Only observed openings may be sealed. Closing an undiscovered branch
     # would leak the simulator's ground-truth map into the controller.
     branch_gate_states.clear()
@@ -3729,6 +3957,10 @@ def begin_junction_guard_formation(robots) -> None:
             continue
         if not lock_branch_motion_frame(descriptor):
             log_local_guard_pending(branch_uid, "MOTION_FRAME_UNAVAILABLE")
+            unavailable.append(branch_uid)
+            continue
+        if not update_local_physical_mouth_width(descriptor):
+            log_local_guard_pending(branch_uid, "PHYSICAL_WIDTH_UNCONFIRMED")
             unavailable.append(branch_uid)
             continue
         branch = descriptor.fixture_key
@@ -3986,12 +4218,55 @@ def junction_guards_formed(robots) -> bool:
         for branch in BRANCHES
     ):
         return False
-    return all(
+    anchors_settled = all(
         robot.junction_guard_anchor is not None
         and robot.position.distance_to(robot.junction_guard_anchor)
         <= JUNCTION_GUARD_POSITION_TOLERANCE
         for robot in guards
     )
+    if not anchors_settled:
+        return False
+    for branch in detected_branch_candidates:
+        if branch in visited:
+            continue
+        descriptor = branch_motion_descriptor(branch)
+        if (
+            descriptor is None
+            or not descriptor.physical_width_confident
+        ):
+            return False
+        row = [
+            robot for robot in guards
+            if robot.junction_guard_branch == branch
+            and robot.junction_guard_layer == 0
+        ]
+        if len(row) < required_junction_guard_count(descriptor):
+            return False
+        laterals = sorted(
+            branch_local_coordinates(robot.position, descriptor)[1]
+            for robot in row
+        )
+        usable_half = local_physical_usable_half_width(descriptor)
+        usable_width = usable_half * 2.0
+        span = laterals[-1] - laterals[0]
+        left_gap = max(0.0, laterals[0] + usable_half)
+        right_gap = max(0.0, usable_half - laterals[-1])
+        maximum_gap = max(
+            (
+                right - left
+                for left, right in zip(laterals, laterals[1:])
+            ),
+            default=0.0,
+        )
+        if (
+            span / max(usable_width, EPSILON)
+            < FRONTIER_LINE_MIN_SPAN_RATIO
+            or left_gap > FRONTIER_LINE_MAX_EDGE_GAP
+            or right_gap > FRONTIER_LINE_MAX_EDGE_GAP
+            or maximum_gap > FRONTIER_LINE_MAX_INTERNAL_GAP
+        ):
+            return False
+    return True
 
 
 def commit_junction_guard_roles(robots, selected_branch: str) -> None:
@@ -4000,6 +4275,9 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
     global frontier_line_lateral_center
     global frontier_line_target_settled_ratio
     global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous
     global frontier_line_row_ready, frontier_line_last_diagnostic_time
     for branch, robot_ids in junction_guard_groups.items():
         branch_uid = branch_uid_for_fixture(branch)
@@ -4020,7 +4298,7 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
                 stored_columns if stored_columns > 0 else len(branch_guards)
             )
             column_count = int(clamp(
-                max(adaptive_shepherd_count(), seed_columns),
+                max(local_frontier_shepherd_count(descriptor), seed_columns),
                 JUNCTION_GUARD_MIN_COUNT,
                 SHEPHERD_MAX_COUNT,
             ))
@@ -4133,12 +4411,17 @@ def commit_junction_guard_roles(robots, selected_branch: str) -> None:
                 if len(frontier_guards) >= 2
                 else 0.0
             )
+            frontier_line_physical_coverage_ratio = 0.0
+            frontier_line_left_edge_gap = float("inf")
+            frontier_line_right_edge_gap = float("inf")
+            frontier_line_continuous = False
             frontier_line_row_ready = False
             frontier_line_last_diagnostic_time = float("-inf")
             print(
                 f"[FrontierLocalFrame] uid={branch_uid} fixture={branch} "
                 f"axial={line_axial:.1f} members={len(assignment)} "
-                f"width={local_guard_observed_width(descriptor):.1f} "
+                f"flow-width={descriptor.observed_flow_width:.1f} "
+                f"physical-width={local_guard_observed_width(descriptor):.1f} "
                 "frame=OBSERVED_MOUTH_T_N"
             )
             thick_mouth_guard_layers[branch] = 0
@@ -4258,10 +4541,10 @@ def get_frontier_shepherds(robots, branch: Optional[str] = None):
 def frontier_row_snapshot(
     frontiers,
     descriptor: BranchDescriptor,
-) -> tuple[float, float, float, bool]:
-    """Measure target settlement and transverse span without changing IDs."""
+) -> tuple[float, float, float, float, float, float, bool, bool]:
+    """Measure settlement and full physical transverse coverage."""
     if not frontiers:
-        return 0.0, 0.0, 0.0, False
+        return 0.0, 0.0, 0.0, 0.0, float("inf"), float("inf"), False, False
     targets = [
         frontier_shepherd_slot_target(robot, frontier_line_depth)
         for robot in frontiers
@@ -4292,13 +4575,57 @@ def frontier_row_snapshot(
         if len(target_laterals) >= 2
         else 0.0
     )
+    usable_half = local_physical_usable_half_width(descriptor)
+    usable_width = usable_half * 2.0
+    ordered_laterals = sorted(lateral_positions)
+    left_edge_gap = (
+        max(0.0, ordered_laterals[0] + usable_half)
+        if ordered_laterals else float("inf")
+    )
+    right_edge_gap = (
+        max(0.0, usable_half - ordered_laterals[-1])
+        if ordered_laterals else float("inf")
+    )
+    coverage_ratio = clamp(
+        current_span / max(usable_width, EPSILON),
+        0.0,
+        1.0,
+    )
+    maximum_internal_gap = max(
+        (
+            right - left
+            for left, right in zip(
+                ordered_laterals,
+                ordered_laterals[1:],
+            )
+        ),
+        default=0.0,
+    )
+    continuous = (
+        len(frontiers) >= local_frontier_shepherd_count(descriptor)
+        and maximum_internal_gap <= FRONTIER_LINE_MAX_INTERNAL_GAP
+    )
     span_ready = (
         target_span <= EPSILON
         or current_span >= target_span * FRONTIER_LINE_MIN_SPAN_RATIO
     )
-    return settled_ratio, current_span, target_span, (
+    row_ready = (
         settled_ratio >= FRONTIER_LINE_TARGET_SETTLED_RATIO
         and span_ready
+        and coverage_ratio >= FRONTIER_LINE_MIN_SPAN_RATIO
+        and left_edge_gap <= FRONTIER_LINE_MAX_EDGE_GAP
+        and right_edge_gap <= FRONTIER_LINE_MAX_EDGE_GAP
+        and continuous
+    )
+    return (
+        settled_ratio,
+        current_span,
+        target_span,
+        coverage_ratio,
+        left_edge_gap,
+        right_edge_gap,
+        continuous,
+        row_ready,
     )
 
 
@@ -4336,13 +4663,14 @@ def update_frontier_lateral_center(
         ),
         default=0.0,
     )
-    physical_half = max(
-        0.0,
-        local_guard_observed_width(descriptor) * 0.5
-        - ROBOT_RADIUS
-        - FRONTIER_LINE_WIDTH_SAFETY_MARGIN,
+    physical_center_half = local_physical_usable_half_width(descriptor)
+    # Drift reserve caps how far the row centre may follow the body; it does
+    # not shorten the row itself. The physical wall clearance is the tighter
+    # bound for the two edge robots.
+    center_limit = min(
+        FRONTIER_LINE_DRIFT_RESERVE,
+        max(0.0, physical_center_half - slot_half),
     )
-    center_limit = max(0.0, physical_half - slot_half)
     desired_center = clamp(desired_center, -center_limit, center_limit)
     maximum_step = FRONTIER_LINE_CENTER_CORRECTION_SPEED * dt
     frontier_line_lateral_center += clamp(
@@ -4352,11 +4680,39 @@ def update_frontier_lateral_center(
     )
 
 
+def refresh_frontier_row_readiness(robots, branch: str) -> bool:
+    """Refresh the one full-width readiness gate without advancing depth."""
+    global frontier_line_target_settled_ratio
+    global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous, frontier_line_row_ready
+    descriptor = branch_motion_descriptor(branch)
+    frontiers = get_frontier_shepherds(robots, branch)
+    if descriptor is None or not frontiers:
+        frontier_line_row_ready = False
+        return False
+    (
+        frontier_line_target_settled_ratio,
+        frontier_line_current_span,
+        frontier_line_target_span,
+        frontier_line_physical_coverage_ratio,
+        frontier_line_left_edge_gap,
+        frontier_line_right_edge_gap,
+        frontier_line_continuous,
+        frontier_line_row_ready,
+    ) = frontier_row_snapshot(frontiers, descriptor)
+    return frontier_line_row_ready
+
+
 def update_frontier_line_progress(robots, branch: str, dt: float) -> None:
     """Advance the intact line only as fast as the NORMAL body can follow."""
     global frontier_line_depth
     global frontier_line_target_settled_ratio
     global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous
     global frontier_line_row_ready
     frontiers = get_frontier_shepherds(robots, branch)
     if not frontiers or frontier_line_branch != branch:
@@ -4367,20 +4723,10 @@ def update_frontier_line_progress(robots, branch: str, dt: float) -> None:
     descriptor = branch_motion_descriptor(branch)
     if descriptor is None:
         return
-    (
-        frontier_line_target_settled_ratio,
-        frontier_line_current_span,
-        frontier_line_target_span,
-        frontier_line_row_ready,
-    ) = frontier_row_snapshot(frontiers, descriptor)
+    refresh_frontier_row_readiness(robots, branch)
     if frontier_line_row_ready:
         update_frontier_lateral_center(robots, branch, descriptor, dt)
-        (
-            frontier_line_target_settled_ratio,
-            frontier_line_current_span,
-            frontier_line_target_span,
-            frontier_line_row_ready,
-        ) = frontier_row_snapshot(frontiers, descriptor)
+        refresh_frontier_row_readiness(robots, branch)
     if not frontier_line_row_ready:
         return
     normal_depths = [
@@ -4423,27 +4769,43 @@ def promote_existing_frontier_line(
     global frontier_line_lateral_center
     global frontier_line_target_settled_ratio
     global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous
     global frontier_line_row_ready
     frontiers = get_frontier_shepherds(robots, branch)
     if not frontiers:
         return []
-    slots = build_shepherd_slots(
-        branch,
-        len(frontiers),
-        observed_boundary_depth,
-    )
-    assignment = assign_shepherd_slots(frontiers, slots)
-    if len(assignment) != len(frontiers):
+    descriptor = branch_motion_descriptor(branch)
+    if descriptor is None:
         return []
+    boundary_depth = (
+        frontier_line_depth
+        if observed_boundary_depth is None
+        else max(0.0, observed_boundary_depth)
+    )
+    local_slots = []
+    for robot in frontiers:
+        if robot.frontier_local_lateral is None:
+            return []
+        slot = local_coordinates_to_world(
+            descriptor,
+            boundary_depth,
+            frontier_line_lateral_center + robot.frontier_local_lateral,
+        )
+        if not is_walkable(slot, robot.radius):
+            return []
+        local_slots.append((robot, slot))
     promoted = []
-    for robot, slot, _ in assignment:
+    for robot, slot in local_slots:
         robot.role = "SHEPHERD"
         robot.shepherd_anchor = slot.copy()
         robot.shepherd_origin = slot.copy()
         robot.shepherd_branch = branch
-        # Backflow/piston geometry is still fixture based, so the local
-        # frontier slot is dropped when the line becomes a SHEPHERD piston.
-        robot.frontier_local_lateral = None
+        # Keep the same local lateral identity through the handoff. Backflow
+        # may still use its legacy geometry after this stationary boundary is
+        # formed, but the transition itself does not rotate, shrink, or
+        # re-auction the physical line.
         robot.junction_guard_anchor = None
         robot.velocity.update(0.0, 0.0)
         robot.acceleration.update(0.0, 0.0)
@@ -4455,12 +4817,77 @@ def promote_existing_frontier_line(
     frontier_line_target_settled_ratio = 0.0
     frontier_line_current_span = 0.0
     frontier_line_target_span = 0.0
+    frontier_line_physical_coverage_ratio = 0.0
+    frontier_line_left_edge_gap = float("inf")
+    frontier_line_right_edge_gap = float("inf")
+    frontier_line_continuous = False
     frontier_line_row_ready = False
     print(
         f"[Frontier -> Shepherd] retained original IDs="
-        f"{[robot.robot_id for robot in promoted]}; no re-election"
+        f"{[robot.robot_id for robot in promoted]}; no re-election; "
+        f"local-depth={boundary_depth:.1f}; local-slots-preserved=True"
     )
     return promoted
+
+
+def resolve_local_frontier_handoff_depth(
+    frontiers,
+    descriptor: BranchDescriptor,
+    contacted_depth: float,
+) -> Optional[float]:
+    """Find the deepest common local row supported by all retained slots.
+
+    A real end wall can be slightly oblique to the locked motion frame. The
+    contact depths then have a small spread, so the physical Shepherd boundary
+    is the deepest nearby axial row where every original lateral slot still
+    has robot-footprint clearance. This is a local t/n collision observation,
+    not a fixture terminal coordinate.
+    """
+    lateral_slots = [
+        frontier_line_lateral_center + robot.frontier_local_lateral
+        for robot in frontiers
+        if robot.frontier_local_lateral is not None
+    ]
+    if len(lateral_slots) != len(frontiers):
+        return None
+
+    def row_is_walkable(depth: float) -> bool:
+        return all(
+            is_walkable(
+                local_coordinates_to_world(descriptor, depth, lateral),
+                ROBOT_RADIUS,
+            )
+            for lateral in lateral_slots
+        )
+
+    if row_is_walkable(contacted_depth):
+        return contacted_depth
+    retreat_step = max(0.25, ROBOT_RADIUS * 0.25)
+    unsafe_depth = contacted_depth
+    safe_depth = None
+    maximum_retreat = ROBOT_RADIUS * 6.0
+    retreat = retreat_step
+    while retreat <= maximum_retreat + EPSILON:
+        candidate = max(0.0, contacted_depth - retreat)
+        if row_is_walkable(candidate):
+            safe_depth = candidate
+            break
+        unsafe_depth = candidate
+        retreat += retreat_step
+    if safe_depth is None:
+        return None
+    # Recover the deepest common row to sub-pixel precision.
+    low = safe_depth
+    high = unsafe_depth
+    if high < low:
+        high = contacted_depth
+    for _ in range(14):
+        middle = 0.5 * (low + high)
+        if row_is_walkable(middle):
+            low = middle
+        else:
+            high = middle
+    return low
 
 # =========================================================
 # 9. Robot creation and spatial hash
@@ -6145,6 +6572,7 @@ def lock_branch_motion_frame(descriptor: BranchDescriptor) -> bool:
         measured_width,
         ROBOT_RADIUS * 2.0,
     )
+    descriptor.observed_flow_width = descriptor.motion_observed_width
     print(
         f"[BranchMotionFrame] uid={descriptor.uid} source={source} "
         f"flow-t=({flow_t.x:.3f},{flow_t.y:.3f}) "
@@ -9468,18 +9896,22 @@ class DeadEndInferenceTracker:
     mean_forward_speed: float = 0.0
     mean_density_ratio: float = 0.0
     lateral_escape_ratio: float = 0.0
+    shepherd_direct_contact_count: int = 0
     shepherd_direct_contact_ratio: float = 0.0
+    shepherd_contact_span: float = 0.0
     shepherd_contact_span_ratio: float = 0.0
     shepherd_mean_forward_speed: float = 0.0
     frontier_forward_progress: float = 0.0
     frontier_progress_rate: float = float("inf")
     branch_robot_count: int = 0
+    required_branch_robot_count: int = 0
     blocking_reason: str = "NO_FRONTIER_LINE"
     confirmation_mode: str = "WAIT"
     frontier_progress_history: deque = field(
         default_factory=lambda: deque(maxlen=32)
     )
     confirmed_depth: float = 0.0
+    handoff_depth: float = 0.0
     confirmed: bool = False
 
     def reset(self, branch: Optional[str] = None):
@@ -9491,16 +9923,20 @@ class DeadEndInferenceTracker:
         self.mean_forward_speed = 0.0
         self.mean_density_ratio = 0.0
         self.lateral_escape_ratio = 0.0
+        self.shepherd_direct_contact_count = 0
         self.shepherd_direct_contact_ratio = 0.0
+        self.shepherd_contact_span = 0.0
         self.shepherd_contact_span_ratio = 0.0
         self.shepherd_mean_forward_speed = 0.0
         self.frontier_forward_progress = 0.0
         self.frontier_progress_rate = float("inf")
         self.branch_robot_count = 0
+        self.required_branch_robot_count = 0
         self.blocking_reason = "NO_FRONTIER_LINE"
         self.confirmation_mode = "WAIT"
         self.frontier_progress_history.clear()
         self.confirmed_depth = 0.0
+        self.handoff_depth = 0.0
         self.confirmed = False
 
     def update(self, robots, branch: str, reference_density: float, dt: float) -> bool:
@@ -9514,20 +9950,24 @@ class DeadEndInferenceTracker:
             and get_robot_region(robot.position) == branch
         ]
         self.branch_robot_count = len(branch_robots)
-        estimate_effective_branch_width(robots, branch)
+        descriptor = branch_motion_descriptor(branch)
+        if descriptor is None or not descriptor.physical_width_confident:
+            self.dwell = 0.0
+            self.blocking_reason = "LOCAL_PHYSICAL_FRAME_UNAVAILABLE"
+            return False
         if not branch_robots:
             self.dwell = 0.0
             self.blocking_reason = "INSUFFICIENT_BRANCH_ROBOTS"
             return False
 
         maximum_depth = max(
-            branch_depth_from_junction(robot.position, branch)
+            observed_branch_axial_depth(robot.position, descriptor)
             for robot in branch_robots
         )
         frontier = [
             robot
             for robot in branch_robots
-            if branch_depth_from_junction(robot.position, branch)
+            if observed_branch_axial_depth(robot.position, descriptor)
             >= maximum_depth - DEAD_END_FRONTIER_DEPTH
         ]
         self.frontier_count = len(frontier)
@@ -9536,11 +9976,13 @@ class DeadEndInferenceTracker:
             self.blocking_reason = "INSUFFICIENT_FRONTIER_ROBOTS"
             return False
 
-        direction = BRANCH_DIRECTIONS[branch]
-        lateral = pygame.Vector2(-direction.y, direction.x)
+        direction, lateral = descriptor_local_basis(descriptor)
         leader = max(
             frontier,
-            key=lambda robot: branch_depth_from_junction(robot.position, branch),
+            key=lambda robot: observed_branch_axial_depth(
+                robot.position,
+                descriptor,
+            ),
         )
         evidences = [robot_contact_evidence(robot) for robot in frontier]
         self.leader_contact = robot_contact_evidence(leader)
@@ -9562,7 +10004,7 @@ class DeadEndInferenceTracker:
         if frontier_shepherds:
             self.frontier_forward_progress = linear_quantile(
                 [
-                    branch_depth_from_junction(robot.position, branch)
+                    observed_branch_axial_depth(robot.position, descriptor)
                     for robot in frontier_shepherds
                 ],
                 0.50,
@@ -9603,6 +10045,9 @@ class DeadEndInferenceTracker:
             if simulation_time - robot.last_forward_obstacle_contact_time
             <= DEAD_END_FORWARD_BUMPER_MEMORY
         ]
+        self.shepherd_direct_contact_count = len(
+            directly_contacting_shepherds
+        )
         self.shepherd_direct_contact_ratio = (
             len(directly_contacting_shepherds)
             / max(len(frontier_shepherds), 1)
@@ -9615,16 +10060,17 @@ class DeadEndInferenceTracker:
             / max(len(frontier_shepherds), 1)
         )
         contact_lateral_coordinates = [
-            (robot.position - get_branch_entrance(branch)).dot(lateral)
+            branch_local_coordinates(robot.position, descriptor)[1]
             for robot in directly_contacting_shepherds
         ]
-        contact_span = (
+        self.shepherd_contact_span = (
             max(contact_lateral_coordinates) - min(contact_lateral_coordinates)
             if len(contact_lateral_coordinates) >= 2
             else 0.0
         )
         self.shepherd_contact_span_ratio = clamp(
-            contact_span / max(corridor_width, EPSILON),
+            self.shepherd_contact_span
+            / max(local_physical_usable_half_width(descriptor) * 2.0, EPSILON),
             0.0,
             1.0,
         )
@@ -9632,10 +10078,13 @@ class DeadEndInferenceTracker:
             DEAD_END_FAST_MIN_BRANCH_ROBOTS,
             len(frontier_shepherds) * 2,
         )
+        self.required_branch_robot_count = required_branch_robots
         contact_stall_conditions = (
             len(frontier_shepherds) >= JUNCTION_GUARD_MIN_COUNT
             and self.shepherd_direct_contact_ratio
             >= DEAD_END_SHEPHERD_DIRECT_CONTACT_RATIO
+            and self.shepherd_contact_span_ratio
+            >= DEAD_END_SHEPHERD_CONTACT_SPAN_RATIO
             and self.frontier_progress_rate
             <= DEAD_END_FRONTIER_PROGRESS_RATE_THRESHOLD
             and self.branch_robot_count >= required_branch_robots
@@ -9649,6 +10098,11 @@ class DeadEndInferenceTracker:
             < DEAD_END_SHEPHERD_DIRECT_CONTACT_RATIO
         ):
             self.blocking_reason = "FRONTIER_CONTACT_RATIO"
+        elif (
+            self.shepherd_contact_span_ratio
+            < DEAD_END_SHEPHERD_CONTACT_SPAN_RATIO
+        ):
+            self.blocking_reason = "FRONTIER_CONTACT_SPAN"
         elif (
             self.frontier_progress_rate
             > DEAD_END_FRONTIER_PROGRESS_RATE_THRESHOLD
@@ -9678,21 +10132,32 @@ class DeadEndInferenceTracker:
         )
         if newly_confirmed:
             self.confirmed = True
-            # Store the contacted leader's measured displacement from the
-            # observed mouth.  This is the Shepherd boundary reference; the
-            # renderer's known branch length is not substituted here.
+            # Confirm the wall at the median local axial contact depth. Keep
+            # the nearby common walkable row separate: it is a placement
+            # target, not a replacement for the measured Dead-end depth.
             self.confirmed_depth = max(
                 0.0,
                 linear_quantile(
                     [
-                        (robot.position - get_branch_entrance(branch)).dot(
-                            direction
+                        observed_branch_axial_depth(
+                            robot.position,
+                            descriptor,
                         )
                         for robot in directly_contacting_shepherds
                     ],
                     0.50,
                 ),
             )
+            resolved_handoff_depth = resolve_local_frontier_handoff_depth(
+                frontier_shepherds,
+                descriptor,
+                self.confirmed_depth,
+            )
+            if resolved_handoff_depth is None:
+                self.confirmed = False
+                self.blocking_reason = "NO_COMMON_LOCAL_HANDOFF_ROW"
+                return False
+            self.handoff_depth = resolved_handoff_depth
             observed_dead_end_depths[branch] = self.confirmed_depth
             metrics.dead_end_events.append({
                 "time": simulation_time,
@@ -9717,6 +10182,7 @@ class DeadEndInferenceTracker:
                 "branch_robot_count": self.branch_robot_count,
                 "confirmation_mode": self.confirmation_mode,
                 "observed_depth": self.confirmed_depth,
+                "handoff_depth": self.handoff_depth,
             })
             print(
                 f"[Dead-end Inference] branch={branch}, "
@@ -9735,6 +10201,7 @@ class DeadEndInferenceTracker:
                 f"dwell={self.dwell:.2f}, "
                 f"mode={self.confirmation_mode}, "
                 f"observed_depth={self.confirmed_depth:.1f}"
+                f", handoff_depth={self.handoff_depth:.1f}"
             )
         return self.confirmed
 
@@ -9769,12 +10236,19 @@ def log_frontier_explore_diagnostics(robots, branch: str) -> None:
         else 0.0
     )
     print(
-        f"[FrontierMotion] branch={branch} robots={len(frontiers)} "
+        f"[FrontierMotion] branch={branch} uid={descriptor.uid} "
+        f"robots={len(frontiers)} "
+        f"physical-width={descriptor.observed_physical_width:.1f} "
+        f"usable-width={local_physical_usable_half_width(descriptor) * 2.0:.1f} "
         f"axial={frontier_line_depth:.1f} "
         f"settled={frontier_line_target_settled_ratio:.2f} "
         f"row-ready={frontier_line_row_ready} "
         f"span={frontier_line_current_span:.1f}/"
         f"{frontier_line_target_span:.1f} "
+        f"coverage={frontier_line_physical_coverage_ratio:.2f} "
+        f"edge-gaps={frontier_line_left_edge_gap:.1f}/"
+        f"{frontier_line_right_edge_gap:.1f} "
+        f"continuous={frontier_line_continuous} "
         f"center={frontier_line_lateral_center:.2f} "
         f"motion-t=({tangent.x:.3f},{tangent.y:.3f}) "
         f"motion-n=({normal.x:.3f},{normal.y:.3f}) "
@@ -9784,6 +10258,90 @@ def log_frontier_explore_diagnostics(robots, branch: str) -> None:
         f"contact-span={contact_span:.1f} "
         f"dead-end-dwell={dead_end_inference_tracker.dwell:.2f} "
         f"blocked={dead_end_inference_tracker.blocking_reason}"
+    )
+    transition_line_reached = (
+        dead_end_inference_tracker.confirmed
+        and all(
+            observed_branch_axial_depth(robot.position, descriptor)
+            >= dead_end_inference_tracker.confirmed_depth
+            - JUNCTION_GUARD_POSITION_TOLERANCE
+            for robot in frontiers
+        )
+    )
+    if not dead_end_inference_tracker.confirmed:
+        transition_blocker = dead_end_inference_tracker.blocking_reason
+    elif not transition_line_reached:
+        transition_blocker = "FRONTIER_BEHIND_CONFIRMED_LOCAL_DEPTH"
+    elif dead_end_inference_tracker.blocking_reason.startswith(
+        "LOCAL_HANDOFF"
+    ):
+        transition_blocker = dead_end_inference_tracker.blocking_reason
+    else:
+        transition_blocker = "READY_FOR_LOCAL_PROMOTE"
+    log_dead_end_transition_diagnostics(
+        robots,
+        branch,
+        transition_line_reached,
+        transition_blocker,
+    )
+
+
+def log_dead_end_transition_diagnostics(
+    robots,
+    branch: str,
+    physical_line_reached: bool,
+    blocking_reason: str,
+) -> None:
+    """Explain the local contact-depth to physical-line handoff gate."""
+    global frontier_dead_end_transition_last_log_time
+    if (
+        simulation_time - frontier_dead_end_transition_last_log_time
+        < 1.0
+    ):
+        return
+    descriptor = branch_motion_descriptor(branch)
+    frontiers = get_frontier_shepherds(robots, branch)
+    if descriptor is None:
+        return
+    if not frontiers:
+        frontiers = [
+            robot for robot in get_shepherds(robots)
+            if robot.shepherd_branch == branch
+        ]
+    frontier_dead_end_transition_last_log_time = simulation_time
+    depths = sorted(
+        observed_branch_axial_depth(robot.position, descriptor)
+        for robot in frontiers
+    )
+    minimum = depths[0] if depths else 0.0
+    median = linear_quantile(depths, 0.50) if depths else 0.0
+    maximum = depths[-1] if depths else 0.0
+    print(
+        f"[DeadEndTransition] branch={branch} uid={descriptor.uid} "
+        f"frontier-shepherds={len(frontiers)} "
+        f"direct-contact="
+        f"{dead_end_inference_tracker.shepherd_direct_contact_count}/"
+        f"{len(frontiers)} "
+        f"direct-contact-ratio="
+        f"{dead_end_inference_tracker.shepherd_direct_contact_ratio:.2f} "
+        f"contact-span={dead_end_inference_tracker.shepherd_contact_span:.1f} "
+        f"contact-span-ratio="
+        f"{dead_end_inference_tracker.shepherd_contact_span_ratio:.2f} "
+        f"frontier-local-axial={minimum:.1f}/{median:.1f}/{maximum:.1f} "
+        f"frontier-progress-rate="
+        f"{dead_end_inference_tracker.frontier_progress_rate:.2f} "
+        f"branch-robots={dead_end_inference_tracker.branch_robot_count}/"
+        f"{dead_end_inference_tracker.required_branch_robot_count} "
+        f"lateral-escape="
+        f"{dead_end_inference_tracker.lateral_escape_ratio:.2f} "
+        f"dwell={dead_end_inference_tracker.dwell:.2f} "
+        f"dead-end-confirmed={dead_end_inference_tracker.confirmed} "
+        f"confirmed-local-axial="
+        f"{dead_end_inference_tracker.confirmed_depth:.1f} "
+        f"handoff-local-axial="
+        f"{dead_end_inference_tracker.handoff_depth:.1f} "
+        f"physical-line-reached={physical_line_reached} "
+        f"blocking-reason={blocking_reason}"
     )
 
 
@@ -12977,9 +13535,16 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
     elif phase == SimulationPhase.FORM_JUNCTION_GUARDS:
         junction_guard_formation_timer += dt
         if pending_branch_start is not None:
-            thick_walls_ready = thick_mouth_guards_formed(
+            unselected_walls_ready = thick_mouth_guards_formed(
                 robots,
                 pending_branch_start,
+            )
+            selected_frontier_ready = refresh_frontier_row_readiness(
+                robots,
+                pending_branch_start,
+            )
+            thick_walls_ready = (
+                unselected_walls_ready and selected_frontier_ready
             )
             junction_guard_stable_dwell = (
                 junction_guard_stable_dwell + dt
@@ -12994,8 +13559,13 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
             ):
                 junction_guard_status = "WAITING_FOR_THICK_KHOP_MOUTH_WALLS"
                 print(
-                    "[Thick Mouth Guard] formation is slow; selected Branch "
-                    "flow remains paused until every physical wall is ready"
+                    "[PhysicalCoverage] Branch opening remains paused: "
+                    f"unselected-walls={unselected_walls_ready}, "
+                    f"selected-frontier={selected_frontier_ready}, "
+                    f"coverage={frontier_line_physical_coverage_ratio:.2f}, "
+                    f"edge-gaps={frontier_line_left_edge_gap:.1f}/"
+                    f"{frontier_line_right_edge_gap:.1f}, "
+                    f"continuous={frontier_line_continuous}"
                 )
                 log_local_guard_formation_diagnostics(robots)
             if (
@@ -13122,19 +13692,45 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 robots,
                 active_branch,
             )
-            physical_line_reached = bool(frontier_shepherds) and all(
-                branch_depth_from_junction(robot.position, active_branch)
-                >= observed_depth - JUNCTION_GUARD_POSITION_TOLERANCE
-                for robot in frontier_shepherds
+            descriptor = branch_motion_descriptor(active_branch)
+            physical_line_reached = (
+                descriptor is not None
+                and bool(frontier_shepherds)
+                and all(
+                    observed_branch_axial_depth(robot.position, descriptor)
+                    >= observed_depth - JUNCTION_GUARD_POSITION_TOLERANCE
+                    for robot in frontier_shepherds
+                )
             )
             if not physical_line_reached:
+                blocking_reason = (
+                    "LOCAL_DESCRIPTOR_UNAVAILABLE"
+                    if descriptor is None
+                    else (
+                        "NO_FRONTIER_ROBOTS"
+                        if not frontier_shepherds
+                        else "FRONTIER_BEHIND_CONFIRMED_LOCAL_DEPTH"
+                    )
+                )
+                log_dead_end_transition_diagnostics(
+                    robots,
+                    active_branch,
+                    False,
+                    blocking_reason,
+                )
                 return
             selected = promote_existing_frontier_line(
                 robots,
                 active_branch,
-                observed_depth,
+                dead_end_inference_tracker.handoff_depth,
             )
             if selected:
+                log_dead_end_transition_diagnostics(
+                    robots,
+                    active_branch,
+                    True,
+                    "READY_LOCAL_HANDOFF",
+                )
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
                 shepherd_form_timer = 0.0
                 # Close a continuous full-width virtual gate immediately.  Any
@@ -13144,6 +13740,16 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 print(
                     f"[Shepherd] original frontier line flattened at dead-end: "
                     f"branch={active_branch}, count={len(selected)}"
+                )
+            else:
+                dead_end_inference_tracker.blocking_reason = (
+                    "LOCAL_HANDOFF_TARGET_UNWALKABLE_OR_INCOMPLETE"
+                )
+                log_dead_end_transition_diagnostics(
+                    robots,
+                    active_branch,
+                    physical_line_reached,
+                    "LOCAL_HANDOFF_TARGET_UNWALKABLE_OR_INCOMPLETE",
                 )
 
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
@@ -13854,7 +14460,11 @@ def reset_dfs_state():
     global frontier_line_lateral_center
     global frontier_line_target_settled_ratio
     global frontier_line_current_span, frontier_line_target_span
+    global frontier_line_physical_coverage_ratio
+    global frontier_line_left_edge_gap, frontier_line_right_edge_gap
+    global frontier_line_continuous
     global frontier_line_row_ready, frontier_line_last_diagnostic_time
+    global frontier_dead_end_transition_last_log_time
     global observed_dead_end_depths
     global last_distributed_vote_counts
     global last_distributed_voter_count, last_distributed_vote_quorum
@@ -13961,8 +14571,13 @@ def reset_dfs_state():
     frontier_line_target_settled_ratio = 0.0
     frontier_line_current_span = 0.0
     frontier_line_target_span = 0.0
+    frontier_line_physical_coverage_ratio = 0.0
+    frontier_line_left_edge_gap = float("inf")
+    frontier_line_right_edge_gap = float("inf")
+    frontier_line_continuous = False
     frontier_line_row_ready = False
     frontier_line_last_diagnostic_time = float("-inf")
+    frontier_dead_end_transition_last_log_time = float("-inf")
     observed_dead_end_depths = {}
     last_distributed_vote_counts = {}
     last_distributed_voter_count = 0
@@ -14539,9 +15154,27 @@ while running:
             f"settled={frontier_line_target_settled_ratio:.2f} "
             f"span={frontier_line_current_span:.1f}/"
             f"{frontier_line_target_span:.1f} "
+            f"coverage={frontier_line_physical_coverage_ratio:.2f} "
+            f"edge={frontier_line_left_edge_gap:.1f}/"
+            f"{frontier_line_right_edge_gap:.1f} "
+            f"continuous={frontier_line_continuous} "
             f"center={frontier_line_lateral_center:.1f} "
             f"ready={frontier_line_row_ready} "
             f"ids={[robot.robot_id for robot in get_frontier_shepherds(robots)]}"
+        ),
+        (
+            "Local physical widths: "
+            + (
+                " | ".join(
+                    f"{branch_identity_label(uid)} "
+                    f"flow={branch_descriptors_by_uid[uid].observed_flow_width:.1f} "
+                    f"physical={branch_descriptors_by_uid[uid].observed_physical_width:.1f} "
+                    f"conf={branch_descriptors_by_uid[uid].physical_width_confident}"
+                    for uid in ordered_discovered_branch_uids()
+                )
+                if branch_descriptors_by_uid
+                else "-"
+            )
         ),
         (
             "Observed guard frontiers: "
