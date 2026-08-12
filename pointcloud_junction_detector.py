@@ -1,457 +1,719 @@
-"""Generate an ideal 2D LiDAR point cloud for a four-way junction."""
+"""
+pointcloud_junction_detector.py
+
+General 2D Junction Point-Cloud Opening Detector.
+
+Research separation
+-------------------
+Simulator-only information:
+    - wall geometry
+    - Anchor world x/y/yaw
+
+Detector-visible information:
+    - Anchor-local LiDAR angle/range only
+
+The detector never receives:
+    - expected branch/way count
+    - expected branch directions
+    - map or wall geometry
+    - Anchor global pose
+    - Junction coordinates
+
+Problem definition
+------------------
+Detector input:
+    P = {(theta_i, r_i)} for i = 1..N
+    where theta_i is the Anchor-local bearing and r_i is the measured range.
+
+Detector output:
+    A variable-length list of open angular sectors. Each sector contains
+    start_angle, end_angle, center_angle, and width_deg.
+    The number of outputs is inferred from the scan; it is never provided.
+
+Pipeline
+--------
+Arbitrary test geometry -> ray casting -> Anchor-local P={(theta,r)}
+-> circular smoothing -> adaptive open-support extraction
+-> circular connected components -> range-gradient boundary refinement
+-> opening start/end angles and automatically inferred opening count
+"""
 
 from __future__ import annotations
 
-import math
-from typing import Any, Iterable, Optional, Sequence, Tuple
+import argparse
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-Point = Tuple[float, float]
-Segment = Tuple[Point, Point]
-Intersection = Tuple[float, Point]
+EPSILON = 1.0e-10
 
 
-def create_4way_junction(
-    corridor_width: float = 2.0,
-    branch_length: float = 12.0,
-) -> Tuple[list[Segment], Point]:
-    """Create the boundary walls of a symmetric four-way cross junction.
+@dataclass(frozen=True)
+class LidarScan:
+    """Anchor-local 2D LiDAR scan; no global map/pose is stored."""
 
-    The free space is the union of one horizontal and one vertical corridor.
-    The returned walls are the eight boundary segments extending away from the
-    central square.  Branch ends deliberately remain open.
+    angle_deg: np.ndarray
+    range_m: np.ndarray
+    hit: np.ndarray
+    local_x: np.ndarray
+    local_y: np.ndarray
+    max_range_m: float
 
-    Args:
-        corridor_width: Constant width of every corridor branch.
-        branch_length: Distance from the anchor to the far end of each wall.
+    def detector_input(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return only information permitted to the localization-free detector."""
+        return self.angle_deg.copy(), self.range_m.copy()
 
-    Returns:
-        A wall-segment list and the anchor at ``(0, 0)``.
-    """
-    if corridor_width <= 0.0:
-        raise ValueError("corridor_width must be positive")
-
-    half_width = corridor_width / 2.0
-    if branch_length <= half_width:
-        raise ValueError("branch_length must exceed half the corridor width")
-
-    h = half_width
-    length = float(branch_length)
-    walls: list[Segment] = [
-        # Upper and lower walls of the left branch.
-        ((-length, h), (-h, h)),
-        ((-length, -h), (-h, -h)),
-        # Upper and lower walls of the right branch.
-        ((h, h), (length, h)),
-        ((h, -h), (length, -h)),
-        # Left and right walls of the upper branch.
-        ((-h, h), (-h, length)),
-        ((h, h), (h, length)),
-        # Left and right walls of the lower branch.
-        ((-h, -length), (-h, -h)),
-        ((h, -length), (h, -h)),
-    ]
-    return walls, (0.0, 0.0)
+    def valid_local_points(self) -> np.ndarray:
+        """Return physical LiDAR returns only in the Anchor-local frame."""
+        return np.column_stack((self.local_x[self.hit], self.local_y[self.hit]))
 
 
-def _cross_2d(a: np.ndarray, b: np.ndarray) -> float:
-    """Return the scalar 2D cross product of two vectors."""
+# -----------------------------------------------------------------------------
+# Geometry / ray casting
+# -----------------------------------------------------------------------------
+
+def cross2d(a: np.ndarray, b: np.ndarray) -> float:
     return float(a[0] * b[1] - a[1] * b[0])
 
 
-def ray_segment_intersection(
+def ray_segment_distance(
     ray_origin: Sequence[float],
     ray_direction: Sequence[float],
-    segment_start: Sequence[float],
-    segment_end: Sequence[float],
-    epsilon: float = 1.0e-10,
-) -> Optional[Intersection]:
-    """Find the nearest intersection between a ray and a finite segment.
+    seg_start: Sequence[float],
+    seg_end: Sequence[float],
+    eps: float = EPSILON,
+) -> Optional[float]:
+    """Nearest forward intersection distance of a ray and a finite segment.
 
-    Args:
-        ray_origin: The ray's starting point.
-        ray_direction: Ray direction, normally a unit vector.
-        segment_start: First endpoint of the wall segment.
-        segment_end: Second endpoint of the wall segment.
-        epsilon: Tolerance used for parallel and boundary comparisons.
-
-    Returns:
-        ``(distance, (x, y))`` for an intersection on the forward ray and
-        within the segment, otherwise ``None``.  Collinear overlap returns the
-        nearest forward point, so the function also behaves sensibly for that
-        otherwise-degenerate case.
+    Handles ordinary intersections, zero-length segments, parallel lines, and
+    collinear overlap. Returns None when there is no forward intersection.
     """
-    origin = np.asarray(ray_origin, dtype=float)
-    direction = np.asarray(ray_direction, dtype=float)
-    start = np.asarray(segment_start, dtype=float)
-    end = np.asarray(segment_end, dtype=float)
+    o = np.asarray(ray_origin, dtype=float)
+    d = np.asarray(ray_direction, dtype=float)
+    p = np.asarray(seg_start, dtype=float)
+    q = np.asarray(seg_end, dtype=float)
 
-    if any(vector.shape != (2,) for vector in (origin, direction, start, end)):
-        raise ValueError("all points and vectors must contain exactly two values")
+    if any(v.shape != (2,) for v in (o, d, p, q)):
+        raise ValueError("ray/segment points must contain exactly two values")
 
-    direction_norm = float(np.linalg.norm(direction))
-    if direction_norm <= epsilon:
+    d_norm = float(np.linalg.norm(d))
+    if d_norm <= eps:
         raise ValueError("ray_direction must be non-zero")
 
-    segment = end - start
-    segment_norm = float(np.linalg.norm(segment))
-    offset = start - origin
+    s = q - p
+    s_norm = float(np.linalg.norm(s))
+    offset = p - o
 
-    # A zero-length segment is treated as a point lying on (or off) the ray.
-    if segment_norm <= epsilon:
-        if abs(_cross_2d(offset, direction)) > epsilon * direction_norm:
+    if s_norm <= eps:
+        if abs(cross2d(offset, d)) > eps * d_norm:
             return None
-        ray_parameter = float(np.dot(offset, direction) / direction_norm**2)
-        if ray_parameter < -epsilon:
-            return None
-        ray_parameter = max(0.0, ray_parameter)
-        point = origin + ray_parameter * direction
-        return ray_parameter * direction_norm, (float(point[0]), float(point[1]))
+        t = float(np.dot(offset, d) / (d_norm * d_norm))
+        return None if t < -eps else max(0.0, t) * d_norm
 
-    denominator = _cross_2d(direction, segment)
-    parallel_tolerance = epsilon * direction_norm * segment_norm
+    denominator = cross2d(d, s)
+    parallel_tolerance = eps * d_norm * s_norm
     if abs(denominator) <= parallel_tolerance:
-        # Parallel lines only intersect when they are collinear.  Project both
-        # endpoints onto the ray and select the closest forward overlap.
-        if abs(_cross_2d(offset, direction)) > epsilon * direction_norm:
+        if abs(cross2d(offset, d)) > eps * d_norm:
             return None
         projections = np.array(
-            [
-                np.dot(start - origin, direction),
-                np.dot(end - origin, direction),
-            ],
-            dtype=float,
-        ) / direction_norm**2
-        if float(np.max(projections)) < -epsilon:
+            [np.dot(p - o, d), np.dot(q - o, d)], dtype=float
+        ) / (d_norm * d_norm)
+        if float(np.max(projections)) < -eps:
             return None
-        ray_parameter = max(0.0, float(np.min(projections)))
-        point = origin + ray_parameter * direction
-        return ray_parameter * direction_norm, (float(point[0]), float(point[1]))
+        return max(0.0, float(np.min(projections))) * d_norm
 
-    # Solve origin + t*direction = start + u*segment using 2D cross products.
-    ray_parameter = _cross_2d(offset, segment) / denominator
-    segment_parameter = _cross_2d(offset, direction) / denominator
-
-    if ray_parameter < -epsilon:
+    t = cross2d(offset, s) / denominator
+    u = cross2d(offset, d) / denominator
+    if t < -eps or u < -eps or u > 1.0 + eps:
         return None
-    if segment_parameter < -epsilon or segment_parameter > 1.0 + epsilon:
-        return None
-
-    # Clamp values accepted only through tolerance back onto the exact domains.
-    ray_parameter = max(0.0, ray_parameter)
-    segment_parameter = min(1.0, max(0.0, segment_parameter))
-    ray_point = origin + ray_parameter * direction
-    segment_point = start + segment_parameter * segment
-    point = 0.5 * (ray_point + segment_point)
-    distance = ray_parameter * direction_norm
-    return distance, (float(point[0]), float(point[1]))
+    return max(0.0, float(t)) * d_norm
 
 
-def simulate_lidar(
-    walls: Iterable[Segment],
-    anchor: Sequence[float],
+def simulate_lidar_scan(
+    wall_segments: Sequence[Sequence[Sequence[float]]],
+    anchor_xy: Sequence[float],
+    *,
+    anchor_yaw_deg: float = 0.0,
+    angle_min_deg: float = -180.0,
+    angle_max_deg: float = 180.0,
     angle_step_deg: float = 1.0,
-    max_range: float = 10.0,
-    noise_std: float = 0.0,
-    rng: Optional[np.random.Generator] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Cast ideal 2D LiDAR rays against arbitrary wall segments.
+    max_range_m: float = 6.0,
+    noise_std_m: float = 0.0,
+    dropout_probability: float = 0.0,
+    seed: Optional[int] = None,
+) -> LidarScan:
+    """Ray-cast a 2D LiDAR scan and return it in the Anchor-local frame."""
+    walls = np.asarray(wall_segments, dtype=float)
+    anchor = np.asarray(anchor_xy, dtype=float)
 
-    Rays span ``[-180, 180)`` degrees.  For each ray, the closest wall hit is
-    retained; if there is no hit within ``max_range``, its endpoint is placed
-    exactly at ``max_range``.  Optional zero-mean Gaussian measurement noise
-    is applied after ideal ray casting.  No junction topology is assumed.
-
-    Args:
-        walls: Arbitrary iterable of wall line segments.
-        anchor: LiDAR origin in world coordinates.
-        angle_step_deg: Positive angular increment in degrees.
-        max_range: Maximum measurable distance.
-        noise_std: Standard deviation of Gaussian range noise.  Zero disables
-            noise.  Noisy measurements are clipped only at zero.
-        rng: Optional NumPy random generator for reproducible noise.
-
-    Returns:
-        Arrays ``(angles_deg, ranges, hit_points)``.  ``hit_points`` contains
-        one world-coordinate endpoint per ray, including max-range endpoints.
-    """
+    if walls.ndim != 3 or walls.shape[1:] != (2, 2):
+        raise ValueError("wall_segments must have shape (N, 2, 2)")
+    if anchor.shape != (2,):
+        raise ValueError("anchor_xy must have length 2")
     if angle_step_deg <= 0.0:
-        raise ValueError("angle_step_deg must be positive")
-    if max_range <= 0.0:
-        raise ValueError("max_range must be positive")
-    if noise_std < 0.0:
-        raise ValueError("noise_std must be non-negative")
+        raise ValueError("angle_step_deg must be > 0")
+    if angle_max_deg <= angle_min_deg:
+        raise ValueError("angle_max_deg must exceed angle_min_deg")
+    if angle_max_deg - angle_min_deg > 360.0 + 1.0e-9:
+        raise ValueError("LiDAR FOV cannot exceed 360 degrees")
+    if max_range_m <= 0.0:
+        raise ValueError("max_range_m must be > 0")
+    if noise_std_m < 0.0:
+        raise ValueError("noise_std_m must be >= 0")
+    if not 0.0 <= dropout_probability <= 1.0:
+        raise ValueError("dropout_probability must be in [0, 1]")
 
-    anchor_array = np.asarray(anchor, dtype=float)
-    if anchor_array.shape != (2,):
-        raise ValueError("anchor must contain exactly two values")
+    angles_local = np.arange(
+        angle_min_deg, angle_max_deg, angle_step_deg, dtype=float
+    )
+    ranges = np.full(angles_local.size, float(max_range_m), dtype=float)
+    hits = np.zeros(angles_local.size, dtype=bool)
+    yaw_rad = np.deg2rad(float(anchor_yaw_deg))
 
-    wall_list = list(walls)
-    angles_deg = np.arange(-180.0, 180.0, angle_step_deg, dtype=float)
-    ranges = np.full(angles_deg.shape, float(max_range), dtype=float)
-    hit_points = np.empty((angles_deg.size, 2), dtype=float)
+    for i, local_angle_deg in enumerate(angles_local):
+        world_angle = yaw_rad + np.deg2rad(local_angle_deg)
+        direction = np.array([np.cos(world_angle), np.sin(world_angle)], dtype=float)
+        nearest = float(max_range_m)
+        found = False
+        for wall in walls:
+            distance = ray_segment_distance(anchor, direction, wall[0], wall[1])
+            if distance is not None and EPSILON < distance <= nearest:
+                nearest = float(distance)
+                found = True
+        if found:
+            ranges[i] = nearest
+            hits[i] = True
 
-    for index, angle_deg in enumerate(angles_deg):
-        angle_rad = math.radians(float(angle_deg))
-        direction = np.array([math.cos(angle_rad), math.sin(angle_rad)])
-        nearest_distance = float(max_range)
+    rng = np.random.default_rng(seed)
+    if noise_std_m > 0.0 and hits.any():
+        hit_idx = np.flatnonzero(hits)
+        ranges[hit_idx] += rng.normal(0.0, noise_std_m, hit_idx.size)
+        ranges[hit_idx] = np.clip(ranges[hit_idx], 0.0, max_range_m)
 
-        for segment_start, segment_end in wall_list:
-            intersection = ray_segment_intersection(
-                anchor_array, direction, segment_start, segment_end
-            )
-            if intersection is not None and intersection[0] < nearest_distance:
-                nearest_distance = intersection[0]
+    if dropout_probability > 0.0 and hits.any():
+        dropout = (rng.random(ranges.size) < dropout_probability) & hits
+        hits[dropout] = False
+        ranges[dropout] = max_range_m
 
-        ranges[index] = nearest_distance
-        hit_points[index] = anchor_array + nearest_distance * direction
+    theta = np.deg2rad(angles_local)
+    local_x = ranges * np.cos(theta)
+    local_y = ranges * np.sin(theta)
 
-    if noise_std > 0.0:
-        generator = rng if rng is not None else np.random.default_rng()
-        ranges = np.maximum(0.0, ranges + generator.normal(0.0, noise_std, ranges.size))
-        angles_rad = np.deg2rad(angles_deg)
-        directions = np.column_stack((np.cos(angles_rad), np.sin(angles_rad)))
-        hit_points = anchor_array + ranges[:, np.newaxis] * directions
-
-    return angles_deg, ranges, hit_points
-
-
-def polar_to_xy(
-    angles_deg: Sequence[float], ranges: Sequence[float]
-) -> np.ndarray:
-    """Convert polar LiDAR measurements to anchor-local Cartesian points.
-
-    Args:
-        angles_deg: Measurement angles in degrees.
-        ranges: Range associated with each angle.
-
-    Returns:
-        An ``(N, 2)`` array whose columns are local ``x`` and ``y``.
-    """
-    angles = np.asarray(angles_deg, dtype=float)
-    radial_ranges = np.asarray(ranges, dtype=float)
-    if angles.ndim != 1 or radial_ranges.ndim != 1:
-        raise ValueError("angles_deg and ranges must be one-dimensional")
-    if angles.shape != radial_ranges.shape:
-        raise ValueError("angles_deg and ranges must have the same length")
-
-    angles_rad = np.deg2rad(angles)
-    return np.column_stack(
-        (radial_ranges * np.cos(angles_rad), radial_ranges * np.sin(angles_rad))
+    return LidarScan(
+        angle_deg=angles_local,
+        range_m=ranges,
+        hit=hits,
+        local_x=local_x,
+        local_y=local_y,
+        max_range_m=float(max_range_m),
     )
 
 
-def smooth_ranges(ranges: Sequence[float], window_size: int = 5) -> np.ndarray:
-    """Smooth a circular LiDAR scan with a centered moving average.
+# -----------------------------------------------------------------------------
+# General N-way test environment generator (simulator only)
+# -----------------------------------------------------------------------------
 
-    The first and last samples are neighbors, as required for a 360-degree
-    scan.  An odd window keeps the filtered value centered on each input ray.
+def _normalize_angle_360(angle_deg: float) -> float:
+    return float(angle_deg % 360.0)
 
-    Args:
-        ranges: One-dimensional range measurements.
-        window_size: Positive odd number of circularly averaged samples.
 
-    Returns:
-        Smoothed ranges with the same shape as the input.
+def _split_wrapped_interval(start_deg: float, end_deg: float) -> list[tuple[float, float]]:
+    """Split a circular [start,end] CCW interval into non-wrapped [0,360] pieces."""
+    start = _normalize_angle_360(start_deg)
+    width = (end_deg - start_deg) % 360.0
+    if width <= EPSILON:
+        return []
+    end_unwrapped = start + width
+    if end_unwrapped <= 360.0 + EPSILON:
+        return [(start, min(end_unwrapped, 360.0))]
+    return [(start, 360.0), (0.0, end_unwrapped - 360.0)]
+
+
+def _merge_linear_intervals(
+    intervals: Sequence[tuple[float, float]],
+    eps: float = 1.0e-9,
+) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    ordered = sorted((float(a), float(b)) for a, b in intervals)
+    merged: list[list[float]] = [[ordered[0][0], ordered[0][1]]]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1] + eps:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
+
+
+def make_n_way_junction_walls(
+    branch_angles_deg: Sequence[float],
+    *,
+    corridor_width_m: float = 2.0,
+    central_radius_m: float = 1.6,
+    branch_length_m: float = 10.0,
+    arc_step_deg: float = 2.0,
+    close_branch_ends: bool = False,
+) -> np.ndarray:
+    """Create a radial N-way junction as wall line segments.
+
+    This function may know N because it creates *test ground truth* only.
+    The detector never receives N or branch angles.
+
+    Geometry:
+      - circular central chamber
+      - one straight corridor for each supplied branch direction
+      - central-circle boundary is removed only where a branch opens
+      - branch ends are open by default
     """
-    values = np.asarray(ranges, dtype=float)
-    if values.ndim != 1 or values.size == 0:
-        raise ValueError("ranges must be a non-empty one-dimensional sequence")
-    if not isinstance(window_size, (int, np.integer)) or window_size <= 0:
-        raise ValueError("window_size must be a positive integer")
-    if window_size % 2 == 0:
-        raise ValueError("window_size must be odd for centered smoothing")
-    if window_size > values.size:
-        raise ValueError("window_size cannot exceed the number of ranges")
-    if not np.all(np.isfinite(values)):
-        raise ValueError("ranges must contain only finite values")
+    angles = np.asarray(branch_angles_deg, dtype=float)
+    if angles.ndim != 1 or angles.size < 1:
+        raise ValueError("branch_angles_deg must be a non-empty 1D sequence")
+    if not np.all(np.isfinite(angles)):
+        raise ValueError("branch angles must be finite")
+    if corridor_width_m <= 0.0:
+        raise ValueError("corridor_width_m must be positive")
+    if central_radius_m <= corridor_width_m / 2.0:
+        raise ValueError("central_radius_m must exceed half the corridor width")
+    if branch_length_m <= central_radius_m:
+        raise ValueError("branch_length_m must exceed central_radius_m")
+    if arc_step_deg <= 0.0:
+        raise ValueError("arc_step_deg must be positive")
 
-    half_window = window_size // 2
-    shifted = [np.roll(values, shift) for shift in range(-half_window, half_window + 1)]
-    return np.mean(shifted, axis=0)
+    # Remove duplicate directions modulo 360.
+    normalized = np.mod(angles, 360.0)
+    normalized = np.sort(normalized)
+    if normalized.size > 1:
+        circular_gaps = np.diff(np.r_[normalized, normalized[0] + 360.0])
+        if np.min(circular_gaps) < 1.0e-6:
+            raise ValueError("branch directions must be unique modulo 360 degrees")
+
+    half_width = corridor_width_m / 2.0
+    r0 = float(np.sqrt(central_radius_m**2 - half_width**2))
+    half_opening_deg = float(np.rad2deg(np.arcsin(half_width / central_radius_m)))
+
+    # Validate that neighboring openings do not overlap on the central chamber.
+    if normalized.size > 1:
+        min_center_gap = float(
+            np.min(np.diff(np.r_[normalized, normalized[0] + 360.0]))
+        )
+        if min_center_gap <= 2.0 * half_opening_deg + 1.0e-6:
+            raise ValueError(
+                "branch openings overlap; increase central_radius_m, "
+                "decrease corridor_width_m, or separate branch angles"
+            )
+
+    walls: list[list[list[float]]] = []
+    opening_intervals: list[tuple[float, float]] = []
+
+    for angle_deg in normalized:
+        phi = np.deg2rad(float(angle_deg))
+        direction = np.array([np.cos(phi), np.sin(phi)], dtype=float)
+        normal = np.array([-np.sin(phi), np.cos(phi)], dtype=float)
+
+        left_start = r0 * direction + half_width * normal
+        right_start = r0 * direction - half_width * normal
+        left_end = branch_length_m * direction + half_width * normal
+        right_end = branch_length_m * direction - half_width * normal
+
+        walls.append([left_start.tolist(), left_end.tolist()])
+        walls.append([right_start.tolist(), right_end.tolist()])
+        if close_branch_ends:
+            walls.append([left_end.tolist(), right_end.tolist()])
+
+        opening_intervals.extend(
+            _split_wrapped_interval(
+                float(angle_deg - half_opening_deg),
+                float(angle_deg + half_opening_deg),
+            )
+        )
+
+    # Add central circular wall only in angular gaps between branch openings.
+    merged_openings = _merge_linear_intervals(opening_intervals)
+    complement: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged_openings:
+        if start > cursor + 1.0e-9:
+            complement.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < 360.0 - 1.0e-9:
+        complement.append((cursor, 360.0))
+
+    for start_deg, end_deg in complement:
+        width = end_deg - start_deg
+        if width <= 1.0e-9:
+            continue
+        segments = max(1, int(np.ceil(width / arc_step_deg)))
+        arc_angles = np.linspace(start_deg, end_deg, segments + 1)
+        points = np.column_stack(
+            (
+                central_radius_m * np.cos(np.deg2rad(arc_angles)),
+                central_radius_m * np.sin(np.deg2rad(arc_angles)),
+            )
+        )
+        for p0, p1 in zip(points[:-1], points[1:]):
+            walls.append([p0.tolist(), p1.tolist()])
+
+    return np.asarray(walls, dtype=float)
 
 
-def circular_range_gradient(
-    angles_deg: Sequence[float], ranges: Sequence[float]
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculate forward range change per degree on a circular scan.
+def evenly_spaced_branch_angles(num_ways: int, rotation_deg: float = 0.0) -> np.ndarray:
+    """Convenience function for tests only; detector does not use it."""
+    if num_ways < 1:
+        raise ValueError("num_ways must be >= 1")
+    return rotation_deg + np.arange(num_ways, dtype=float) * (360.0 / num_ways)
 
-    Returns one gradient at the angular midpoint between every ray and its
-    successor.  The final successor is the first ray plus 360 degrees.
-    """
-    angles = np.asarray(angles_deg, dtype=float)
-    values = np.asarray(ranges, dtype=float)
-    if angles.ndim != 1 or values.ndim != 1 or angles.shape != values.shape:
-        raise ValueError("angles_deg and ranges must be equal-length 1D arrays")
-    if angles.size < 3:
-        raise ValueError("at least three LiDAR samples are required")
-    if not np.all(np.isfinite(angles)) or not np.all(np.isfinite(values)):
-        raise ValueError("angles_deg and ranges must contain only finite values")
-    if np.any(np.diff(angles) <= 0.0):
-        raise ValueError("angles_deg must be strictly increasing")
 
-    angular_steps = np.diff(np.append(angles, angles[0] + 360.0))
-    if np.any(angular_steps <= 0.0):
-        raise ValueError("angles_deg must span less than one full revolution")
-
-    gradient = (np.roll(values, -1) - values) / angular_steps
-    boundary_angles = angles + 0.5 * angular_steps
-    boundary_angles = _normalize_angles(boundary_angles)
-    return boundary_angles, gradient
-
+# -----------------------------------------------------------------------------
+# Detector utilities: angle/range only
+# -----------------------------------------------------------------------------
 
 def _normalize_angles(angles_deg: Any) -> Any:
-    """Normalize scalar or array angles to the half-open interval [-180, 180)."""
     normalized = (np.asarray(angles_deg) + 180.0) % 360.0 - 180.0
     if np.ndim(angles_deg) == 0:
         return float(normalized)
     return normalized
 
 
+def _validate_circular_scan(
+    angles_deg: Sequence[float], ranges: Sequence[float]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    angles = np.asarray(angles_deg, dtype=float)
+    values = np.asarray(ranges, dtype=float)
+    if angles.ndim != 1 or values.ndim != 1 or angles.shape != values.shape:
+        raise ValueError("angles_deg and ranges must be equal-length 1D arrays")
+    if angles.size < 8:
+        raise ValueError("at least 8 LiDAR rays are required")
+    if not np.all(np.isfinite(angles)) or not np.all(np.isfinite(values)):
+        raise ValueError("angles/ranges must contain finite values")
+    if np.any(values < 0.0):
+        raise ValueError("ranges cannot be negative")
+    if np.any(np.diff(angles) <= 0.0):
+        raise ValueError("angles_deg must be strictly increasing")
+
+    steps = np.diff(np.r_[angles, angles[0] + 360.0])
+    if np.any(steps <= 0.0):
+        raise ValueError("angles must describe one circular revolution")
+    if abs(float(np.sum(steps)) - 360.0) > max(1.0, 2.0 * float(np.median(steps))):
+        raise ValueError("detector expects an approximately 360-degree scan")
+    return angles, values, steps
+
+
+def smooth_ranges(ranges: Sequence[float], window_size: int = 5) -> np.ndarray:
+    """Centered circular moving average."""
+    values = np.asarray(ranges, dtype=float)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("ranges must be a non-empty 1D sequence")
+    if not isinstance(window_size, (int, np.integer)) or window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+    if window_size % 2 == 0:
+        raise ValueError("window_size must be odd")
+    if window_size > values.size:
+        raise ValueError("window_size cannot exceed scan length")
+    half = window_size // 2
+    return np.mean([np.roll(values, s) for s in range(-half, half + 1)], axis=0)
+
+
+def circular_range_gradient(
+    angles_deg: Sequence[float], ranges: Sequence[float]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward circular range gradient in m/degree at ray boundaries."""
+    angles, values, steps = _validate_circular_scan(angles_deg, ranges)
+    gradient = (np.roll(values, -1) - values) / steps
+    boundary_angles = _normalize_angles(angles + 0.5 * steps)
+    return boundary_angles, gradient
+
+
 def _automatic_gradient_threshold(
     gradient: np.ndarray,
-    threshold_mad_scale: float,
-    min_gradient_threshold: float,
+    mad_scale: float,
+    minimum: float,
 ) -> float:
-    """Estimate a robust gradient-magnitude threshold using median and MAD."""
     magnitudes = np.abs(gradient)
     median = float(np.median(magnitudes))
     mad = float(np.median(np.abs(magnitudes - median)))
     robust_sigma = 1.4826 * mad
-    return max(float(min_gradient_threshold), median + threshold_mad_scale * robust_sigma)
+    return max(float(minimum), median + mad_scale * robust_sigma)
 
 
-def _group_boundary_candidates(
-    candidate_indices: np.ndarray,
-    boundary_angles: np.ndarray,
-    gradient: np.ndarray,
-    max_gap_deg: float,
-) -> list[float]:
-    """Group nearby same-sign boundary candidates on a circular angle domain."""
-    if candidate_indices.size == 0:
+def _circular_runs(mask: np.ndarray, value: bool = True) -> list[np.ndarray]:
+    """Return circular connected components of a boolean mask as index arrays."""
+    mask = np.asarray(mask, dtype=bool)
+    n = mask.size
+    if n == 0:
         return []
+    target = mask == value
+    if not np.any(target):
+        return []
+    if np.all(target):
+        return [np.arange(n, dtype=int)]
 
-    positions = (boundary_angles[candidate_indices] + 180.0) % 360.0
-    order = np.argsort(positions)
-    sorted_indices = candidate_indices[order]
-    sorted_positions = positions[order]
-    groups: list[list[int]] = [[int(sorted_indices[0])]]
-
-    for previous_position, position, index in zip(
-        sorted_positions[:-1], sorted_positions[1:], sorted_indices[1:]
-    ):
-        if position - previous_position <= max_gap_deg:
-            groups[-1].append(int(index))
-        else:
-            groups.append([int(index)])
-
-    # The last and first groups may be adjacent through the circular seam.
-    wrap_gap = sorted_positions[0] + 360.0 - sorted_positions[-1]
-    if len(groups) > 1 and wrap_gap <= max_gap_deg:
-        groups[0] = groups[-1] + groups[0]
-        groups.pop()
-
-    representatives = []
-    for group in groups:
-        group_array = np.asarray(group, dtype=int)
-        strongest_index = int(group_array[np.argmax(np.abs(gradient[group_array]))])
-        representatives.append(float(boundary_angles[strongest_index]))
-    return sorted(representatives)
+    starts = np.flatnonzero(target & ~np.roll(target, 1))
+    runs: list[np.ndarray] = []
+    for start in starts:
+        indices = [int(start)]
+        cursor = (int(start) + 1) % n
+        while target[cursor] and cursor != start:
+            indices.append(cursor)
+            cursor = (cursor + 1) % n
+        runs.append(np.asarray(indices, dtype=int))
+    return runs
 
 
-def _opening_width(start_angle: float, end_angle: float) -> float:
-    """Return positive counter-clockwise width from start to end."""
+def _run_width_deg(run: np.ndarray, angular_steps: np.ndarray) -> float:
+    return float(np.sum(angular_steps[run]))
+
+
+def _fill_short_circular_gaps(
+    mask: np.ndarray,
+    angular_steps: np.ndarray,
+    max_gap_deg: float,
+) -> np.ndarray:
+    """Fill short false runs surrounded by open samples."""
+    if max_gap_deg <= 0.0:
+        return mask.copy()
+    result = np.asarray(mask, dtype=bool).copy()
+    if np.all(result) or not np.any(result):
+        return result
+    for run in _circular_runs(result, value=False):
+        if _run_width_deg(run, angular_steps) <= max_gap_deg:
+            before = (int(run[0]) - 1) % result.size
+            after = (int(run[-1]) + 1) % result.size
+            if result[before] and result[after]:
+                result[run] = True
+    return result
+
+
+def _boundary_angle_before_ray(
+    ray_index: int,
+    boundary_angles: np.ndarray,
+) -> float:
+    return float(boundary_angles[(ray_index - 1) % boundary_angles.size])
+
+
+def _boundary_angle_after_ray(
+    ray_index: int,
+    boundary_angles: np.ndarray,
+) -> float:
+    return float(boundary_angles[ray_index % boundary_angles.size])
+
+
+def _circular_index_window(center: int, radius: int, n: int) -> np.ndarray:
+    offsets = np.arange(-radius, radius + 1, dtype=int)
+    return (center + offsets) % n
+
+
+def _refine_boundary_from_gradient(
+    target_gradient_index: int,
+    gradient: np.ndarray,
+    boundary_angles: np.ndarray,
+    *,
+    positive: bool,
+    search_radius_samples: int,
+    minimum_strength: float,
+    fallback_angle: float,
+) -> tuple[float, float, bool]:
+    candidates = _circular_index_window(
+        target_gradient_index, search_radius_samples, gradient.size
+    )
+    local = gradient[candidates]
+    if positive:
+        best_local = int(np.argmax(local))
+        strength = float(local[best_local])
+        valid = strength >= minimum_strength
+    else:
+        best_local = int(np.argmin(local))
+        strength = float(-local[best_local])
+        valid = strength >= minimum_strength
+    if not valid:
+        return float(fallback_angle), max(0.0, strength), False
+    idx = int(candidates[best_local])
+    return float(boundary_angles[idx]), strength, True
+
+
+def _positive_ccw_width(start_angle: float, end_angle: float) -> float:
     return float((end_angle - start_angle) % 360.0)
 
 
 def _detect_openings_with_diagnostics(
     angles_deg: Sequence[float],
     ranges: Sequence[float],
+    *,
     smoothing_window_size: int = 5,
-    gradient_threshold: Optional[float] = None,
-    threshold_mad_scale: float = 4.0,
-    min_gradient_threshold: float = 0.05,
-    candidate_group_gap_deg: float = 3.0,
+    wall_reference_quantile: float = 0.25,
+    far_range_fraction: float = 0.55,
+    merge_gap_deg: float = 3.0,
     min_opening_width_deg: float = 5.0,
-    max_opening_width_deg: Optional[float] = 120.0,
-) -> Tuple[list[dict[str, float]], dict[str, Any]]:
-    """Run the range-discontinuity baseline and retain plot diagnostics."""
-    angles = np.asarray(angles_deg, dtype=float)
-    raw_ranges = np.asarray(ranges, dtype=float)
-    if angles.ndim != 1 or raw_ranges.ndim != 1 or angles.shape != raw_ranges.shape:
-        raise ValueError("angles_deg and ranges must be equal-length 1D arrays")
-    if np.any(raw_ranges < 0.0):
-        raise ValueError("ranges cannot be negative")
-    if threshold_mad_scale < 0.0 or min_gradient_threshold < 0.0:
-        raise ValueError("threshold parameters must be non-negative")
-    if candidate_group_gap_deg <= 0.0:
-        raise ValueError("candidate_group_gap_deg must be positive")
-    if min_opening_width_deg <= 0.0 or min_opening_width_deg >= 360.0:
-        raise ValueError("min_opening_width_deg must be in (0, 360)")
-    if max_opening_width_deg is not None:
-        if max_opening_width_deg <= min_opening_width_deg or max_opening_width_deg > 360.0:
-            raise ValueError("max_opening_width_deg must exceed the minimum and be <= 360")
-    if gradient_threshold is not None and gradient_threshold <= 0.0:
-        raise ValueError("gradient_threshold must be positive when supplied")
+    gradient_threshold: Optional[float] = None,
+    gradient_mad_scale: float = 4.0,
+    min_gradient_threshold: float = 0.05,
+    boundary_search_deg: float = 6.0,
+) -> tuple[list[dict[str, float]], dict[str, Any]]:
+    """Detect an arbitrary number of openings using only local angle/range.
 
-    smoothed = smooth_ranges(raw_ranges, smoothing_window_size)
+    No expected way count or expected direction appears anywhere in this
+    function. The number of outputs is the number of connected open angular
+    components found in the current scan.
+
+    Method
+    ------
+    1) circular moving-average smoothing
+    2) infer near-wall reference and far-range ceiling from the scan itself
+    3) classify angular samples that are sufficiently far as "open support"
+    4) merge only short internal gaps
+    5) each remaining circular connected component is one opening candidate
+    6) refine candidate start/end with local positive/negative range gradients
+    """
+    angles, raw, angular_steps = _validate_circular_scan(angles_deg, ranges)
+
+    if smoothing_window_size <= 0 or smoothing_window_size % 2 == 0:
+        raise ValueError("smoothing_window_size must be a positive odd integer")
+    if not 0.0 <= wall_reference_quantile < 1.0:
+        raise ValueError("wall_reference_quantile must be in [0,1)")
+    if not 0.0 < far_range_fraction < 1.0:
+        raise ValueError("far_range_fraction must be in (0,1)")
+    if merge_gap_deg < 0.0:
+        raise ValueError("merge_gap_deg must be non-negative")
+    if not 0.0 < min_opening_width_deg < 360.0:
+        raise ValueError("min_opening_width_deg must be in (0,360)")
+    if boundary_search_deg < 0.0:
+        raise ValueError("boundary_search_deg must be non-negative")
+
+    smoothed = smooth_ranges(raw, smoothing_window_size)
+
+    # These are inferred from the scan; the detector is not passed sensor/map metadata.
+    wall_reference = float(np.quantile(smoothed, wall_reference_quantile))
+    range_ceiling = float(np.max(raw))
+    dynamic_span = max(0.0, range_ceiling - wall_reference)
+
+    # If there is no meaningful contrast, no opening can be supported by this baseline.
+    if dynamic_span <= 1.0e-6:
+        diagnostics = {
+            "smoothed_ranges": smoothed,
+            "open_support_mask": np.zeros(raw.size, dtype=bool),
+            "open_threshold": range_ceiling,
+            "wall_reference": wall_reference,
+            "range_ceiling": range_ceiling,
+            "boundary_angles": np.array([], dtype=float),
+            "gradient": np.array([], dtype=float),
+            "gradient_threshold": 0.0,
+            "start_angles": [],
+            "end_angles": [],
+        }
+        return [], diagnostics
+
+    open_threshold = wall_reference + far_range_fraction * dynamic_span
+    open_support = smoothed >= open_threshold
+    open_support = _fill_short_circular_gaps(
+        open_support, angular_steps, merge_gap_deg
+    )
+
     boundary_angles, gradient = circular_range_gradient(angles, smoothed)
-    threshold = (
+    grad_threshold = (
         float(gradient_threshold)
         if gradient_threshold is not None
         else _automatic_gradient_threshold(
-            gradient, threshold_mad_scale, min_gradient_threshold
+            gradient, gradient_mad_scale, min_gradient_threshold
         )
     )
 
-    start_candidates = np.flatnonzero(gradient >= threshold)
-    end_candidates = np.flatnonzero(gradient <= -threshold)
-    starts = _group_boundary_candidates(
-        start_candidates, boundary_angles, gradient, candidate_group_gap_deg
-    )
-    ends = _group_boundary_candidates(
-        end_candidates, boundary_angles, gradient, candidate_group_gap_deg
-    )
+    median_step = float(np.median(angular_steps))
+    search_radius_samples = int(np.ceil(boundary_search_deg / median_step))
 
-    # Pair every rising edge with its next falling edge around the circle.  No
-    # branch count or expected direction is used anywhere in this baseline.
     openings: list[dict[str, float]] = []
-    used_end_indices: set[int] = set()
-    for start in starts:
-        ranked_ends = sorted(
-            enumerate(ends), key=lambda item: _opening_width(start, item[1])
-        )
-        for end_index, end in ranked_ends:
-            width = _opening_width(start, end)
-            if end_index in used_end_indices or width <= 0.0:
-                continue
-            if width < min_opening_width_deg:
-                break
-            if max_opening_width_deg is not None and width > max_opening_width_deg:
-                break
-            center = _normalize_angles(start + width / 2.0)
-            openings.append(
-                {
-                    "start_angle": float(_normalize_angles(start)),
-                    "end_angle": float(_normalize_angles(end)),
-                    "center_angle": float(center),
-                    "width_deg": float(width),
-                }
-            )
-            used_end_indices.add(end_index)
-            break
+    for run in _circular_runs(open_support, value=True):
+        coarse_width = _run_width_deg(run, angular_steps)
+        if coarse_width < min_opening_width_deg:
+            continue
+        if coarse_width >= 359.0:
+            # Entire scan is far: there is no observable wall/opening separation.
+            continue
 
-    openings.sort(key=lambda opening: opening["center_angle"])
+        start_ray = int(run[0])
+        end_ray = int(run[-1])
+        coarse_start = _boundary_angle_before_ray(start_ray, boundary_angles)
+        coarse_end = _boundary_angle_after_ray(end_ray, boundary_angles)
+
+        start_grad_index = (start_ray - 1) % gradient.size
+        end_grad_index = end_ray % gradient.size
+
+        start_angle, start_strength, start_refined = _refine_boundary_from_gradient(
+            start_grad_index,
+            gradient,
+            boundary_angles,
+            positive=True,
+            search_radius_samples=search_radius_samples,
+            minimum_strength=grad_threshold,
+            fallback_angle=coarse_start,
+        )
+        end_angle, end_strength, end_refined = _refine_boundary_from_gradient(
+            end_grad_index,
+            gradient,
+            boundary_angles,
+            positive=False,
+            search_radius_samples=search_radius_samples,
+            minimum_strength=grad_threshold,
+            fallback_angle=coarse_end,
+        )
+
+        width = _positive_ccw_width(start_angle, end_angle)
+        # Gradient refinement can jump to a neighboring lobe under heavy noise.
+        # Fall back to the connected-component boundaries if that becomes implausible.
+        if width < min_opening_width_deg or width > min(359.0, coarse_width + 2.0 * boundary_search_deg + 2.0):
+            start_angle = coarse_start
+            end_angle = coarse_end
+            width = _positive_ccw_width(start_angle, end_angle)
+            start_refined = False
+            end_refined = False
+
+        if width < min_opening_width_deg:
+            continue
+
+        center_angle = float(_normalize_angles(start_angle + width / 2.0))
+        mean_range = float(np.mean(smoothed[run]))
+        peak_range = float(np.max(smoothed[run]))
+        contrast_score = float(
+            np.clip((mean_range - wall_reference) / max(dynamic_span, EPSILON), 0.0, 1.0)
+        )
+        boundary_score = float(
+            np.clip(
+                min(start_strength, end_strength) / max(grad_threshold, EPSILON),
+                0.0,
+                1.0,
+            )
+        )
+        confidence = float(0.7 * contrast_score + 0.3 * boundary_score)
+
+        openings.append(
+            {
+                "start_angle": float(_normalize_angles(start_angle)),
+                "end_angle": float(_normalize_angles(end_angle)),
+                "center_angle": center_angle,
+                "width_deg": float(width),
+                "mean_range_m": mean_range,
+                "peak_range_m": peak_range,
+                "confidence": confidence,
+                "start_refined": float(start_refined),
+                "end_refined": float(end_refined),
+            }
+        )
+
+    openings.sort(key=lambda item: item["center_angle"])
     diagnostics: dict[str, Any] = {
         "smoothed_ranges": smoothed,
+        "open_support_mask": open_support,
+        "open_threshold": float(open_threshold),
+        "wall_reference": float(wall_reference),
+        "range_ceiling": float(range_ceiling),
         "boundary_angles": boundary_angles,
         "gradient": gradient,
-        "gradient_threshold": threshold,
-        "start_angles": [opening["start_angle"] for opening in openings],
-        "end_angles": [opening["end_angle"] for opening in openings],
+        "gradient_threshold": float(grad_threshold),
+        "start_angles": [o["start_angle"] for o in openings],
+        "end_angles": [o["end_angle"] for o in openings],
     }
     return openings, diagnostics
 
@@ -459,274 +721,354 @@ def _detect_openings_with_diagnostics(
 def detect_openings(
     angles_deg: Sequence[float],
     ranges: Sequence[float],
-    smoothing_window_size: int = 5,
-    gradient_threshold: Optional[float] = None,
-    threshold_mad_scale: float = 4.0,
-    min_gradient_threshold: float = 0.05,
-    candidate_group_gap_deg: float = 3.0,
-    min_opening_width_deg: float = 5.0,
-    max_opening_width_deg: Optional[float] = 120.0,
+    **kwargs: Any,
 ) -> list[dict[str, float]]:
-    """Detect opening intervals using only angle-distance measurements.
+    """Detect open angular sectors from Anchor-local range-vs-angle data only.
 
-    This is intentionally a range-discontinuity *baseline*, not a final
-    junction detector.  Rising gradients propose opening starts and falling
-    gradients propose ends.  Candidate grouping and width limits make its
-    sensitivity configurable for noise, shallow branches, narrow openings,
-    max-range clipping, natural range peaks, and circular wrap-around.
+    Parameters
+    ----------
+    angles_deg:
+        Anchor-local LiDAR bearing angles. No world heading is accepted here.
+    ranges:
+        Measured range associated with each angle.
 
-    Neither walls, environment geometry, branch count, nor expected branch
-    directions are accepted or inferred from hard-coded constants.
+    Returns
+    -------
+    list of dict
+        Variable-length output. Each item contains ``start_angle``,
+        ``end_angle``, ``center_angle`` and ``width_deg`` (plus diagnostics
+        such as confidence). ``len(result)`` is the detected opening count.
 
-    Args:
-        angles_deg: Strictly increasing ray angles covering a circular scan.
-        ranges: Range measurement for each angle.
-        smoothing_window_size: Odd circular moving-average window.
-        gradient_threshold: Manual absolute gradient threshold in range/degree.
-            If omitted, a median/MAD robust threshold is estimated.
-        threshold_mad_scale: Robust-sigma multiplier for the automatic threshold.
-        min_gradient_threshold: Floor for the automatic threshold.
-        candidate_group_gap_deg: Maximum angular gap within a boundary group.
-        min_opening_width_deg: Reject narrower paired intervals.
-        max_opening_width_deg: Optional upper width limit, useful for rejecting
-            broad natural peaks.  ``None`` disables the upper limit.
-
-    Returns:
-        Opening dictionaries with start, end, center, and positive circular
-        width.  A wrap-around opening has ``start_angle > end_angle``.
+    Notes
+    -----
+    The detector is intentionally NOT given a branch count, branch labels,
+    expected branch directions, wall geometry, map, Anchor global pose, or
+    Junction coordinates. 3-way/4-way/5-way are therefore test cases only,
+    not algorithm modes.
     """
-    openings, _ = _detect_openings_with_diagnostics(
-        angles_deg=angles_deg,
-        ranges=ranges,
-        smoothing_window_size=smoothing_window_size,
-        gradient_threshold=gradient_threshold,
-        threshold_mad_scale=threshold_mad_scale,
-        min_gradient_threshold=min_gradient_threshold,
-        candidate_group_gap_deg=candidate_group_gap_deg,
-        min_opening_width_deg=min_opening_width_deg,
-        max_opening_width_deg=max_opening_width_deg,
-    )
+    openings, _ = _detect_openings_with_diagnostics(angles_deg, ranges, **kwargs)
     return openings
 
 
-def visualize_results(
-    walls: Iterable[Segment],
-    anchor: Sequence[float],
-    angles_deg: np.ndarray,
-    ranges: np.ndarray,
-    hit_points: np.ndarray,
-    max_range: float,
-    ray_stride: int = 15,
-    openings: Optional[Sequence[dict[str, float]]] = None,
-    detector_diagnostics: Optional[dict[str, Any]] = None,
-) -> Tuple[plt.Figure, np.ndarray]:
-    """Visualize geometry, point cloud, and optional baseline detections."""
-    if ray_stride <= 0:
-        raise ValueError("ray_stride must be positive")
+def detect_openings_from_point_cloud(
+    point_cloud_theta_r: Sequence[Sequence[float]],
+    **kwargs: Any,
+) -> list[dict[str, float]]:
+    """Detect openings directly from P={(theta_i, r_i)}.
 
-    wall_list = list(walls)
-    anchor_array = np.asarray(anchor, dtype=float)
-    figure, axes = plt.subplots(1, 3, figsize=(16, 5))
-    geometry_axis, cloud_axis, range_axis = axes
+    This is the research-facing API matching the Junction-detector problem
+    definition. The input must be an ``(N, 2)`` array-like object whose first
+    column is Anchor-local angle [deg] and second column is range [m].
 
-    for start, end in wall_list:
-        geometry_axis.plot(
-            [start[0], end[0]], [start[1], end[1]], color="black", linewidth=2
+    The samples are sorted by angle before detection. No way-count or geometry
+    information is accepted.
+    """
+    cloud = np.asarray(point_cloud_theta_r, dtype=float)
+    if cloud.ndim != 2 or cloud.shape[1] != 2:
+        raise ValueError("point_cloud_theta_r must have shape (N, 2): [theta_deg, range_m]")
+    if cloud.shape[0] < 8:
+        raise ValueError("at least 8 point-cloud samples are required")
+    if not np.all(np.isfinite(cloud)):
+        raise ValueError("point cloud must contain only finite values")
+
+    order = np.argsort(cloud[:, 0])
+    angles = cloud[order, 0]
+    ranges = cloud[order, 1]
+    return detect_openings(angles, ranges, **kwargs)
+
+
+# -----------------------------------------------------------------------------
+# Save / visualization
+# -----------------------------------------------------------------------------
+
+def save_local_scan_csv(scan: LidarScan, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["angle_deg", "range_m", "hit", "local_x_m", "local_y_m"])
+        for a, r, h, x, y in zip(
+            scan.angle_deg, scan.range_m, scan.hit, scan.local_x, scan.local_y
+        ):
+            writer.writerow(
+                [f"{a:.6f}", f"{r:.6f}", int(h), f"{x:.6f}", f"{y:.6f}"]
+            )
+
+
+def plot_results(
+    walls: np.ndarray,
+    anchor_xy: Sequence[float],
+    scan: LidarScan,
+    openings: Sequence[dict[str, float]],
+    diagnostics: dict[str, Any],
+    *,
+    anchor_yaw_deg: float = 0.0,
+    save_path: Optional[str | Path] = None,
+    show: bool = True,
+) -> None:
+    anchor = np.asarray(anchor_xy, dtype=float)
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
+    world_ax, cloud_ax, range_ax = axes
+
+    for wall in walls:
+        world_ax.plot(
+            [wall[0, 0], wall[1, 0]], [wall[0, 1], wall[1, 1]], linewidth=1.7
         )
-    for point in hit_points[::ray_stride]:
-        geometry_axis.plot(
-            [anchor_array[0], point[0]],
-            [anchor_array[1], point[1]],
-            color="tab:orange",
-            alpha=0.35,
-            linewidth=0.8,
-        )
-    geometry_axis.scatter(*anchor_array, marker="*", s=130, color="red", zorder=3)
-    geometry_axis.set_title("A. Four-way junction and sampled rays")
-    geometry_axis.set_xlabel("x")
-    geometry_axis.set_ylabel("y")
-    geometry_axis.set_aspect("equal", adjustable="box")
-    geometry_axis.grid(alpha=0.2)
-
-    # With measurement noise, range values alone cannot reliably distinguish a
-    # wall return from a max-range return, so avoid assigning ground-truth labels.
-    cloud_axis.scatter(
-        hit_points[:, 0],
-        hit_points[:, 1],
-        s=12,
-        color="tab:blue",
-        label="LiDAR endpoint",
+    world_ax.scatter(anchor[0], anchor[1], marker="x", s=80, label="Anchor")
+    yaw = np.deg2rad(anchor_yaw_deg)
+    world_ax.arrow(
+        anchor[0],
+        anchor[1],
+        0.7 * np.cos(yaw),
+        0.7 * np.sin(yaw),
+        width=0.015,
+        length_includes_head=True,
     )
-    cloud_axis.scatter(*anchor_array, marker="*", s=130, color="red", label="anchor")
-    if openings:
-        direction_length = max_range * 0.85
-        for index, opening in enumerate(openings):
-            center_rad = math.radians(opening["center_angle"])
-            endpoint = anchor_array + direction_length * np.array(
-                [math.cos(center_rad), math.sin(center_rad)]
-            )
-            cloud_axis.plot(
-                [anchor_array[0], endpoint[0]],
-                [anchor_array[1], endpoint[1]],
-                color="tab:green",
-                linestyle="--",
-                linewidth=1.2,
-                alpha=0.8,
-                label="opening center" if index == 0 else None,
-            )
-    cloud_axis.set_title("B. LiDAR point cloud")
-    cloud_axis.set_xlabel("x")
-    cloud_axis.set_ylabel("y")
-    cloud_axis.set_aspect("equal", adjustable="box")
-    cloud_axis.grid(alpha=0.2)
-    cloud_axis.legend(loc="upper right", fontsize=8)
+    world_ax.set_aspect("equal", adjustable="box")
+    world_ax.set_title("A. Simulator ground truth")
+    world_ax.set_xlabel("world x [m]")
+    world_ax.set_ylabel("world y [m]")
+    world_ax.grid(True, alpha=0.3)
+    world_ax.legend()
 
-    range_axis.plot(
-        angles_deg, ranges, color="tab:blue", linewidth=0.9, alpha=0.55, label="raw range"
+    cloud_ax.scatter(
+        scan.local_x[scan.hit], scan.local_y[scan.hit], s=9, label="LiDAR returns"
     )
-    if detector_diagnostics is not None:
-        smoothed_ranges = np.asarray(detector_diagnostics["smoothed_ranges"])
-        range_axis.plot(
-            angles_deg,
-            smoothed_ranges,
-            color="black",
-            linewidth=1.4,
-            label="smoothed range",
+    if np.any(~scan.hit):
+        cloud_ax.scatter(
+            scan.local_x[~scan.hit],
+            scan.local_y[~scan.hit],
+            s=5,
+            alpha=0.15,
+            label="No return / max range",
         )
+    cloud_ax.scatter([0.0], [0.0], marker="x", s=80, label="Anchor local origin")
+    for i, opening in enumerate(openings):
+        theta = np.deg2rad(opening["center_angle"])
+        endpoint = 0.85 * scan.max_range_m * np.array([np.cos(theta), np.sin(theta)])
+        cloud_ax.plot(
+            [0.0, endpoint[0]],
+            [0.0, endpoint[1]],
+            linestyle="--",
+            linewidth=1.2,
+            label="Detected opening center" if i == 0 else None,
+        )
+    cloud_ax.set_aspect("equal", adjustable="box")
+    cloud_ax.set_title("B. Anchor-local point cloud")
+    cloud_ax.set_xlabel("local x [m]")
+    cloud_ax.set_ylabel("local y [m]")
+    cloud_ax.grid(True, alpha=0.3)
+    cloud_ax.legend(fontsize=8)
 
-        for index, opening in enumerate(openings or []):
-            start = opening["start_angle"]
-            end = opening["end_angle"]
-            span_label = "detected opening" if index == 0 else None
-            if start <= end:
-                range_axis.axvspan(
-                    start, end, color="tab:green", alpha=0.12, label=span_label
-                )
-            else:
-                range_axis.axvspan(
-                    start, 180.0, color="tab:green", alpha=0.12, label=span_label
-                )
-                range_axis.axvspan(-180.0, end, color="tab:green", alpha=0.12)
-
-        start_angles = np.asarray(detector_diagnostics["start_angles"], dtype=float)
-        end_angles = np.asarray(detector_diagnostics["end_angles"], dtype=float)
-        if start_angles.size:
-            start_ranges = np.interp(start_angles, angles_deg, smoothed_ranges)
-            range_axis.scatter(
-                start_angles,
-                start_ranges,
-                marker="^",
-                s=55,
-                color="tab:green",
-                zorder=5,
-                label="opening start",
-            )
-        if end_angles.size:
-            end_ranges = np.interp(end_angles, angles_deg, smoothed_ranges)
-            range_axis.scatter(
-                end_angles,
-                end_ranges,
-                marker="v",
-                s=55,
-                color="tab:red",
-                zorder=5,
-                label="opening end",
-            )
-
-        gradient_axis = range_axis.twinx()
-        boundary_angles = np.asarray(detector_diagnostics["boundary_angles"])
-        gradient = np.asarray(detector_diagnostics["gradient"])
-        threshold = float(detector_diagnostics["gradient_threshold"])
-        gradient_axis.plot(
-            boundary_angles,
-            gradient,
-            color="tab:purple",
-            linewidth=0.7,
+    smoothed = np.asarray(diagnostics["smoothed_ranges"], dtype=float)
+    open_mask = np.asarray(diagnostics["open_support_mask"], dtype=bool)
+    range_ax.plot(scan.angle_deg, scan.range_m, linewidth=0.8, alpha=0.45, label="raw")
+    range_ax.plot(scan.angle_deg, smoothed, linewidth=1.4, label="smoothed")
+    range_ax.axhline(
+        diagnostics["open_threshold"], linestyle="--", linewidth=1.1, label="adaptive open threshold"
+    )
+    if np.any(open_mask):
+        range_ax.scatter(
+            scan.angle_deg[open_mask],
+            smoothed[open_mask],
+            s=8,
             alpha=0.35,
-            label="range gradient",
+            label="open support",
         )
-        gradient_axis.axhline(
-            threshold,
-            color="tab:orange",
-            linestyle=":",
-            linewidth=1.1,
-            label=f"gradient threshold (+/-{threshold:.2f})",
-        )
-        gradient_axis.axhline(
-            -threshold, color="tab:orange", linestyle=":", linewidth=1.1
-        )
-        gradient_axis.set_ylabel("range change / deg", color="tab:purple")
-        gradient_axis.tick_params(axis="y", labelcolor="tab:purple")
 
-        range_handles, range_labels = range_axis.get_legend_handles_labels()
-        gradient_handles, gradient_labels = gradient_axis.get_legend_handles_labels()
-        range_axis.legend(
-            range_handles + gradient_handles,
-            range_labels + gradient_labels,
-            loc="upper right",
-            fontsize=7,
-        )
+    for i, opening in enumerate(openings):
+        start = opening["start_angle"]
+        end = opening["end_angle"]
+        label = "detected opening" if i == 0 else None
+        if start <= end:
+            range_ax.axvspan(start, end, alpha=0.10, label=label)
+        else:
+            range_ax.axvspan(start, 180.0, alpha=0.10, label=label)
+            range_ax.axvspan(-180.0, end, alpha=0.10)
+
+    gradient_ax = range_ax.twinx()
+    gradient_ax.plot(
+        diagnostics["boundary_angles"],
+        diagnostics["gradient"],
+        linewidth=0.7,
+        alpha=0.28,
+        label="range gradient",
+    )
+    threshold = float(diagnostics["gradient_threshold"])
+    gradient_ax.axhline(threshold, linestyle=":", linewidth=1.0)
+    gradient_ax.axhline(-threshold, linestyle=":", linewidth=1.0)
+    gradient_ax.set_ylabel("range gradient [m/deg]")
+
+    range_ax.set_title("C. Detector-visible range profile")
+    range_ax.set_xlabel("local angle [deg]")
+    range_ax.set_ylabel("range [m]")
+    range_ax.set_xlim(float(scan.angle_deg[0]), float(scan.angle_deg[-1]))
+    range_ax.set_ylim(0.0, scan.max_range_m * 1.05)
+    range_ax.grid(True, alpha=0.3)
+    h1, l1 = range_ax.get_legend_handles_labels()
+    h2, l2 = gradient_ax.get_legend_handles_labels()
+    range_ax.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper right")
+
+    fig.tight_layout()
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=180, bbox_inches="tight")
+        print(f"[saved] {save_path}")
+    if show:
+        plt.show()
     else:
-        range_axis.legend(loc="upper right", fontsize=8)
-    range_axis.set_title("C. Range profile")
-    range_axis.set_xlabel("angle [deg]")
-    range_axis.set_ylabel("range")
-    range_axis.set_xlim(-180.0, 180.0)
-    range_axis.set_ylim(0.0, max(max_range, float(np.max(ranges))) * 1.05)
-    range_axis.grid(alpha=0.3)
+        plt.close(fig)
 
-    figure.tight_layout()
-    return figure, axes
+
+# -----------------------------------------------------------------------------
+# CLI / regression test
+# -----------------------------------------------------------------------------
+
+def run_case(
+    branch_angles_deg: Sequence[float],
+    *,
+    anchor_xy: tuple[float, float] = (0.0, 0.0),
+    anchor_yaw_deg: float = 0.0,
+    corridor_width_m: float = 2.0,
+    central_radius_m: float = 1.6,
+    branch_length_m: float = 10.0,
+    max_range_m: float = 6.0,
+    noise_std_m: float = 0.0,
+    dropout_probability: float = 0.0,
+    angle_step_deg: float = 1.0,
+    seed: int = 7,
+) -> tuple[np.ndarray, LidarScan, list[dict[str, float]], dict[str, Any]]:
+    walls = make_n_way_junction_walls(
+        branch_angles_deg,
+        corridor_width_m=corridor_width_m,
+        central_radius_m=central_radius_m,
+        branch_length_m=branch_length_m,
+    )
+    scan = simulate_lidar_scan(
+        walls,
+        anchor_xy,
+        anchor_yaw_deg=anchor_yaw_deg,
+        angle_step_deg=angle_step_deg,
+        max_range_m=max_range_m,
+        noise_std_m=noise_std_m,
+        dropout_probability=dropout_probability,
+        seed=seed,
+    )
+    detector_angles, detector_ranges = scan.detector_input()
+    point_cloud_theta_r = np.column_stack((detector_angles, detector_ranges))
+
+    # Research-facing detector input: P={(theta_i, r_i)} only.
+    # The test geometry and its branch count/directions stay outside this boundary.
+    openings = detect_openings_from_point_cloud(point_cloud_theta_r)
+    _, diagnostics = _detect_openings_with_diagnostics(detector_angles, detector_ranges)
+    return walls, scan, openings, diagnostics
+
+
+def regression_test_way_counts(
+    way_counts: Sequence[int] = (3, 4, 5, 6, 7, 8),
+) -> list[tuple[int, int, bool]]:
+    """Test different N using the exact same detector without count hints."""
+    results: list[tuple[int, int, bool]] = []
+    for n in way_counts:
+        # Use a larger central chamber automatically so high-N openings remain separate.
+        central_radius = max(1.6, 0.55 * n)
+        branch_angles = evenly_spaced_branch_angles(n, rotation_deg=11.0)
+        _, _, openings, _ = run_case(
+            branch_angles,
+            central_radius_m=central_radius,
+            noise_std_m=0.0,
+            anchor_xy=(0.0, 0.0),
+            anchor_yaw_deg=23.0,
+        )
+        detected = len(openings)
+        results.append((n, detected, detected == n))
+    return results
+
+
+def _parse_branch_angles(text: Optional[str], ways: int, rotation_deg: float) -> np.ndarray:
+    if text:
+        values = [float(part.strip()) for part in text.split(",") if part.strip()]
+        if not values:
+            raise ValueError("--branch-angles did not contain any angles")
+        return np.asarray(values, dtype=float)
+    return evenly_spaced_branch_angles(ways, rotation_deg=rotation_deg)
 
 
 def main() -> None:
-    """Generate a junction scan, detect baseline openings, and visualize it."""
-    max_range = 10.0
-    noise_std = 0.05
-    walls, anchor = create_4way_junction()
-    angles_deg, ranges, hit_points = simulate_lidar(
-        walls,
-        anchor,
-        angle_step_deg=1.0,
-        max_range=max_range,
-        noise_std=noise_std,
-        rng=np.random.default_rng(7),
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ways", type=int, default=4, help="TEST ONLY: number of openings used to generate synthetic geometry")
+    parser.add_argument(
+        "--branch-angles",
+        type=str,
+        default=None,
+        help='TEST ONLY: synthetic opening directions, e.g. "0,65,160,245"',
     )
-    local_points = polar_to_xy(angles_deg, ranges)
+    parser.add_argument("--rotation", type=float, default=0.0)
+    parser.add_argument("--corridor-width", type=float, default=2.0)
+    parser.add_argument("--central-radius", type=float, default=1.8)
+    parser.add_argument("--branch-length", type=float, default=10.0)
+    parser.add_argument("--anchor-x", type=float, default=0.0)
+    parser.add_argument("--anchor-y", type=float, default=0.0)
+    parser.add_argument("--anchor-yaw", type=float, default=0.0)
+    parser.add_argument("--angle-step", type=float, default=1.0)
+    parser.add_argument("--max-range", type=float, default=6.0)
+    parser.add_argument("--noise", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--csv", type=str, default="general_local_scan.csv")
+    parser.add_argument("--save", type=str, default=None)
+    parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--regression", action="store_true")
+    args = parser.parse_args()
 
-    # The anchor is (0, 0), so local Cartesian points equal world endpoints.
-    if not np.allclose(local_points + np.asarray(anchor), hit_points):
-        raise RuntimeError("polar and ray-cast point clouds are inconsistent")
+    if args.regression:
+        print("=== Way-count-agnostic regression ===")
+        for expected, detected, ok in regression_test_way_counts():
+            print(f"N={expected}: detected={detected} -> {'PASS' if ok else 'FAIL'}")
+        return
 
-    # Only angle-distance data enter the detector.  Geometry and branch count
-    # remain strictly outside this range-discontinuity baseline.
-    openings, diagnostics = _detect_openings_with_diagnostics(
-        angles_deg,
-        ranges,
-        smoothing_window_size=5,
-        min_opening_width_deg=5.0,
+    branch_angles = _parse_branch_angles(args.branch_angles, args.ways, args.rotation)
+    walls, scan, openings, diagnostics = run_case(
+        branch_angles,
+        anchor_xy=(args.anchor_x, args.anchor_y),
+        anchor_yaw_deg=args.anchor_yaw,
+        corridor_width_m=args.corridor_width,
+        central_radius_m=args.central_radius,
+        branch_length_m=args.branch_length,
+        max_range_m=args.max_range,
+        noise_std_m=args.noise,
+        dropout_probability=args.dropout,
+        angle_step_deg=args.angle_step,
     )
 
-    print(f"Detected openings: {len(openings)}")
-    for index, opening in enumerate(openings):
+    save_local_scan_csv(scan, args.csv)
+
+    print("=== General Point-Cloud Junction Opening Detector ===")
+    print(f"test-only ground-truth openings : {len(branch_angles)}")
+    print(f"Detected openings              : {len(openings)}")
+    print("Detector was given only P={(theta_i, r_i)}; no way count or branch directions.")
+    for i, opening in enumerate(openings):
         print(
-            f"Opening {index}: start={opening['start_angle']:.1f}\N{DEGREE SIGN}, "
-            f"end={opening['end_angle']:.1f}\N{DEGREE SIGN}, "
-            f"center={opening['center_angle']:.1f}\N{DEGREE SIGN}, "
-            f"width={opening['width_deg']:.1f}\N{DEGREE SIGN}"
+            f"  Opening {i}: start={opening['start_angle']:.1f} deg, "
+            f"end={opening['end_angle']:.1f} deg, "
+            f"center={opening['center_angle']:.1f} deg, "
+            f"width={opening['width_deg']:.1f} deg, "
+            f"confidence={opening['confidence']:.2f}"
         )
 
-    visualize_results(
+    print("\nDetector receives only: Anchor-local P={(theta_i, r_i)}")
+    print("Detector does NOT receive: way count, branch labels/directions, walls/map, global pose, junction coordinates")
+
+    plot_results(
         walls,
-        anchor,
-        angles_deg,
-        ranges,
-        hit_points,
-        max_range=max_range,
-        openings=openings,
-        detector_diagnostics=diagnostics,
+        (args.anchor_x, args.anchor_y),
+        scan,
+        openings,
+        diagnostics,
+        anchor_yaw_deg=args.anchor_yaw,
+        save_path=args.save,
+        show=not args.no_show,
     )
-    plt.show()
 
 
 if __name__ == "__main__":
