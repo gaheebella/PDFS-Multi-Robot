@@ -478,6 +478,30 @@ def smooth_ranges(ranges: Sequence[float], window_size: int = 5) -> np.ndarray:
     return np.mean([np.roll(values, s) for s in range(-half, half + 1)], axis=0)
 
 
+def circular_median_filter(ranges: Sequence[float], window_size: int = 5) -> np.ndarray:
+    """Robust circular median prefilter for isolated high-range sensor losses.
+
+    A true opening spans multiple adjacent bearings, so it survives a short
+    median window. Isolated dropout / partial-visibility spikes surrounded by
+    wall returns are suppressed. Only range values are used; no hit mask or
+    global information is exposed to the detector.
+    """
+    values = np.asarray(ranges, dtype=float)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("ranges must be a non-empty 1D sequence")
+    if not isinstance(window_size, (int, np.integer)) or window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+    if window_size % 2 == 0:
+        raise ValueError("window_size must be odd")
+    if window_size > values.size:
+        raise ValueError("window_size cannot exceed scan length")
+    if window_size == 1:
+        return values.copy()
+    half = window_size // 2
+    stack = np.vstack([np.roll(values, shift) for shift in range(-half, half + 1)])
+    return np.median(stack, axis=0)
+
+
 def circular_range_gradient(
     angles_deg: Sequence[float], ranges: Sequence[float]
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -604,6 +628,7 @@ def _detect_openings_with_diagnostics(
     ranges: Sequence[float],
     *,
     smoothing_window_size: int = 5,
+    median_prefilter_window_size: int = 1,
     wall_reference_quantile: float = 0.25,
     far_range_fraction: float = 0.55,
     merge_gap_deg: float = 3.0,
@@ -632,6 +657,8 @@ def _detect_openings_with_diagnostics(
 
     if smoothing_window_size <= 0 or smoothing_window_size % 2 == 0:
         raise ValueError("smoothing_window_size must be a positive odd integer")
+    if median_prefilter_window_size <= 0 or median_prefilter_window_size % 2 == 0:
+        raise ValueError("median_prefilter_window_size must be a positive odd integer")
     if not 0.0 <= wall_reference_quantile < 1.0:
         raise ValueError("wall_reference_quantile must be in [0,1)")
     if not 0.0 < far_range_fraction < 1.0:
@@ -643,17 +670,22 @@ def _detect_openings_with_diagnostics(
     if boundary_search_deg < 0.0:
         raise ValueError("boundary_search_deg must be non-negative")
 
-    smoothed = smooth_ranges(raw, smoothing_window_size)
+    # Suppress isolated max-range spikes before averaging. This improves
+    # dropout/partial-visibility robustness while preserving broad openings.
+    prefiltered = circular_median_filter(raw, median_prefilter_window_size)
+    smoothed = smooth_ranges(prefiltered, smoothing_window_size)
 
     # These are inferred from the scan; the detector is not passed sensor/map metadata.
     wall_reference = float(np.quantile(smoothed, wall_reference_quantile))
-    range_ceiling = float(np.max(raw))
+    range_ceiling = float(np.max(prefiltered))
     dynamic_span = max(0.0, range_ceiling - wall_reference)
 
     # If there is no meaningful contrast, no opening can be supported by this baseline.
     if dynamic_span <= 1.0e-6:
         diagnostics = {
-            "smoothed_ranges": smoothed,
+            "prefiltered_ranges": prefiltered,
+            "prefiltered_ranges": prefiltered,
+        "smoothed_ranges": smoothed,
             "open_support_mask": np.zeros(raw.size, dtype=bool),
             "open_threshold": range_ceiling,
             "wall_reference": wall_reference,
@@ -1218,7 +1250,7 @@ def _sector_iou_deg(a: dict[str, float], b: dict[str, float]) -> float:
     return 0.0 if union <= EPSILON else float(best_intersection / union)
 
 
-def ground_truth_openings_from_geometry(
+def physical_mouth_openings_from_geometry(
     branch_angles_deg: Sequence[float],
     *,
     anchor_xy: Sequence[float],
@@ -1226,7 +1258,7 @@ def ground_truth_openings_from_geometry(
     corridor_width_m: float,
     central_radius_m: float,
 ) -> list[dict[str, float]]:
-    """Geometric opening sectors used ONLY for evaluation, never by detector.
+    """Physical branch-mouth sectors used ONLY as a secondary diagnostic.
 
     Each physical branch mouth is represented by the two points where its side
     walls meet the central chamber.  Those points are projected into the same
@@ -1284,6 +1316,84 @@ def ground_truth_openings_from_geometry(
     result.sort(key=lambda x: x["center_angle"])
     return result
 
+
+
+def _interpolate_threshold_crossing_angle(
+    angle_a: float,
+    range_a: float,
+    angle_b: float,
+    range_b: float,
+    threshold: float,
+) -> float:
+    """Interpolate a circular angular threshold crossing between adjacent rays."""
+    delta = (float(angle_b) - float(angle_a)) % 360.0
+    if delta > 180.0:
+        delta -= 360.0
+    denom = float(range_b) - float(range_a)
+    frac = 0.5 if abs(denom) <= EPSILON else float(np.clip((threshold - float(range_a)) / denom, 0.0, 1.0))
+    return float(_normalize_angles(float(angle_a) + frac * delta))
+
+
+def ground_truth_openings_from_ideal_scan(
+    walls: np.ndarray,
+    *,
+    anchor_xy: Sequence[float],
+    anchor_yaw_deg: float,
+    angle_step_deg: float,
+    max_range_m: float,
+    wall_reference_quantile: float = 0.25,
+    far_range_fraction: float = 0.55,
+    min_opening_width_deg: float = 5.0,
+) -> tuple[list[dict[str, float]], float]:
+    """Simulator-only GT for the detector's observable long-free-path sector.
+
+    The current range-profile detector estimates bearings that provide a
+    sufficiently long free path. It does not estimate the entire physical
+    corridor mouth. Primary boundary accuracy is therefore measured against an
+    ideal noise-free LiDAR scan using the same declared free-path definition.
+    Geometry remains evaluation-only and is never fed to the detector.
+    """
+    ideal = simulate_lidar_scan(
+        walls, anchor_xy, anchor_yaw_deg=anchor_yaw_deg,
+        angle_step_deg=angle_step_deg, max_range_m=max_range_m,
+        noise_std_m=0.0, dropout_probability=0.0, occlusion_probability=0.0,
+        visible_boundary_ratio=1.0, seed=0,
+    )
+    angles = np.asarray(ideal.angle_deg, dtype=float)
+    ranges = np.asarray(ideal.range_m, dtype=float)
+    _, _, angular_steps = _validate_circular_scan(angles, ranges)
+    wall_reference = float(np.quantile(ranges, wall_reference_quantile))
+    ceiling = float(np.max(ranges))
+    threshold = wall_reference + far_range_fraction * max(0.0, ceiling - wall_reference)
+    mask = ranges >= threshold
+    sectors: list[dict[str, float]] = []
+    for run in _circular_runs(mask, value=True):
+        if _run_width_deg(run, angular_steps) < min_opening_width_deg:
+            continue
+        first, last = int(run[0]), int(run[-1])
+        prev_idx, next_idx = (first - 1) % ranges.size, (last + 1) % ranges.size
+        start = _interpolate_threshold_crossing_angle(
+            angles[prev_idx], ranges[prev_idx], angles[first], ranges[first], threshold
+        )
+        end = _interpolate_threshold_crossing_angle(
+            angles[last], ranges[last], angles[next_idx], ranges[next_idx], threshold
+        )
+        width = _positive_ccw_width(start, end)
+        if width < min_opening_width_deg or width >= 359.0:
+            continue
+        sectors.append({
+            "start_angle": start,
+            "end_angle": end,
+            "center_angle": float(_normalize_angles(start + width / 2.0)),
+            "width_deg": float(width),
+        })
+    sectors.sort(key=lambda item: item["center_angle"])
+    return sectors, float(threshold)
+
+
+# Compatibility alias. This is the physical-mouth diagnostic, not primary GT.
+def ground_truth_openings_from_geometry(*args: Any, **kwargs: Any) -> list[dict[str, float]]:
+    return physical_mouth_openings_from_geometry(*args, **kwargs)
 
 def _match_openings(
     ground_truth: Sequence[dict[str, float]],
@@ -1436,12 +1546,12 @@ def _evaluate_case(
         local_motion_direction_deg=motion,
         incoming_tolerance_deg=incoming_tolerance_deg,
     )
-    gt = ground_truth_openings_from_geometry(
-        branch_angles,
+    gt, evaluation_free_path_threshold_m = ground_truth_openings_from_ideal_scan(
+        _walls,
         anchor_xy=anchor_xy,
         anchor_yaw_deg=anchor_yaw_deg,
-        corridor_width_m=corridor_width_m,
-        central_radius_m=central_radius_m,
+        angle_step_deg=angle_step_deg,
+        max_range_m=max_range_m,
     )
     metrics = evaluate_detection(
         gt,
@@ -1450,6 +1560,20 @@ def _evaluate_case(
         detected_topology=topology.topology,
         min_acceptable_iou=min_acceptable_iou,
     )
+    mouth_gt = physical_mouth_openings_from_geometry(
+        branch_angles,
+        anchor_xy=anchor_xy,
+        anchor_yaw_deg=anchor_yaw_deg,
+        corridor_width_m=corridor_width_m,
+        central_radius_m=central_radius_m,
+    )
+    mouth_metrics = evaluate_detection(mouth_gt, openings, min_acceptable_iou=0.0)
+    metrics.update({
+        "evaluation_boundary_definition": "ideal_free_path_sector",
+        "evaluation_free_path_threshold_m": evaluation_free_path_threshold_m,
+        "physical_mouth_mean_iou": mouth_metrics["mean_iou"],
+        "physical_mouth_boundary_mae_deg": mouth_metrics["boundary_mae_deg"],
+    })
     metrics.update(
         {
             "seed": seed,
@@ -1496,9 +1620,12 @@ def _summarize_rows(rows: Sequence[dict[str, Any]], label: str) -> None:
     print(f"\n[{label}] runs={len(rows)}")
     print(f"  opening-count accuracy : {100.0 * count_acc:.1f}%")
     print(f"  topology accuracy      : {100.0 * topo_acc:.1f}%" if np.isfinite(topo_acc) else "  topology accuracy      : n/a")
-    print(f"  mean angular IoU       : {np.mean(mean_ious):.3f}" if mean_ious else "  mean angular IoU       : n/a")
+    print(f"  free-sector mean IoU   : {np.mean(mean_ious):.3f}" if mean_ious else "  free-sector mean IoU   : n/a")
     print(f"  center-angle MAE       : {np.mean(center_mae):.2f} deg" if center_mae else "  center-angle MAE       : n/a")
-    print(f"  boundary MAE           : {np.mean(boundary_mae):.2f} deg" if boundary_mae else "  boundary MAE           : n/a")
+    print(f"  free-sector boundary MAE: {np.mean(boundary_mae):.2f} deg" if boundary_mae else "  free-sector boundary MAE: n/a")
+    mouth_mae = [float(r.get("physical_mouth_boundary_mae_deg", float("nan"))) for r in rows]
+    mouth_mae = [v for v in mouth_mae if np.isfinite(v)]
+    print(f"  physical-mouth boundary MAE (diagnostic): {np.mean(mouth_mae):.2f} deg" if mouth_mae else "  physical-mouth boundary MAE (diagnostic): n/a")
     print(f"  runs with any failure  : {len(failures)}/{len(rows)}")
     if failures:
         first = failures[0]
@@ -1839,12 +1966,12 @@ def main() -> None:
     print("Neither stage receives: global map/pose, junction coordinates, expected way count, or expected branch directions")
 
     if args.evaluate:
-        gt_openings = ground_truth_openings_from_geometry(
-            branch_angles,
+        gt_openings, eval_free_path_threshold = ground_truth_openings_from_ideal_scan(
+            walls,
             anchor_xy=(args.anchor_x, args.anchor_y),
             anchor_yaw_deg=args.anchor_yaw,
-            corridor_width_m=args.corridor_width,
-            central_radius_m=args.central_radius,
+            angle_step_deg=args.angle_step,
+            max_range_m=args.max_range,
         )
         metrics = evaluate_detection(
             gt_openings,
@@ -1853,16 +1980,30 @@ def main() -> None:
             detected_topology=topology_result.topology,
             min_acceptable_iou=args.min_acceptable_iou,
         )
+        mouth_gt = physical_mouth_openings_from_geometry(
+            branch_angles,
+            anchor_xy=(args.anchor_x, args.anchor_y),
+            anchor_yaw_deg=args.anchor_yaw,
+            corridor_width_m=args.corridor_width,
+            central_radius_m=args.central_radius,
+        )
+        mouth_metrics = evaluate_detection(mouth_gt, openings, min_acceptable_iou=0.0)
+        metrics["evaluation_free_path_threshold_m"] = eval_free_path_threshold
+        metrics["physical_mouth_mean_iou"] = mouth_metrics["mean_iou"]
+        metrics["physical_mouth_boundary_mae_deg"] = mouth_metrics["boundary_mae_deg"]
         print("\n=== Detection Accuracy Evaluation ===")
+        print("Primary boundary target : ideal free-path sector (not full physical mouth)")
+        print(f"Free-path threshold     : {metrics['evaluation_free_path_threshold_m']:.3f} m")
         print(f"Ground-truth openings : {metrics['ground_truth_count']}")
         print(f"Detected openings     : {metrics['detected_count']}")
         print(f"Count correct         : {metrics['count_correct']}")
         print(f"Matched / FP / FN     : {metrics['matched_openings']} / {metrics['false_positive']} / {metrics['false_negative']}")
         print(f"Precision/Recall/F1   : {metrics['precision']:.3f} / {metrics['recall']:.3f} / {metrics['f1']:.3f}")
-        print(f"Mean / minimum IoU    : {metrics['mean_iou']:.3f} / {metrics['min_iou']:.3f}")
+        print(f"Free-sector mean/min IoU: {metrics['mean_iou']:.3f} / {metrics['min_iou']:.3f}")
         print(f"Center-angle MAE      : {metrics['center_mae_deg']:.2f} deg")
         print(f"Start / end MAE       : {metrics['start_mae_deg']:.2f} / {metrics['end_mae_deg']:.2f} deg")
-        print(f"Boundary MAE          : {metrics['boundary_mae_deg']:.2f} deg")
+        print(f"Free-sector boundary MAE: {metrics['boundary_mae_deg']:.2f} deg")
+        print(f"Physical-mouth boundary MAE (diagnostic): {metrics['physical_mouth_boundary_mae_deg']:.2f} deg")
         print(f"Expected topology     : {metrics['expected_topology']}")
         print(f"Detected topology     : {metrics['detected_topology']}")
         print(f"Topology correct      : {metrics['topology_correct']}")
