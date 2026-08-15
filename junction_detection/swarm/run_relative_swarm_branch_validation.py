@@ -23,11 +23,14 @@ from junction_detection.swarm.relative_swarm_branch_validator import (
 
 @dataclass(frozen=True)
 class SyntheticCase:
-    """Simulator-only test frames and their expected candidate count."""
+    """Simulator-only frames and their semantic expected Branch count."""
 
     name: str
     description: str
-    expected_branch_count: int
+    semantic_expected_branch_count: int
+    required_to_pass: bool
+    known_limitation_reason: str | None
+    visualization_reference_directions_deg: tuple[float, ...]
     frames: tuple[tuple[RobotObservation, ...], ...]
     measurement_noise_std_m: float
     bearing_noise_std_deg: float
@@ -72,32 +75,79 @@ def _temporarily_stalled_range(timestamp: float, frame_index: int) -> float:
     return _progress_range(timestamp, frame_index)
 
 
-def _neighbor_map(groups: Sequence[Sequence[str]]) -> dict[str, tuple[str, ...]]:
-    """Create disconnected all-to-all local neighbor groups."""
-    neighbors: dict[str, tuple[str, ...]] = {}
+def _clique_neighbor_map(
+    groups: Sequence[Sequence[str]],
+) -> dict[str, set[str]]:
+    """Create disconnected all-to-all neighbor groups for synthetic tests."""
+    neighbors: dict[str, set[str]] = {}
     for group in groups:
         group_tuple = tuple(group)
         for robot_id in group_tuple:
-            neighbors[robot_id] = tuple(other for other in group_tuple if other != robot_id)
+            if robot_id in neighbors:
+                raise ValueError(f"robot appears in multiple groups: {robot_id}")
+            neighbors[robot_id] = {
+                other for other in group_tuple if other != robot_id
+            }
     return neighbors
+
+
+def _chain_neighbor_map(robot_ids: Sequence[str]) -> dict[str, set[str]]:
+    """Create a sparse R0--R1--... chain neighbor graph."""
+    ordered = tuple(robot_ids)
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("chain robot IDs must be unique")
+    neighbors = {robot_id: set() for robot_id in ordered}
+    for first, second in zip(ordered[:-1], ordered[1:]):
+        neighbors[first].add(second)
+        neighbors[second].add(first)
+    return neighbors
+
+
+def _merge_neighbor_maps(
+    *maps: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Merge disjoint or partially overlapping synthetic neighbor maps."""
+    merged: dict[str, set[str]] = {}
+    for neighbor_map in maps:
+        for robot_id, neighbor_ids in neighbor_map.items():
+            merged.setdefault(robot_id, set()).update(neighbor_ids)
+    return merged
+
+
+def _add_undirected_edges(
+    neighbor_map: dict[str, set[str]],
+    edges: Sequence[tuple[str, str]],
+) -> dict[str, set[str]]:
+    """Return a copy with manually specified bridge links added."""
+    result = {robot_id: set(neighbor_ids) for robot_id, neighbor_ids in neighbor_map.items()}
+    for first, second in edges:
+        if first == second:
+            raise ValueError("manual neighbor edges cannot be self-links")
+        if first not in result or second not in result:
+            raise ValueError("manual edge endpoint is absent from the neighbor map")
+        result[first].add(second)
+        result[second].add(first)
+    return result
 
 
 def _build_case(
     *,
     name: str,
     description: str,
-    expected_branch_count: int,
+    semantic_expected_branch_count: int,
+    required_to_pass: bool,
+    known_limitation_reason: str | None,
+    visualization_reference_directions_deg: tuple[float, ...] = (),
     timestamps: np.ndarray,
     robot_models: dict[str, tuple[RangeFunction, float]],
-    neighbor_groups: Sequence[Sequence[str]],
+    neighbor_map: dict[str, set[str]],
     rng: np.random.Generator,
     measurement_noise_std_m: float,
     bearing_noise_std_deg: float,
 ) -> SyntheticCase:
     """Build local relative frames without constructing global positions."""
-    neighbors = _neighbor_map(neighbor_groups)
-    if set(neighbors) != set(robot_models):
-        raise ValueError("every synthetic robot must belong to exactly one neighbor group")
+    if set(neighbor_map) != set(robot_models):
+        raise ValueError("every synthetic robot must appear in the neighbor map")
     frames: list[tuple[RobotObservation, ...]] = []
     for frame_index, timestamp in enumerate(timestamps):
         frame: list[RobotObservation] = []
@@ -112,14 +162,17 @@ def _build_case(
                     robot_id=robot_id,
                     anchor_range_m=max(0.0, anchor_range),
                     anchor_bearing_deg=bearing,
-                    neighbor_ids=neighbors[robot_id],
+                    neighbor_ids=tuple(sorted(neighbor_map[robot_id])),
                 )
             )
         frames.append(tuple(frame))
     return SyntheticCase(
         name=name,
         description=description,
-        expected_branch_count=expected_branch_count,
+        semantic_expected_branch_count=semantic_expected_branch_count,
+        required_to_pass=required_to_pass,
+        known_limitation_reason=known_limitation_reason,
+        visualization_reference_directions_deg=visualization_reference_directions_deg,
         frames=tuple(frames),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
@@ -132,7 +185,7 @@ def create_synthetic_cases(
     measurement_noise_std_m: float = 0.01,
     bearing_noise_std_deg: float = 0.4,
 ) -> tuple[SyntheticCase, ...]:
-    """Create the five required local-relative validation scenarios."""
+    """Create five regressions, one limitation case, and one sparse-graph case."""
     if measurement_noise_std_m < 0.0 or bearing_noise_std_deg < 0.0:
         raise ValueError("synthetic noise standard deviations must be non-negative")
     master_rng = np.random.default_rng(seed)
@@ -142,13 +195,15 @@ def create_synthetic_cases(
     case_1 = _build_case(
         name="case_1_wall",
         description="All robots plateau after initial outward motion.",
-        expected_branch_count=0,
+        semantic_expected_branch_count=0,
+        required_to_pass=True,
+        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             robot_id: (_plateau_range, -30.0 + 12.0 * index)
             for index, robot_id in enumerate(wall_ids)
         },
-        neighbor_groups=(wall_ids,),
+        neighbor_map=_clique_neighbor_map((wall_ids,)),
         rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
@@ -159,7 +214,9 @@ def create_synthetic_cases(
     case_2 = _build_case(
         name="case_2_one_branch",
         description="One connected progressing cohort and one plateau group.",
-        expected_branch_count=1,
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             **{
@@ -171,7 +228,7 @@ def create_synthetic_cases(
                 for index, robot_id in enumerate(one_wall_ids)
             },
         },
-        neighbor_groups=(branch_ids, one_wall_ids),
+        neighbor_map=_clique_neighbor_map((branch_ids, one_wall_ids)),
         rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
@@ -183,7 +240,9 @@ def create_synthetic_cases(
     case_3 = _build_case(
         name="case_3_two_branches",
         description="Two disconnected progressing cohorts at distinct bearings.",
-        expected_branch_count=2,
+        semantic_expected_branch_count=2,
+        required_to_pass=True,
+        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             **{
@@ -199,7 +258,7 @@ def create_synthetic_cases(
                 for index, robot_id in enumerate(two_wall_ids)
             },
         },
-        neighbor_groups=(branch_a, branch_b, two_wall_ids),
+        neighbor_map=_clique_neighbor_map((branch_a, branch_b, two_wall_ids)),
         rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
@@ -209,7 +268,9 @@ def create_synthetic_cases(
     case_4 = _build_case(
         name="case_4_temporary_stall",
         description="One cohort member stalls for one frame while peers progress.",
-        expected_branch_count=1,
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             robot_id: (
@@ -218,7 +279,7 @@ def create_synthetic_cases(
             )
             for index, robot_id in enumerate(stall_ids)
         },
-        neighbor_groups=(stall_ids,),
+        neighbor_map=_clique_neighbor_map((stall_ids,)),
         rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
@@ -229,18 +290,79 @@ def create_synthetic_cases(
     case_5 = _build_case(
         name="case_5_bearing_wraparound",
         description="One progressing cohort spans the -180/+180 bearing seam.",
-        expected_branch_count=1,
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             robot_id: (_progress_range, wrap_bearings[index])
             for index, robot_id in enumerate(wrap_ids)
         },
-        neighbor_groups=(wrap_ids,),
+        neighbor_map=_clique_neighbor_map((wrap_ids,)),
         rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
     )
-    return case_1, case_2, case_3, case_4, case_5
+    bridged_a = tuple(f"bridge_a_{index}" for index in range(4))
+    bridged_b = tuple(f"bridge_b_{index}" for index in range(4))
+    bridge_id = "central_bridge"
+    bridged_map = _merge_neighbor_maps(
+        _clique_neighbor_map((bridged_a,)),
+        _clique_neighbor_map((bridged_b,)),
+        {bridge_id: set()},
+    )
+    bridged_map = _add_undirected_edges(
+        bridged_map,
+        ((bridged_a[-1], bridge_id), (bridge_id, bridged_b[0])),
+    )
+    case_6 = _build_case(
+        name="case_6_bridged_two_branches",
+        description=(
+            "Two semantic Branches merge into one progressing connected component "
+            "through a central progressing robot."
+        ),
+        semantic_expected_branch_count=2,
+        required_to_pass=False,
+        known_limitation_reason=(
+            "two semantic branches are merged by one progressing connected component"
+        ),
+        visualization_reference_directions_deg=(-58.0, 58.0),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, -58.0 + 1.6 * (index - 1.5))
+                for index, robot_id in enumerate(bridged_a)
+            },
+            **{
+                robot_id: (_progress_range, 58.0 + 1.6 * (index - 1.5))
+                for index, robot_id in enumerate(bridged_b)
+            },
+            bridge_id: (_progress_range, 0.0),
+        },
+        neighbor_map=bridged_map,
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    sparse_ids = tuple(f"sparse_{index}" for index in range(5))
+    case_7 = _build_case(
+        name="case_7_sparse_one_branch",
+        description="Five progressing robots connected only as a sparse chain.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        known_limitation_reason=None,
+        timestamps=timestamps,
+        robot_models={
+            robot_id: (_progress_range, -132.0 + 1.5 * (index - 2.0))
+            for index, robot_id in enumerate(sparse_ids)
+        },
+        neighbor_map=_chain_neighbor_map(sparse_ids),
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+    return case_1, case_2, case_3, case_4, case_5, case_6, case_7
 
 
 def run_synthetic_case(
@@ -248,14 +370,14 @@ def run_synthetic_case(
     *,
     temporal_window_s: float,
     minimum_observations: int,
-    significance_z: float,
+    confidence_multiplier: float,
     minimum_cohort_size: int,
 ) -> SyntheticCaseResult:
     """Run one case through the public local-observation validator interface."""
     validator = RelativeSwarmBranchValidator(
         temporal_window_s=temporal_window_s,
         minimum_observations=minimum_observations,
-        significance_z=significance_z,
+        confidence_multiplier=confidence_multiplier,
         minimum_cohort_size=minimum_cohort_size,
     )
     results = tuple(validator.update(frame) for frame in case.frames)
@@ -273,7 +395,7 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     final_states = {str(trend.robot_id): trend.state for trend in final.trends}
     colors = {
         "progressing": "tab:green",
-        "plateau": "tab:blue",
+        "non_progressing": "tab:blue",
         "uncertain": "tab:orange",
     }
     figure = plt.figure(figsize=(15, 11))
@@ -337,7 +459,7 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
             drawn_edges.add(edge)
             points = np.vstack((local_positions[robot_id], local_positions[neighbor_id]))
             local_axis.plot(points[:, 0], points[:, 1], color="0.75", linewidth=0.7)
-    for state in ("progressing", "plateau", "uncertain"):
+    for state in ("progressing", "non_progressing", "uncertain"):
         members = [robot_id for robot_id in robot_ids if final_states[robot_id] == state]
         if not members:
             continue
@@ -351,6 +473,19 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
             [0.0, radius * np.cos(theta)], [0.0, radius * np.sin(theta)],
             linestyle="--", linewidth=1.5, label=f"Branch {candidate.cohort_id}",
         )
+    for index, direction_deg in enumerate(
+        result.case.visualization_reference_directions_deg
+    ):
+        theta = np.deg2rad(direction_deg)
+        radius = max(observation.anchor_range_m for observation in latest.values())
+        local_axis.plot(
+            [0.0, radius * np.cos(theta)],
+            [0.0, radius * np.sin(theta)],
+            color="black",
+            linestyle=":",
+            linewidth=1.2,
+            label="semantic Branch reference (test only)" if index == 0 else None,
+        )
     local_axis.set_title("C. Reconstructed Anchor-local cohort graph")
     local_axis.set_xlabel("local x from range/bearing [m]")
     local_axis.set_ylabel("local y from range/bearing [m]")
@@ -358,7 +493,7 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     local_axis.grid(alpha=0.3)
     local_axis.legend(fontsize=8)
 
-    for state in ("progressing", "plateau", "uncertain"):
+    for state in ("progressing", "non_progressing", "uncertain"):
         members = [robot_id for robot_id in robot_ids if final_states[robot_id] == state]
         if not members:
             continue
@@ -374,11 +509,24 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
             [theta, theta], [0.0, max_radius], linewidth=2.0,
             label=f"cohort {candidate.cohort_id}: {candidate.estimated_direction_deg:.1f} deg",
         )
+    for index, direction_deg in enumerate(
+        result.case.visualization_reference_directions_deg
+    ):
+        theta = np.deg2rad(direction_deg)
+        bearing_axis.plot(
+            [theta, theta],
+            [0.0, max_radius],
+            color="black",
+            linestyle=":",
+            linewidth=1.2,
+            label="semantic reference (test only)" if index == 0 else None,
+        )
     bearing_axis.set_title("D. Circular bearing and detected Branch direction")
     bearing_axis.legend(fontsize=8, loc="lower left", bbox_to_anchor=(0.0, -0.25))
 
     figure.suptitle(
-        f"{result.case.name}: expected={result.case.expected_branch_count}, "
+        f"{result.case.name}: semantic expected="
+        f"{result.case.semantic_expected_branch_count}, "
         f"detected={len(final.branch_candidates)}",
         fontsize=14,
     )
@@ -395,7 +543,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bearing-noise-std", type=float, default=0.4)
     parser.add_argument("--temporal-window", type=float, default=4.0)
     parser.add_argument("--minimum-observations", type=int, default=5)
-    parser.add_argument("--significance-z", type=float, default=1.96)
+    parser.add_argument(
+        "--confidence-multiplier",
+        type=float,
+        default=1.96,
+        help=(
+            "normal-approximation confidence multiplier for synthetic validation; "
+            "1.96 does not guarantee exact small-sample 95%% coverage; evaluate "
+            "Student-t, bootstrap, or empirical calibration on real SPH/robot data"
+        ),
+    )
     parser.add_argument("--minimum-cohort-size", type=int, default=2)
     parser.add_argument(
         "--output-dir",
@@ -419,7 +576,7 @@ def main() -> None:
             case,
             temporal_window_s=args.temporal_window,
             minimum_observations=args.minimum_observations,
-            significance_z=args.significance_z,
+            confidence_multiplier=args.confidence_multiplier,
             minimum_cohort_size=args.minimum_cohort_size,
         )
         for case in cases
@@ -435,22 +592,32 @@ def main() -> None:
     print(
         f"Inference settings: window={args.temporal_window:.2f} s, "
         f"minimum_observations={args.minimum_observations}, "
-        f"z={args.significance_z:.3f}, minimum_cohort_size={args.minimum_cohort_size}"
+        f"confidence_multiplier={args.confidence_multiplier:.3f}, "
+        f"minimum_cohort_size={args.minimum_cohort_size}"
     )
 
     all_passed = True
     for result in results:
         final = result.final_result
         detected = len(final.branch_candidates)
-        passed = detected == result.case.expected_branch_count
-        all_passed &= passed
+        passed = detected == result.case.semantic_expected_branch_count
+        if result.case.required_to_pass:
+            status = "PASS" if passed else "FAIL"
+            all_passed &= passed
+        elif passed:
+            status = "DIAGNOSTIC MATCH"
+        else:
+            status = "KNOWN LIMITATION"
         print(
-            f"{result.case.name}: expected={result.case.expected_branch_count}, "
-            f"detected={detected} -> {'PASS' if passed else 'FAIL'}"
+            f"{result.case.name}: semantic_expected="
+            f"{result.case.semantic_expected_branch_count}, "
+            f"detected={detected} -> {status}"
         )
+        if status == "KNOWN LIMITATION":
+            print(f"  KNOWN LIMITATION: {result.case.known_limitation_reason}")
         print(
             f"  progressing={len(final.progressing_robot_ids)}, "
-            f"plateau={len(final.plateau_robot_ids)}, "
+            f"non_progressing={len(final.non_progressing_robot_ids)}, "
             f"uncertain={len(final.uncertain_robot_ids)}"
         )
         for candidate in final.branch_candidates:
@@ -467,7 +634,7 @@ def main() -> None:
             print(f"  plot={path}")
 
     if not all_passed:
-        raise SystemExit("one or more synthetic validation cases failed")
+        raise SystemExit("one or more required synthetic validation cases failed")
 
 
 if __name__ == "__main__":

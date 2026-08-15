@@ -22,7 +22,7 @@ import numpy as np
 
 
 RobotId = Hashable
-MotionState = Literal["progressing", "plateau", "uncertain"]
+MotionState = Literal["progressing", "non_progressing", "uncertain"]
 
 
 @dataclass(frozen=True)
@@ -113,11 +113,11 @@ class BranchCandidate:
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """Branch candidates plus explicit progressing/plateau diagnostics."""
+    """Branch candidates plus explicit radial-trend diagnostics."""
 
     timestamp: float
     progressing_robot_ids: tuple[RobotId, ...]
-    plateau_robot_ids: tuple[RobotId, ...]
+    non_progressing_robot_ids: tuple[RobotId, ...]
     uncertain_robot_ids: tuple[RobotId, ...]
     progressing_components: tuple[tuple[RobotId, ...], ...]
     rejected_progressing_components: tuple[tuple[RobotId, ...], ...]
@@ -158,10 +158,19 @@ class RelativeSwarmBranchValidator:
     experimental validation settings, not claimed physical constants.
 
     A robot is ``progressing`` when the lower confidence bound of its OLS radial
-    slope is above zero. It is ``plateau`` when the slope confidence interval
-    contains zero, and ``uncertain`` otherwise (for example significant retreat).
-    OLS is used because it directly supports irregular timestamps and provides
-    an interpretable slope uncertainty without SciPy or a tuned velocity cutoff.
+    slope is above zero. It is ``non_progressing`` when that interval contains
+    zero, which means positive progress was not statistically confirmed—not that
+    the robot was proven to be physically stopped at a wall. A significantly
+    negative slope and insufficient history remain ``uncertain``.
+
+    ``confidence_multiplier=1.96`` is a normal-approximation multiplier used for
+    synthetic validation. It does not claim exact 95% coverage for small samples;
+    Student-t, bootstrap, or empirical calibration should be evaluated on real
+    SPH/robot data. OLS is retained because it handles irregular timestamps and
+    provides interpretable slope uncertainty without SciPy or a velocity cutoff.
+
+    All defaults are experimental synthetic-validation settings, not claimed
+    physical constants.
     """
 
     def __init__(
@@ -169,20 +178,20 @@ class RelativeSwarmBranchValidator:
         *,
         temporal_window_s: float = 4.0,
         minimum_observations: int = 5,
-        significance_z: float = 1.96,
+        confidence_multiplier: float = 1.96,
         minimum_cohort_size: int = 2,
     ) -> None:
         if not isfinite(float(temporal_window_s)) or temporal_window_s <= 0.0:
             raise ValueError("temporal_window_s must be finite and positive")
         if minimum_observations < 3:
             raise ValueError("minimum_observations must be at least 3 for slope uncertainty")
-        if not isfinite(float(significance_z)) or significance_z <= 0.0:
-            raise ValueError("significance_z must be finite and positive")
+        if not isfinite(float(confidence_multiplier)) or confidence_multiplier <= 0.0:
+            raise ValueError("confidence_multiplier must be finite and positive")
         if minimum_cohort_size < 2:
             raise ValueError("minimum_cohort_size must be at least 2")
         self.temporal_window_s = float(temporal_window_s)
         self.minimum_observations = int(minimum_observations)
-        self.significance_z = float(significance_z)
+        self.confidence_multiplier = float(confidence_multiplier)
         self.minimum_cohort_size = int(minimum_cohort_size)
         self._history: dict[RobotId, deque[RobotObservation]] = defaultdict(deque)
         self._last_frame_timestamp: Optional[float] = None
@@ -233,7 +242,9 @@ class RelativeSwarmBranchValidator:
         progressing = tuple(
             trend.robot_id for trend in trends if trend.state == "progressing"
         )
-        plateau = tuple(trend.robot_id for trend in trends if trend.state == "plateau")
+        non_progressing = tuple(
+            trend.robot_id for trend in trends if trend.state == "non_progressing"
+        )
         uncertain = tuple(
             trend.robot_id for trend in trends if trend.state == "uncertain"
         )
@@ -257,7 +268,7 @@ class RelativeSwarmBranchValidator:
         return ValidationResult(
             timestamp=timestamp,
             progressing_robot_ids=progressing,
-            plateau_robot_ids=plateau,
+            non_progressing_robot_ids=non_progressing,
             uncertain_robot_ids=uncertain,
             progressing_components=components,
             rejected_progressing_components=rejected,
@@ -301,18 +312,18 @@ class RelativeSwarmBranchValidator:
                 state = "uncertain"
                 test_statistic = float("-inf")
             else:
-                state = "plateau"
+                state = "non_progressing"
                 test_statistic = 0.0
             ci_low = slope
             ci_high = slope
         else:
             test_statistic = slope / slope_standard_error
-            ci_low = slope - self.significance_z * slope_standard_error
-            ci_high = slope + self.significance_z * slope_standard_error
+            ci_low = slope - self.confidence_multiplier * slope_standard_error
+            ci_high = slope + self.confidence_multiplier * slope_standard_error
             if ci_low > 0.0:
                 state = "progressing"
             elif ci_low <= 0.0 <= ci_high:
-                state = "plateau"
+                state = "non_progressing"
             else:
                 state = "uncertain"
 
