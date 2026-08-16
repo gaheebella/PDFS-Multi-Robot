@@ -7,7 +7,9 @@ It never constructs or passes simulator world x/y coordinates to the validator.
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -18,6 +20,7 @@ from junction_detection.swarm.relative_swarm_branch_validator import (
     RelativeSwarmBranchValidator,
     RobotObservation,
     ValidationResult,
+    circular_distance_deg,
 )
 
 
@@ -29,7 +32,6 @@ class SyntheticCase:
     description: str
     semantic_expected_branch_count: int
     required_to_pass: bool
-    known_limitation_reason: str | None
     visualization_reference_directions_deg: tuple[float, ...]
     frames: tuple[tuple[RobotObservation, ...], ...]
     measurement_noise_std_m: float
@@ -50,6 +52,8 @@ class SyntheticCaseResult:
 
 
 RangeFunction = Callable[[float, int], float]
+BearingFunction = Callable[[float, int], float]
+BearingModel = float | BearingFunction
 
 
 def _irregular_timestamps(rng: np.random.Generator, count: int = 18) -> np.ndarray:
@@ -66,6 +70,11 @@ def _plateau_range(timestamp: float, _: int) -> float:
 def _progress_range(timestamp: float, _: int) -> float:
     """Continue moving radially through a synthetic open corridor."""
     return 1.0 + 0.36 * timestamp
+
+
+def _return_range(timestamp: float, _: int) -> float:
+    """Move consistently back toward the Anchor for state regression."""
+    return max(0.2, 5.0 - 0.24 * timestamp)
 
 
 def _temporarily_stalled_range(timestamp: float, frame_index: int) -> float:
@@ -136,25 +145,33 @@ def _build_case(
     description: str,
     semantic_expected_branch_count: int,
     required_to_pass: bool,
-    known_limitation_reason: str | None,
     visualization_reference_directions_deg: tuple[float, ...] = (),
     timestamps: np.ndarray,
-    robot_models: dict[str, tuple[RangeFunction, float]],
+    robot_models: dict[str, tuple[RangeFunction, BearingModel]],
     neighbor_map: dict[str, set[str]],
     rng: np.random.Generator,
     measurement_noise_std_m: float,
     bearing_noise_std_deg: float,
+    observation_start_frames: dict[str, int] | None = None,
 ) -> SyntheticCase:
     """Build local relative frames without constructing global positions."""
     if set(neighbor_map) != set(robot_models):
         raise ValueError("every synthetic robot must appear in the neighbor map")
     frames: list[tuple[RobotObservation, ...]] = []
+    start_frames = observation_start_frames or {}
     for frame_index, timestamp in enumerate(timestamps):
         frame: list[RobotObservation] = []
         for robot_id in sorted(robot_models):
-            range_function, nominal_bearing = robot_models[robot_id]
+            if frame_index < start_frames.get(robot_id, 0):
+                continue
+            range_function, bearing_model = robot_models[robot_id]
             anchor_range = range_function(float(timestamp), frame_index)
             anchor_range += float(rng.normal(0.0, measurement_noise_std_m))
+            nominal_bearing = (
+                bearing_model(float(timestamp), frame_index)
+                if callable(bearing_model)
+                else bearing_model
+            )
             bearing = nominal_bearing + float(rng.normal(0.0, bearing_noise_std_deg))
             frame.append(
                 RobotObservation(
@@ -171,7 +188,6 @@ def _build_case(
         description=description,
         semantic_expected_branch_count=semantic_expected_branch_count,
         required_to_pass=required_to_pass,
-        known_limitation_reason=known_limitation_reason,
         visualization_reference_directions_deg=visualization_reference_directions_deg,
         frames=tuple(frames),
         measurement_noise_std_m=measurement_noise_std_m,
@@ -185,7 +201,7 @@ def create_synthetic_cases(
     measurement_noise_std_m: float = 0.01,
     bearing_noise_std_deg: float = 0.4,
 ) -> tuple[SyntheticCase, ...]:
-    """Create five regressions, one limitation case, and one sparse-graph case."""
+    """Create required baseline and structural regression scenarios."""
     if measurement_noise_std_m < 0.0 or bearing_noise_std_deg < 0.0:
         raise ValueError("synthetic noise standard deviations must be non-negative")
     master_rng = np.random.default_rng(seed)
@@ -197,7 +213,6 @@ def create_synthetic_cases(
         description="All robots plateau after initial outward motion.",
         semantic_expected_branch_count=0,
         required_to_pass=True,
-        known_limitation_reason=None,
         timestamps=timestamps,
         robot_models={
             robot_id: (_plateau_range, -30.0 + 12.0 * index)
@@ -216,7 +231,7 @@ def create_synthetic_cases(
         description="One connected progressing cohort and one plateau group.",
         semantic_expected_branch_count=1,
         required_to_pass=True,
-        known_limitation_reason=None,
+        visualization_reference_directions_deg=(34.0,),
         timestamps=timestamps,
         robot_models={
             **{
@@ -242,7 +257,7 @@ def create_synthetic_cases(
         description="Two disconnected progressing cohorts at distinct bearings.",
         semantic_expected_branch_count=2,
         required_to_pass=True,
-        known_limitation_reason=None,
+        visualization_reference_directions_deg=(-65.0, 82.0),
         timestamps=timestamps,
         robot_models={
             **{
@@ -270,7 +285,7 @@ def create_synthetic_cases(
         description="One cohort member stalls for one frame while peers progress.",
         semantic_expected_branch_count=1,
         required_to_pass=True,
-        known_limitation_reason=None,
+        visualization_reference_directions_deg=(112.0,),
         timestamps=timestamps,
         robot_models={
             robot_id: (
@@ -292,7 +307,7 @@ def create_synthetic_cases(
         description="One progressing cohort spans the -180/+180 bearing seam.",
         semantic_expected_branch_count=1,
         required_to_pass=True,
-        known_limitation_reason=None,
+        visualization_reference_directions_deg=(-180.0,),
         timestamps=timestamps,
         robot_models={
             robot_id: (_progress_range, wrap_bearings[index])
@@ -322,10 +337,7 @@ def create_synthetic_cases(
             "through a central progressing robot."
         ),
         semantic_expected_branch_count=2,
-        required_to_pass=False,
-        known_limitation_reason=(
-            "two semantic branches are merged by one progressing connected component"
-        ),
+        required_to_pass=True,
         visualization_reference_directions_deg=(-58.0, 58.0),
         timestamps=timestamps,
         robot_models={
@@ -351,7 +363,7 @@ def create_synthetic_cases(
         description="Five progressing robots connected only as a sparse chain.",
         semantic_expected_branch_count=1,
         required_to_pass=True,
-        known_limitation_reason=None,
+        visualization_reference_directions_deg=(-132.0,),
         timestamps=timestamps,
         robot_models={
             robot_id: (_progress_range, -132.0 + 1.5 * (index - 2.0))
@@ -362,7 +374,194 @@ def create_synthetic_cases(
         measurement_noise_std_m=measurement_noise_std_m,
         bearing_noise_std_deg=bearing_noise_std_deg,
     )
-    return case_1, case_2, case_3, case_4, case_5, case_6, case_7
+
+    wide_ids = tuple(f"wide_{index}" for index in range(7))
+    case_8 = _build_case(
+        name="case_8_wide_one_branch",
+        description=(
+            "One broad Branch remains connected through gradual 15-degree "
+            "neighbor-to-neighbor bearing changes."
+        ),
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(0.0,),
+        timestamps=timestamps,
+        robot_models={
+            robot_id: (_progress_range, -45.0 + 15.0 * index)
+            for index, robot_id in enumerate(wide_ids)
+        },
+        neighbor_map=_chain_neighbor_map(wide_ids),
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    close_a = tuple(f"close_a_{index}" for index in range(3))
+    close_b = tuple(f"close_b_{index}" for index in range(3))
+    close_map = _merge_neighbor_maps(
+        _clique_neighbor_map((close_a,)),
+        _clique_neighbor_map((close_b,)),
+    )
+    close_map = _add_undirected_edges(close_map, ((close_a[-1], close_b[0]),))
+    case_9 = _build_case(
+        name="case_9_close_two_branches",
+        description="Two nearby direction groups have a 28-degree bridge edge gap.",
+        semantic_expected_branch_count=2,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(-15.0, 15.0),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, -16.0 + index)
+                for index, robot_id in enumerate(close_a)
+            },
+            **{
+                robot_id: (_progress_range, 14.0 + index)
+                for index, robot_id in enumerate(close_b)
+            },
+        },
+        neighbor_map=close_map,
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    reciprocal_ids = tuple(f"reciprocal_{index}" for index in range(3))
+    one_way_id = "one_way_outlier"
+    asymmetric_map = _merge_neighbor_maps(
+        _clique_neighbor_map((reciprocal_ids,)),
+        {one_way_id: {reciprocal_ids[0]}},
+    )
+    case_10 = _build_case(
+        name="case_10_one_way_neighbor",
+        description="A one-way outlier report must not merge with a valid cohort.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(45.0,),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, 44.0 + index)
+                for index, robot_id in enumerate(reciprocal_ids)
+            },
+            one_way_id: (_progress_range, -100.0),
+        },
+        neighbor_map=asymmetric_map,
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    returning_branch_ids = tuple(f"return_branch_{index}" for index in range(3))
+    returning_id = "returning_robot"
+    case_11 = _build_case(
+        name="case_11_returning_robot",
+        description="A negative-slope robot is classified separately from the Branch.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(90.0,),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, 89.0 + index)
+                for index, robot_id in enumerate(returning_branch_ids)
+            },
+            returning_id: (_return_range, 92.0),
+        },
+        neighbor_map=_clique_neighbor_map(((
+            *returning_branch_ids,
+            returning_id,
+        ),)),
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    supported_ids = tuple(f"supported_{index}" for index in range(3))
+    late_id = "late_observation_robot"
+    case_12 = _build_case(
+        name="case_12_insufficient_robot",
+        description="One robot appears only in the final two frames.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(-30.0,),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, -31.0 + index)
+                for index, robot_id in enumerate(supported_ids)
+            },
+            late_id: (_progress_range, -28.0),
+        },
+        neighbor_map=_clique_neighbor_map(((*supported_ids, late_id),)),
+        observation_start_frames={late_id: len(timestamps) - 2},
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    isolated_branch_ids = tuple(f"isolated_branch_{index}" for index in range(3))
+    isolated_id = "isolated_progressing_robot"
+    case_13 = _build_case(
+        name="case_13_isolated_progressing_robot",
+        description="One progressing robot is isolated below minimum cohort size.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(140.0,),
+        timestamps=timestamps,
+        robot_models={
+            **{
+                robot_id: (_progress_range, 139.0 + index)
+                for index, robot_id in enumerate(isolated_branch_ids)
+            },
+            isolated_id: (_progress_range, 20.0),
+        },
+        neighbor_map=_merge_neighbor_maps(
+            _clique_neighbor_map((isolated_branch_ids,)), {isolated_id: set()}
+        ),
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+
+    jitter_ids = tuple(f"jitter_{index}" for index in range(4))
+    case_14 = _build_case(
+        name="case_14_temporal_bearing_jitter",
+        description="A single Branch has small time-varying bearing oscillations.",
+        semantic_expected_branch_count=1,
+        required_to_pass=True,
+        visualization_reference_directions_deg=(-75.0,),
+        timestamps=timestamps,
+        robot_models={
+            robot_id: (
+                _progress_range,
+                lambda timestamp, _frame, offset=index: (
+                    -76.5 + offset + 2.0 * np.sin(0.9 * timestamp + 0.4 * offset)
+                ),
+            )
+            for index, robot_id in enumerate(jitter_ids)
+        },
+        neighbor_map=_clique_neighbor_map((jitter_ids,)),
+        rng=np.random.default_rng(int(master_rng.integers(0, 2**32 - 1))),
+        measurement_noise_std_m=measurement_noise_std_m,
+        bearing_noise_std_deg=bearing_noise_std_deg,
+    )
+    return (
+        case_1,
+        case_2,
+        case_3,
+        case_4,
+        case_5,
+        case_6,
+        case_7,
+        case_8,
+        case_9,
+        case_10,
+        case_11,
+        case_12,
+        case_13,
+        case_14,
+    )
 
 
 def run_synthetic_case(
@@ -370,15 +569,19 @@ def run_synthetic_case(
     *,
     temporal_window_s: float,
     minimum_observations: int,
-    confidence_multiplier: float,
+    confidence_level: float,
     minimum_cohort_size: int,
+    neighbor_edge_policy: str,
+    maximum_neighbor_bearing_gap_deg: float,
 ) -> SyntheticCaseResult:
     """Run one case through the public local-observation validator interface."""
     validator = RelativeSwarmBranchValidator(
         temporal_window_s=temporal_window_s,
         minimum_observations=minimum_observations,
-        confidence_multiplier=confidence_multiplier,
+        confidence_level=confidence_level,
         minimum_cohort_size=minimum_cohort_size,
+        neighbor_edge_policy=neighbor_edge_policy,
+        maximum_neighbor_bearing_gap_deg=maximum_neighbor_bearing_gap_deg,
     )
     results = tuple(validator.update(frame) for frame in case.frames)
     return SyntheticCaseResult(case=case, validation_results=results)
@@ -396,7 +599,8 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     colors = {
         "progressing": "tab:green",
         "non_progressing": "tab:blue",
-        "uncertain": "tab:orange",
+        "returning": "tab:purple",
+        "insufficient": "tab:gray",
     }
     figure = plt.figure(figsize=(15, 11))
     range_axis = figure.add_subplot(2, 2, 1)
@@ -404,12 +608,22 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     local_axis = figure.add_subplot(2, 2, 3)
     bearing_axis = figure.add_subplot(2, 2, 4, projection="polar")
 
-    robot_ids = sorted(str(observation.robot_id) for observation in result.case.frames[0])
+    robot_ids = sorted(
+        {
+            str(observation.robot_id)
+            for frame in result.case.frames
+            for observation in frame
+        }
+    )
     for robot_id in robot_ids:
         times = []
         ranges = []
         for frame in result.case.frames:
-            observation = next(obs for obs in frame if str(obs.robot_id) == robot_id)
+            observation = next(
+                (obs for obs in frame if str(obs.robot_id) == robot_id), None
+            )
+            if observation is None:
+                continue
             times.append(observation.timestamp)
             ranges.append(observation.anchor_range_m)
         state = final_states[robot_id]
@@ -459,7 +673,7 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
             drawn_edges.add(edge)
             points = np.vstack((local_positions[robot_id], local_positions[neighbor_id]))
             local_axis.plot(points[:, 0], points[:, 1], color="0.75", linewidth=0.7)
-    for state in ("progressing", "non_progressing", "uncertain"):
+    for state in ("progressing", "non_progressing", "returning", "insufficient"):
         members = [robot_id for robot_id in robot_ids if final_states[robot_id] == state]
         if not members:
             continue
@@ -493,7 +707,7 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     local_axis.grid(alpha=0.3)
     local_axis.legend(fontsize=8)
 
-    for state in ("progressing", "non_progressing", "uncertain"):
+    for state in ("progressing", "non_progressing", "returning", "insufficient"):
         members = [robot_id for robot_id in robot_ids if final_states[robot_id] == state]
         if not members:
             continue
@@ -536,31 +750,288 @@ def plot_case_result(result: SyntheticCaseResult, output_path: Path) -> None:
     plt.close(figure)
 
 
+def _parse_number_list(text: str, cast: Callable[[str], float | int]) -> tuple:
+    """Parse a comma-separated sweep candidate list."""
+    if not text.strip():
+        return ()
+    return tuple(cast(item.strip()) for item in text.split(",") if item.strip())
+
+
+def _mean_reference_direction_error_deg(result: SyntheticCaseResult) -> float:
+    """Return mean nearest-reference circular error for test evaluation only."""
+    references = result.case.visualization_reference_directions_deg
+    candidates = result.final_result.branch_candidates
+    if not references or not candidates:
+        return float("nan")
+    return float(
+        np.mean(
+            [
+                min(
+                    circular_distance_deg(candidate.estimated_direction_deg, reference)
+                    for reference in references
+                )
+                for candidate in candidates
+            ]
+        )
+    )
+
+
+def _run_sweep(args: argparse.Namespace) -> tuple[int, int]:
+    """Run a Cartesian parameter smoke sweep and write one row per case/config."""
+    temporal_windows = _parse_number_list(args.sweep_temporal_windows, float) or (
+        args.temporal_window,
+    )
+    observation_counts = _parse_number_list(
+        args.sweep_minimum_observations, int
+    ) or (args.minimum_observations,)
+    confidence_levels = _parse_number_list(args.sweep_confidence_levels, float) or (
+        args.confidence_level,
+    )
+    cohort_sizes = _parse_number_list(args.sweep_minimum_cohort_sizes, int) or (
+        args.minimum_cohort_size,
+    )
+    bearing_gaps = _parse_number_list(args.sweep_bearing_gaps_deg, float) or (
+        args.maximum_neighbor_bearing_gap_deg,
+    )
+    range_noises = _parse_number_list(args.sweep_range_noise_stds, float) or (
+        args.range_noise_std,
+    )
+    bearing_noises = _parse_number_list(args.sweep_bearing_noise_stds, float) or (
+        args.bearing_noise_std,
+    )
+    neighbor_policies = tuple(
+        policy.strip()
+        for policy in args.sweep_neighbor_edge_policies.split(",")
+        if policy.strip()
+    ) or (args.neighbor_edge_policy,)
+    invalid_policies = set(neighbor_policies) - {"reciprocal", "union"}
+    if invalid_policies:
+        raise ValueError(
+            f"invalid sweep neighbor edge policies: {sorted(invalid_policies)}"
+        )
+    seed_start = args.seed if args.sweep_seed_start is None else args.sweep_seed_start
+    fieldnames = (
+        "case_name",
+        "seed",
+        "temporal_window_s",
+        "minimum_observations",
+        "confidence_level",
+        "minimum_cohort_size",
+        "neighbor_edge_policy",
+        "maximum_neighbor_bearing_gap_deg",
+        "range_noise_std_m",
+        "bearing_noise_std_deg",
+        "expected_branch_count",
+        "detected_branch_count",
+        "pass",
+        "false_positive_count",
+        "missed_branch_count",
+        "detected_directions_deg",
+        "reference_directions_deg",
+        "mean_circular_direction_error_deg",
+        "progressing_count",
+        "non_progressing_count",
+        "returning_count",
+        "insufficient_count",
+        "rejected_component_count",
+        "rejected_subcohort_count",
+    )
+    args.sweep_csv.parent.mkdir(parents=True, exist_ok=True)
+    row_count = 0
+    passed_count = 0
+    with args.sweep_csv.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for seed_offset in range(args.sweep_runs):
+            seed = seed_start + seed_offset
+            for (
+                range_noise,
+                bearing_noise,
+                temporal_window,
+                minimum_observations,
+                confidence_level,
+                minimum_cohort_size,
+                neighbor_policy,
+                bearing_gap,
+            ) in product(
+                range_noises,
+                bearing_noises,
+                temporal_windows,
+                observation_counts,
+                confidence_levels,
+                cohort_sizes,
+                neighbor_policies,
+                bearing_gaps,
+            ):
+                cases = create_synthetic_cases(
+                    seed=seed,
+                    measurement_noise_std_m=range_noise,
+                    bearing_noise_std_deg=bearing_noise,
+                )
+                for case in cases:
+                    result = run_synthetic_case(
+                        case,
+                        temporal_window_s=temporal_window,
+                        minimum_observations=minimum_observations,
+                        confidence_level=confidence_level,
+                        minimum_cohort_size=minimum_cohort_size,
+                        neighbor_edge_policy=neighbor_policy,
+                        maximum_neighbor_bearing_gap_deg=bearing_gap,
+                    )
+                    final = result.final_result
+                    expected = case.semantic_expected_branch_count
+                    detected = len(final.branch_candidates)
+                    passed = detected == expected
+                    writer.writerow(
+                        {
+                            "case_name": case.name,
+                            "seed": seed,
+                            "temporal_window_s": temporal_window,
+                            "minimum_observations": minimum_observations,
+                            "confidence_level": confidence_level,
+                            "minimum_cohort_size": minimum_cohort_size,
+                            "neighbor_edge_policy": neighbor_policy,
+                            "maximum_neighbor_bearing_gap_deg": bearing_gap,
+                            "range_noise_std_m": range_noise,
+                            "bearing_noise_std_deg": bearing_noise,
+                            "expected_branch_count": expected,
+                            "detected_branch_count": detected,
+                            "pass": passed,
+                            "false_positive_count": max(0, detected - expected),
+                            "missed_branch_count": max(0, expected - detected),
+                            "detected_directions_deg": ";".join(
+                                f"{candidate.estimated_direction_deg:.6f}"
+                                for candidate in final.branch_candidates
+                            ),
+                            "reference_directions_deg": ";".join(
+                                f"{direction:.6f}"
+                                for direction in case.visualization_reference_directions_deg
+                            ),
+                            "mean_circular_direction_error_deg": (
+                                f"{_mean_reference_direction_error_deg(result):.6f}"
+                            ),
+                            "progressing_count": len(final.progressing_robot_ids),
+                            "non_progressing_count": len(
+                                final.non_progressing_robot_ids
+                            ),
+                            "returning_count": len(final.returning_robot_ids),
+                            "insufficient_count": len(final.insufficient_robot_ids),
+                            "rejected_component_count": len(
+                                final.rejected_progressing_components
+                            ),
+                            "rejected_subcohort_count": len(
+                                final.rejected_bearing_subcohorts
+                            ),
+                        }
+                    )
+                    row_count += 1
+                    passed_count += int(passed)
+    return row_count, passed_count
+
+
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--range-noise-std", type=float, default=0.01)
-    parser.add_argument("--bearing-noise-std", type=float, default=0.4)
-    parser.add_argument("--temporal-window", type=float, default=4.0)
-    parser.add_argument("--minimum-observations", type=int, default=5)
+    parser = argparse.ArgumentParser(
+        description="Synthetic localization-free relative swarm Branch validation."
+    )
+    parser.add_argument("--seed", type=int, default=17, help="synthetic RNG seed")
     parser.add_argument(
-        "--confidence-multiplier",
-        type=float,
-        default=1.96,
+        "--range-noise-std", type=float, default=0.01,
+        help="synthetic Anchor-range Gaussian noise standard deviation [m]",
+    )
+    parser.add_argument(
+        "--bearing-noise-std", type=float, default=0.4,
+        help="synthetic Anchor-bearing Gaussian noise standard deviation [deg]",
+    )
+    parser.add_argument(
+        "--temporal-window", type=float, default=4.0,
+        help="recent OLS and representative-bearing history window [s]",
+    )
+    parser.add_argument(
+        "--minimum-observations", type=int, default=5,
+        help="minimum per-robot samples required for OLS trend inference",
+    )
+    parser.add_argument(
+        "--confidence-level", type=float, default=0.95,
+        help="two-sided Student-t slope confidence level using df=n-2",
+    )
+    parser.add_argument(
+        "--minimum-cohort-size", type=int, default=2,
+        help="minimum progressing robots required for a Branch candidate",
+    )
+    parser.add_argument(
+        "--neighbor-edge-policy", choices=("reciprocal", "union"),
+        default="reciprocal",
         help=(
-            "normal-approximation confidence multiplier for synthetic validation; "
-            "1.96 does not guarantee exact small-sample 95%% coverage; evaluate "
-            "Student-t, bootstrap, or empirical calibration on real SPH/robot data"
+            "reciprocal requires both robots to report a link (default, prevents "
+            "one bad report from merging cohorts); union accepts either report"
         ),
     )
-    parser.add_argument("--minimum-cohort-size", type=int, default=2)
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("/tmp/relative_swarm_branch_validation"),
+        "--maximum-neighbor-bearing-gap-deg", type=float, default=20.0,
+        help=(
+            "maximum circular temporal-bearing difference [deg] retained on an "
+            "existing progressing neighbor edge before sub-cohort splitting"
+        ),
     )
-    parser.add_argument("--no-plots", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--output-dir", type=Path,
+        default=Path("/tmp/relative_swarm_branch_validation"),
+        help="directory for single-run PNG files",
+    )
+    parser.add_argument("--no-plots", action="store_true", help="skip PNG output")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="print per-robot assignment and rejected-edge diagnostics",
+    )
+    parser.add_argument(
+        "--sweep-runs", type=int, default=0,
+        help="number of consecutive seeds for optional CSV sweep; 0 disables",
+    )
+    parser.add_argument(
+        "--sweep-seed-start", type=int, default=None,
+        help="first sweep seed; defaults to --seed",
+    )
+    parser.add_argument(
+        "--sweep-temporal-windows", default="",
+        help="comma-separated temporal-window candidates [s]",
+    )
+    parser.add_argument(
+        "--sweep-minimum-observations", default="",
+        help="comma-separated minimum-observation candidates",
+    )
+    parser.add_argument(
+        "--sweep-confidence-levels", default="",
+        help="comma-separated two-sided Student-t confidence-level candidates",
+    )
+    parser.add_argument(
+        "--sweep-minimum-cohort-sizes", default="",
+        help="comma-separated minimum-cohort-size candidates",
+    )
+    parser.add_argument(
+        "--sweep-bearing-gaps-deg", default="",
+        help="comma-separated maximum neighbor bearing-gap candidates [deg]",
+    )
+    parser.add_argument(
+        "--sweep-neighbor-edge-policies", default="",
+        help="comma-separated reciprocal/union neighbor-policy candidates",
+    )
+    parser.add_argument(
+        "--sweep-range-noise-stds", default="",
+        help="comma-separated range-noise standard deviations [m]",
+    )
+    parser.add_argument(
+        "--sweep-bearing-noise-stds", default="",
+        help="comma-separated bearing-noise standard deviations [deg]",
+    )
+    parser.add_argument(
+        "--sweep-csv", type=Path,
+        default=Path("junction_detection/swarm/output/relative_swarm_branch_sweep.csv"),
+        help="CSV output path for optional sweep",
+    )
+    args = parser.parse_args()
+    if args.sweep_runs < 0:
+        parser.error("--sweep-runs must be non-negative")
+    return args
 
 
 def main() -> None:
@@ -576,8 +1047,10 @@ def main() -> None:
             case,
             temporal_window_s=args.temporal_window,
             minimum_observations=args.minimum_observations,
-            confidence_multiplier=args.confidence_multiplier,
+            confidence_level=args.confidence_level,
             minimum_cohort_size=args.minimum_cohort_size,
+            neighbor_edge_policy=args.neighbor_edge_policy,
+            maximum_neighbor_bearing_gap_deg=args.maximum_neighbor_bearing_gap_deg,
         )
         for case in cases
     )
@@ -592,8 +1065,11 @@ def main() -> None:
     print(
         f"Inference settings: window={args.temporal_window:.2f} s, "
         f"minimum_observations={args.minimum_observations}, "
-        f"confidence_multiplier={args.confidence_multiplier:.3f}, "
-        f"minimum_cohort_size={args.minimum_cohort_size}"
+        f"confidence_level={args.confidence_level:.3f}, "
+        f"minimum_cohort_size={args.minimum_cohort_size}, "
+        f"neighbor_edge_policy={args.neighbor_edge_policy}, "
+        f"maximum_neighbor_bearing_gap="
+        f"{args.maximum_neighbor_bearing_gap_deg:.2f} deg"
     )
 
     all_passed = True
@@ -601,38 +1077,65 @@ def main() -> None:
         final = result.final_result
         detected = len(final.branch_candidates)
         passed = detected == result.case.semantic_expected_branch_count
+        status = "PASS" if passed else "FAIL"
         if result.case.required_to_pass:
-            status = "PASS" if passed else "FAIL"
             all_passed &= passed
-        elif passed:
-            status = "DIAGNOSTIC MATCH"
-        else:
-            status = "KNOWN LIMITATION"
         print(
             f"{result.case.name}: semantic_expected="
             f"{result.case.semantic_expected_branch_count}, "
             f"detected={detected} -> {status}"
         )
-        if status == "KNOWN LIMITATION":
-            print(f"  KNOWN LIMITATION: {result.case.known_limitation_reason}")
         print(
             f"  progressing={len(final.progressing_robot_ids)}, "
             f"non_progressing={len(final.non_progressing_robot_ids)}, "
-            f"uncertain={len(final.uncertain_robot_ids)}"
+            f"returning={len(final.returning_robot_ids)}, "
+            f"insufficient={len(final.insufficient_robot_ids)}, "
+            f"rejected_components={len(final.rejected_progressing_components)}, "
+            f"rejected_subcohorts={len(final.rejected_bearing_subcohorts)}"
         )
         for candidate in final.branch_candidates:
             print(
                 f"  cohort={candidate.cohort_id}, robots={candidate.robot_count}, "
                 f"direction={candidate.estimated_direction_deg:.2f} deg, "
                 f"spread={candidate.circular_bearing_spread_deg:.2f} deg, "
+                f"resultant={candidate.mean_resultant_length:.4f}, "
                 f"mean_slope={candidate.mean_radial_slope_mps:.4f} m/s, "
                 f"min_CI_low={candidate.min_slope_ci_low_mps:.4f} m/s"
             )
+        if args.verbose:
+            for diagnostic in final.robot_diagnostics:
+                print(
+                    f"  robot={diagnostic.robot_id!r}, n={diagnostic.observation_count}, "
+                    f"state={diagnostic.motion_state}, "
+                    f"slope={diagnostic.radial_slope_mps:.5f}, "
+                    f"SE={diagnostic.slope_standard_error_mps:.5f}, "
+                    f"CI=[{diagnostic.slope_ci_low_mps:.5f}, "
+                    f"{diagnostic.slope_ci_high_mps:.5f}], "
+                    f"RMSE={diagnostic.residual_rmse_m:.5f}, "
+                    f"range={diagnostic.latest_range_m:.3f}, "
+                    f"bearing={diagnostic.representative_bearing_deg:.2f}, "
+                    f"neighbors={diagnostic.neighbor_ids}, "
+                    f"component={diagnostic.graph_component_id}, "
+                    f"cohort={diagnostic.final_cohort_id}, "
+                    f"excluded={diagnostic.excluded}, "
+                    f"reason={diagnostic.exclusion_reason}"
+                )
+            for edge in final.rejected_neighbor_edges:
+                print(
+                    f"  rejected_edge=({edge.first_robot_id!r}, "
+                    f"{edge.second_robot_id!r}), reason={edge.reason}"
+                )
         if not args.no_plots:
             path = args.output_dir / f"{result.case.name}.png"
             plot_case_result(result, path)
             print(f"  plot={path}")
 
+    if args.sweep_runs:
+        rows, passed_rows = _run_sweep(args)
+        print(
+            f"Sweep: rows={rows}, passed={passed_rows}, failed={rows - passed_rows}, "
+            f"csv={args.sweep_csv}"
+        )
     if not all_passed:
         raise SystemExit("one or more required synthetic validation cases failed")
 
