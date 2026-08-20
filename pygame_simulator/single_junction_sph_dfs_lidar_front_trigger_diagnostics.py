@@ -28,7 +28,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 TARGET = ROOT / "pygame_simulator/single_junction_sph_dfs_provisional_anchor_junction_confirmation.py"
-OUTPUT = ROOT / "junction_detection/integration/output/lidar_front_trigger_diagnostics"
+OUTPUT = Path(os.environ.get(
+    "SPH_DFS_DIAGNOSTIC_OUTPUT",
+    str(ROOT / "junction_detection/integration/output/lidar_front_trigger_diagnostics"),
+))
 
 
 def _cross_geometry() -> tuple[list[tuple[int, int]], float, tuple[float, float], tuple[tuple[float, float], tuple[float, float]]]:
@@ -75,6 +78,12 @@ class DiagnosticCollector:
             "FRONT_COHORT": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
             "FRONT_LOCAL_REDUCED": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
         }
+        self.local_lateral_states = {
+            "LOCAL_FRONT_SURFACE": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
+            "LOCAL_FRONT_COHORT": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
+        }
+        self.previous_local_membership: set[int] = set()
+        self.local_membership_rows: list[dict] = []
         self.front_maintenance_dwell = 0.0
         self.previous_frontmost_signed_boundary: float | None = None
         self.previous_observed_signed_boundary: float | None = None
@@ -107,6 +116,55 @@ class DiagnosticCollector:
         radius = float(globals_dict.get("JUNCTION_OBSERVATION_RADIUS", 84.0 * 1.35))
         observed = tuple(r for r in robots if r.position.distance_to(front_center) <= radius)
         return front, forward, projections, observed
+
+    def _local_front_topology(self, mobile, globals_dict, timestamp):
+        """Build a shadow front surface from existing SPH support neighbors.
+
+        Each robot uses its own observed-velocity direction.  The support
+        radius is the production ``SMOOTHING_LENGTH``; no front-specific
+        radius, angle, quantile, GT geometry, or robot-count threshold is
+        introduced here.
+        """
+        min_speed = float(globals_dict.get("JUNCTION_COHORT_MIN_SPEED", 1.2))
+        support = float(globals_dict.get("SMOOTHING_LENGTH", 22.0 * 0.70))
+        surface = []
+        neighbor_map = {}
+        direction_unavailable = 0
+        for robot in mobile:
+            velocity = robot.observed_velocity
+            direction_available = velocity.length() >= min_speed
+            neighbors = [
+                peer for peer in mobile
+                if peer is not robot and robot.position.distance_to(peer.position) <= support
+            ]
+            neighbor_map[robot] = neighbors
+            forward_count = 0
+            if direction_available:
+                forward = velocity.normalize()
+                forward_count = sum((peer.position - robot.position).dot(forward) > 0.0 for peer in neighbors)
+                if forward_count == 0:
+                    surface.append(robot)
+            else:
+                direction_unavailable += 1
+            self.local_membership_rows.append({
+                "timestamp": float(timestamp), "robot_id": robot.robot_id,
+                "speed": float(velocity.length()), "direction_available": direction_available,
+                "sph_neighbor_count": len(neighbors), "forward_neighbor_count": forward_count,
+                "is_local_front_surface": False,
+            })
+        robot_by_id = {robot.robot_id: robot for robot in mobile}
+        surface_ids = {robot.robot_id for robot in surface}
+        cohort_ids = set(surface_ids)
+        for robot in surface:
+            cohort_ids.update(peer.robot_id for peer in neighbor_map[robot])
+        for row in self.local_membership_rows[-len(mobile):]:
+            row["is_local_front_surface"] = row["robot_id"] in surface_ids
+            row["is_local_front_cohort"] = row["robot_id"] in cohort_ids
+        current_ids = cohort_ids
+        union = self.previous_local_membership | current_ids
+        overlap = len(self.previous_local_membership & current_ids) / len(union) if union else 1.0
+        self.previous_local_membership = current_ids
+        return tuple(robot_by_id[robot_id] for robot_id in surface_ids), tuple(robot_by_id[robot_id] for robot_id in cohort_ids), direction_unavailable, overlap
 
     def _lateral_features(self, observed, forward, globals_dict, timestamp, state):
         """Apply the unchanged lateral math to one independent cohort state."""
@@ -267,6 +325,9 @@ class DiagnosticCollector:
         front, forward, projections, observed = self._front_features(mobile, globals_dict)
         if not front or forward is None:
             return
+        local_surface, local_cohort, direction_unavailable, local_overlap = self._local_front_topology(
+            mobile, globals_dict, timestamp
+        )
         if self.lidar_id is None:
             # Hardware identity is assigned once from the initial front surface;
             # it is never re-elected on later frames.
@@ -348,6 +409,14 @@ class DiagnosticCollector:
                 cohort, forward, globals_dict, timestamp, self.lateral_states[name]
             ) for name, cohort in cohorts.items()
         }
+        local_features = {
+            name: self._lateral_features(
+                cohort, forward, globals_dict, timestamp, self.local_lateral_states[name]
+            ) for name, cohort in {
+                "LOCAL_FRONT_SURFACE": local_surface,
+                "LOCAL_FRONT_COHORT": local_cohort,
+            }.items()
+        }
         variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate, lateral_min, lateral_max, lateral_p90_span = cohort_features["BROAD_OBSERVED"]
         row = {
             "timestamp": float(timestamp),
@@ -406,6 +475,10 @@ class DiagnosticCollector:
             "broad_observed_robot_count": len(observed),
             "front_local_robot_count": len(front_local),
             "front_local_reduced_radius": reduced_radius,
+            "local_front_surface_robot_count": len(local_surface),
+            "local_front_cohort_robot_count": len(local_cohort),
+            "local_front_direction_unavailable_count": direction_unavailable,
+            "local_front_cohort_jaccard_overlap": local_overlap,
             # Descriptive analysis markers only; these are not production
             # trigger thresholds and do not affect robot behavior.
             "lateral_ratio_gt_1_1": expansion_ratio > 1.1,
@@ -414,6 +487,22 @@ class DiagnosticCollector:
             "scan_change_gt_5": bool(scan_change != "" and scan_change > 5.0),
         }
         for cohort_name, values in cohort_features.items():
+            prefix = cohort_name.lower()
+            row.update({
+                f"{prefix}_variance": values[0],
+                f"{prefix}_baseline": values[1],
+                f"{prefix}_variance_delta": values[2],
+                f"{prefix}_expansion_ratio": values[3],
+                f"{prefix}_expansion_dwell": values[4],
+                f"{prefix}_variance_rate": values[5],
+                f"{prefix}_lateral_span": values[7] - values[6],
+                f"{prefix}_lateral_p90_minus_p10": values[8],
+                f"{prefix}_ratio_gt_1_1": values[3] > 1.1,
+                f"{prefix}_ratio_gt_1_28": values[3] > 1.28,
+                f"{prefix}_dwell_positive": values[4] > 0.0,
+                f"{prefix}_sustained_marker": values[4] > 0.0 and values[5] > 0.0,
+            })
+        for cohort_name, values in local_features.items():
             prefix = cohort_name.lower()
             row.update({
                 f"{prefix}_variance": values[0],
@@ -445,6 +534,7 @@ class DiagnosticCollector:
         self._save_cohort_summary()
         self._save_cohort_events()
         self._save_cohort_plot()
+        self._save_local_front_outputs()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
@@ -632,6 +722,65 @@ class DiagnosticCollector:
         fig.tight_layout()
         fig.savefig(OUTPUT / "lidar_front_trigger_cohort_comparison.png", dpi=150)
         plt.close(fig)
+
+    def _save_local_front_outputs(self):
+        """Export local-topology timeline, memberships, events, and plot."""
+        timeline_fields = [
+            "timestamp", "front_cohort_robot_count", "local_front_surface_robot_count",
+            "local_front_cohort_robot_count", "local_front_direction_unavailable_count",
+            "local_front_cohort_jaccard_overlap", "local_front_surface_variance",
+            "local_front_surface_baseline", "local_front_surface_expansion_ratio",
+            "local_front_surface_expansion_dwell", "local_front_surface_variance_rate",
+            "local_front_cohort_variance", "local_front_cohort_baseline",
+            "local_front_cohort_expansion_ratio", "local_front_cohort_expansion_dwell",
+            "local_front_cohort_variance_rate", "evaluation_only_sph_phase",
+            "evaluation_only_frontmost_signed_boundary_distance",
+            "evaluation_only_front_cohort_signed_boundary_distance",
+        ]
+        with (OUTPUT / "lidar_front_trigger_local_front_timeline.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=timeline_fields); writer.writeheader()
+            writer.writerows({field: row.get(field, "") for field in timeline_fields} for row in self.rows)
+        membership_fields = ["timestamp", "robot_id", "speed", "direction_available", "sph_neighbor_count", "forward_neighbor_count", "is_local_front_surface", "is_local_front_cohort"]
+        with (OUTPUT / "local_front_membership.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=membership_fields); writer.writeheader(); writer.writerows(self.local_membership_rows)
+        reference = self._event_summary()
+        with (OUTPUT / "local_front_event_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["cohort_name", "ratio_onset", "positive_dwell_onset", "sustained_onset", "delta_t_frontmost", "delta_t_quantile_front_center"]
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()
+            for cohort in ("FRONT_COHORT", "LOCAL_FRONT_SURFACE", "LOCAL_FRONT_COHORT"):
+                sustained = self._cohort_event(cohort, "sustained_marker")
+                ratio = self._cohort_event(cohort, "ratio_gt_1_28")
+                dwell = self._cohort_event(cohort, "dwell_positive")
+                writer.writerow({
+                    "cohort_name": cohort,
+                    "ratio_onset": "" if ratio is None else ratio,
+                    "positive_dwell_onset": "" if dwell is None else dwell,
+                    "sustained_onset": "" if sustained is None else sustained,
+                    "delta_t_frontmost": "" if sustained is None or reference.get("frontmost_boundary_crossing") is None else sustained - reference["frontmost_boundary_crossing"],
+                    "delta_t_quantile_front_center": "" if sustained is None or reference.get("front_cohort_center_crossing") is None else sustained - reference["front_cohort_center_crossing"],
+                })
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_JUNCTION_REGION")
+        with (OUTPUT / "local_front_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["cohort_name", "phase", "sample_count", "variance_mean", "variance_std", "ratio_mean", "ratio_max", "ratio_gt_1_1_count", "ratio_gt_1_28_count", "positive_dwell_count", "sustained_count"]
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()
+            for cohort in ("FRONT_COHORT", "LOCAL_FRONT_SURFACE", "LOCAL_FRONT_COHORT"):
+                prefix = cohort.lower()
+                for phase in phases:
+                    rows = [r for r in self.rows if r["evaluation_only_sph_phase"] == phase]
+                    values = [float(r[f"{prefix}_variance"]) for r in rows]; ratios = [float(r[f"{prefix}_expansion_ratio"]) for r in rows]
+                    writer.writerow({"cohort_name": cohort, "phase": phase, "sample_count": len(rows), "variance_mean": float(np.mean(values)) if values else "", "variance_std": float(np.std(values)) if values else "", "ratio_mean": float(np.mean(ratios)) if ratios else "", "ratio_max": max(ratios) if ratios else "", "ratio_gt_1_1_count": sum(r[f"{prefix}_ratio_gt_1_1"] for r in rows), "ratio_gt_1_28_count": sum(r[f"{prefix}_ratio_gt_1_28"] for r in rows), "positive_dwell_count": sum(r[f"{prefix}_dwell_positive"] for r in rows), "sustained_count": sum(r[f"{prefix}_sustained_marker"] for r in rows)})
+        time = np.asarray([r["timestamp"] for r in self.rows])
+        fig, axes = plt.subplots(5, 1, figsize=(11, 13), sharex=True)
+        for cohort, label in (("FRONT_COHORT", "QUANTILE_FRONT"), ("LOCAL_FRONT_SURFACE", "LOCAL_SURFACE"), ("LOCAL_FRONT_COHORT", "LOCAL_COHORT")):
+            prefix = cohort.lower(); axes[0].plot(time, [r[f"{prefix}_robot_count"] if f"{prefix}_robot_count" in r else r["local_front_surface_robot_count"] if cohort == "LOCAL_FRONT_SURFACE" else r["local_front_cohort_robot_count"] if cohort == "LOCAL_FRONT_COHORT" else r["front_cohort_robot_count"] for r in self.rows], label=label)
+            axes[1].plot(time, [r[f"{prefix}_expansion_ratio"] for r in self.rows], label=label)
+            axes[2].plot(time, [r[f"{prefix}_variance"] for r in self.rows], label=label)
+        axes[3].plot(time, [r["evaluation_only_frontmost_signed_boundary_distance"] for r in self.rows], label="frontmost GT")
+        axes[3].plot(time, [r["evaluation_only_front_cohort_signed_boundary_distance"] for r in self.rows], label="quantile center GT")
+        axes[4].plot(time, [r["local_front_cohort_jaccard_overlap"] for r in self.rows], label="local cohort Jaccard")
+        for axis, label in zip(axes, ("robot count", "expansion ratio", "variance", "signed boundary distance", "membership overlap")):
+            axis.set_ylabel(label); axis.legend(loc="best")
+        axes[-1].set_xlabel("time [s]"); fig.suptitle("Local front topology shadow comparison (GT evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_front_shadow_comparison.png", dpi=150); plt.close(fig)
 
     def _save_phase_summary(self):
         """Summarize actual cohort phases and descriptive false onsets."""
