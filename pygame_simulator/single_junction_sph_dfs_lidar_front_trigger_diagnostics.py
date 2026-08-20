@@ -31,7 +31,7 @@ TARGET = ROOT / "pygame_simulator/single_junction_sph_dfs_provisional_anchor_jun
 OUTPUT = ROOT / "junction_detection/integration/output/lidar_front_trigger_diagnostics"
 
 
-def _cross_geometry() -> tuple[list[tuple[int, int]], float, tuple[float, float]]:
+def _cross_geometry() -> tuple[list[tuple[int, int]], float, tuple[float, float], tuple[tuple[float, float], tuple[float, float]]]:
     """Return the unchanged benchmark polygon, corridor width, and GT center."""
     center = (400, 350)
     scale = 0.70
@@ -54,7 +54,8 @@ def _cross_geometry() -> tuple[list[tuple[int, int]], float, tuple[float, float]
         (center[0] - half - normal, center[1] - half),
         (center[0] - half, center[1] - half),
     ]
-    return points, float(width), center
+    opening_boundary = ((center[0] - half, center[1] + half), (center[0] + half, center[1] + half))
+    return points, float(width), center, opening_boundary
 
 
 class DiagnosticCollector:
@@ -73,9 +74,10 @@ class DiagnosticCollector:
         self.diagnostic_baseline = 0.0
         self.diagnostic_dwell = 0.0
         self.front_maintenance_dwell = 0.0
+        self.previous_frontmost_signed_boundary: float | None = None
         self.last_sample_timestamp: float | None = None
         self.sample_interval_s = 0.1
-        self.polygon, self.max_range, self.gt_center = _cross_geometry()
+        self.polygon, self.max_range, self.gt_center, self.opening_boundary = _cross_geometry()
 
     def _front_features(self, robots, globals_dict):
         """Recompute the existing local front/cohort geometry every sample."""
@@ -125,6 +127,51 @@ class DiagnosticCollector:
         rate = 0.0 if self.previous_variance is None else (variance - self.previous_variance) / max(dt, 1e-12)
         self.previous_variance = variance
         return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate
+
+    def _evaluation_geometry(self, position):
+        """Return GT opening distance/phase; never used by runtime control."""
+        (x0, y), (x1, _) = self.opening_boundary
+        clamped_x = min(max(position.x, x0), x1)
+        boundary_distance = math.hypot(position.x - clamped_x, position.y - y)
+        width = self.max_range
+        signed_from_boundary = position.y - y
+        center_distance = math.hypot(position.x - self.gt_center[0], position.y - self.gt_center[1])
+        if signed_from_boundary > 2.0 * width:
+            phase = "CORRIDOR"
+        elif signed_from_boundary > 0.0:
+            phase = "OPENING_APPROACH"
+        elif center_distance <= 2.0 * width:
+            phase = "JUNCTION_REGION"
+        else:
+            phase = "POST_MIN_DISTANCE"
+        inside_zone = signed_from_boundary <= 0.0 and x0 <= position.x <= x1
+        return boundary_distance, center_distance, phase, inside_zone
+
+    def _sph_evaluation_geometry(self, front, observed):
+        """Compute cohort progress/phase using GT geometry for evaluation only."""
+        boundary_y = self.opening_boundary[0][1]
+        front_center = sum((r.position for r in front), type(front[0].position)()) / max(len(front), 1)
+        observed_center = sum((r.position for r in observed), type(front[0].position)()) / max(len(observed), 1)
+        relevant = observed or front
+        frontmost = min(relevant, key=lambda r: r.position.y)
+        front_distance = self._evaluation_geometry(front_center)[0]
+        observed_distance = self._evaluation_geometry(observed_center)[0]
+        frontmost_distance = self._evaluation_geometry(frontmost.position)[0]
+        signed = frontmost.position.y - boundary_y
+        previous = self.previous_frontmost_signed_boundary
+        self.previous_frontmost_signed_boundary = signed
+        width = self.max_range
+        if signed > 2.0 * width:
+            phase = "SPH_CORRIDOR"
+        elif signed > 0.0:
+            phase = "SPH_OPENING_APPROACH"
+        elif previous is not None and previous > 0.0:
+            phase = "SPH_BOUNDARY_CROSSING"
+        elif self._evaluation_geometry(frontmost.position)[1] <= 2.0 * width:
+            phase = "SPH_JUNCTION_REGION"
+        else:
+            phase = "SPH_POST_BOUNDARY"
+        return front_center, observed_center, front_distance, observed_distance, frontmost_distance, phase
 
     def _local_front_maintenance(self, lidar, robots, forward, dt, globals_dict):
         """Apply a weak bias only while local neighbors show persistent burial."""
@@ -207,6 +254,15 @@ class DiagnosticCollector:
         frontier_max = max(all_progress)
         global_rank = sum(value > global_projection for value in all_progress) + 1
         maintenance = self._local_front_maintenance(lidar, robots, forward, dt, globals_dict)
+        opening_distance, center_distance, evaluation_phase, inside_zone = self._evaluation_geometry(lidar.position)
+        (
+            front_center,
+            observed_center,
+            front_center_boundary_distance,
+            observed_center_boundary_distance,
+            frontmost_boundary_distance,
+            sph_phase,
+        ) = self._sph_evaluation_geometry(front, observed)
 
         velocity = lidar.observed_velocity
         raw_heading = ""
@@ -278,6 +334,20 @@ class DiagnosticCollector:
             "evaluation_only_gt_distance_to_junction": math.hypot(
                 lidar.position.x - self.gt_center[0], lidar.position.y - self.gt_center[1]
             ),
+            "evaluation_only_gt_distance_to_opening_boundary": opening_distance,
+            "evaluation_only_inside_junction_opening_zone": inside_zone,
+            "evaluation_only_phase": evaluation_phase,
+            "evaluation_only_sph_phase": sph_phase,
+            "evaluation_only_front_cohort_center_distance_to_opening_boundary": front_center_boundary_distance,
+            "evaluation_only_observed_cohort_center_distance_to_opening_boundary": observed_center_boundary_distance,
+            "evaluation_only_frontmost_progress_distance_to_opening_boundary": frontmost_boundary_distance,
+            "observed_cohort_robot_count": len(observed),
+            # Descriptive analysis markers only; these are not production
+            # trigger thresholds and do not affect robot behavior.
+            "lateral_ratio_gt_1_1": expansion_ratio > 1.1,
+            "lateral_ratio_gt_1_28": expansion_ratio > 1.28,
+            "lateral_dwell_positive": expansion_dwell > 0.0,
+            "scan_change_gt_5": bool(scan_change != "" and scan_change > 5.0),
         }
         self.rows.append(row)
 
@@ -290,22 +360,104 @@ class DiagnosticCollector:
             writer.writerows(self.rows)
         if not self.rows:
             return
+        self._save_phase_summary()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
         gt_distance = np.asarray([r["evaluation_only_gt_distance_to_junction"] for r in self.rows])
-        figure, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        boundary_distance = np.asarray([r["evaluation_only_gt_distance_to_opening_boundary"] for r in self.rows])
+        figure, axes = plt.subplots(5, 1, figsize=(10, 12), sharex=True)
         axes[0].plot(time, variance, label="lateral variance")
         axes[0].plot(time, [r["lateral_baseline"] for r in self.rows], label="adaptive baseline")
         axes[0].legend(); axes[0].set_ylabel("SPH spread")
-        axes[1].plot(time, scan_change, color="tab:orange", label="cheap LiDAR scan change")
-        axes[1].legend(); axes[1].set_ylabel("range change")
-        axes[2].plot(time, gt_distance, color="tab:gray", label="GT distance (evaluation-only)")
-        axes[2].legend(); axes[2].set_ylabel("distance"); axes[2].set_xlabel("time [s]")
-        figure.suptitle("Fixed hardware LiDAR/front-cohort diagnostic")
+        axes[1].plot(time, [r["lateral_expansion_ratio"] for r in self.rows], label="lateral ratio")
+        axes[1].plot(time, [r["lateral_expansion_dwell"] for r in self.rows], label="lateral dwell")
+        axes[1].legend(); axes[1].set_ylabel("ratio / dwell")
+        axes[2].plot(time, [r["evaluation_only_front_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="front cohort boundary distance")
+        axes[2].plot(time, [r["evaluation_only_observed_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="observed cohort boundary distance")
+        axes[2].plot(time, [r["evaluation_only_frontmost_progress_distance_to_opening_boundary"] for r in self.rows], label="frontmost boundary distance")
+        axes[2].axhline(0.0, color="black", linestyle=":", label="boundary crossing")
+        axes[2].legend(); axes[2].set_ylabel("SPH boundary distance")
+        axes[3].plot(time, [r["cheap_lidar_left_free_fraction"] for r in self.rows], label="left free")
+        axes[3].plot(time, [r["cheap_lidar_right_free_fraction"] for r in self.rows], label="right free")
+        axes[3].plot(time, [r["cheap_lidar_free_angular_fraction"] for r in self.rows], label="total free")
+        axes[3].legend(); axes[3].set_ylabel("free fraction")
+        axes[4].plot(time, scan_change, color="tab:orange", label="scan change")
+        axes[4].legend(); axes[4].set_ylabel("range change"); axes[4].set_xlabel("time [s]")
+        for axis in axes:
+            for row in self.rows:
+                if row["evaluation_only_sph_phase"] == "SPH_OPENING_APPROACH":
+                    axis.axvspan(row["timestamp"] - 0.05, row["timestamp"] + 0.05, color="tab:green", alpha=0.03)
+        figure.suptitle("Fixed hardware LiDAR/front-cohort diagnostic (GT overlays evaluation-only)")
         figure.tight_layout()
         figure.savefig(OUTPUT / "lidar_front_trigger_timeline.png", dpi=150)
         plt.close(figure)
+        self._print_onset_summary()
+
+    def _save_phase_summary(self):
+        """Summarize actual cohort phases and descriptive false onsets."""
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
+        fields = (
+            "phase", "sample_count", "variance_mean", "variance_std",
+            "ratio_mean", "ratio_max", "dwell_positive_fraction",
+            "ratio_gt_1_1_count", "ratio_gt_1_28_count", "dwell_positive_count",
+        )
+        with (OUTPUT / "lidar_front_trigger_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for phase in phases:
+                rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
+                variances = [float(row["lateral_variance"]) for row in rows]
+                ratios = [float(row["lateral_expansion_ratio"]) for row in rows]
+                writer.writerow({
+                    "phase": phase,
+                    "sample_count": len(rows),
+                    "variance_mean": float(np.mean(variances)) if rows else "",
+                    "variance_std": float(np.std(variances)) if rows else "",
+                    "ratio_mean": float(np.mean(ratios)) if rows else "",
+                    "ratio_max": max(ratios) if rows else "",
+                    "dwell_positive_fraction": sum(row["lateral_dwell_positive"] for row in rows) / len(rows) if rows else "",
+                    "ratio_gt_1_1_count": sum(row["lateral_ratio_gt_1_1"] for row in rows),
+                    "ratio_gt_1_28_count": sum(row["lateral_ratio_gt_1_28"] for row in rows),
+                    "dwell_positive_count": sum(row["lateral_dwell_positive"] for row in rows),
+                })
+
+    def _print_onset_summary(self):
+        """Print first descriptive markers with evaluation-only geometry."""
+        markers = (
+            ("lateral_ratio_gt_1_1", "ratio>1.1"),
+            ("lateral_ratio_gt_1_28", "ratio>1.28"),
+            ("lateral_dwell_positive", "dwell>0"),
+            ("scan_change_gt_5", "scan_change>5"),
+        )
+        for field, label in markers:
+            row = next((item for item in self.rows if item[field]), None)
+            if row is None:
+                print(f"{label}: not observed")
+            else:
+                message = (
+                    f"{label}: t={row['timestamp']:.4f}, "
+                    f"center_dist={row['evaluation_only_gt_distance_to_junction']:.3f}, "
+                    f"boundary_dist={row['evaluation_only_gt_distance_to_opening_boundary']:.3f}, "
+                    f"front_cohort_boundary={row['evaluation_only_front_cohort_center_distance_to_opening_boundary']:.3f}, "
+                    f"observed_cohort_boundary={row['evaluation_only_observed_cohort_center_distance_to_opening_boundary']:.3f}, "
+                    f"frontmost_boundary={row['evaluation_only_frontmost_progress_distance_to_opening_boundary']:.3f}, "
+                    f"sph_phase={row['evaluation_only_sph_phase']}"
+                )
+                if field == "scan_change_gt_5":
+                    message += (
+                        f", left_free={row['cheap_lidar_left_free_fraction']}, "
+                        f"right_free={row['cheap_lidar_right_free_fraction']}, "
+                        f"total_free={row['cheap_lidar_free_angular_fraction']}"
+                    )
+                else:
+                    message += (
+                        f", variance={row['lateral_variance']:.3f}, "
+                        f"baseline={row['lateral_baseline']:.3f}, "
+                        f"ratio={row['lateral_expansion_ratio']:.3f}, "
+                        f"dwell={row['lateral_expansion_dwell']:.3f}"
+                    )
+                print(message)
 
 
 def run() -> None:
