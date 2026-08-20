@@ -67,25 +67,63 @@ class DiagnosticCollector:
         self.lidar_id: int | None = int(configured) if configured else None
         self.previous_ranges: np.ndarray | None = None
         self.previous_yaw: float | None = None
+        self.previous_forward = None
+        self.previous_heading = None
+        self.previous_variance: float | None = None
+        self.diagnostic_baseline = 0.0
+        self.diagnostic_dwell = 0.0
         self.last_sample_timestamp: float | None = None
         self.sample_interval_s = 0.1
         self.polygon, self.max_range, self.gt_center = _cross_geometry()
 
-    @staticmethod
-    def _front_features(manager, robots, globals_dict):
-        """Reuse the manager's local forward/front-quantile definition."""
-        forward = manager.evidence_forward
-        if forward is None or forward.length_squared() <= 1e-12:
-            moving = [r.observed_velocity for r in robots if r.observed_velocity.length() > 1e-6]
-            if not moving:
-                return (), None, None
-            forward = sum(moving, type(moving[0])()).normalize()
+    def _front_features(self, robots, globals_dict):
+        """Recompute the existing local front/cohort geometry every sample."""
+        min_speed = float(globals_dict.get("JUNCTION_COHORT_MIN_SPEED", 1.2))
+        moving = [r.observed_velocity for r in robots if r.observed_velocity.length() >= min_speed]
+        if not moving:
+            return (), None, None, ()
+        forward = sum(moving, type(moving[0])())
+        if forward.length_squared() <= 1e-12:
+            return (), None, None, ()
+        forward = forward.normalize()
+        if self.previous_forward is not None and forward.dot(self.previous_forward) < 0.0:
+            # Resolve local motion's 180-degree sign ambiguity by temporal
+            # continuity; no global/GT heading is used.
+            forward = -forward
+        self.previous_forward = forward
         center = sum((r.position for r in robots), type(robots[0].position)()) / max(len(robots), 1)
         projections = [(r.position - center).dot(forward) for r in robots]
-        quantile = float(globals_dict.get("JUNCTION_FRONT_QUANTILE", 0.85))
+        quantile = float(globals_dict.get("JUNCTION_FRONT_QUANTILE", 0.68))
         threshold = float(np.quantile(projections, quantile))
         front = tuple(r for r, value in zip(robots, projections) if value >= threshold)
-        return front, forward, projections
+        front_center = sum((r.position for r in front), type(robots[0].position)()) / max(len(front), 1)
+        radius = float(globals_dict.get("JUNCTION_OBSERVATION_RADIUS", 84.0 * 1.35))
+        observed = tuple(r for r in robots if r.position.distance_to(front_center) <= radius)
+        return front, forward, projections, observed
+
+    def _lateral_features(self, observed, forward, globals_dict, timestamp):
+        """Recompute lateral spread independently of AnchorShadow lifecycle."""
+        if not observed:
+            return 0.0, self.diagnostic_baseline, 0.0, 1.0, self.diagnostic_dwell, 0.0
+        center = sum((r.position for r in observed), type(observed[0].position)()) / len(observed)
+        lateral = type(forward)(-forward.y, forward.x)
+        values = [(r.position - center).dot(lateral) for r in observed]
+        variance = float(sum(v * v for v in values) / len(values))
+        min_delta = float(globals_dict.get("JUNCTION_LATERAL_EXPANSION_MIN", (4.5 * 0.70) ** 2))
+        ratio_limit = float(globals_dict.get("JUNCTION_LATERAL_EXPANSION_RATIO", 1.28))
+        alpha = float(globals_dict.get("JUNCTION_BASELINE_ALPHA", 0.035))
+        if self.diagnostic_baseline <= 1e-12:
+            self.diagnostic_baseline = max(variance, min_delta)
+        delta = variance - self.diagnostic_baseline
+        ratio = variance / max(self.diagnostic_baseline, 1e-12)
+        expanding = delta >= min_delta and ratio >= ratio_limit
+        dt = 0.0 if not self.rows else max(timestamp - self.rows[-1]["timestamp"], 1e-12)
+        self.diagnostic_dwell = self.diagnostic_dwell + dt if expanding else 0.0
+        if not expanding and variance < self.diagnostic_baseline:
+            self.diagnostic_baseline += alpha * (variance - self.diagnostic_baseline)
+        rate = 0.0 if self.previous_variance is None else (variance - self.previous_variance) / max(dt, 1e-12)
+        self.previous_variance = variance
+        return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate
 
     def sample(self, manager, robots, timestamp, globals_dict):
         if (
@@ -97,7 +135,7 @@ class DiagnosticCollector:
         mobile = tuple(r for r in robots if r.role == "NORMAL" and r.connected_to_base)
         if not mobile:
             return
-        front, forward, projections = self._front_features(manager, mobile, globals_dict)
+        front, forward, projections, observed = self._front_features(mobile, globals_dict)
         if not front or forward is None:
             return
         if self.lidar_id is None:
@@ -111,10 +149,22 @@ class DiagnosticCollector:
         lidar_projection = (lidar.position - front_center).dot(forward)
         front_projections = [(r.position - front_center).dot(forward) for r in front]
         rank = sum(value > lidar_projection for value in front_projections) + 1
+        global_projection = (lidar.position - front_center).dot(forward)
+        all_progress = [(r.position - front_center).dot(forward) for r in mobile]
+        frontier_max = max(all_progress)
+        global_rank = sum(value > global_projection for value in all_progress) + 1
 
         velocity = lidar.observed_velocity
+        raw_heading = ""
+        heading_flip_corrected = False
         if velocity.length_squared() > 1e-12:
-            yaw = math.degrees(math.atan2(velocity.y, velocity.x))
+            heading = velocity.normalize()
+            raw_heading = math.degrees(math.atan2(heading.y, heading.x))
+            if self.previous_heading is not None and heading.dot(self.previous_heading) < 0.0:
+                heading = -heading
+                heading_flip_corrected = True
+            self.previous_heading = heading
+            yaw = math.degrees(math.atan2(heading.y, heading.x))
             self.previous_yaw = yaw
         elif self.previous_yaw is not None:
             yaw = self.previous_yaw
@@ -135,8 +185,9 @@ class DiagnosticCollector:
         if self.previous_ranges is not None:
             scan_change = float(np.mean(np.abs(scan.ranges - self.previous_ranges)))
         self.previous_ranges = scan.ranges.copy()
-        variance = float(manager.evidence_lateral_variance)
-        baseline = float(manager.evidence_baseline_lateral_variance)
+        variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate = self._lateral_features(
+            observed, forward, globals_dict, timestamp
+        )
         row = {
             "timestamp": float(timestamp),
             "lidar_robot_id": self.lidar_id,
@@ -145,12 +196,18 @@ class DiagnosticCollector:
             "lidar_is_in_front_cohort": lidar in front,
             "lidar_front_rank": rank,
             "front_projection_relative_to_cohort": float(lidar_projection),
+            "global_frontier_max_projection": float(frontier_max),
+            "lidar_global_frontier_gap": float(frontier_max - global_projection),
+            "lidar_global_progress_rank": global_rank,
+            "raw_local_heading_deg": raw_heading,
+            "stable_local_heading_deg": yaw,
+            "heading_flip_corrected": heading_flip_corrected,
             "lateral_variance": variance,
             "lateral_baseline": baseline,
-            "lateral_variance_delta": variance - baseline,
-            "lateral_expansion_ratio": float(manager.evidence_expansion_ratio),
-            "lateral_expansion_dwell": float(manager.evidence_expansion_dwell),
-            "lateral_variance_rate": "" if not self.rows else (variance - self.rows[-1]["lateral_variance"]) / max(float(timestamp) - self.rows[-1]["timestamp"], 1e-9),
+            "lateral_variance_delta": variance_delta,
+            "lateral_expansion_ratio": expansion_ratio,
+            "lateral_expansion_dwell": expansion_dwell,
+            "lateral_variance_rate": variance_rate,
             "cheap_lidar_left_range": float(np.mean(left_ranges)),
             "cheap_lidar_right_range": float(np.mean(right_ranges)),
             "cheap_lidar_left_free_fraction": float(np.mean(~scan.hit[left])),
