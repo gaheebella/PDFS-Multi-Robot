@@ -75,9 +75,11 @@ class DiagnosticCollector:
         self.diagnostic_dwell = 0.0
         self.front_maintenance_dwell = 0.0
         self.previous_frontmost_signed_boundary: float | None = None
+        self.previous_observed_signed_boundary: float | None = None
         self.last_sample_timestamp: float | None = None
         self.sample_interval_s = 0.1
         self.polygon, self.max_range, self.gt_center, self.opening_boundary = _cross_geometry()
+        self.initial_setup_offset_y = float(os.environ.get("SPH_DFS_DIAGNOSTIC_START_OFFSET_Y", "20.0"))
 
     def _front_features(self, robots, globals_dict):
         """Recompute the existing local front/cohort geometry every sample."""
@@ -107,7 +109,7 @@ class DiagnosticCollector:
     def _lateral_features(self, observed, forward, globals_dict, timestamp):
         """Recompute lateral spread independently of AnchorShadow lifecycle."""
         if not observed:
-            return 0.0, self.diagnostic_baseline, 0.0, 1.0, self.diagnostic_dwell, 0.0
+            return 0.0, self.diagnostic_baseline, 0.0, 1.0, self.diagnostic_dwell, 0.0, 0.0, 0.0, 0.0
         center = sum((r.position for r in observed), type(observed[0].position)()) / len(observed)
         lateral = type(forward)(-forward.y, forward.x)
         values = [(r.position - center).dot(lateral) for r in observed]
@@ -126,7 +128,8 @@ class DiagnosticCollector:
             self.diagnostic_baseline += alpha * (variance - self.diagnostic_baseline)
         rate = 0.0 if self.previous_variance is None else (variance - self.previous_variance) / max(dt, 1e-12)
         self.previous_variance = variance
-        return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate
+        p10, p90 = np.percentile(values, [10.0, 90.0])
+        return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate, min(values), max(values), float(p90 - p10)
 
     def _evaluation_geometry(self, position):
         """Return GT opening distance/phase; never used by runtime control."""
@@ -157,21 +160,45 @@ class DiagnosticCollector:
         front_distance = self._evaluation_geometry(front_center)[0]
         observed_distance = self._evaluation_geometry(observed_center)[0]
         frontmost_distance = self._evaluation_geometry(frontmost.position)[0]
-        signed = frontmost.position.y - boundary_y
+        frontmost_signed = frontmost.position.y - boundary_y
+        observed_signed = observed_center.y - boundary_y
+        def crossed_fraction(cohort):
+            """Return boundary-crossed fraction for evaluation only.
+
+            The opening span is used to avoid counting robots that are below
+            the horizontal boundary but outside the opening itself.  This is
+            post-hoc GT bookkeeping and is never consumed by runtime control.
+            """
+            if not cohort:
+                return 0.0
+            crossed = sum(
+                r.position.y <= boundary_y
+                and self.opening_boundary[0][0] <= r.position.x <= self.opening_boundary[1][0]
+                for r in cohort
+            )
+            return float(crossed / len(cohort))
+        front_crossed_fraction = crossed_fraction(front)
+        observed_crossed_fraction = crossed_fraction(observed)
         previous = self.previous_frontmost_signed_boundary
-        self.previous_frontmost_signed_boundary = signed
-        width = self.max_range
-        if signed > 2.0 * width:
+        previous_observed = self.previous_observed_signed_boundary
+        self.previous_frontmost_signed_boundary = frontmost_signed
+        self.previous_observed_signed_boundary = observed_signed
+        if frontmost_signed > 0.0 and observed_signed > 0.0:
             phase = "SPH_CORRIDOR"
-        elif signed > 0.0:
+        elif frontmost_signed <= 0.0 and observed_signed > 0.0:
             phase = "SPH_OPENING_APPROACH"
-        elif previous is not None and previous > 0.0:
+        elif previous_observed is not None and previous_observed > 0.0 and observed_signed <= 0.0:
             phase = "SPH_BOUNDARY_CROSSING"
-        elif self._evaluation_geometry(frontmost.position)[1] <= 2.0 * width:
+        elif observed_signed <= 0.0 and self._evaluation_geometry(observed_center)[1] <= 2.0 * self.max_range:
             phase = "SPH_JUNCTION_REGION"
         else:
             phase = "SPH_POST_BOUNDARY"
-        return front_center, observed_center, front_distance, observed_distance, frontmost_distance, phase
+        return (
+            front_center, observed_center, front_distance, observed_distance,
+            frontmost_distance, phase, front_crossed_fraction,
+            observed_crossed_fraction,
+            frontmost_signed, observed_signed,
+        )
 
     def _local_front_maintenance(self, lidar, robots, forward, dt, globals_dict):
         """Apply a weak bias only while local neighbors show persistent burial."""
@@ -262,6 +289,10 @@ class DiagnosticCollector:
             observed_center_boundary_distance,
             frontmost_boundary_distance,
             sph_phase,
+            front_crossed_fraction,
+            observed_crossed_fraction,
+            frontmost_signed_boundary,
+            observed_signed_boundary,
         ) = self._sph_evaluation_geometry(front, observed)
 
         velocity = lidar.observed_velocity
@@ -295,7 +326,7 @@ class DiagnosticCollector:
         if self.previous_ranges is not None:
             scan_change = float(np.mean(np.abs(scan.ranges - self.previous_ranges)))
         self.previous_ranges = scan.ranges.copy()
-        variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate = self._lateral_features(
+        variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate, lateral_min, lateral_max, lateral_p90_span = self._lateral_features(
             observed, forward, globals_dict, timestamp
         )
         row = {
@@ -325,6 +356,10 @@ class DiagnosticCollector:
             "lateral_expansion_ratio": expansion_ratio,
             "lateral_expansion_dwell": expansion_dwell,
             "lateral_variance_rate": variance_rate,
+            "lateral_min": lateral_min,
+            "lateral_max": lateral_max,
+            "lateral_span": lateral_max - lateral_min,
+            "lateral_p90_minus_p10": lateral_p90_span,
             "cheap_lidar_left_range": float(np.mean(left_ranges)),
             "cheap_lidar_right_range": float(np.mean(right_ranges)),
             "cheap_lidar_left_free_fraction": float(np.mean(~scan.hit[left])),
@@ -341,6 +376,12 @@ class DiagnosticCollector:
             "evaluation_only_front_cohort_center_distance_to_opening_boundary": front_center_boundary_distance,
             "evaluation_only_observed_cohort_center_distance_to_opening_boundary": observed_center_boundary_distance,
             "evaluation_only_frontmost_progress_distance_to_opening_boundary": frontmost_boundary_distance,
+            "evaluation_only_frontmost_boundary_distance": frontmost_boundary_distance,
+            "evaluation_only_frontmost_signed_boundary_distance": frontmost_signed_boundary,
+            "evaluation_only_front_cohort_signed_boundary_distance": front_center.y - self.opening_boundary[0][1],
+            "evaluation_only_observed_cohort_signed_boundary_distance": observed_signed_boundary,
+            "evaluation_only_front_cohort_crossed_fraction": front_crossed_fraction,
+            "evaluation_only_observed_cohort_crossed_fraction": observed_crossed_fraction,
             "observed_cohort_robot_count": len(observed),
             # Descriptive analysis markers only; these are not production
             # trigger thresholds and do not affect robot behavior.
@@ -361,29 +402,41 @@ class DiagnosticCollector:
         if not self.rows:
             return
         self._save_phase_summary()
+        self._save_event_summary()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
         gt_distance = np.asarray([r["evaluation_only_gt_distance_to_junction"] for r in self.rows])
         boundary_distance = np.asarray([r["evaluation_only_gt_distance_to_opening_boundary"] for r in self.rows])
-        figure, axes = plt.subplots(5, 1, figsize=(10, 12), sharex=True)
+        figure, axes = plt.subplots(4, 1, figsize=(10, 11), sharex=True)
         axes[0].plot(time, variance, label="lateral variance")
         axes[0].plot(time, [r["lateral_baseline"] for r in self.rows], label="adaptive baseline")
         axes[0].legend(); axes[0].set_ylabel("SPH spread")
         axes[1].plot(time, [r["lateral_expansion_ratio"] for r in self.rows], label="lateral ratio")
         axes[1].plot(time, [r["lateral_expansion_dwell"] for r in self.rows], label="lateral dwell")
         axes[1].legend(); axes[1].set_ylabel("ratio / dwell")
-        axes[2].plot(time, [r["evaluation_only_front_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="front cohort boundary distance")
-        axes[2].plot(time, [r["evaluation_only_observed_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="observed cohort boundary distance")
-        axes[2].plot(time, [r["evaluation_only_frontmost_progress_distance_to_opening_boundary"] for r in self.rows], label="frontmost boundary distance")
-        axes[2].axhline(0.0, color="black", linestyle=":", label="boundary crossing")
-        axes[2].legend(); axes[2].set_ylabel("SPH boundary distance")
-        axes[3].plot(time, [r["cheap_lidar_left_free_fraction"] for r in self.rows], label="left free")
-        axes[3].plot(time, [r["cheap_lidar_right_free_fraction"] for r in self.rows], label="right free")
-        axes[3].plot(time, [r["cheap_lidar_free_angular_fraction"] for r in self.rows], label="total free")
-        axes[3].legend(); axes[3].set_ylabel("free fraction")
-        axes[4].plot(time, scan_change, color="tab:orange", label="scan change")
-        axes[4].legend(); axes[4].set_ylabel("range change"); axes[4].set_xlabel("time [s]")
+        axes[2].plot(time, [r["evaluation_only_front_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="front cohort center")
+        axes[2].plot(time, [r["evaluation_only_observed_cohort_center_distance_to_opening_boundary"] for r in self.rows], label="observed cohort center")
+        axes[2].plot(time, [r["evaluation_only_frontmost_boundary_distance"] for r in self.rows], label="frontmost")
+        axes[2].axhline(0.0, color="black", linestyle=":", label="boundary")
+        axes[2].legend(); axes[2].set_ylabel("boundary distance")
+        axes[3].plot(time, [r["evaluation_only_front_cohort_crossed_fraction"] for r in self.rows], label="front crossed fraction")
+        axes[3].plot(time, [r["evaluation_only_observed_cohort_crossed_fraction"] for r in self.rows], label="observed crossed fraction")
+        axes[3].set_ylim(-0.02, 1.02); axes[3].legend(); axes[3].set_ylabel("crossed fraction"); axes[3].set_xlabel("time [s]")
+        event_summary = self._event_summary()
+        event_styles = {
+            "first_sustained_lateral_onset": ("tab:red", "sustained lateral onset"),
+            "first_existing_expansion_ratio_onset": ("tab:orange", "ratio onset"),
+            "first_positive_lateral_dwell": ("tab:purple", "positive dwell"),
+            "frontmost_boundary_crossing": ("tab:blue", "frontmost crossing"),
+            "front_cohort_center_crossing": ("tab:green", "front center crossing"),
+            "observed_cohort_center_crossing": ("tab:brown", "observed center crossing"),
+        }
+        for key, (color, label) in event_styles.items():
+            timestamp = event_summary.get(key)
+            if timestamp is not None:
+                for axis in axes:
+                    axis.axvline(timestamp, color=color, linestyle="--", alpha=0.65, label=label)
         for axis in axes:
             for row in self.rows:
                 if row["evaluation_only_sph_phase"] == "SPH_OPENING_APPROACH":
@@ -394,12 +447,53 @@ class DiagnosticCollector:
         plt.close(figure)
         self._print_onset_summary()
 
+    def _event_summary(self):
+        """Compute retrospective event times; all markers are evaluation-only."""
+        if not self.rows:
+            return {}
+        def first(predicate):
+            row = next((item for item in self.rows if predicate(item)), None)
+            return None if row is None else float(row["timestamp"])
+        def crossing(field):
+            previous = None
+            for row in self.rows:
+                current = float(row[field])
+                if previous is not None and previous > 0.0 and current <= 0.0:
+                    return float(row["timestamp"])
+                previous = current
+            return None
+        # B/C reuse existing expansion and dwell definitions.  A requires the
+        # same existing condition plus a positive measured variance rate, so
+        # no new production threshold is introduced.
+        events = {
+            "first_sustained_lateral_onset": first(lambda r: r["lateral_dwell_positive"] and r["lateral_variance_rate"] > 0.0),
+            "first_existing_expansion_ratio_onset": first(lambda r: r["lateral_ratio_gt_1_28"]),
+            "first_positive_lateral_dwell": first(lambda r: r["lateral_dwell_positive"]),
+            "frontmost_boundary_crossing": crossing("evaluation_only_frontmost_signed_boundary_distance"),
+            "front_cohort_center_crossing": crossing("evaluation_only_front_cohort_signed_boundary_distance"),
+            "observed_cohort_center_crossing": crossing("evaluation_only_observed_cohort_signed_boundary_distance"),
+        }
+        for name, crossing in (("frontmost", "frontmost_boundary_crossing"), ("front_center", "front_cohort_center_crossing"), ("observed_center", "observed_cohort_center_crossing")):
+            onset = events["first_sustained_lateral_onset"]
+            crossing_time = events[crossing]
+            events[f"delta_t_{name}"] = None if onset is None or crossing_time is None else onset - crossing_time
+        return events
+
+    def _save_event_summary(self):
+        """Persist retrospective onset/crossing timestamps and signed deltas."""
+        events = self._event_summary()
+        with (OUTPUT / "lidar_front_trigger_event_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["event", "timestamp_or_delta_s"])
+            writer.writerows((key, value if value is not None else "") for key, value in events.items())
+
     def _save_phase_summary(self):
         """Summarize actual cohort phases and descriptive false onsets."""
         phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
         fields = (
             "phase", "sample_count", "variance_mean", "variance_std",
-            "ratio_mean", "ratio_max", "dwell_positive_fraction",
+            "variance_rate_mean", "ratio_mean", "ratio_max", "dwell_positive_fraction",
+            "lateral_span_mean", "lateral_p90_minus_p10_mean",
             "ratio_gt_1_1_count", "ratio_gt_1_28_count", "dwell_positive_count",
         )
         with (OUTPUT / "lidar_front_trigger_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -408,15 +502,21 @@ class DiagnosticCollector:
             for phase in phases:
                 rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
                 variances = [float(row["lateral_variance"]) for row in rows]
+                rates = [float(row["lateral_variance_rate"]) for row in rows]
                 ratios = [float(row["lateral_expansion_ratio"]) for row in rows]
+                spans = [float(row["lateral_span"]) for row in rows]
+                robust_spans = [float(row["lateral_p90_minus_p10"]) for row in rows]
                 writer.writerow({
                     "phase": phase,
                     "sample_count": len(rows),
                     "variance_mean": float(np.mean(variances)) if rows else "",
                     "variance_std": float(np.std(variances)) if rows else "",
+                    "variance_rate_mean": float(np.mean(rates)) if rows else "",
                     "ratio_mean": float(np.mean(ratios)) if rows else "",
                     "ratio_max": max(ratios) if rows else "",
                     "dwell_positive_fraction": sum(row["lateral_dwell_positive"] for row in rows) / len(rows) if rows else "",
+                    "lateral_span_mean": float(np.mean(spans)) if rows else "",
+                    "lateral_p90_minus_p10_mean": float(np.mean(robust_spans)) if rows else "",
                     "ratio_gt_1_1_count": sum(row["lateral_ratio_gt_1_1"] for row in rows),
                     "ratio_gt_1_28_count": sum(row["lateral_ratio_gt_1_28"] for row in rows),
                     "dwell_positive_count": sum(row["lateral_dwell_positive"] for row in rows),
@@ -424,6 +524,10 @@ class DiagnosticCollector:
 
     def _print_onset_summary(self):
         """Print first descriptive markers with evaluation-only geometry."""
+        events = self._event_summary()
+        print("retrospective_event_summary:")
+        for key, value in events.items():
+            print(f"  {key}={value if value is not None else 'not observed'}")
         markers = (
             ("lateral_ratio_gt_1_1", "ratio>1.1"),
             ("lateral_ratio_gt_1_28", "ratio>1.28"),
@@ -459,7 +563,6 @@ class DiagnosticCollector:
                     )
                 print(message)
 
-
 def run() -> None:
     """Run the unchanged simulator headlessly and export diagnostics."""
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -472,6 +575,7 @@ def run() -> None:
 
     collector = DiagnosticCollector(simulate_polygon_lidar)
     target_name = str(TARGET)
+    initial_offset_y = collector.initial_setup_offset_y
 
     def local_trace(frame, event, arg):
         if event == "return":
@@ -483,6 +587,8 @@ def run() -> None:
         return local_trace
 
     def global_trace(frame, event, arg):
+        if event == "call" and frame.f_code.co_filename == target_name and frame.f_code.co_name == "initialize_simulation":
+            return initialization_trace
         if (
             event == "call"
             and frame.f_code.co_filename == target_name
@@ -495,6 +601,18 @@ def run() -> None:
             frame.f_trace_lines = False
             return local_trace
         return None
+
+    def initialization_trace(frame, event, arg):
+        if event == "return" and isinstance(arg, tuple) and arg and isinstance(arg[0], list):
+            robots = arg[0]
+            # Evaluation-only setup: translate the initial swarm along the
+            # known incoming-corridor axis without changing geometry, width,
+            # forces, or production simulator code.
+            for robot in robots:
+                robot.position.y += initial_offset_y
+                robot.previous_position.y += initial_offset_y
+            return None
+        return initialization_trace
 
     previous_trace = sys.gettrace()
     sys.settrace(global_trace)
