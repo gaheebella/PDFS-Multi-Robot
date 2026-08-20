@@ -70,9 +70,11 @@ class DiagnosticCollector:
         self.previous_yaw: float | None = None
         self.previous_forward = None
         self.previous_heading = None
-        self.previous_variance: float | None = None
-        self.diagnostic_baseline = 0.0
-        self.diagnostic_dwell = 0.0
+        self.lateral_states = {
+            "BROAD_OBSERVED": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
+            "FRONT_COHORT": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
+            "FRONT_LOCAL_REDUCED": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
+        }
         self.front_maintenance_dwell = 0.0
         self.previous_frontmost_signed_boundary: float | None = None
         self.previous_observed_signed_boundary: float | None = None
@@ -106,10 +108,10 @@ class DiagnosticCollector:
         observed = tuple(r for r in robots if r.position.distance_to(front_center) <= radius)
         return front, forward, projections, observed
 
-    def _lateral_features(self, observed, forward, globals_dict, timestamp):
-        """Recompute lateral spread independently of AnchorShadow lifecycle."""
+    def _lateral_features(self, observed, forward, globals_dict, timestamp, state):
+        """Apply the unchanged lateral math to one independent cohort state."""
         if not observed:
-            return 0.0, self.diagnostic_baseline, 0.0, 1.0, self.diagnostic_dwell, 0.0, 0.0, 0.0, 0.0
+            return 0.0, state["baseline"], 0.0, 1.0, state["dwell"], 0.0, 0.0, 0.0, 0.0
         center = sum((r.position for r in observed), type(observed[0].position)()) / len(observed)
         lateral = type(forward)(-forward.y, forward.x)
         values = [(r.position - center).dot(lateral) for r in observed]
@@ -117,19 +119,19 @@ class DiagnosticCollector:
         min_delta = float(globals_dict.get("JUNCTION_LATERAL_EXPANSION_MIN", (4.5 * 0.70) ** 2))
         ratio_limit = float(globals_dict.get("JUNCTION_LATERAL_EXPANSION_RATIO", 1.28))
         alpha = float(globals_dict.get("JUNCTION_BASELINE_ALPHA", 0.035))
-        if self.diagnostic_baseline <= 1e-12:
-            self.diagnostic_baseline = max(variance, min_delta)
-        delta = variance - self.diagnostic_baseline
-        ratio = variance / max(self.diagnostic_baseline, 1e-12)
+        if state["baseline"] <= 1e-12:
+            state["baseline"] = max(variance, min_delta)
+        delta = variance - state["baseline"]
+        ratio = variance / max(state["baseline"], 1e-12)
         expanding = delta >= min_delta and ratio >= ratio_limit
         dt = 0.0 if not self.rows else max(timestamp - self.rows[-1]["timestamp"], 1e-12)
-        self.diagnostic_dwell = self.diagnostic_dwell + dt if expanding else 0.0
-        if not expanding and variance < self.diagnostic_baseline:
-            self.diagnostic_baseline += alpha * (variance - self.diagnostic_baseline)
-        rate = 0.0 if self.previous_variance is None else (variance - self.previous_variance) / max(dt, 1e-12)
-        self.previous_variance = variance
+        state["dwell"] = state["dwell"] + dt if expanding else 0.0
+        if not expanding and variance < state["baseline"]:
+            state["baseline"] += alpha * (variance - state["baseline"])
+        rate = 0.0 if state["previous_variance"] is None else (variance - state["previous_variance"]) / max(dt, 1e-12)
+        state["previous_variance"] = variance
         p10, p90 = np.percentile(values, [10.0, 90.0])
-        return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate, min(values), max(values), float(p90 - p10)
+        return variance, state["baseline"], delta, ratio, state["dwell"], rate, min(values), max(values), float(p90 - p10)
 
     def _evaluation_geometry(self, position):
         """Return GT opening distance/phase; never used by runtime control."""
@@ -294,6 +296,21 @@ class DiagnosticCollector:
             frontmost_signed_boundary,
             observed_signed_boundary,
         ) = self._sph_evaluation_geometry(front, observed)
+        # All three sets are selected from local robot geometry only.  The
+        # reduced radius is tied to the existing communication/sensing scale,
+        # rather than an experiment-specific tuned distance.
+        comm_range = float(globals_dict.get("COMM_RANGE", 54.0 * 0.70))
+        observation_radius = float(globals_dict.get("JUNCTION_OBSERVATION_RADIUS", 84.0 * 1.35))
+        reduced_radius = min(comm_range, observation_radius)
+        front_local = tuple(
+            robot for robot in mobile
+            if robot.position.distance_to(front_center) <= reduced_radius
+        )
+        cohorts = {
+            "BROAD_OBSERVED": observed,
+            "FRONT_COHORT": front,
+            "FRONT_LOCAL_REDUCED": front_local,
+        }
 
         velocity = lidar.observed_velocity
         raw_heading = ""
@@ -326,9 +343,12 @@ class DiagnosticCollector:
         if self.previous_ranges is not None:
             scan_change = float(np.mean(np.abs(scan.ranges - self.previous_ranges)))
         self.previous_ranges = scan.ranges.copy()
-        variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate, lateral_min, lateral_max, lateral_p90_span = self._lateral_features(
-            observed, forward, globals_dict, timestamp
-        )
+        cohort_features = {
+            name: self._lateral_features(
+                cohort, forward, globals_dict, timestamp, self.lateral_states[name]
+            ) for name, cohort in cohorts.items()
+        }
+        variance, baseline, variance_delta, expansion_ratio, expansion_dwell, variance_rate, lateral_min, lateral_max, lateral_p90_span = cohort_features["BROAD_OBSERVED"]
         row = {
             "timestamp": float(timestamp),
             "lidar_robot_id": self.lidar_id,
@@ -383,6 +403,9 @@ class DiagnosticCollector:
             "evaluation_only_front_cohort_crossed_fraction": front_crossed_fraction,
             "evaluation_only_observed_cohort_crossed_fraction": observed_crossed_fraction,
             "observed_cohort_robot_count": len(observed),
+            "broad_observed_robot_count": len(observed),
+            "front_local_robot_count": len(front_local),
+            "front_local_reduced_radius": reduced_radius,
             # Descriptive analysis markers only; these are not production
             # trigger thresholds and do not affect robot behavior.
             "lateral_ratio_gt_1_1": expansion_ratio > 1.1,
@@ -390,6 +413,22 @@ class DiagnosticCollector:
             "lateral_dwell_positive": expansion_dwell > 0.0,
             "scan_change_gt_5": bool(scan_change != "" and scan_change > 5.0),
         }
+        for cohort_name, values in cohort_features.items():
+            prefix = cohort_name.lower()
+            row.update({
+                f"{prefix}_variance": values[0],
+                f"{prefix}_baseline": values[1],
+                f"{prefix}_variance_delta": values[2],
+                f"{prefix}_expansion_ratio": values[3],
+                f"{prefix}_expansion_dwell": values[4],
+                f"{prefix}_variance_rate": values[5],
+                f"{prefix}_lateral_span": values[7] - values[6],
+                f"{prefix}_lateral_p90_minus_p10": values[8],
+                f"{prefix}_ratio_gt_1_1": values[3] > 1.1,
+                f"{prefix}_ratio_gt_1_28": values[3] > 1.28,
+                f"{prefix}_dwell_positive": values[4] > 0.0,
+                f"{prefix}_sustained_marker": values[4] > 0.0 and values[5] > 0.0,
+            })
         self.rows.append(row)
 
     def save(self):
@@ -403,6 +442,9 @@ class DiagnosticCollector:
             return
         self._save_phase_summary()
         self._save_event_summary()
+        self._save_cohort_summary()
+        self._save_cohort_events()
+        self._save_cohort_plot()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
@@ -487,6 +529,110 @@ class DiagnosticCollector:
             writer.writerow(["event", "timestamp_or_delta_s"])
             writer.writerows((key, value if value is not None else "") for key, value in events.items())
 
+    def _cohort_event(self, cohort_name, marker):
+        prefix = cohort_name.lower()
+        row = next((r for r in self.rows if bool(r[f"{prefix}_{marker}"])), None)
+        return None if row is None else float(row["timestamp"])
+
+    def _save_cohort_events(self):
+        """Persist cohort onset times and deltas against GT entry references."""
+        reference = self._event_summary()
+        with (OUTPUT / "lidar_front_trigger_cohort_events.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["cohort_name", "ratio_onset", "positive_dwell_onset", "sustained_onset", "delta_t_frontmost", "delta_t_front_center"]
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for cohort in self.lateral_states:
+                sustained = self._cohort_event(cohort, "sustained_marker")
+                ratio = self._cohort_event(cohort, "ratio_gt_1_28")
+                dwell = self._cohort_event(cohort, "dwell_positive")
+                writer.writerow({
+                    "cohort_name": cohort,
+                    "ratio_onset": "" if ratio is None else ratio,
+                    "positive_dwell_onset": "" if dwell is None else dwell,
+                    "sustained_onset": "" if sustained is None else sustained,
+                    "delta_t_frontmost": "" if sustained is None or reference.get("frontmost_boundary_crossing") is None else sustained - reference["frontmost_boundary_crossing"],
+                    "delta_t_front_center": "" if sustained is None or reference.get("front_cohort_center_crossing") is None else sustained - reference["front_cohort_center_crossing"],
+                })
+
+    def _save_cohort_summary(self):
+        """Write cohort event and phase statistics for this single run."""
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_JUNCTION_REGION")
+        fields = ["cohort_name", "mean_robot_count", "sustained_onset", "delta_t_frontmost", "delta_t_front_center"]
+        for phase in phases:
+            fields.extend([
+                f"{phase.lower()}_variance_mean", f"{phase.lower()}_variance_std",
+                f"{phase.lower()}_variance_rate_std", f"{phase.lower()}_ratio_mean",
+                f"{phase.lower()}_ratio_max", f"{phase.lower()}_false_ratio_1_28_count",
+                f"{phase.lower()}_positive_dwell_count",
+            ])
+        with (OUTPUT / "lidar_front_trigger_cohort_comparison_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for cohort_name in self.lateral_states:
+                prefix = cohort_name.lower()
+                count_key = {
+                    "BROAD_OBSERVED": "broad_observed_robot_count",
+                    "FRONT_COHORT": "front_cohort_robot_count",
+                    "FRONT_LOCAL_REDUCED": "front_local_robot_count",
+                }[cohort_name]
+                sustained = self._cohort_event(cohort_name, "sustained_marker")
+                row = {
+                    "cohort_name": cohort_name,
+                    "mean_robot_count": float(np.mean([r[count_key] for r in self.rows])),
+                    "sustained_onset": sustained if sustained is not None else "",
+                    "delta_t_frontmost": "" if sustained is None or self._event_summary().get("frontmost_boundary_crossing") is None else sustained - self._event_summary()["frontmost_boundary_crossing"],
+                    "delta_t_front_center": "" if sustained is None or self._event_summary().get("front_cohort_center_crossing") is None else sustained - self._event_summary()["front_cohort_center_crossing"],
+                }
+                for phase in phases:
+                    rows = [r for r in self.rows if r["evaluation_only_sph_phase"] == phase]
+                    values = [float(r[f"{prefix}_variance"]) for r in rows]
+                    rates = [float(r[f"{prefix}_variance_rate"]) for r in rows]
+                    ratios = [float(r[f"{prefix}_expansion_ratio"]) for r in rows]
+                    key = phase.lower()
+                    row.update({
+                        f"{key}_variance_mean": float(np.mean(values)) if values else "",
+                        f"{key}_variance_std": float(np.std(values)) if values else "",
+                        f"{key}_variance_rate_std": float(np.std(rates)) if rates else "",
+                        f"{key}_ratio_mean": float(np.mean(ratios)) if ratios else "",
+                        f"{key}_ratio_max": max(ratios) if ratios else "",
+                        f"{key}_false_ratio_1_28_count": sum(r[f"{prefix}_ratio_gt_1_28"] for r in rows),
+                        f"{key}_positive_dwell_count": sum(r[f"{prefix}_dwell_positive"] for r in rows),
+                    })
+                writer.writerow(row)
+
+    def _save_cohort_plot(self):
+        """Plot the three retrospective local-cohort signals."""
+        time = np.asarray([r["timestamp"] for r in self.rows])
+        fig, axes = plt.subplots(5, 1, figsize=(11, 14), sharex=True)
+        labels = {"BROAD_OBSERVED": "BROAD", "FRONT_COHORT": "FRONT", "FRONT_LOCAL_REDUCED": "FRONT_LOCAL"}
+        for cohort, label in labels.items():
+            prefix = cohort.lower()
+            axes[0].plot(time, [r[f"{prefix}_variance"] for r in self.rows], label=label)
+            axes[1].plot(time, [r[f"{prefix}_expansion_ratio"] for r in self.rows], label=label)
+            axes[2].plot(time, [r[f"{prefix}_variance_rate"] for r in self.rows], label=label)
+        axes[3].plot(time, [r["evaluation_only_frontmost_signed_boundary_distance"] for r in self.rows], label="frontmost GT")
+        axes[3].plot(time, [r["evaluation_only_front_cohort_signed_boundary_distance"] for r in self.rows], label="front center GT")
+        axes[3].plot(time, [r["evaluation_only_observed_cohort_signed_boundary_distance"] for r in self.rows], label="observed center GT")
+        axes[3].axhline(0.0, color="black", linestyle=":")
+        for cohort, label in labels.items():
+            count_key = "observed_cohort_robot_count" if cohort == "BROAD_OBSERVED" else ("front_cohort_robot_count" if cohort == "FRONT_COHORT" else "front_local_robot_count")
+            axes[4].plot(time, [r[count_key] for r in self.rows], label=label)
+        event_times = [("frontmost crossing", self._event_summary().get("frontmost_boundary_crossing")),
+                       ("front center crossing", self._event_summary().get("front_cohort_center_crossing"))]
+        for cohort, label in labels.items():
+            event_times.append((f"{label} sustained onset", self._cohort_event(cohort, "sustained_marker")))
+        for label, timestamp in event_times:
+            if timestamp is not None:
+                for axis in axes:
+                    axis.axvline(timestamp, linestyle="--", alpha=0.55, label=label)
+        for axis, ylabel in zip(axes, ("variance", "ratio", "variance rate", "signed boundary distance", "robot count")):
+            axis.set_ylabel(ylabel); axis.legend(loc="best")
+        axes[-1].set_xlabel("time [s]")
+        fig.suptitle("Retrospective lateral cohort comparison (GT overlays evaluation-only)")
+        fig.tight_layout()
+        fig.savefig(OUTPUT / "lidar_front_trigger_cohort_comparison.png", dpi=150)
+        plt.close(fig)
+
     def _save_phase_summary(self):
         """Summarize actual cohort phases and descriptive false onsets."""
         phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
@@ -528,6 +674,12 @@ class DiagnosticCollector:
         print("retrospective_event_summary:")
         for key, value in events.items():
             print(f"  {key}={value if value is not None else 'not observed'}")
+        for cohort in self.lateral_states:
+            print(
+                f"  {cohort}: ratio={self._cohort_event(cohort, 'ratio_gt_1_28')}, "
+                f"dwell={self._cohort_event(cohort, 'dwell_positive')}, "
+                f"sustained={self._cohort_event(cohort, 'sustained_marker')}"
+            )
         markers = (
             ("lateral_ratio_gt_1_1", "ratio>1.1"),
             ("lateral_ratio_gt_1_28", "ratio>1.28"),
