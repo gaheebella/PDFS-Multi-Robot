@@ -63,7 +63,7 @@ class DiagnosticCollector:
     def __init__(self, simulate_lidar):
         self.simulate_lidar = simulate_lidar
         self.rows: list[dict] = []
-        configured = os.environ.get("SPH_DFS_LIDAR_ROBOT_ID")
+        configured = os.environ.get("SPH_DFS_LIDAR_ROBOT_ID", "27")
         self.lidar_id: int | None = int(configured) if configured else None
         self.previous_ranges: np.ndarray | None = None
         self.previous_yaw: float | None = None
@@ -72,6 +72,7 @@ class DiagnosticCollector:
         self.previous_variance: float | None = None
         self.diagnostic_baseline = 0.0
         self.diagnostic_dwell = 0.0
+        self.front_maintenance_dwell = 0.0
         self.last_sample_timestamp: float | None = None
         self.sample_interval_s = 0.1
         self.polygon, self.max_range, self.gt_center = _cross_geometry()
@@ -125,7 +126,59 @@ class DiagnosticCollector:
         self.previous_variance = variance
         return variance, self.diagnostic_baseline, delta, ratio, self.diagnostic_dwell, rate
 
-    def sample(self, manager, robots, timestamp, globals_dict):
+    def _local_front_maintenance(self, lidar, robots, forward, dt, globals_dict):
+        """Apply a weak bias only while local neighbors show persistent burial."""
+        comm_range = float(globals_dict.get("COMM_RANGE", 54.0 * 0.70))
+        robot_radius = float(globals_dict.get("ROBOT_RADIUS", 1.60 * 0.70))
+        peers = [
+            peer for peer in robots
+            if peer is not lidar and peer.role == "NORMAL"
+            and peer.connected_to_base
+            and lidar.position.distance_to(peer.position) <= comm_range
+        ]
+        forward_rows, rear_rows = [], []
+        for peer in peers:
+            longitudinal = (peer.position - lidar.position).dot(forward)
+            if longitudinal > robot_radius:
+                forward_rows.append((longitudinal, peer))
+            elif longitudinal < -robot_radius:
+                rear_rows.append((-longitudinal, peer))
+        forward_speeds = [peer.observed_velocity.dot(forward) for _, peer in forward_rows]
+        own_forward_speed = lidar.observed_velocity.dot(forward)
+        mean_forward_speed = float(np.mean(forward_speeds)) if forward_speeds else None
+        # A local burial signature is a nearby forward layer moving faster than
+        # the LiDAR robot while a rear layer still preserves connectivity.
+        buried_signature = (
+            bool(forward_rows) and bool(rear_rows)
+            and mean_forward_speed is not None
+            and own_forward_speed < mean_forward_speed
+        )
+        state = "FRONT" if not forward_rows else (
+            "BURIED" if buried_signature else "UNCERTAIN"
+        )
+        self.front_maintenance_dwell = (
+            self.front_maintenance_dwell + dt if state == "BURIED" else 0.0
+        )
+        required = float(globals_dict.get("JUNCTION_EXPANSION_DWELL_TIME", 0.14))
+        active = state == "BURIED" and self.front_maintenance_dwell >= required and bool(rear_rows)
+        push_speed = float(globals_dict.get("PRESSURE_PUSH_MAX_SPEED", 42.0 * 0.70))
+        bias = forward * (0.08 * push_speed) if active else type(forward)()
+        if active:
+            lidar.velocity += bias * dt
+        ranges = [value for value, _ in forward_rows]
+        return {
+            "local_forward_neighbor_count": len(forward_rows),
+            "local_rear_neighbor_count": len(rear_rows),
+            "nearest_forward_neighbor_range": min(ranges) if ranges else "",
+            "mean_forward_neighbor_range": float(np.mean(ranges)) if ranges else "",
+            "local_front_state": state,
+            "front_maintenance_active": active,
+            "front_maintenance_bias": float(bias.length()),
+            "local_neighbor_connectivity_count": len(peers),
+            "front_neighbor_mean_forward_speed": mean_forward_speed if mean_forward_speed is not None else "",
+        }
+
+    def sample(self, manager, robots, timestamp, dt, globals_dict):
         if (
             self.last_sample_timestamp is not None
             and timestamp - self.last_sample_timestamp < self.sample_interval_s - 1e-9
@@ -153,6 +206,7 @@ class DiagnosticCollector:
         all_progress = [(r.position - front_center).dot(forward) for r in mobile]
         frontier_max = max(all_progress)
         global_rank = sum(value > global_projection for value in all_progress) + 1
+        maintenance = self._local_front_maintenance(lidar, robots, forward, dt, globals_dict)
 
         velocity = lidar.observed_velocity
         raw_heading = ""
@@ -202,6 +256,13 @@ class DiagnosticCollector:
             "raw_local_heading_deg": raw_heading,
             "stable_local_heading_deg": yaw,
             "heading_flip_corrected": heading_flip_corrected,
+            "lidar_local_forward_speed": float(lidar.observed_velocity.dot(forward)),
+            **maintenance,
+            "lidar_minus_front_mean_speed": (
+                "" if maintenance["front_neighbor_mean_forward_speed"] == ""
+                else float(lidar.observed_velocity.dot(forward))
+                - maintenance["front_neighbor_mean_forward_speed"]
+            ),
             "lateral_variance": variance,
             "lateral_baseline": baseline,
             "lateral_variance_delta": variance_delta,
@@ -263,7 +324,10 @@ def run() -> None:
     def local_trace(frame, event, arg):
         if event == "return":
             local = frame.f_locals
-            collector.sample(local["self"], local["robots"], local["timestamp"], frame.f_globals)
+            collector.sample(
+                local["self"], local["robots"], local["timestamp"],
+                local["dt"], frame.f_globals,
+            )
         return local_trace
 
     def global_trace(frame, event, arg):
