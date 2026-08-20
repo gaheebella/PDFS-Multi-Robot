@@ -83,7 +83,13 @@ class DiagnosticCollector:
             "LOCAL_FRONT_COHORT": {"previous_variance": None, "baseline": 0.0, "dwell": 0.0},
         }
         self.previous_local_membership: set[int] = set()
+        self.previous_surface_membership: set[int] = set()
         self.local_membership_rows: list[dict] = []
+        self.speed_audit_rows: list[dict] = []
+        self.neighbor_audit_rows: list[dict] = []
+        self.boundary_robot_rows: list[dict] = []
+        self.boundary_thresholds = (90, 120, 150, 180)
+        self.previous_boundary_ids = {threshold: set() for threshold in self.boundary_thresholds}
         self.front_maintenance_dwell = 0.0
         self.previous_frontmost_signed_boundary: float | None = None
         self.previous_observed_signed_boundary: float | None = None
@@ -164,7 +170,86 @@ class DiagnosticCollector:
         union = self.previous_local_membership | current_ids
         overlap = len(self.previous_local_membership & current_ids) / len(union) if union else 1.0
         self.previous_local_membership = current_ids
-        return tuple(robot_by_id[robot_id] for robot_id in surface_ids), tuple(robot_by_id[robot_id] for robot_id in cohort_ids), direction_unavailable, overlap
+        surface_union = self.previous_surface_membership | surface_ids
+        retention = len(self.previous_surface_membership & surface_ids) / len(self.previous_surface_membership) if self.previous_surface_membership else 1.0
+        new_fraction = len(surface_ids - self.previous_surface_membership) / len(surface_ids) if surface_ids else 0.0
+        self.previous_surface_membership = surface_ids
+        return tuple(robot_by_id[robot_id] for robot_id in surface_ids), tuple(robot_by_id[robot_id] for robot_id in cohort_ids), direction_unavailable, overlap, retention, new_fraction
+
+    def _audit_speed_and_neighbors(self, mobile, globals_dict, timestamp, phase):
+        """Record speed distributions and compare diagnostic/physics sets.
+
+        ``compute_sph_forces`` uses the physics cell search, excludes self and
+        PEBBLE roles, and accepts ``0 < distance**2 <= SMOOTHING_LENGTH**2``.
+        For this mobile NORMAL-only diagnostic cohort, the equivalent set is
+        reconstructed without changing production code.
+        """
+        min_speed = float(globals_dict.get("JUNCTION_COHORT_MIN_SPEED", 1.2))
+        support = float(globals_dict.get("SMOOTHING_LENGTH", 22.0 * 0.70))
+        for robot in mobile:
+            speed = float(robot.observed_velocity.length())
+            self.speed_audit_rows.append({
+                "timestamp": float(timestamp), "speed": speed,
+                "direction_available": speed >= min_speed,
+                "evaluation_only_sph_phase": phase,
+            })
+            diagnostic = {
+                peer.robot_id for peer in mobile
+                if peer is not robot and robot.position.distance_to(peer.position) <= support
+            }
+            physics = {
+                peer.robot_id for peer in mobile
+                if peer is not robot
+                and peer.role != "PEBBLE"
+                and 0.0 < robot.position.distance_squared_to(peer.position) <= support * support
+            }
+            union = diagnostic | physics
+            intersection = diagnostic & physics
+            self.neighbor_audit_rows.append({
+                "timestamp": float(timestamp), "robot_id": robot.robot_id,
+                "evaluation_only_sph_phase": phase,
+                "diagnostic_neighbor_count": len(diagnostic),
+                "physics_neighbor_count": len(physics),
+                "intersection_count": len(intersection), "union_count": len(union),
+                "jaccard": len(intersection) / len(union) if union else 1.0,
+                "diagnostic_only_count": len(diagnostic - physics),
+                "physics_only_count": len(physics - diagnostic),
+                "exact_match": diagnostic == physics,
+            })
+
+    def _angular_boundary_topology(self, mobile, globals_dict, timestamp, phase, lidar, yaw):
+        """Find velocity-independent local boundary candidates by angular gap."""
+        support = float(globals_dict.get("SMOOTHING_LENGTH", 22.0 * 0.70))
+        max_gaps = {}
+        neighbor_counts = {}
+        for robot in mobile:
+            neighbors = [peer for peer in mobile if peer is not robot and robot.position.distance_to(peer.position) <= support]
+            bearings = sorted(math.atan2(peer.position.y - robot.position.y, peer.position.x - robot.position.x) % (2.0 * math.pi) for peer in neighbors)
+            if not bearings:
+                max_gap = 360.0
+            elif len(bearings) == 1:
+                max_gap = 360.0
+            else:
+                gaps = [bearings[index + 1] - bearings[index] for index in range(len(bearings) - 1)]
+                gaps.append((bearings[0] + 2.0 * math.pi) - bearings[-1])
+                max_gap = math.degrees(max(gaps))
+            max_gaps[robot.robot_id] = max_gap
+            neighbor_counts[robot.robot_id] = len(neighbors)
+            dx = robot.position.x - lidar.position.x
+            dy = robot.position.y - lidar.position.y
+            yaw_rad = math.radians(yaw)
+            local_x = dx * math.cos(yaw_rad) + dy * math.sin(yaw_rad)
+            local_y = -dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
+            self.boundary_robot_rows.append({"timestamp": float(timestamp), "phase": phase, "robot_id": robot.robot_id, "physics_neighbor_count": len(neighbors), "max_neighbor_angular_gap_deg": max_gap, "direction_available": robot.observed_velocity.length() >= float(globals_dict.get("JUNCTION_COHORT_MIN_SPEED", 1.2)), "forward_neighbor_zero": False, "in_existing_front_cohort": False, "local_x": local_x, "local_y": local_y, "local_bearing_deg": math.degrees(math.atan2(local_y, local_x))})
+        boundary_sets = {}
+        for threshold in self.boundary_thresholds:
+            current = {robot_id for robot_id, gap in max_gaps.items() if gap >= threshold}
+            previous = self.previous_boundary_ids[threshold]
+            retention = len(previous & current) / len(previous) if previous else 1.0
+            new_fraction = len(current - previous) / len(current) if current else 0.0
+            self.previous_boundary_ids[threshold] = current
+            boundary_sets[threshold] = (current, retention, new_fraction)
+        return max_gaps, neighbor_counts, boundary_sets
 
     def _lateral_features(self, observed, forward, globals_dict, timestamp, state):
         """Apply the unchanged lateral math to one independent cohort state."""
@@ -325,7 +410,7 @@ class DiagnosticCollector:
         front, forward, projections, observed = self._front_features(mobile, globals_dict)
         if not front or forward is None:
             return
-        local_surface, local_cohort, direction_unavailable, local_overlap = self._local_front_topology(
+        local_surface, local_cohort, direction_unavailable, local_overlap, surface_retention, surface_new_fraction = self._local_front_topology(
             mobile, globals_dict, timestamp
         )
         if self.lidar_id is None:
@@ -357,6 +442,7 @@ class DiagnosticCollector:
             frontmost_signed_boundary,
             observed_signed_boundary,
         ) = self._sph_evaluation_geometry(front, observed)
+        self._audit_speed_and_neighbors(mobile, globals_dict, timestamp, sph_phase)
         # All three sets are selected from local robot geometry only.  The
         # reduced radius is tied to the existing communication/sensing scale,
         # rather than an experiment-specific tuned distance.
@@ -389,6 +475,12 @@ class DiagnosticCollector:
             yaw = self.previous_yaw
         else:
             yaw = math.degrees(math.atan2(forward.y, forward.x))
+        max_gaps, boundary_neighbor_counts, boundary_sets = self._angular_boundary_topology(
+            mobile, globals_dict, timestamp, sph_phase, lidar, yaw
+        )
+        for item in self.boundary_robot_rows[-len(mobile):]:
+            item["forward_neighbor_zero"] = item["robot_id"] in {robot.robot_id for robot in local_surface}
+            item["in_existing_front_cohort"] = item["robot_id"] in {robot.robot_id for robot in front}
         scan = self.simulate_lidar(
             polygon_points=self.polygon,
             anchor_xy=(lidar.position.x, lidar.position.y),
@@ -479,6 +571,10 @@ class DiagnosticCollector:
             "local_front_cohort_robot_count": len(local_cohort),
             "local_front_direction_unavailable_count": direction_unavailable,
             "local_front_cohort_jaccard_overlap": local_overlap,
+            "forward_zero_neighbor_count": len(local_surface),
+            "forward_zero_neighbor_fraction": len(local_surface) / max(len(mobile) - direction_unavailable, 1),
+            "surface_robot_id_retention_fraction": surface_retention,
+            "surface_robot_new_fraction": surface_new_fraction,
             # Descriptive analysis markers only; these are not production
             # trigger thresholds and do not affect robot behavior.
             "lateral_ratio_gt_1_1": expansion_ratio > 1.1,
@@ -486,6 +582,14 @@ class DiagnosticCollector:
             "lateral_dwell_positive": expansion_dwell > 0.0,
             "scan_change_gt_5": bool(scan_change != "" and scan_change > 5.0),
         }
+        for threshold in self.boundary_thresholds:
+            current, retention, new_fraction = boundary_sets[threshold]
+            prefix = f"boundary_gap{threshold}"
+            row[f"{prefix}_count"] = len(current)
+            row[f"{prefix}_fraction"] = len(current) / max(len(mobile), 1)
+            row[f"{prefix}_retention_fraction"] = retention
+            row[f"{prefix}_new_fraction"] = new_fraction
+            row[f"{prefix}_max_gap_mean"] = float(np.mean([max_gaps[robot_id] for robot_id in max_gaps])) if max_gaps else ""
         for cohort_name, values in cohort_features.items():
             prefix = cohort_name.lower()
             row.update({
@@ -518,6 +622,16 @@ class DiagnosticCollector:
                 f"{prefix}_dwell_positive": values[4] > 0.0,
                 f"{prefix}_sustained_marker": values[4] > 0.0 and values[5] > 0.0,
             })
+        if self.rows:
+            dt_sample = max(float(timestamp) - self.rows[-1]["timestamp"], 1e-12)
+            row["forward_zero_neighbor_count_rate"] = (row["forward_zero_neighbor_count"] - self.rows[-1]["forward_zero_neighbor_count"]) / dt_sample
+            row["forward_zero_neighbor_fraction_rate"] = (row["forward_zero_neighbor_fraction"] - self.rows[-1]["forward_zero_neighbor_fraction"]) / dt_sample
+        else:
+            row["forward_zero_neighbor_count_rate"] = 0.0
+            row["forward_zero_neighbor_fraction_rate"] = 0.0
+        recent = self.rows[-2:] + [row]
+        row["surface_count_ma"] = float(np.mean([r["forward_zero_neighbor_count"] for r in recent]))
+        row["surface_fraction_ma"] = float(np.mean([r["forward_zero_neighbor_fraction"] for r in recent]))
         self.rows.append(row)
 
     def save(self):
@@ -535,6 +649,9 @@ class DiagnosticCollector:
         self._save_cohort_events()
         self._save_cohort_plot()
         self._save_local_front_outputs()
+        self._save_local_front_audit()
+        self._save_surface_peak_audit()
+        self._save_sph_boundary_audit()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
@@ -781,6 +898,164 @@ class DiagnosticCollector:
         for axis, label in zip(axes, ("robot count", "expansion ratio", "variance", "signed boundary distance", "membership overlap")):
             axis.set_ylabel(label); axis.legend(loc="best")
         axes[-1].set_xlabel("time [s]"); fig.suptitle("Local front topology shadow comparison (GT evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_front_shadow_comparison.png", dpi=150); plt.close(fig)
+
+    def _save_local_front_audit(self):
+        """Persist speed/neighbor audits without changing detector membership."""
+        with (OUTPUT / "local_front_speed_samples.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = ["timestamp", "speed", "direction_available", "evaluation_only_sph_phase"]
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(self.speed_audit_rows)
+        with (OUTPUT / "local_front_neighbor_consistency.csv").open("w", newline="", encoding="utf-8") as handle:
+            fields = list(self.neighbor_audit_rows[0]) if self.neighbor_audit_rows else ["timestamp"]
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(self.neighbor_audit_rows)
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
+        stats_fields = ["phase", "count", "mean", "std", "min", "p10", "p25", "median", "p75", "p90", "max", "direction_available_count", "direction_unavailable_count", "direction_available_fraction", "available_mean", "available_median", "available_p10", "available_p90", "unavailable_mean", "unavailable_median", "unavailable_p10", "unavailable_p90"]
+        with (OUTPUT / "local_front_speed_distribution.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=stats_fields); writer.writeheader()
+            for phase in phases:
+                rows = [r for r in self.speed_audit_rows if r["evaluation_only_sph_phase"] == phase]
+                values = np.asarray([r["speed"] for r in rows], dtype=float)
+                available = np.asarray([r["speed"] for r in rows if r["direction_available"]], dtype=float)
+                unavailable = np.asarray([r["speed"] for r in rows if not r["direction_available"]], dtype=float)
+                percentiles = np.percentile(values, [10, 25, 50, 75, 90]) if len(values) else []
+                def group_stats(group):
+                    if not len(group): return ["", "", "", ""]
+                    return [float(np.mean(group)), float(np.median(group)), float(np.percentile(group, 10)), float(np.percentile(group, 90))]
+                writer.writerow({"phase": phase, "count": len(values), "mean": float(np.mean(values)) if len(values) else "", "std": float(np.std(values)) if len(values) else "", "min": float(np.min(values)) if len(values) else "", "p10": percentiles[0] if len(values) else "", "p25": percentiles[1] if len(values) else "", "median": percentiles[2] if len(values) else "", "p75": percentiles[3] if len(values) else "", "p90": percentiles[4] if len(values) else "", "max": float(np.max(values)) if len(values) else "", "direction_available_count": len(available), "direction_unavailable_count": len(unavailable), "direction_available_fraction": len(available) / len(values) if len(values) else "", "available_mean": group_stats(available)[0], "available_median": group_stats(available)[1], "available_p10": group_stats(available)[2], "available_p90": group_stats(available)[3], "unavailable_mean": group_stats(unavailable)[0], "unavailable_median": group_stats(unavailable)[1], "unavailable_p10": group_stats(unavailable)[2], "unavailable_p90": group_stats(unavailable)[3]})
+        neighbor_fields = ["phase", "sample_count", "diagnostic_neighbor_mean", "physics_neighbor_mean", "jaccard_mean", "jaccard_median", "jaccard_p10", "jaccard_min", "diagnostic_only_fraction", "physics_only_fraction", "exact_match_fraction"]
+        with (OUTPUT / "local_front_neighbor_audit_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=neighbor_fields); writer.writeheader()
+            for phase in phases:
+                rows = [r for r in self.neighbor_audit_rows if r["evaluation_only_sph_phase"] == phase]
+                j = np.asarray([r["jaccard"] for r in rows], dtype=float)
+                writer.writerow({"phase": phase, "sample_count": len(rows), "diagnostic_neighbor_mean": float(np.mean([r["diagnostic_neighbor_count"] for r in rows])) if rows else "", "physics_neighbor_mean": float(np.mean([r["physics_neighbor_count"] for r in rows])) if rows else "", "jaccard_mean": float(np.mean(j)) if len(j) else "", "jaccard_median": float(np.median(j)) if len(j) else "", "jaccard_p10": float(np.percentile(j, 10)) if len(j) else "", "jaccard_min": float(np.min(j)) if len(j) else "", "diagnostic_only_fraction": sum(r["diagnostic_only_count"] for r in rows) / max(sum(r["union_count"] for r in rows), 1), "physics_only_fraction": sum(r["physics_only_count"] for r in rows) / max(sum(r["union_count"] for r in rows), 1), "exact_match_fraction": sum(r["exact_match"] for r in rows) / len(rows) if rows else ""})
+        time = sorted({r["timestamp"] for r in self.speed_audit_rows})
+        fig, axes = plt.subplots(5, 1, figsize=(11, 13), sharex=True)
+        for phase in phases:
+            rows = [r for r in self.speed_audit_rows if r["evaluation_only_sph_phase"] == phase]
+            if not rows: continue
+        by_time = {}
+        for r in self.speed_audit_rows: by_time.setdefault(r["timestamp"], []).append(r)
+        axes[0].plot(time, [len(by_time[t]) for t in time], label="mobile")
+        axes[0].plot(time, [sum(r["direction_available"] for r in by_time[t]) for t in time], label="available")
+        axes[0].plot(time, [sum(not r["direction_available"] for r in by_time[t]) for t in time], label="unavailable")
+        axes[1].boxplot([[r["speed"] for r in self.speed_audit_rows if r["evaluation_only_sph_phase"] == p] for p in phases], tick_labels=phases, showfliers=False)
+        timeline = {r["timestamp"]: r for r in self.rows}
+        axes[2].plot(time, [timeline[t]["local_front_surface_robot_count"] for t in time], label="surface count")
+        axes[2].plot(time, [sum(r["direction_available"] for r in by_time[t]) / max(len(by_time[t]), 1) for t in time], label="available fraction")
+        audit_time = sorted({r["timestamp"] for r in self.neighbor_audit_rows})
+        audit_by_time = {}
+        for r in self.neighbor_audit_rows: audit_by_time.setdefault(r["timestamp"], []).append(r)
+        axes[3].plot(audit_time, [np.mean([r["diagnostic_neighbor_count"] for r in audit_by_time[t]]) for t in audit_time], label="diagnostic neighbors")
+        axes[3].plot(audit_time, [np.mean([r["physics_neighbor_count"] for r in audit_by_time[t]]) for t in audit_time], label="physics neighbors")
+        axes[4].plot(audit_time, [np.mean([r["jaccard"] for r in audit_by_time[t]]) for t in audit_time], label="neighbor Jaccard")
+        for axis, ylabel in zip(axes, ("robot count", "speed", "surface / availability", "neighbor count", "Jaccard")):
+            axis.set_ylabel(ylabel); axis.legend(loc="best")
+        axes[-1].set_xlabel("time [s]"); fig.suptitle("Local-front direction and SPH-neighbor audit (evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_front_direction_neighbor_audit.png", dpi=150); plt.close(fig)
+
+    def _save_surface_peak_audit(self):
+        """Analyze forward-zero-neighbor population retrospectively only."""
+        fields = ["timestamp", "direction_available_count", "direction_unavailable_count", "forward_zero_neighbor_count", "forward_zero_neighbor_fraction", "forward_zero_neighbor_count_rate", "forward_zero_neighbor_fraction_rate", "surface_count_ma", "surface_fraction_ma", "surface_robot_id_retention_fraction", "surface_robot_new_fraction", "evaluation_only_sph_phase", "evaluation_only_gt_distance_to_opening_boundary", "evaluation_only_front_cohort_center_distance_to_opening_boundary", "evaluation_only_observed_cohort_center_distance_to_opening_boundary", "evaluation_only_frontmost_progress_distance_to_opening_boundary", "lateral_variance", "lateral_expansion_ratio", "lateral_expansion_dwell", "cheap_lidar_free_angular_fraction"]
+        by_time = {}
+        for item in self.speed_audit_rows:
+            by_time.setdefault(item["timestamp"], []).append(item)
+        for row in self.rows:
+            speeds = by_time.get(row["timestamp"], [])
+            row["direction_available_count"] = sum(item["direction_available"] for item in speeds)
+            row["direction_unavailable_count"] = sum(not item["direction_available"] for item in speeds)
+        with (OUTPUT / "local_front_surface_peak_timeline.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows({field: row.get(field, "") for field in fields} for row in self.rows)
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
+        with (OUTPUT / "local_front_surface_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            summary_fields = ["phase", "sample_count", "direction_available_count_mean", "direction_available_fraction_mean", "surface_count_mean", "surface_count_std", "surface_count_max", "surface_fraction_mean", "surface_fraction_std", "surface_fraction_max"]
+            writer = csv.DictWriter(handle, fieldnames=summary_fields); writer.writeheader()
+            for phase in phases:
+                rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
+                counts = [row["forward_zero_neighbor_count"] for row in rows]; fractions = [row["forward_zero_neighbor_fraction"] for row in rows]
+                writer.writerow({"phase": phase, "sample_count": len(rows), "direction_available_count_mean": float(np.mean([row["direction_available_count"] for row in rows])) if rows else "", "direction_available_fraction_mean": float(np.mean([row["direction_available_count"] / max(row["direction_available_count"] + row["direction_unavailable_count"], 1) for row in rows])) if rows else "", "surface_count_mean": float(np.mean(counts)) if rows else "", "surface_count_std": float(np.std(counts)) if rows else "", "surface_count_max": max(counts) if rows else "", "surface_fraction_mean": float(np.mean(fractions)) if rows else "", "surface_fraction_std": float(np.std(fractions)) if rows else "", "surface_fraction_max": max(fractions) if rows else ""})
+        peaks = []
+        for index in range(1, len(self.rows) - 1):
+            previous_row, row, next_row = self.rows[index - 1:index + 2]
+            if row["forward_zero_neighbor_count"] > previous_row["forward_zero_neighbor_count"] and row["forward_zero_neighbor_count"] >= next_row["forward_zero_neighbor_count"] and next_row["forward_zero_neighbor_count"] < row["forward_zero_neighbor_count"]:
+                peaks.append(("surface_count", row))
+            if row["forward_zero_neighbor_fraction"] > previous_row["forward_zero_neighbor_fraction"] and row["forward_zero_neighbor_fraction"] >= next_row["forward_zero_neighbor_fraction"] and next_row["forward_zero_neighbor_fraction"] < row["forward_zero_neighbor_fraction"]:
+                peaks.append(("surface_fraction", row))
+        peaks.sort(key=lambda item: item[1]["forward_zero_neighbor_fraction"], reverse=True)
+        with (OUTPUT / "local_front_surface_peaks.csv").open("w", newline="", encoding="utf-8") as handle:
+            peak_fields = ["peak_type", "timestamp", "phase", "count", "fraction", "opening_boundary_distance", "front_center_boundary_distance", "observed_center_boundary_distance", "frontmost_boundary_distance"]
+            writer = csv.DictWriter(handle, fieldnames=peak_fields); writer.writeheader()
+            for peak_type, row in peaks[:10]:
+                writer.writerow({"peak_type": peak_type, "timestamp": row["timestamp"], "phase": row["evaluation_only_sph_phase"], "count": row["forward_zero_neighbor_count"], "fraction": row["forward_zero_neighbor_fraction"], "opening_boundary_distance": row["evaluation_only_gt_distance_to_opening_boundary"], "front_center_boundary_distance": row["evaluation_only_front_cohort_center_distance_to_opening_boundary"], "observed_center_boundary_distance": row["evaluation_only_observed_cohort_center_distance_to_opening_boundary"], "frontmost_boundary_distance": row["evaluation_only_frontmost_progress_distance_to_opening_boundary"]})
+        max_count = max(self.rows, key=lambda row: row["forward_zero_neighbor_count"])
+        max_fraction = max(self.rows, key=lambda row: row["forward_zero_neighbor_fraction"])
+        print(f"surface_peak_count: t={max_count['timestamp']:.4f}, phase={max_count['evaluation_only_sph_phase']}, count={max_count['forward_zero_neighbor_count']}, fraction={max_count['forward_zero_neighbor_fraction']:.4f}")
+        print(f"surface_peak_fraction: t={max_fraction['timestamp']:.4f}, phase={max_fraction['evaluation_only_sph_phase']}, count={max_fraction['forward_zero_neighbor_count']}, fraction={max_fraction['forward_zero_neighbor_fraction']:.4f}")
+        fig, axes = plt.subplots(6, 1, figsize=(11, 15), sharex=True)
+        time = np.asarray([row["timestamp"] for row in self.rows])
+        axes[0].plot(time, [row["direction_available_count"] for row in self.rows], label="direction available")
+        axes[0].plot(time, [row["direction_unavailable_count"] for row in self.rows], label="direction unavailable")
+        axes[1].plot(time, [row["forward_zero_neighbor_count"] for row in self.rows], label="surface count")
+        axes[1].plot(time, [row["surface_count_ma"] for row in self.rows], label="surface count MA (3 samples)")
+        axes[2].plot(time, [row["forward_zero_neighbor_fraction"] for row in self.rows], label="surface fraction")
+        axes[2].plot(time, [row["surface_fraction_ma"] for row in self.rows], label="surface fraction MA (3 samples)")
+        axes[3].plot(time, [row["lateral_expansion_ratio"] for row in self.rows], label="lateral ratio")
+        axes[3].plot(time, [row["lateral_expansion_dwell"] for row in self.rows], label="lateral dwell")
+        axes[4].plot(time, [row["evaluation_only_frontmost_progress_distance_to_opening_boundary"] for row in self.rows], label="frontmost boundary distance")
+        axes[5].plot(time, [row["cheap_lidar_free_angular_fraction"] for row in self.rows], label="cheap LiDAR free fraction")
+        for axis, ylabel in zip(axes, ("direction count", "surface count", "surface fraction", "lateral expansion", "boundary distance", "LiDAR free")):
+            axis.set_ylabel(ylabel); axis.legend(loc="best")
+            for row in self.rows:
+                if row["evaluation_only_sph_phase"] == "SPH_OPENING_APPROACH": axis.axvspan(row["timestamp"] - 0.05, row["timestamp"] + 0.05, color="tab:green", alpha=0.025)
+        axes[-1].set_xlabel("time [s]"); fig.suptitle("Forward-zero-neighbor surface peak audit (evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_front_surface_peak_audit.png", dpi=150); plt.close(fig)
+
+    def _save_sph_boundary_audit(self):
+        """Export angular-gap boundary shadow comparison and phase summaries."""
+        fields = ["timestamp", "evaluation_only_sph_phase", "front_cohort_robot_count", "forward_zero_neighbor_count", "forward_zero_neighbor_fraction"]
+        for threshold in self.boundary_thresholds:
+            fields.extend([f"boundary_gap{threshold}_{suffix}" for suffix in ("count", "fraction", "retention_fraction", "new_fraction", "max_gap_mean")])
+        with (OUTPUT / "local_sph_boundary_timeline.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows({field: row.get(field, "") for field in fields} for row in self.rows)
+        robot_fields = list(self.boundary_robot_rows[0]) if self.boundary_robot_rows else ["timestamp"]
+        with (OUTPUT / "local_sph_boundary_robot_audit.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=robot_fields); writer.writeheader(); writer.writerows(self.boundary_robot_rows)
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
+        summary_fields = ["threshold", "phase", "sample_count", "boundary_count_mean", "boundary_count_std", "boundary_count_min", "boundary_count_max", "boundary_fraction_mean", "boundary_fraction_std", "boundary_fraction_min", "boundary_fraction_max", "max_gap_mean", "max_gap_median", "boundary_available_fraction", "boundary_forward_zero_overlap_fraction", "front_cohort_boundary_fraction"]
+        with (OUTPUT / "local_sph_boundary_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=summary_fields); writer.writeheader()
+            for threshold in self.boundary_thresholds:
+                for phase in phases:
+                    rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
+                    counts = [row[f"boundary_gap{threshold}_count"] for row in rows]; fractions = [row[f"boundary_gap{threshold}_fraction"] for row in rows]
+                    robot_rows = [row for row in self.boundary_robot_rows if row["phase"] == phase and row["max_neighbor_angular_gap_deg"] >= threshold]
+                    writer.writerow({"threshold": threshold, "phase": phase, "sample_count": len(rows), "boundary_count_mean": float(np.mean(counts)) if counts else "", "boundary_count_std": float(np.std(counts)) if counts else "", "boundary_count_min": min(counts) if counts else "", "boundary_count_max": max(counts) if counts else "", "boundary_fraction_mean": float(np.mean(fractions)) if fractions else "", "boundary_fraction_std": float(np.std(fractions)) if fractions else "", "boundary_fraction_min": min(fractions) if fractions else "", "boundary_fraction_max": max(fractions) if fractions else "", "max_gap_mean": float(np.mean([r["max_neighbor_angular_gap_deg"] for r in robot_rows])) if robot_rows else "", "max_gap_median": float(np.median([r["max_neighbor_angular_gap_deg"] for r in robot_rows])) if robot_rows else "", "boundary_available_fraction": sum(r["direction_available"] for r in robot_rows) / len(robot_rows) if robot_rows else "", "boundary_forward_zero_overlap_fraction": sum(r["forward_neighbor_zero"] for r in robot_rows) / len(robot_rows) if robot_rows else "", "front_cohort_boundary_fraction": sum(r["in_existing_front_cohort"] for r in robot_rows) / len(robot_rows) if robot_rows else ""})
+        comparison_fields = ["timestamp", "phase", "threshold", "front_cohort_count", "boundary_count", "forward_zero_count", "intersection_count", "forward_zero_inside_boundary_fraction", "boundary_also_forward_zero_fraction", "boundary_inside_front_cohort_fraction"]
+        with (OUTPUT / "local_sph_boundary_method_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=comparison_fields); writer.writeheader()
+            for row in self.rows:
+                forward_ids = {item["robot_id"] for item in self.boundary_robot_rows if item["timestamp"] == row["timestamp"] and item["forward_neighbor_zero"]}
+                front_ids = {item["robot_id"] for item in self.boundary_robot_rows if item["timestamp"] == row["timestamp"] and item["in_existing_front_cohort"]}
+                for threshold in self.boundary_thresholds:
+                    boundary_ids = {item["robot_id"] for item in self.boundary_robot_rows if item["timestamp"] == row["timestamp"] and item["max_neighbor_angular_gap_deg"] >= threshold}
+                    writer.writerow({"timestamp": row["timestamp"], "phase": row["evaluation_only_sph_phase"], "threshold": threshold, "front_cohort_count": len(front_ids), "boundary_count": len(boundary_ids), "forward_zero_count": len(forward_ids), "intersection_count": len(boundary_ids & forward_ids), "forward_zero_inside_boundary_fraction": len(forward_ids & boundary_ids) / len(forward_ids) if forward_ids else "", "boundary_also_forward_zero_fraction": len(boundary_ids & forward_ids) / len(boundary_ids) if boundary_ids else "", "boundary_inside_front_cohort_fraction": len(boundary_ids & front_ids) / len(boundary_ids) if boundary_ids else ""})
+        fig, axes = plt.subplots(6, 1, figsize=(11, 15), sharex=True); time = np.asarray([row["timestamp"] for row in self.rows])
+        for threshold in self.boundary_thresholds:
+            axes[0].plot(time, [row[f"boundary_gap{threshold}_count"] for row in self.rows], label=f"gap {threshold}°")
+            axes[1].plot(time, [row[f"boundary_gap{threshold}_fraction"] for row in self.rows], label=f"gap {threshold}°")
+        axes[2].plot(time, [row["forward_zero_neighbor_count"] for row in self.rows], label="forward-zero")
+        axes[2].plot(time, [row["boundary_gap120_count"] for row in self.rows], label="angular boundary 120°")
+        for phase, color in (("SPH_CORRIDOR", "tab:blue"), ("SPH_OPENING_APPROACH", "tab:green"), ("SPH_BOUNDARY_CROSSING", "tab:orange"), ("SPH_JUNCTION_REGION", "tab:red")):
+            phase_rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
+            if phase_rows: axes[3].scatter([phase] * len(phase_rows), [phase_rows[index]["boundary_gap120_fraction"] for index in range(len(phase_rows))], color=color, label=phase)
+        for phase in phases:
+            phase_rows = [row for row in self.boundary_robot_rows if row["phase"] == phase]
+            if phase_rows: axes[4].hist([row["max_neighbor_angular_gap_deg"] for row in phase_rows], bins=18, alpha=0.35, label=phase)
+        sample_indices = [0, next((i for i, row in enumerate(self.rows) if row["evaluation_only_sph_phase"] == "SPH_OPENING_APPROACH"), 0), next((i for i, row in enumerate(self.rows) if row["evaluation_only_sph_phase"] == "SPH_BOUNDARY_CROSSING"), 0), next((i for i, row in enumerate(self.rows) if row["evaluation_only_sph_phase"] == "SPH_JUNCTION_REGION"), 0)]
+        for index in sample_indices:
+            ids = {item["robot_id"] for item in self.boundary_robot_rows if item["timestamp"] == self.rows[index]["timestamp"] and item["max_neighbor_angular_gap_deg"] >= 120}
+            points = [item for item in self.boundary_robot_rows if item["timestamp"] == self.rows[index]["timestamp"]]
+            axes[5].scatter([item["local_x"] for item in points if item["robot_id"] in ids], [item["local_y"] for item in points if item["robot_id"] in ids], s=5, label=f"t={self.rows[index]['timestamp']:.1f}")
+        for axis, ylabel in zip(axes, ("boundary count", "boundary fraction", "method count", "phase fraction", "max gap", "local boundary scatter")):
+            axis.set_ylabel(ylabel); axis.legend(loc="best")
+        axes[-1].set_xlabel("local x / phase"); fig.suptitle("Local SPH angular-gap boundary audit (evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_sph_boundary_audit.png", dpi=150); plt.close(fig)
 
     def _save_phase_summary(self):
         """Summarize actual cohort phases and descriptive false onsets."""
