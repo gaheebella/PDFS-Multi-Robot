@@ -27,6 +27,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "junction_detection/integration/output/pre_exploration_general_pipeline"
 CASES = ("M0_STRAIGHT", "M1_CROSS_BASELINE", "M2_T_JUNCTION", "M3_ANGLED_Y", "M4_ASYMMETRIC_CROSS", "M5_UNEQUAL_WIDTH")
+PROPULSION_MODES = ("production_compression", "local_forward")
 
 # Copied from the production pre-Junction physical parameter block. The
 # physical initialization pulse is retained; branch/DFS forces are excluded.
@@ -101,6 +102,15 @@ BASE_PISTON_REACTION_GAIN = 260.0 * 3.0
 BASE_PISTON_REACTION_FORCE_LIMIT = 260.0 * 3.0
 BASE_PISTON_REACTION_RISE_TIME = 0.25
 BASE_PISTON_REACTION_DURATION = 5.0
+# Evaluation-derived target scale: the production M1 pre-entrance mean speed
+# is about 65 world units/s.  Multiplying by the unchanged viscous damping
+# gives the smallest constant body-forward force with that terminal scale.
+LOCAL_FORWARD_REFERENCE_SPEED = 65.0
+LOCAL_FORWARD_DRIVE_FORCE = DAMPING * LOCAL_FORWARD_REFERENCE_SPEED
+LOCAL_FOLLOWER_DRIVE_WEIGHT = 0.50
+DEPLOYMENT_BODY_YAW_RAD = math.pi / 2.0
+DEFAULT_GUI_SCALE = 0.75
+LOCAL_WALL_CONFINEMENT_MAX_WIDTH = SMOOTHING_LENGTH * 6.0
 
 Point = tuple[float, float]
 Segment = tuple[Point, Point]
@@ -307,6 +317,12 @@ class RobotState:
     density: float = 0.0
     pressure: float = 0.0
     ingress_lane_x: float = 0.0
+    # Explicit deployment-time body pose. Runtime control reads this
+    # proprioceptive yaw; it never queries map/GT Junction geometry.
+    body_yaw_rad: float = DEPLOYMENT_BODY_YAW_RAD
+    heading_parent_id: int | None = None
+    heading_hop: int = -1
+    propulsion_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -373,23 +389,37 @@ class LidarSensor:
 
 class SimulatorWorld:
     """Global physics/world owner; branch metadata never leaves this class."""
-    def __init__(self, geometry: GeometryCase):
+    def __init__(self, geometry: GeometryCase, propulsion_mode: str = "production_compression"):
+        if propulsion_mode not in PROPULSION_MODES:
+            raise ValueError(f"unknown propulsion mode: {propulsion_mode}")
         self.geometry = geometry
+        self.propulsion_mode = propulsion_mode
         self.robots = self._create_robots()
+        self.initial_mean_y = float(np.mean([robot.position[1] for robot in self.robots]))
+        self.initial_front_y = float(max(robot.position[1] for robot in self.robots))
         self.time = 0.0
         self.wall_contacts = self.wall_corrections = 0
         self.rest_lengths: dict[tuple[int, int], float] = {}
-        self.lidar_robot_id = max(self.robots, key=lambda robot: (robot.position[1], -abs(robot.position[0]))).robot_id
+        self.lidar_robot_id = self._select_initial_lidar_leader()
+        self._initialize_local_heading_propagation()
+        lidar = next(robot for robot in self.robots if robot.robot_id == self.lidar_robot_id)
+        self.initial_lidar_position = lidar.position.copy()
         self.sensor = LidarSensor()
         self.lidar_yaw_deg = 90.0
         neighbors = self._neighbors()
         self._densities(neighbors)
-        self.reference_density = float(np.mean([robot.density for robot in self.robots])) * 0.62
+        initial_mean_density = float(np.mean([robot.density for robot in self.robots]))
+        # Both modes use the production normal-SPH reference density. The
+        # local-forward variant skips only artificial energy storage/release.
+        self.reference_density = initial_mean_density * 0.62
         entrance = geometry.entrance_y if geometry.entrance_y is not None else -42.0
         # Production BASE_COMPRESSION_CENTER is 0.60 Base lengths behind the
         # Junction entrance. The sign is converted to this world's +Y ingress.
         self.compression_center = np.array([0.0, entrance - 0.60 * PRODUCTION_BASE_LENGTH])
         self.ingress_target_y = entrance + 96.6
+        self.last_mean_pressure_force = 0.0
+        self.last_mean_repulsion_force = 0.0
+        self.last_mean_lateral_sph_force = 0.0
 
     def _create_robots(self):
         half = self.geometry.incoming_width/2
@@ -402,9 +432,45 @@ class SimulatorWorld:
         robots = []
         for robot_id in range(ROBOT_COUNT):
             row, column = divmod(robot_id, per_row)
-            position = np.array([left+column*GRID_SPACING, bottom+row*GRID_ROW_SPACING])
+            if self.propulsion_mode == "local_forward" and row == ROBOT_COUNT // per_row and ROBOT_COUNT % per_row:
+                partial_count = ROBOT_COUNT % per_row
+                x = (column - 0.5 * (partial_count - 1)) * GRID_SPACING
+            else:
+                x = left + column * GRID_SPACING
+            position = np.array([x, bottom+row*GRID_ROW_SPACING])
             robots.append(RobotState(robot_id, position, ingress_lane_x=float(position[0])))
         return robots
+
+    def _select_initial_lidar_leader(self) -> int:
+        """Select the fixed front-row robot nearest deployment lateral center."""
+        front_y = max(robot.position[1] for robot in self.robots)
+        front = [robot for robot in self.robots if abs(robot.position[1]-front_y) <= EPSILON]
+        xs = [robot.position[0] for robot in self.robots]
+        self.initial_front_center_x = 0.5 * (min(xs) + max(xs))
+        return min(front,key=lambda robot:(abs(robot.position[0]-self.initial_front_center_x),robot.robot_id)).robot_id
+
+    def _initialize_local_heading_propagation(self) -> None:
+        """Propagate leader body heading over the initial local support graph."""
+        by_id = {robot.robot_id: robot for robot in self.robots}
+        neighbors = self._neighbors()
+        leader = by_id[self.lidar_robot_id]
+        leader.heading_hop = 0
+        leader.propulsion_weight = 1.0
+        queue = [leader.robot_id]
+        while queue:
+            parent_id = queue.pop(0)
+            parent = by_id[parent_id]
+            for peer in sorted(neighbors[parent_id],key=lambda robot: robot.robot_id):
+                if peer.heading_hop >= 0:
+                    continue
+                peer.heading_parent_id = parent_id
+                peer.heading_hop = parent.heading_hop + 1
+                peer.body_yaw_rad = parent.body_yaw_rad
+                # All connected followers receive the same weak relayed drive.
+                # A hop gradient stretched the long body despite having the
+                # same mean weight; uniform 0.5 preserves that measured scale.
+                peer.propulsion_weight = LOCAL_FOLLOWER_DRIVE_WEIGHT
+                queue.append(peer.robot_id)
 
     def _grid(self):
         grid = {}
@@ -430,18 +496,29 @@ class SimulatorWorld:
         for robot in self.robots:
             robot.density = max(EPSILON, self_value+sum(_kernel(float(np.linalg.norm(peer.position-robot.position))) for peer in neighbors[robot.robot_id]))
 
+    def _local_wall_confinement(self, robot: RobotState) -> bool:
+        """Detect a corridor from two body-lateral wall ranges only."""
+        lateral = np.array([-math.sin(robot.body_yaw_rad),math.cos(robot.body_yaw_rad)])
+        ranges=[]
+        for direction in (lateral,-lateral):
+            hits=[hit for wall in self.geometry.walls if (hit:=LidarSensor._ray_hit(robot.position,direction,wall)) is not None]
+            ranges.append(min(hits) if hits else math.inf)
+        return all(math.isfinite(value) for value in ranges) and sum(ranges) <= LOCAL_WALL_CONFINEMENT_MAX_WIDTH
+
     def step(self):
         neighbors = self._neighbors(); self._densities(neighbors)
-        pressure_scale = _pressure_scale(self.time)
+        production_mode = self.propulsion_mode == "production_compression"
+        pressure_scale = _pressure_scale(self.time) if production_mode else SPH_PRESSURE_SCALE
         for robot in self.robots:
             ratio = robot.density/max(self.reference_density,EPSILON)
             raw_pressure = max(0.0, PRESSURE_GAIN*robot.density*(ratio**STIFFNESS_EXPONENT-1.0))
             robot.pressure = raw_pressure * pressure_scale
-            stored_floor = PRESSURE_GAIN * robot.density * BASE_STORED_PRESSURE_FLOOR * _stored_pressure_envelope(self.time)
+            stored_floor = PRESSURE_GAIN * robot.density * BASE_STORED_PRESSURE_FLOOR * (_stored_pressure_envelope(self.time) if production_mode else 0.0)
             robot.pressure = max(robot.pressure, stored_floor)
         accelerations = {}
-        equilibrium = _equilibrium_radius(self.time)
-        release_active = BASE_COMPRESSION_DURATION <= self.time < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION
+        equilibrium = _equilibrium_radius(self.time) if production_mode else SAFE_RADIUS * NORMAL_EQUILIBRIUM_SCALE
+        release_active = production_mode and BASE_COMPRESSION_DURATION <= self.time < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION
+        pressure_magnitudes=[]; repulsion_magnitudes=[]; lateral_sph_magnitudes=[]
         for robot in self.robots:
             pressure=np.zeros(2); viscosity=np.zeros(2); elastic=np.zeros(2); repulsion=np.zeros(2)
             for peer in neighbors[robot.robot_id]:
@@ -480,7 +557,17 @@ class SimulatorWorld:
             pressure=_limit(pressure,INITIAL_RELEASE_PRESSURE_FORCE_LIMIT if release_active else PRESSURE_FORCE_LIMIT)
             if release_active: viscosity *= INITIAL_RELEASE_VISCOSITY_MULTIPLIER
             viscosity=_limit(viscosity,VISCOSITY_FORCE_LIMIT); elastic=_limit(elastic,VISCOELASTIC_FORCE_LIMIT)
-            if self.time < BASE_COMPRESSION_DURATION:
+            sph_force=pressure+viscosity+elastic+repulsion
+            pressure_magnitudes.append(float(np.linalg.norm(pressure)))
+            repulsion_magnitudes.append(float(np.linalg.norm(repulsion)))
+            lateral_sph_magnitudes.append(abs(float(sph_force[0])))
+            if not production_mode:
+                # The command is [forward, lateral]=[F, 0] in the robot body
+                # frame, transformed solely for physics integration.
+                route = np.array([
+                    math.cos(robot.body_yaw_rad), math.sin(robot.body_yaw_rad)
+                ]) * LOCAL_FORWARD_DRIVE_FORCE * robot.propulsion_weight
+            elif self.time < BASE_COMPRESSION_DURATION:
                 compression = self.compression_center - robot.position
                 distance = float(np.linalg.norm(compression))
                 scale = min(1.0, max(0.15, distance / max(self.geometry.incoming_width * 0.55 / 2.0, EPSILON)))
@@ -494,16 +581,22 @@ class SimulatorWorld:
             entrance=self.geometry.entrance_y if self.geometry.entrance_y is not None else -42.0
             base_depth=float(np.clip((entrance-robot.position[1])/PRODUCTION_BASE_LENGTH,0.0,1.0))
             normalized_pressure=robot.pressure/max(PRESSURE_GAIN*robot.density,EPSILON)
-            piston_magnitude=min(BASE_PISTON_REACTION_FORCE_LIMIT,BASE_PISTON_REACTION_GAIN*normalized_pressure*_smoothstep(base_depth)*_base_piston_envelope(self.time))
+            piston_magnitude=(min(BASE_PISTON_REACTION_FORCE_LIMIT,BASE_PISTON_REACTION_GAIN*normalized_pressure*_smoothstep(base_depth)*_base_piston_envelope(self.time)) if production_mode else 0.0)
             piston=np.array([0.0,piston_magnitude])
             total=pressure+viscosity+elastic+repulsion+route+piston-(DAMPING+(INITIAL_RELEASE_EXTRA_DAMPING if release_active else 0.0))*robot.velocity
             raw=_limit(total,MAX_ACCELERATION)
             alpha = INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA
             accelerations[robot.robot_id]=(1-alpha)*robot.acceleration+alpha*raw
+        self.last_mean_pressure_force=float(np.mean(pressure_magnitudes))
+        self.last_mean_repulsion_force=float(np.mean(repulsion_magnitudes))
+        self.last_mean_lateral_sph_force=float(np.mean(lateral_sph_magnitudes))
         for robot in self.robots:
             old=robot.position.copy(); robot.acceleration=accelerations[robot.robot_id]; robot.velocity += robot.acceleration*DT
-            # Production applies corridor-lateral damping before speed clamp.
-            robot.velocity[0] *= math.exp(-CORRIDOR_LATERAL_VELOCITY_DAMPING*DT)
+            # LOCAL_FORWARD uses only two body-lateral wall ranges: damping is
+            # active in a bounded corridor and disappears naturally when an
+            # opening makes either side unbounded. No GT phase is consulted.
+            if production_mode or self._local_wall_confinement(robot):
+                robot.velocity[0] *= math.exp(-CORRIDOR_LATERAL_VELOCITY_DAMPING*DT)
             robot.velocity=_limit(robot.velocity,MAX_SPEED)
             # Production Robot.update performs axis-separated is_walkable
             # checks and damps/rebounds only the blocked velocity component.
@@ -548,9 +641,14 @@ class SimulatorWorld:
             "max_speed":float(np.max(np.linalg.norm(velocities,axis=1))),"mean_speed_sanity":float(np.mean(np.linalg.norm(velocities,axis=1))),
             "min_inter_robot_distance":minimum,"mean_nearest_neighbor_distance_sanity":float(np.mean(nearest_all)),
             "overlap_pair_count":overlap_pairs,"maximum_pair_penetration":maximum_penetration,
-            "swarm_lateral_span_sanity":float(np.ptp(positions[:,0])),"swarm_longitudinal_span_sanity":float(np.ptp(positions[:,1]))}
+            "swarm_lateral_span_sanity":float(np.ptp(positions[:,0])),"swarm_longitudinal_span_sanity":float(np.ptp(positions[:,1])),
+            "mean_density":float(np.mean([robot.density for robot in self.robots])),"density_std":float(np.std([robot.density for robot in self.robots])),
+            "mean_pressure":float(np.mean([robot.pressure for robot in self.robots])),"mean_pressure_force":self.last_mean_pressure_force,
+            "mean_repulsion_force":self.last_mean_repulsion_force,"mean_lateral_sph_force":self.last_mean_lateral_sph_force}
 
     def initialization_phase(self) -> str:
+        if self.propulsion_mode == "local_forward":
+            return "LOCAL_FORWARD"
         if self.time < BASE_COMPRESSION_DURATION:
             return "INITIAL_COMPRESSION"
         if self.time < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION:
@@ -663,7 +761,8 @@ class GroundTruthEvaluator:
     """Evaluation-only world/geometry consumer."""
     def __init__(self, geometry): self.geometry=geometry
     def evaluate(self, world, runtime, local_mask):
-        if self.geometry.entrance_y is None: return {"gt_phase":"CORRIDOR_ONLY","gt_frontmost_crossed":False,"gt_reference_front_crossed":False,"gt_local_front_crossed":False}
+        progress={"gt_mean_forward_progress":float(np.mean([robot.position[1] for robot in world.robots])-world.initial_mean_y),"gt_frontmost_forward_progress":float(max(robot.position[1] for robot in world.robots)-world.initial_front_y)}
+        if self.geometry.entrance_y is None: return {"gt_phase":"CORRIDOR_ONLY","gt_frontmost_crossed":False,"gt_reference_front_crossed":False,"gt_local_front_crossed":False,**progress}
         entrance=self.geometry.entrance_y; frontmost=max(robot.position[1] for robot in world.robots)
         ids=np.array([robot.robot_id for robot in world.robots]); positions=np.array([robot.position for robot in world.robots]); forward=np.array([runtime["common_forward_x"],runtime["common_forward_y"]]); center=np.mean(positions,axis=0); projections=(positions-center)@forward; ref=positions[projections>=np.quantile(projections,REFERENCE_FRONT_QUANTILE)]
         local_positions=positions[local_mask]
@@ -674,38 +773,49 @@ class GroundTruthEvaluator:
         elif frontmost<entrance: phase="OPENING_APPROACH"
         elif ref_y<entrance: phase="BOUNDARY_CROSSING"
         else: phase="JUNCTION_REGION"
-        return {"gt_phase":phase,"gt_frontmost_crossed":frontmost>=entrance,"gt_reference_front_crossed":ref_y>=entrance,"gt_local_front_crossed":bool(math.isfinite(local_center_y) and local_center_y>=entrance)}
+        return {"gt_phase":phase,"gt_frontmost_crossed":frontmost>=entrance,"gt_reference_front_crossed":ref_y>=entrance,"gt_local_front_crossed":bool(math.isfinite(local_center_y) and local_center_y>=entrance),**progress}
 
 
 class SimulationRunner:
-    def __init__(self, case_id):
-        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None
+    def __init__(self, case_id, propulsion_mode="production_compression"):
+        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None
     def step(self, frame):
         self.world.step()
         if frame%max(1,round(SAMPLE_PERIOD/DT)): return None
         observation=LocalObservationBuilder.build(self.world); swarm,visual=self.swarm.analyze(observation); lidar=self.lidar.analyze(observation.lidar_scan)
-        row={"map_case":self.geometry.case_id,"frame":frame,"timestamp":self.world.time,"initialization_phase":self.world.initialization_phase(),"lidar_robot_id":self.world.lidar_robot_id,**swarm,**lidar,**self.world.sanity()}
+        row={"map_case":self.geometry.case_id,"propulsion_mode":self.world.propulsion_mode,"frame":frame,"timestamp":self.world.time,"initialization_phase":self.world.initialization_phase(),"lidar_robot_id":self.world.lidar_robot_id,"lidar_initial_x":float(self.world.initial_lidar_position[0]),"lidar_initial_y":float(self.world.initial_lidar_position[1]),"lidar_initial_front_center_offset":float(self.world.initial_lidar_position[0]-self.world.initial_front_center_x),**swarm,**lidar,**self.world.sanity()}
         row.update(self.gt.evaluate(self.world,row,visual["local_mask"])); self.rows.append(row); self.last_visual=(observation,visual); return row
 
 
-def run_headless(case_id,frames):
-    runner=SimulationRunner(case_id)
+def run_headless(case_id,frames,propulsion_mode="production_compression"):
+    runner=SimulationRunner(case_id,propulsion_mode)
     for frame in range(frames): runner.step(frame)
     return runner
 
 
 def save_case(runner,output):
-    folder=output/runner.geometry.case_id; folder.mkdir(parents=True,exist_ok=True)
+    folder=output/runner.geometry.case_id
+    if runner.world.propulsion_mode != "production_compression":
+        folder=output/runner.world.propulsion_mode/runner.geometry.case_id
+    folder.mkdir(parents=True,exist_ok=True)
     with (folder/"pre_exploration_timeline.csv").open("w",newline="",encoding="utf-8") as handle:
         writer=csv.DictWriter(handle,fieldnames=list(runner.rows[0])); writer.writeheader(); writer.writerows(runner.rows)
 
 
 class PygameRenderer:
-    def __init__(self, show_trails=False, show_gt=False):
+    def __init__(self, geometry, gui_scale=DEFAULT_GUI_SCALE, show_trails=False, show_gt=False):
         import pygame
         pygame.init(); self.pygame=pygame; self.screen=pygame.display.set_mode((1100,800)); self.clock=pygame.time.Clock(); self.font=pygame.font.Font(None,22)
-        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_trails=show_trails; self.trails=[]
-    def world_to_screen(self,point): return int(550+point[0]*2),int(720-(point[1]+220)*2)
+        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_trails=show_trails; self.trails=[]; self.gui_scale=gui_scale
+        self.configure_camera(geometry)
+    def configure_camera(self,geometry):
+        vertices=np.array([point for rect in geometry.free_rects for point in rect.vertices],dtype=float)
+        minimum=np.min(vertices,axis=0); maximum=np.max(vertices,axis=0); span=np.maximum(maximum-minimum,1.0)
+        self.camera_center=0.5*(minimum+maximum)
+        self.pixels_per_world=self.gui_scale*min(1020.0/(span[0]+40.0),700.0/(span[1]+40.0))
+    def world_to_screen(self,point):
+        relative=np.asarray(point)-self.camera_center
+        return int(550+relative[0]*self.pixels_per_world),int(430-relative[1]*self.pixels_per_world)
     def draw(self,runner,frame):
         pygame=self.pygame; self.screen.fill((18,22,28))
         for rect in runner.geometry.free_rects: pygame.draw.polygon(self.screen,(48,56,65),[self.world_to_screen(point) for point in rect.vertices])
@@ -732,27 +842,27 @@ class PygameRenderer:
             for angle,range_value in zip(scan.angles_deg[::8],scan.ranges[::8]):
                 radians=math.radians(runner.world.lidar_yaw_deg+angle); endpoint=lidar.position+np.array([math.cos(radians),math.sin(radians)])*range_value
                 pygame.draw.line(self.screen,(90,90,55),self.world_to_screen(lidar.position),self.world_to_screen(endpoint),1)
-        latest=runner.rows[-1] if runner.rows else {}; hud=[f"Map {runner.geometry.case_id} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id}","SPACE pause R reset 1-6 map G GT D diagnostics L rays T trails ESC quit"]
+        latest=runner.rows[-1] if runner.rows else {}; hud=[f"Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} auto-centered","SPACE pause R reset 1-6 map G GT D diagnostics L rays T trails ESC quit"]
         if self.show_diagnostics and latest: hud += [f"init phase={latest['initialization_phase']}",f"min distance={latest['min_inter_robot_distance']:.3f} overlap pairs={latest['overlap_pair_count']} max speed={latest['max_speed']:.2f}",f"wall contacts={latest['wall_contact_count']} projection corrections={latest['wall_projection_correction_count']}",f"local/reference front={latest['local_front_size']}/{latest['reference_front_size']} lateral span={latest['local_front_lateral_span']:.2f}",f"motion spread={latest['motion_bearing_spread']:.2f} neighbor mean={latest['mean_neighbor_degree']:.2f}",f"boundary={latest['boundary_count']} components={latest['boundary_component_count']}",f"LiDAR L/R support={latest['lidar_left_wall_support']:.2f}/{latest['lidar_right_wall_support']:.2f} forward={latest['lidar_forward_range']:.1f} free span={latest['lidar_free_space_angular_span']:.1f}"]
         for index,text in enumerate(hud): self.screen.blit(self.font.render(text,True,(245,245,245)),(12,10+index*22))
         pygame.display.flip(); self.clock.tick(60)
 
 
-def run_gui(case_id,frames,show_trails=False,show_gt=False):
+def run_gui(case_id,frames,show_trails=False,show_gt=False,propulsion_mode="production_compression",gui_scale=DEFAULT_GUI_SCALE):
     import pygame
-    renderer=PygameRenderer(show_trails,show_gt); cases=list(CASES); current=cases.index(case_id); runner=SimulationRunner(case_id); frame=0; running=True
+    cases=list(CASES); current=cases.index(case_id); runner=SimulationRunner(case_id,propulsion_mode); renderer=PygameRenderer(runner.geometry,gui_scale,show_trails,show_gt); frame=0; running=True
     while running and (frames<=0 or frame<frames):
         for event in pygame.event.get():
             if event.type==pygame.QUIT: running=False
             elif event.type==pygame.KEYDOWN:
                 if event.key==pygame.K_ESCAPE: running=False
                 elif event.key==pygame.K_SPACE: renderer.paused=not renderer.paused
-                elif event.key==pygame.K_r: runner=SimulationRunner(cases[current]); frame=0; renderer.trails=[]
+                elif event.key==pygame.K_r: runner=SimulationRunner(cases[current],propulsion_mode); frame=0; renderer.trails=[]
                 elif event.key==pygame.K_g: renderer.show_gt=not renderer.show_gt
                 elif event.key==pygame.K_d: renderer.show_diagnostics=not renderer.show_diagnostics
                 elif event.key==pygame.K_l: renderer.show_lidar=not renderer.show_lidar
                 elif event.key==pygame.K_t: renderer.show_trails=not renderer.show_trails
-                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=SimulationRunner(cases[current]); frame=0; renderer.trails=[]
+                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=SimulationRunner(cases[current],propulsion_mode); renderer.configure_camera(runner.geometry); frame=0; renderer.trails=[]
         if not renderer.paused: runner.step(frame); frame+=1
         renderer.draw(runner,frame)
     pygame.quit()
@@ -760,6 +870,8 @@ def run_gui(case_id,frames,show_trails=False,show_gt=False):
 
 def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("--map-case",choices=CASES); parser.add_argument("--frames",type=int,default=600)
+    parser.add_argument("--propulsion-mode",choices=PROPULSION_MODES,default="production_compression")
+    parser.add_argument("--gui-scale",type=float,default=DEFAULT_GUI_SCALE)
     modes=parser.add_mutually_exclusive_group(); modes.add_argument("--gui",action="store_true"); modes.add_argument("--headless",action="store_true")
     parser.add_argument("--output-dir",type=Path,default=Path(os.environ.get("PRE_EXPLORATION_OUTPUT",DEFAULT_OUTPUT))); parser.add_argument("--show-trails",action="store_true"); parser.add_argument("--show-gt",action="store_true")
     return parser.parse_args(argv)
@@ -767,9 +879,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args=parse_args(argv)
-    if args.gui: run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt)
+    if args.gui: run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt,args.propulsion_mode,args.gui_scale)
     else:
-        case=args.map_case or "M1_CROSS_BASELINE"; runner=run_headless(case,args.frames); save_case(runner,args.output_dir); print(f"case={case} rows={len(runner.rows)} output={args.output_dir.resolve()}")
+        case=args.map_case or "M1_CROSS_BASELINE"; runner=run_headless(case,args.frames,args.propulsion_mode); save_case(runner,args.output_dir); print(f"case={case} propulsion_mode={args.propulsion_mode} rows={len(runner.rows)} output={args.output_dir.resolve()}")
 
 
 if __name__=="__main__": main()
