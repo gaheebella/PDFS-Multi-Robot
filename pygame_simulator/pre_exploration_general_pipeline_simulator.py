@@ -15,6 +15,7 @@ import argparse
 import csv
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +26,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_OUTPUT = ROOT / "junction_detection/integration/output/pre_exploration_general_pipeline"
 CASES = ("M0_STRAIGHT", "M1_CROSS_BASELINE", "M2_T_JUNCTION", "M3_ANGLED_Y", "M4_ASYMMETRIC_CROSS", "M5_UNEQUAL_WIDTH")
 PROPULSION_MODES = ("production_compression", "local_forward")
@@ -108,6 +111,9 @@ BASE_PISTON_REACTION_DURATION = 5.0
 LOCAL_FORWARD_REFERENCE_SPEED = 65.0
 LOCAL_FORWARD_DRIVE_FORCE = DAMPING * LOCAL_FORWARD_REFERENCE_SPEED
 LOCAL_FOLLOWER_DRIVE_WEIGHT = 0.50
+# Production uses 54 world units before MAP_SCALE for local communication.
+# Keep communication/propagation distinct from the shorter SPH support graph.
+LOCAL_COMMUNICATION_RANGE = 54.0 * MAP_SCALE
 DEPLOYMENT_BODY_YAW_RAD = math.pi / 2.0
 DEFAULT_GUI_SCALE = 0.75
 LOCAL_WALL_CONFINEMENT_MAX_WIDTH = SMOOTHING_LENGTH * 6.0
@@ -401,12 +407,16 @@ class SimulatorWorld:
         self.wall_contacts = self.wall_corrections = 0
         self.rest_lengths: dict[tuple[int, int], float] = {}
         self.lidar_robot_id = self._select_initial_lidar_leader()
-        self._initialize_local_heading_propagation()
         lidar = next(robot for robot in self.robots if robot.robot_id == self.lidar_robot_id)
         self.initial_lidar_position = lidar.position.copy()
         self.sensor = LidarSensor()
         self.lidar_yaw_deg = 90.0
         neighbors = self._neighbors()
+        self.last_communication_edges: list[tuple[int, int]] = []
+        self.last_support_debug_edges: list[tuple[int, int]] = []
+        self.last_connectivity: dict[str, float | int | bool] = {}
+        self.local_graph_update_index = 0
+        self._update_local_heading_propagation(neighbors)
         self._densities(neighbors)
         initial_mean_density = float(np.mean([robot.density for robot in self.robots]))
         # Both modes use the production normal-SPH reference density. The
@@ -420,6 +430,7 @@ class SimulatorWorld:
         self.last_mean_pressure_force = 0.0
         self.last_mean_repulsion_force = 0.0
         self.last_mean_lateral_sph_force = 0.0
+        self.suspect_hold_active = False
 
     def _create_robots(self):
         half = self.geometry.incoming_width/2
@@ -449,18 +460,28 @@ class SimulatorWorld:
         self.initial_front_center_x = 0.5 * (min(xs) + max(xs))
         return min(front,key=lambda robot:(abs(robot.position[0]-self.initial_front_center_x),robot.robot_id)).robot_id
 
-    def _initialize_local_heading_propagation(self) -> None:
-        """Propagate leader body heading over the initial local support graph."""
+    def _update_local_heading_propagation(self, support_neighbors=None) -> None:
+        """Propagate leader heading over the current local communication graph.
+
+        The leader/front-pack gap uses only rear-half-space relative positions.
+        It never uses a global centroid, progress rank, map or Junction phase.
+        """
         by_id = {robot.robot_id: robot for robot in self.robots}
-        neighbors = self._neighbors()
+        support_neighbors = support_neighbors or self._neighbors()
+        communication_neighbors = self._range_neighbors(LOCAL_COMMUNICATION_RANGE)
         leader = by_id[self.lidar_robot_id]
+        for robot in self.robots:
+            robot.heading_parent_id = None
+            robot.heading_hop = -1
+            robot.propulsion_weight = 0.0
         leader.heading_hop = 0
         leader.propulsion_weight = 1.0
         queue = [leader.robot_id]
+        propagation_edges = []
         while queue:
             parent_id = queue.pop(0)
             parent = by_id[parent_id]
-            for peer in sorted(neighbors[parent_id],key=lambda robot: robot.robot_id):
+            for peer in sorted(communication_neighbors[parent_id],key=lambda robot: robot.robot_id):
                 if peer.heading_hop >= 0:
                     continue
                 peer.heading_parent_id = parent_id
@@ -470,7 +491,72 @@ class SimulatorWorld:
                 # A hop gradient stretched the long body despite having the
                 # same mean weight; uniform 0.5 preserves that measured scale.
                 peer.propulsion_weight = LOCAL_FOLLOWER_DRIVE_WEIGHT
+                propagation_edges.append((parent_id, peer.robot_id))
                 queue.append(peer.robot_id)
+
+        component_size = sum(robot.heading_hop >= 0 for robot in self.robots)
+        support_edge_count = sum(len(peers) for peers in support_neighbors.values()) // 2
+        communication_edge_count = sum(len(peers) for peers in communication_neighbors.values()) // 2
+        support_debug_edges = []
+        for robot_id in sorted(support_neighbors):
+            for peer in sorted(support_neighbors[robot_id], key=lambda item: item.robot_id):
+                if robot_id < peer.robot_id and len(support_debug_edges) < 800:
+                    support_debug_edges.append((robot_id, peer.robot_id))
+        self.last_communication_edges = propagation_edges
+        self.last_support_debug_edges = support_debug_edges
+        self.last_connectivity = {
+            "communication_range": LOCAL_COMMUNICATION_RANGE,
+            "support_range": SMOOTHING_LENGTH,
+            "leader_connected_component_size": component_size,
+            "connected_to_leader_count": max(0, component_size - 1),
+            "disconnected_count": len(self.robots) - component_size,
+            "leader_max_hop": max((robot.heading_hop for robot in self.robots), default=-1),
+            "communication_edge_count": communication_edge_count,
+            "support_edge_count": support_edge_count,
+        }
+        self._update_leader_gap(support_neighbors)
+
+    def _update_leader_gap(self, support_neighbors) -> None:
+        """Update gap-aware leader drive from the current one-hop support set."""
+        leader = next(robot for robot in self.robots if robot.robot_id == self.lidar_robot_id)
+        forward = np.array([math.cos(leader.body_yaw_rad), math.sin(leader.body_yaw_rad)])
+        direct_followers = support_neighbors[leader.robot_id]
+        rear_followers = [
+            peer for peer in direct_followers
+            if float(np.dot(peer.position - leader.position, forward)) <= 0.0
+        ]
+        nearest_all = min(
+            (float(np.linalg.norm(peer.position - leader.position)) for peer in direct_followers),
+            default=math.inf,
+        )
+        front_gap = min(
+            (float(np.linalg.norm(peer.position - leader.position)) for peer in rear_followers),
+            default=math.inf,
+        )
+        if front_gap <= VISCOELASTIC_LINK_RADIUS:
+            leader_drive_scale = 1.0
+        elif front_gap < SMOOTHING_LENGTH:
+            leader_drive_scale = max(
+                LOCAL_FOLLOWER_DRIVE_WEIGHT,
+                _smoothstep(
+                    (SMOOTHING_LENGTH - front_gap)
+                    / (SMOOTHING_LENGTH - VISCOELASTIC_LINK_RADIUS)
+                ),
+            )
+        else:
+            # Matching follower drive avoids a rear pack piling into a stopped
+            # leader while still removing the leader's 2:1 force advantage.
+            leader_drive_scale = LOCAL_FOLLOWER_DRIVE_WEIGHT
+        leader.propulsion_weight = leader_drive_scale
+        self.last_connectivity.update({
+            "leader_to_nearest_follower_distance": nearest_all,
+            "leader_to_front_pack_gap": front_gap,
+            "normalized_leader_gap": front_gap / LOCAL_COMMUNICATION_RANGE,
+            "leader_connected": bool(rear_followers),
+            "leader_communication_connected": self.last_connectivity.get("leader_connected_component_size", 0) > 1,
+            "leader_drive_scale": leader_drive_scale,
+            "leader_forward_speed": float(np.dot(leader.velocity, forward)),
+        })
 
     def _grid(self):
         grid = {}
@@ -479,17 +565,27 @@ class SimulatorWorld:
             grid.setdefault(key, []).append(robot)
         return grid
 
-    def _neighbors(self):
-        grid = self._grid(); result = {}
+    def _range_neighbors(self, radius: float):
+        """Return the current distance graph at a local physical radius."""
+        cell_size = radius
+        grid = {}
         for robot in self.robots:
-            key = tuple(np.floor(robot.position/SMOOTHING_LENGTH).astype(int)); nearby=[]
+            key = tuple(np.floor(robot.position / cell_size).astype(int))
+            grid.setdefault(key, []).append(robot)
+        result = {}
+        for robot in self.robots:
+            key = tuple(np.floor(robot.position / cell_size).astype(int)); nearby=[]
             for dx in (-1,0,1):
                 for dy in (-1,0,1):
                     for peer in grid.get((key[0]+dx,key[1]+dy),()):
-                        if peer is not robot and np.linalg.norm(peer.position-robot.position) <= SMOOTHING_LENGTH:
+                        if peer is not robot and np.linalg.norm(peer.position-robot.position) <= radius:
                             nearby.append(peer)
             result[robot.robot_id] = nearby
         return result
+
+    def _neighbors(self):
+        """Return the SPH support graph (not the communication graph)."""
+        return self._range_neighbors(SMOOTHING_LENGTH)
 
     def _densities(self, neighbors):
         self_value = _kernel(0.0)
@@ -508,6 +604,14 @@ class SimulatorWorld:
     def step(self):
         neighbors = self._neighbors(); self._densities(neighbors)
         production_mode = self.propulsion_mode == "production_compression"
+        if not production_mode:
+            # Communication propagation runs at the existing 0.1 s local
+            # sensor cadence; gap-aware drive still updates every physics step.
+            if self.local_graph_update_index % max(1, round(SAMPLE_PERIOD / DT)) == 0:
+                self._update_local_heading_propagation(neighbors)
+            else:
+                self._update_leader_gap(neighbors)
+            self.local_graph_update_index += 1
         pressure_scale = _pressure_scale(self.time) if production_mode else SPH_PRESSURE_SCALE
         for robot in self.robots:
             ratio = robot.density/max(self.reference_density,EPSILON)
@@ -564,7 +668,7 @@ class SimulatorWorld:
             if not production_mode:
                 # The command is [forward, lateral]=[F, 0] in the robot body
                 # frame, transformed solely for physics integration.
-                route = np.array([
+                route = np.zeros(2) if self.suspect_hold_active else np.array([
                     math.cos(robot.body_yaw_rad), math.sin(robot.body_yaw_rad)
                 ]) * LOCAL_FORWARD_DRIVE_FORCE * robot.propulsion_weight
             elif self.time < BASE_COMPRESSION_DURATION:
@@ -646,7 +750,18 @@ class SimulatorWorld:
             "mean_pressure":float(np.mean([robot.pressure for robot in self.robots])),"mean_pressure_force":self.last_mean_pressure_force,
             "mean_repulsion_force":self.last_mean_repulsion_force,"mean_lateral_sph_force":self.last_mean_lateral_sph_force}
 
+    def connectivity_diagnostics(self):
+        """Return local leader/graph diagnostics without world/GT fields."""
+        return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and not self.suspect_hold_active}
+
+    def activate_suspect_hold(self) -> None:
+        """Latch LOCAL_FORWARD route suppression until the world is reset."""
+        if self.propulsion_mode == "local_forward":
+            self.suspect_hold_active = True
+
     def initialization_phase(self) -> str:
+        if self.propulsion_mode == "local_forward" and self.suspect_hold_active:
+            return "SUSPECT_HOLD"
         if self.propulsion_mode == "local_forward":
             return "LOCAL_FORWARD"
         if self.time < BASE_COMPRESSION_DURATION:
@@ -708,7 +823,7 @@ class SwarmDiagnostics:
                 for candidate in tuple(remaining):
                     if np.linalg.norm(positions[current]-positions[candidate])<=SMOOTHING_LENGTH: remaining.remove(candidate); group.add(candidate); queue.append(candidate)
             components.append(group)
-        sizes=sorted(map(len,components),reverse=True); boundary_ids={int(ids[i]) for i in boundary}
+        sizes=sorted(map(len,components),reverse=True); ratios=[size/max(len(boundary),1) for size in sizes]; boundary_ids={int(ids[i]) for i in boundary}
         retention=len(boundary_ids&self.previous_boundary)/len(self.previous_boundary) if self.previous_boundary else 1.; self.previous_boundary=boundary_ids
         boundary_positions=positions[boundary] if boundary else np.empty((0,2)); relative=boundary_positions-center if boundary else boundary_positions
         covariance=np.cov(relative.T,bias=True) if len(relative)>1 else np.zeros((2,2)); eigen=np.linalg.eigvalsh(covariance)
@@ -737,6 +852,7 @@ class SwarmDiagnostics:
             "mean_neighbor_degree":float(np.mean(degrees)),"median_neighbor_degree":float(np.median(degrees)),"neighbor_degree_std":float(np.std(degrees)),"mean_nearest_neighbor_distance":float(np.mean(nearest)),
             "neighbor_graph_component_count":len(graph_components),"largest_neighbor_component_fraction":max(map(len,graph_components))/len(ids),
             "boundary_count":len(boundary),"boundary_fraction":len(boundary)/len(ids),"boundary_component_count":len(components),"boundary_largest_component_fraction":sizes[0]/max(len(boundary),1) if sizes else 0.,"boundary_second_component_fraction":sizes[1]/max(len(boundary),1) if len(sizes)>1 else 0.,"boundary_membership_retention":retention,
+            "boundary_component_count_vector":sizes,"boundary_component_ratio_vector":ratios,
             "boundary_lateral_span":float(np.ptp(boundary_lat)) if len(boundary_lat) else 0.,"boundary_longitudinal_span":float(np.ptp(boundary_lon)) if len(boundary_lon) else 0.,"boundary_angular_spread":math.degrees(float(np.ptp(angles))) if len(angles) else 0.,"boundary_covariance_trace":float(np.trace(covariance)),"boundary_anisotropy":float((eigen[-1]-eigen[0])/max(eigen.sum(),EPSILON))}
         return result,{"reference_mask":reference_mask,"local_mask":local_mask,"boundary_indices":boundary,"forward":forward}
 
@@ -777,14 +893,20 @@ class GroundTruthEvaluator:
 
 
 class SimulationRunner:
-    def __init__(self, case_id, propulsion_mode="production_compression"):
-        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None
+    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False):
+        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None; self.shadow_detector=shadow_detector; self.hold_on_suspect=hold_on_suspect
     def step(self, frame):
         self.world.step()
         if frame%max(1,round(SAMPLE_PERIOD/DT)): return None
         observation=LocalObservationBuilder.build(self.world); swarm,visual=self.swarm.analyze(observation); lidar=self.lidar.analyze(observation.lidar_scan)
-        row={"map_case":self.geometry.case_id,"propulsion_mode":self.world.propulsion_mode,"frame":frame,"timestamp":self.world.time,"initialization_phase":self.world.initialization_phase(),"lidar_robot_id":self.world.lidar_robot_id,"lidar_initial_x":float(self.world.initial_lidar_position[0]),"lidar_initial_y":float(self.world.initial_lidar_position[1]),"lidar_initial_front_center_offset":float(self.world.initial_lidar_position[0]-self.world.initial_front_center_x),**swarm,**lidar,**self.world.sanity()}
-        row.update(self.gt.evaluate(self.world,row,visual["local_mask"])); self.rows.append(row); self.last_visual=(observation,visual); return row
+        row={"map_case":self.geometry.case_id,"propulsion_mode":self.world.propulsion_mode,"frame":frame,"timestamp":self.world.time,"initialization_phase":self.world.initialization_phase(),"lidar_robot_id":self.world.lidar_robot_id,"lidar_initial_x":float(self.world.initial_lidar_position[0]),"lidar_initial_y":float(self.world.initial_lidar_position[1]),"lidar_initial_front_center_offset":float(self.world.initial_lidar_position[0]-self.world.initial_front_center_x),**swarm,**lidar,**self.world.sanity(),**self.world.connectivity_diagnostics()}
+        row.update(self.gt.evaluate(self.world,row,visual["local_mask"]))
+        if self.shadow_detector is not None:
+            from junction_detection.integration.run_junction_shadow_detection import runtime_features
+            detected=self.shadow_detector.update(float(row["timestamp"]),runtime_features(row)); row.update(detected)
+            if self.hold_on_suspect and detected["shadow_junction_suspected"]: self.world.activate_suspect_hold()
+            row["suspect_hold_active"]=self.world.suspect_hold_active; row["local_forward_propulsion_active"]=self.world.propulsion_mode=="local_forward" and not self.world.suspect_hold_active; row["initialization_phase"]=self.world.initialization_phase()
+        self.rows.append(row); self.last_visual=(observation,visual); return row
 
 
 def run_headless(case_id,frames,propulsion_mode="production_compression"):
@@ -794,6 +916,8 @@ def run_headless(case_id,frames,propulsion_mode="production_compression"):
 
 
 def save_case(runner,output):
+    if not runner.rows:
+        return
     folder=output/runner.geometry.case_id
     if runner.world.propulsion_mode != "production_compression":
         folder=output/runner.world.propulsion_mode/runner.geometry.case_id
@@ -806,7 +930,7 @@ class PygameRenderer:
     def __init__(self, geometry, gui_scale=DEFAULT_GUI_SCALE, show_trails=False, show_gt=False):
         import pygame
         pygame.init(); self.pygame=pygame; self.screen=pygame.display.set_mode((1100,800)); self.clock=pygame.time.Clock(); self.font=pygame.font.Font(None,22)
-        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_trails=show_trails; self.trails=[]; self.gui_scale=gui_scale
+        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_trails=show_trails; self.show_communication_links=True; self.show_support_links=True; self.trails=[]; self.gui_scale=gui_scale
         self.configure_camera(geometry)
     def configure_camera(self,geometry):
         vertices=np.array([point for rect in geometry.free_rects for point in rect.vertices],dtype=float)
@@ -825,7 +949,18 @@ class PygameRenderer:
         visual=runner.last_visual; reference=local=boundary=set(); forward=np.array([0.,1.])
         if visual:
             observation,data=visual; reference=set(observation.robot_ids[data["reference_mask"]]); local=set(observation.robot_ids[data["local_mask"]]); boundary={int(observation.robot_ids[i]) for i in data["boundary_indices"]}; forward=data["forward"]
+        if runner.world.propulsion_mode == "local_forward":
+            # Quantile/reference cohorts are retained in CSV only as historical
+            # diagnostics; LOCAL_FORWARD GUI uses local graph evidence instead.
+            reference=local=set()
         lidar=next(robot for robot in runner.world.robots if robot.robot_id==runner.world.lidar_robot_id)
+        by_id={robot.robot_id:robot for robot in runner.world.robots}
+        if self.show_support_links:
+            for start_id,end_id in runner.world.last_support_debug_edges:
+                pygame.draw.line(self.screen,(75,115,165),self.world_to_screen(by_id[start_id].position),self.world_to_screen(by_id[end_id].position),1)
+        if self.show_communication_links:
+            for start_id,end_id in runner.world.last_communication_edges:
+                pygame.draw.line(self.screen,(100,210,115),self.world_to_screen(by_id[start_id].position),self.world_to_screen(by_id[end_id].position),1)
         if self.show_trails:
             self.trails.append(lidar.position.copy()); self.trails[:]=self.trails[-240:]
             if len(self.trails)>1: pygame.draw.lines(self.screen,(110,180,255),False,[self.world_to_screen(point) for point in self.trails],2)
@@ -842,30 +977,59 @@ class PygameRenderer:
             for angle,range_value in zip(scan.angles_deg[::8],scan.ranges[::8]):
                 radians=math.radians(runner.world.lidar_yaw_deg+angle); endpoint=lidar.position+np.array([math.cos(radians),math.sin(radians)])*range_value
                 pygame.draw.line(self.screen,(90,90,55),self.world_to_screen(lidar.position),self.world_to_screen(endpoint),1)
-        latest=runner.rows[-1] if runner.rows else {}; hud=[f"Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} auto-centered","SPACE pause R reset 1-6 map G GT D diagnostics L rays T trails ESC quit"]
-        if self.show_diagnostics and latest: hud += [f"init phase={latest['initialization_phase']}",f"min distance={latest['min_inter_robot_distance']:.3f} overlap pairs={latest['overlap_pair_count']} max speed={latest['max_speed']:.2f}",f"wall contacts={latest['wall_contact_count']} projection corrections={latest['wall_projection_correction_count']}",f"local/reference front={latest['local_front_size']}/{latest['reference_front_size']} lateral span={latest['local_front_lateral_span']:.2f}",f"motion spread={latest['motion_bearing_spread']:.2f} neighbor mean={latest['mean_neighbor_degree']:.2f}",f"boundary={latest['boundary_count']} components={latest['boundary_component_count']}",f"LiDAR L/R support={latest['lidar_left_wall_support']:.2f}/{latest['lidar_right_wall_support']:.2f} forward={latest['lidar_forward_range']:.1f} free span={latest['lidar_free_space_angular_span']:.1f}"]
+        run_state="PAUSED" if self.paused else "RUNNING"
+        latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays T trails C comm N support ESC quit"]
+        if self.show_diagnostics and latest:
+            second_size=round(latest['boundary_count']*latest['boundary_second_component_fraction'])
+            counts=list(latest.get('boundary_component_count_vector',[])); ratios=list(latest.get('boundary_component_ratio_vector',[])); suffix="..." if len(counts)>5 else ""
+            counts_text=f"{counts[:5]}{suffix}"; ratios_text="["+",".join(f"{value:.3f}" for value in ratios[:5])+"]"+suffix
+            spread_label=(f"local surface-pack span={latest['local_front_lateral_span']:.2f}" if runner.world.propulsion_mode=="local_forward" else f"local/reference front={latest['local_front_size']}/{latest['reference_front_size']} lateral span={latest['local_front_lateral_span']:.2f}")
+            hud += [f"init phase={latest['initialization_phase']}",f"min distance={latest['min_inter_robot_distance']:.3f} overlap pairs={latest['overlap_pair_count']} max speed={latest['max_speed']:.2f}",f"wall contacts={latest['wall_contact_count']} projection corrections={latest['wall_projection_correction_count']}",spread_label,f"motion spread={latest['motion_bearing_spread']:.2f} neighbor mean={latest['mean_neighbor_degree']:.2f}",f"boundary={latest['boundary_count']} B-comp={latest['boundary_component_count']} largest={latest['boundary_largest_component_fraction']:.2f} second size={second_size}",f"B-counts={counts_text} B-ratios={ratios_text}",f"LiDAR L/R support={latest['lidar_left_wall_support']:.2f}/{latest['lidar_right_wall_support']:.2f} forward={latest['lidar_forward_range']:.1f} free span={latest['lidar_free_space_angular_span']:.1f}"]
+            if runner.world.propulsion_mode=="local_forward":
+                hud += [f"Leader connected={latest['leader_connected']} comp size={latest['leader_connected_component_size']} gap={latest['leader_to_front_pack_gap']:.2f}",f"Nearest follower={latest['leader_to_nearest_follower_distance']:.2f} disconnected={latest['disconnected_count']} comm edges={latest['communication_edge_count']}"]
+        if self.show_diagnostics and "shadow_junction_suspected" in latest:
+            detector_state="JUNCTION_SUSPECTED" if latest.get("suspect_hold_active",False) or latest["shadow_junction_suspected"] else "NO_JUNCTION"
+            hud += [f"Detector={detector_state} hold={latest.get('suspect_hold_active',False)} propulsion={latest.get('local_forward_propulsion_active',False)}",f"SPH expansion={int(latest['shadow_sph_expansion'])} Boundary change={int(latest['shadow_boundary_change'])} LiDAR geometry={int(latest['shadow_lidar_geometry_change'])} Fusion={int(latest['shadow_fusion_trigger'])}"]
         for index,text in enumerate(hud): self.screen.blit(self.font.render(text,True,(245,245,245)),(12,10+index*22))
         pygame.display.flip(); self.clock.tick(60)
 
 
+def _new_gui_runner(case_id, propulsion_mode):
+    """Create a GUI runner; LOCAL_FORWARD receives the frozen shadow detector."""
+    if propulsion_mode == "local_forward":
+        from junction_detection.integration.run_junction_shadow_detection import FROZEN_GUI_THRESHOLDS, ShadowJunctionDetector
+        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=True)
+    return SimulationRunner(case_id,propulsion_mode)
+
+
+def _advance_gui_frame(runner, renderer, frame):
+    """Advance exactly one physics frame unless SPACE has paused the GUI."""
+    if renderer.paused:
+        return frame
+    runner.step(frame)
+    return frame+1
+
+
 def run_gui(case_id,frames,show_trails=False,show_gt=False,propulsion_mode="production_compression",gui_scale=DEFAULT_GUI_SCALE):
     import pygame
-    cases=list(CASES); current=cases.index(case_id); runner=SimulationRunner(case_id,propulsion_mode); renderer=PygameRenderer(runner.geometry,gui_scale,show_trails,show_gt); frame=0; running=True
+    cases=list(CASES); current=cases.index(case_id); runner=_new_gui_runner(case_id,propulsion_mode); renderer=PygameRenderer(runner.geometry,gui_scale,show_trails,show_gt); frame=0; running=True
     while running and (frames<=0 or frame<frames):
         for event in pygame.event.get():
             if event.type==pygame.QUIT: running=False
             elif event.type==pygame.KEYDOWN:
                 if event.key==pygame.K_ESCAPE: running=False
                 elif event.key==pygame.K_SPACE: renderer.paused=not renderer.paused
-                elif event.key==pygame.K_r: runner=SimulationRunner(cases[current],propulsion_mode); frame=0; renderer.trails=[]
+                elif event.key==pygame.K_r: runner=_new_gui_runner(cases[current],propulsion_mode); frame=0; renderer.trails=[]
                 elif event.key==pygame.K_g: renderer.show_gt=not renderer.show_gt
                 elif event.key==pygame.K_d: renderer.show_diagnostics=not renderer.show_diagnostics
                 elif event.key==pygame.K_l: renderer.show_lidar=not renderer.show_lidar
                 elif event.key==pygame.K_t: renderer.show_trails=not renderer.show_trails
-                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=SimulationRunner(cases[current],propulsion_mode); renderer.configure_camera(runner.geometry); frame=0; renderer.trails=[]
-        if not renderer.paused: runner.step(frame); frame+=1
+                elif event.key==pygame.K_c: renderer.show_communication_links=not renderer.show_communication_links
+                elif event.key==pygame.K_n: renderer.show_support_links=not renderer.show_support_links
+                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=_new_gui_runner(cases[current],propulsion_mode); renderer.configure_camera(runner.geometry); frame=0; renderer.trails=[]
+        frame=_advance_gui_frame(runner,renderer,frame)
         renderer.draw(runner,frame)
-    pygame.quit()
+    pygame.quit(); return runner
 
 
 def parse_args(argv=None):
@@ -879,7 +1043,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args=parse_args(argv)
-    if args.gui: run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt,args.propulsion_mode,args.gui_scale)
+    if args.gui:
+        runner=run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt,args.propulsion_mode,args.gui_scale); save_case(runner,args.output_dir)
     else:
         case=args.map_case or "M1_CROSS_BASELINE"; runner=run_headless(case,args.frames,args.propulsion_mode); save_case(runner,args.output_dir); print(f"case={case} propulsion_mode={args.propulsion_mode} rows={len(runner.rows)} output={args.output_dir.resolve()}")
 
