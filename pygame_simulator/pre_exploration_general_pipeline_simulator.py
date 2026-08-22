@@ -2,7 +2,8 @@
 
 This module does not import the legacy multi-geometry evaluator.  It implements
 a small, general world around the production pre-Junction SPH equations while
-excluding DFS, Guards, Shepherds, branch routing, Anchors, and trigger states.
+excluding DFS, Guards, Shepherds, and branch routing. Its optional clean-GUI
+path can latch a shadow suspicion into a provisional fixed observation Anchor.
 
 The runtime diagnostics consume :class:`LocalObservation` only. They require
 neither a global map, global localization, GPS, nor SLAM-based poses. Global
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import sys
@@ -72,6 +74,9 @@ BOUNDARY_GAP_DEG = 120.0
 EPSILON = 1e-8
 LIDAR_RAYS = 360
 LIDAR_MAX_RANGE = 150.0
+BASELINE_CORRIDOR_WIDTH = 84.0
+MIN_SPEED = 1.2
+ANCHOR_STATIONARY_DWELL_STEPS = max(1, round(SAMPLE_PERIOD / DT))
 
 # Adapted from production's MOVE_TO_JUNCTION initialization protocol
 # (get_base_pressure_scale, adaptive_equilibrium_radius, compute_route_force,
@@ -288,7 +293,7 @@ class GeometryBuilder:
     """Owns map metadata; no runtime diagnostic receives this object."""
     @staticmethod
     def build(case_id: str) -> GeometryCase:
-        width, incoming, junction, length = 84.0, 190.0, 84.0, 150.0
+        width, incoming, junction, length = BASELINE_CORRIDOR_WIDTH, 190.0, 84.0, 150.0
         definitions = {
             "M0_STRAIGHT": (),
             "M1_CROSS_BASELINE": (BranchSpec(0, width, length), BranchSpec(-90, width, length), BranchSpec(90, width, length)),
@@ -431,6 +436,17 @@ class SimulatorWorld:
         self.last_mean_repulsion_force = 0.0
         self.last_mean_lateral_sph_force = 0.0
         self.suspect_hold_active = False
+        self.braking_active = False
+        self.stationary_dwell_steps = 0
+        self.provisional_fixed_anchor = False
+        self.pointcloud_ready = False
+        self.physics_frame_index = 0
+        self.suspect_entry_position: np.ndarray | None = None
+        self.suspect_entry_time = math.nan
+        self.anchor_entry_frame = -1
+        self.anchor_entry_time = math.nan
+        self.anchor_position: np.ndarray | None = None
+        self.anchor_heading_rad = math.nan
 
     def _create_robots(self):
         half = self.geometry.incoming_width/2
@@ -687,14 +703,23 @@ class SimulatorWorld:
             normalized_pressure=robot.pressure/max(PRESSURE_GAIN*robot.density,EPSILON)
             piston_magnitude=(min(BASE_PISTON_REACTION_FORCE_LIMIT,BASE_PISTON_REACTION_GAIN*normalized_pressure*_smoothstep(base_depth)*_base_piston_envelope(self.time)) if production_mode else 0.0)
             piston=np.array([0.0,piston_magnitude])
+            braking_leader=not production_mode and self.suspect_hold_active and not self.provisional_fixed_anchor and robot.robot_id==self.lidar_robot_id
             total=pressure+viscosity+elastic+repulsion+route+piston-(DAMPING+(INITIAL_RELEASE_EXTRA_DAMPING if release_active else 0.0))*robot.velocity
             raw=_limit(total,MAX_ACCELERATION)
-            alpha = INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA
+            if braking_leader:
+                # Local velocity cancellation, bounded by the existing
+                # acceleration scale. Bypassing the propulsion EMA prevents a
+                # non-zero equilibrium with persistent SPH contact forces.
+                raw=_limit(-robot.velocity/DT,MAX_ACCELERATION)
+            alpha = 1.0 if braking_leader else (INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA)
             accelerations[robot.robot_id]=(1-alpha)*robot.acceleration+alpha*raw
         self.last_mean_pressure_force=float(np.mean(pressure_magnitudes))
         self.last_mean_repulsion_force=float(np.mean(repulsion_magnitudes))
         self.last_mean_lateral_sph_force=float(np.mean(lateral_sph_magnitudes))
         for robot in self.robots:
+            if self.provisional_fixed_anchor and robot.robot_id==self.lidar_robot_id:
+                robot.position=self.anchor_position.copy(); robot.velocity[:]=0.; robot.acceleration[:]=0.; robot.observed_velocity[:]=0.
+                continue
             old=robot.position.copy(); robot.acceleration=accelerations[robot.robot_id]; robot.velocity += robot.acceleration*DT
             # LOCAL_FORWARD uses only two body-lateral wall ranges: damping is
             # active in a bounded corridor and disappears naturally when an
@@ -717,11 +742,36 @@ class SimulatorWorld:
                 # geometric projection, matching production's behavior.
                 self.wall_corrections += 1
             robot.observed_velocity=(robot.position-old)/DT
+        self._update_anchor_transition()
         self.time += DT
+        self.physics_frame_index += 1
+
+    def _update_anchor_transition(self) -> None:
+        """Confirm local stationarity, then latch the current leader pose."""
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        if not self.suspect_hold_active or self.provisional_fixed_anchor:
+            self.braking_active=False
+            return
+        self.braking_active=True
+        if float(np.linalg.norm(leader.velocity)) < MIN_SPEED:
+            self.stationary_dwell_steps += 1
+        else:
+            self.stationary_dwell_steps = 0
+        if self.stationary_dwell_steps < ANCHOR_STATIONARY_DWELL_STEPS:
+            return
+        self.provisional_fixed_anchor=True; self.braking_active=False; self.pointcloud_ready=True
+        self.anchor_entry_frame=self.physics_frame_index; self.anchor_entry_time=self.time+DT
+        self.anchor_position=leader.position.copy(); self.anchor_heading_rad=leader.body_yaw_rad
+        leader.velocity[:]=0.; leader.acceleration[:]=0.; leader.observed_velocity[:]=0.
 
     def local_observation(self) -> LocalObservation:
         lidar=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
-        if np.linalg.norm(lidar.observed_velocity) > MIN_SPEED:
+        if self.propulsion_mode == "local_forward":
+            # Profile angles are defined in the proprioceptive body frame.
+            # Observed velocity can contain lateral SPH motion and therefore
+            # must not rotate the LiDAR reference axis.
+            self.lidar_yaw_deg=math.degrees(lidar.body_yaw_rad)
+        elif np.linalg.norm(lidar.observed_velocity) > MIN_SPEED:
             candidate=math.degrees(math.atan2(lidar.observed_velocity[1],lidar.observed_velocity[0]))
             delta=(candidate-self.lidar_yaw_deg+180)%360-180
             if abs(delta)<90: self.lidar_yaw_deg=candidate
@@ -752,14 +802,31 @@ class SimulatorWorld:
 
     def connectivity_diagnostics(self):
         """Return local leader/graph diagnostics without world/GT fields."""
-        return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and not self.suspect_hold_active}
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        followers=[robot for robot in self.robots if robot.robot_id!=self.lidar_robot_id]
+        leader_speed=float(np.linalg.norm(leader.velocity))
+        anchor_displacement=(float(np.linalg.norm(leader.position-self.anchor_position)) if self.anchor_position is not None else 0.0)
+        heading_change=(abs(math.degrees((leader.body_yaw_rad-self.anchor_heading_rad+math.pi)%(2*math.pi)-math.pi)) if math.isfinite(self.anchor_heading_rad) else 0.0)
+        hold_displacement=(float(np.linalg.norm(leader.position-self.suspect_entry_position)) if self.suspect_entry_position is not None else 0.0)
+        return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and not self.suspect_hold_active,
+            "leader_braking_active":self.braking_active,"leader_speed":leader_speed,"leader_stationary":leader_speed<MIN_SPEED,"stationary_speed_threshold":MIN_SPEED,
+            "follower_mean_speed":float(np.mean([np.linalg.norm(robot.velocity) for robot in followers])),"follower_moving_fraction":float(np.mean([np.linalg.norm(robot.velocity)>=MIN_SPEED for robot in followers])),
+            "stationary_dwell_steps":self.stationary_dwell_steps,"stationary_dwell_target":ANCHOR_STATIONARY_DWELL_STEPS,"provisional_fixed_anchor":self.provisional_fixed_anchor,
+            "pointcloud_ready":self.pointcloud_ready,"suspect_entry_time":self.suspect_entry_time,"anchor_entry_frame":self.anchor_entry_frame,"anchor_entry_time":self.anchor_entry_time,
+            "anchor_x_eval":float(self.anchor_position[0]) if self.anchor_position is not None else math.nan,"anchor_y_eval":float(self.anchor_position[1]) if self.anchor_position is not None else math.nan,
+            "leader_displacement_since_hold":hold_displacement,"leader_displacement_since_anchor":anchor_displacement,"leader_heading_change_since_anchor":heading_change}
 
     def activate_suspect_hold(self) -> None:
         """Latch LOCAL_FORWARD route suppression until the world is reset."""
         if self.propulsion_mode == "local_forward":
+            if not self.suspect_hold_active:
+                leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+                self.suspect_entry_position=leader.position.copy(); self.suspect_entry_time=self.time
             self.suspect_hold_active = True
 
     def initialization_phase(self) -> str:
+        if self.propulsion_mode == "local_forward" and self.provisional_fixed_anchor:
+            return "PROVISIONAL_FIXED_ANCHOR"
         if self.propulsion_mode == "local_forward" and self.suspect_hold_active:
             return "SUSPECT_HOLD"
         if self.propulsion_mode == "local_forward":
@@ -769,9 +836,6 @@ class SimulatorWorld:
         if self.time < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION:
             return "INITIAL_RELEASE"
         return "NORMAL_INGRESS"
-
-
-MIN_SPEED = 1.2
 
 
 class LocalObservationBuilder:
@@ -873,6 +937,71 @@ class CheapLidarDiagnostics:
         return {"lidar_left_wall_support":float(np.mean(hit[left])),"lidar_right_wall_support":float(np.mean(hit[right])),"lidar_forward_range":float(np.median(ranges[forward])),"lidar_range_discontinuity":float(np.max(discontinuity)),"lidar_range_total_variation":float(np.mean(discontinuity)),"lidar_free_space_angular_span":float(longest),"lidar_range_profile_change":change}
 
 
+def _circular_mask_sectors(angles_deg: np.ndarray, mask: np.ndarray) -> list[tuple[float, float]]:
+    """Merge adjacent body-relative scan bins, including the -180/180 seam."""
+    indices=np.flatnonzero(mask)
+    if not len(indices): return []
+    if len(indices)==len(mask): return [(float(angles_deg[0]),float(angles_deg[-1]))]
+    # Rotate after an unchanged bin, so a seam-crossing run becomes one run.
+    start=(int(indices[0])-1)%len(mask)
+    while mask[start]: start=(start-1)%len(mask)
+    ordered=(np.arange(len(mask))+start+1)%len(mask); sectors=[]; run=[]
+    for index in ordered:
+        if mask[index]: run.append(int(index))
+        elif run:
+            sectors.append((float(angles_deg[run[0]]),float(angles_deg[run[-1]]))); run=[]
+    if run: sectors.append((float(angles_deg[run[0]]),float(angles_deg[run[-1]])))
+    return sectors
+
+
+class LidarGeometryReasonDiagnostics:
+    """Explain frozen detector evidence without changing its runtime contract."""
+    def __init__(self, lidar_threshold: float):
+        self.bootstrap=[]; self.baseline_profile=None
+        # Evaluation-only ray threshold derived from the frozen normalized
+        # LiDAR score and sensor range; it does not feed detector decisions.
+        self.range_delta_threshold=float(lidar_threshold*LIDAR_MAX_RANGE)
+
+    @staticmethod
+    def _format_sectors(sectors: list[tuple[float,float]]) -> str:
+        return "["+",".join(f"({start:.0f},{end:.0f})" for start,end in sectors)+"]"
+
+    def analyze(self, scan: LidarScan, row: dict) -> tuple[dict,dict]:
+        """Return scalar reasons and masks from body-relative range changes."""
+        if self.baseline_profile is None:
+            self.bootstrap.append(scan.ranges.copy())
+            if len(self.bootstrap)>=3: self.baseline_profile=np.median(np.stack(self.bootstrap),axis=0)
+        baseline=(self.baseline_profile if self.baseline_profile is not None else np.median(np.stack(self.bootstrap),axis=0))
+        angles=scan.angles_deg; current=scan.ranges; delta=current-baseline
+        left=(angles>=20)&(angles<=160); right=(angles<=-20)&(angles>=-160); forward=np.abs(angles)<=15
+        base_hit=baseline<scan.max_range-1e-9; now_hit=current<scan.max_range-1e-9
+        base_left=float(np.mean(base_hit[left])); base_right=float(np.mean(base_hit[right])); base_forward=float(np.median(baseline[forward]))
+        wall_loss=base_hit&(~now_hit)&(delta>self.range_delta_threshold)
+        free_increase=(delta>self.range_delta_threshold)&(~wall_loss)
+        wall_sectors=_circular_mask_sectors(angles,wall_loss); free_sectors=_circular_mask_sectors(angles,free_increase)
+        positive_sectors=_circular_mask_sectors(angles,delta>self.range_delta_threshold)
+        largest=max(positive_sectors,key=lambda pair: ((pair[1]-pair[0])%360),default=None)
+        free_base=float(row.get("baseline_lidar_free_space_angular_span",row["lidar_free_space_angular_span"]))
+        free_now=float(row["lidar_free_space_angular_span"])
+        left_now=float(row["lidar_left_wall_support"]); right_now=float(row["lidar_right_wall_support"])
+        # L/R and forward baselines below are debug summaries. The frozen
+        # detector itself uses current side-wall loss, free-span growth from
+        # its baseline, and scan-profile change in one aggregate score.
+        result={
+            "lidar_left_support_baseline":base_left,"lidar_left_support_current":left_now,"lidar_left_support_delta":left_now-base_left,
+            "lidar_right_support_baseline":base_right,"lidar_right_support_current":right_now,"lidar_right_support_delta":right_now-base_right,
+            "lidar_free_span_baseline":free_base,"lidar_free_span_current":free_now,"lidar_free_span_delta":free_now-free_base,
+            "lidar_forward_baseline":base_forward,"lidar_forward_current":float(row["lidar_forward_range"]),"lidar_forward_delta":float(row["lidar_forward_range"])-base_forward,
+            "lidar_left_support_changed":bool(left_now<base_left),"lidar_right_support_changed":bool(right_now<base_right),"lidar_free_span_changed":bool(free_now>free_base),
+            "lidar_profile_change_score":float(row.get("lidar_evidence_smoothed",0.0)),"lidar_profile_change_threshold":float(row.get("lidar_threshold",0.0)),"lidar_profile_changed":bool(row.get("shadow_lidar_geometry_change",False)),
+            "lidar_range_delta_diagnostic_threshold":self.range_delta_threshold,
+            "wall_loss_sectors":self._format_sectors(wall_sectors),"free_space_increase_sectors":self._format_sectors(free_sectors),
+            "largest_range_increase_sector":self._format_sectors([largest] if largest is not None else []),
+            "lidar_geometry_reason_summary":f"wall_loss={len(wall_sectors)} free_increase={len(free_sectors)}",
+        }
+        return result,{"lidar_wall_loss_mask":wall_loss,"lidar_free_increase_mask":free_increase}
+
+
 class GroundTruthEvaluator:
     """Evaluation-only world/geometry consumer."""
     def __init__(self, geometry): self.geometry=geometry
@@ -893,19 +1022,29 @@ class GroundTruthEvaluator:
 
 
 class SimulationRunner:
-    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False):
+    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False, profile_detector=None):
         self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None; self.shadow_detector=shadow_detector; self.hold_on_suspect=hold_on_suspect
+        self.lidar_reason=(LidarGeometryReasonDiagnostics(shadow_detector.thresholds.lidar) if shadow_detector is not None else None)
+        self.profile_detector=profile_detector; self.last_profile_result=None
     def step(self, frame):
         self.world.step()
         if frame%max(1,round(SAMPLE_PERIOD/DT)): return None
         observation=LocalObservationBuilder.build(self.world); swarm,visual=self.swarm.analyze(observation); lidar=self.lidar.analyze(observation.lidar_scan)
         row={"map_case":self.geometry.case_id,"propulsion_mode":self.world.propulsion_mode,"frame":frame,"timestamp":self.world.time,"initialization_phase":self.world.initialization_phase(),"lidar_robot_id":self.world.lidar_robot_id,"lidar_initial_x":float(self.world.initial_lidar_position[0]),"lidar_initial_y":float(self.world.initial_lidar_position[1]),"lidar_initial_front_center_offset":float(self.world.initial_lidar_position[0]-self.world.initial_front_center_x),**swarm,**lidar,**self.world.sanity(),**self.world.connectivity_diagnostics()}
+        if self.profile_detector is not None:
+            profile=self.profile_detector.detect(observation.lidar_scan.angles_deg,observation.lidar_scan.ranges); self.last_profile_result=profile
+            groups=profile["opening_groups"]
+            row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","corridor_width","profile_max_range","profile_lateral_offset","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
+            row["opening_groups_json"]=json.dumps(groups,separators=(",",":")); visual.update({"profile_open_candidate_mask":profile["open_candidate_mask"],"profile_confirmed_opening_mask":profile["confirmed_opening_mask"],"profile_expected_ranges":profile["expected_ranges"]})
+        # Everything above this line is runtime-local. GT is appended only
+        # after the profile detector has completed its decision.
         row.update(self.gt.evaluate(self.world,row,visual["local_mask"]))
         if self.shadow_detector is not None:
             from junction_detection.integration.run_junction_shadow_detection import runtime_features
             detected=self.shadow_detector.update(float(row["timestamp"]),runtime_features(row)); row.update(detected)
             if self.hold_on_suspect and detected["shadow_junction_suspected"]: self.world.activate_suspect_hold()
             row["suspect_hold_active"]=self.world.suspect_hold_active; row["local_forward_propulsion_active"]=self.world.propulsion_mode=="local_forward" and not self.world.suspect_hold_active; row["initialization_phase"]=self.world.initialization_phase()
+            reasons,masks=self.lidar_reason.analyze(observation.lidar_scan,row); row.update(reasons); visual.update(masks)
         self.rows.append(row); self.last_visual=(observation,visual); return row
 
 
@@ -974,31 +1113,55 @@ class PygameRenderer:
         pygame.draw.line(self.screen,(80,230,255),self.world_to_screen(lidar.position),self.world_to_screen(lidar.position+forward*18),3)
         if self.show_lidar and visual:
             scan=visual[0].lidar_scan
-            for angle,range_value in zip(scan.angles_deg[::8],scan.ranges[::8]):
+            wall_loss=visual[1].get("lidar_wall_loss_mask",np.zeros(len(scan.ranges),dtype=bool)); free_increase=visual[1].get("lidar_free_increase_mask",np.zeros(len(scan.ranges),dtype=bool))
+            profile_candidate=visual[1].get("profile_open_candidate_mask",np.zeros(len(scan.ranges),dtype=bool)); profile_confirmed=visual[1].get("profile_confirmed_opening_mask",np.zeros(len(scan.ranges),dtype=bool))
+            for index in range(0,len(scan.ranges),4):
+                angle=scan.angles_deg[index]; range_value=scan.ranges[index]
                 radians=math.radians(runner.world.lidar_yaw_deg+angle); endpoint=lidar.position+np.array([math.cos(radians),math.sin(radians)])*range_value
-                pygame.draw.line(self.screen,(90,90,55),self.world_to_screen(lidar.position),self.world_to_screen(endpoint),1)
+                color=((235,70,235) if profile_confirmed[index] else ((245,165,45) if profile_candidate[index] else ((235,90,55) if wall_loss[index] else ((55,225,235) if free_increase[index] else (90,90,55)))))
+                emphasized=profile_candidate[index] or wall_loss[index] or free_increase[index]
+                pygame.draw.line(self.screen,color,self.world_to_screen(lidar.position),self.world_to_screen(endpoint),2 if emphasized else 1)
         run_state="PAUSED" if self.paused else "RUNNING"
         latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays T trails C comm N support ESC quit"]
+        if "profile_detector_state" in latest:
+            hud += [f"[LiDAR Profile Detector] mode=GEOMETRY_BASED state={latest['profile_detector_state']}",f"width={latest['corridor_width']:.1f} local offset={latest['profile_lateral_offset']:+.2f} max_range={latest['profile_max_range']:.1f} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
         if self.show_diagnostics and latest:
             second_size=round(latest['boundary_count']*latest['boundary_second_component_fraction'])
             counts=list(latest.get('boundary_component_count_vector',[])); ratios=list(latest.get('boundary_component_ratio_vector',[])); suffix="..." if len(counts)>5 else ""
             counts_text=f"{counts[:5]}{suffix}"; ratios_text="["+",".join(f"{value:.3f}" for value in ratios[:5])+"]"+suffix
             spread_label=(f"local surface-pack span={latest['local_front_lateral_span']:.2f}" if runner.world.propulsion_mode=="local_forward" else f"local/reference front={latest['local_front_size']}/{latest['reference_front_size']} lateral span={latest['local_front_lateral_span']:.2f}")
-            hud += [f"init phase={latest['initialization_phase']}",f"min distance={latest['min_inter_robot_distance']:.3f} overlap pairs={latest['overlap_pair_count']} max speed={latest['max_speed']:.2f}",f"wall contacts={latest['wall_contact_count']} projection corrections={latest['wall_projection_correction_count']}",spread_label,f"motion spread={latest['motion_bearing_spread']:.2f} neighbor mean={latest['mean_neighbor_degree']:.2f}",f"boundary={latest['boundary_count']} B-comp={latest['boundary_component_count']} largest={latest['boundary_largest_component_fraction']:.2f} second size={second_size}",f"B-counts={counts_text} B-ratios={ratios_text}",f"LiDAR L/R support={latest['lidar_left_wall_support']:.2f}/{latest['lidar_right_wall_support']:.2f} forward={latest['lidar_forward_range']:.1f} free span={latest['lidar_free_space_angular_span']:.1f}"]
+            hud += [f"init phase={latest['initialization_phase']}",f"min distance={latest['min_inter_robot_distance']:.3f} overlap pairs={latest['overlap_pair_count']} max speed={latest['max_speed']:.2f}",f"wall contacts={latest['wall_contact_count']} projection corrections={latest['wall_projection_correction_count']}",f"[SPH] {spread_label} motion spread={latest['motion_bearing_spread']:.2f}",f"[Boundary] count={latest['boundary_count']} comps={latest['boundary_component_count']} largest={latest['boundary_largest_component_fraction']:.2f} second={second_size}",f"B-counts={counts_text} B-ratios={ratios_text}"]
             if runner.world.propulsion_mode=="local_forward":
                 hud += [f"Leader connected={latest['leader_connected']} comp size={latest['leader_connected_component_size']} gap={latest['leader_to_front_pack_gap']:.2f}",f"Nearest follower={latest['leader_to_nearest_follower_distance']:.2f} disconnected={latest['disconnected_count']} comm edges={latest['communication_edge_count']}"]
         if self.show_diagnostics and "shadow_junction_suspected" in latest:
             detector_state="JUNCTION_SUSPECTED" if latest.get("suspect_hold_active",False) or latest["shadow_junction_suspected"] else "NO_JUNCTION"
-            hud += [f"Detector={detector_state} hold={latest.get('suspect_hold_active',False)} propulsion={latest.get('local_forward_propulsion_active',False)}",f"SPH expansion={int(latest['shadow_sph_expansion'])} Boundary change={int(latest['shadow_boundary_change'])} LiDAR geometry={int(latest['shadow_lidar_geometry_change'])} Fusion={int(latest['shadow_fusion_trigger'])}"]
+            hud += [f"[Legacy Shadow EVAL ONLY] {detector_state} Fusion={int(latest['shadow_fusion_trigger'])} SPH={int(latest['shadow_sph_expansion'])} Boundary={int(latest['shadow_boundary_change'])}",
+                f"[LiDAR Geometry] Trigger={int(latest['shadow_lidar_geometry_change'])} {latest.get('lidar_geometry_reason_summary','-')}",
+                f"L support {latest.get('lidar_left_support_baseline',0):.2f}->{latest.get('lidar_left_support_current',0):.2f} d={latest.get('lidar_left_support_delta',0):+.2f} changed={latest.get('lidar_left_support_changed',False)}",
+                f"R support {latest.get('lidar_right_support_baseline',0):.2f}->{latest.get('lidar_right_support_current',0):.2f} d={latest.get('lidar_right_support_delta',0):+.2f} changed={latest.get('lidar_right_support_changed',False)}",
+                f"Free span {latest.get('lidar_free_span_baseline',0):.1f}->{latest.get('lidar_free_span_current',0):.1f} d={latest.get('lidar_free_span_delta',0):+.1f} changed={latest.get('lidar_free_span_changed',False)}",
+                f"Forward {latest.get('lidar_forward_baseline',0):.1f}->{latest.get('lidar_forward_current',0):.1f} d={latest.get('lidar_forward_delta',0):+.1f}",
+                f"LiDAR evidence={latest.get('lidar_profile_change_score',0):.4f} threshold={latest.get('lidar_profile_change_threshold',0):.4f} changed={latest.get('lidar_profile_changed',False)}",
+                f"Sectors wall={latest.get('wall_loss_sectors','[]')} free={latest.get('free_space_increase_sectors','[]')}",
+                f"[Anchor] phase={latest['initialization_phase']} hold={latest.get('suspect_hold_active',False)} propulsion={latest.get('local_forward_propulsion_active',False)} braking={latest.get('leader_braking_active',False)}",
+                f"leader speed={latest.get('leader_speed',0):.3f} stationary={latest.get('leader_stationary',False)} dwell={latest.get('stationary_dwell_steps',0)}/{latest.get('stationary_dwell_target',0)}",
+                f"Anchor={latest.get('provisional_fixed_anchor',False)} PointCloud ready={latest.get('pointcloud_ready',False)}"]
+        if self.show_diagnostics and "opening_groups_json" in latest:
+            groups=json.loads(latest["opening_groups_json"])
+            hud += ["[Profile groups] "+("none" if not groups else " | ".join(f"G{group['group_id']}=[{group['start_angle_deg']:.1f},{group['end_angle_deg']:.1f}] c={group['center_angle_deg']:.1f} w={group['angular_width_deg']:.1f}" for group in groups[:4]))]
         for index,text in enumerate(hud): self.screen.blit(self.font.render(text,True,(245,245,245)),(12,10+index*22))
         pygame.display.flip(); self.clock.tick(60)
 
 
 def _new_gui_runner(case_id, propulsion_mode):
-    """Create a GUI runner; LOCAL_FORWARD receives the frozen shadow detector."""
+    """Create a GUI runner with the moving LiDAR-profile detector."""
     if propulsion_mode == "local_forward":
         from junction_detection.integration.run_junction_shadow_detection import FROZEN_GUI_THRESHOLDS, ShadowJunctionDetector
-        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=True)
+        from junction_detection.pointcloud.lidar_profile_junction_detector import GeometryProfileConfig, LidarProfileJunctionDetector
+        profile=LidarProfileJunctionDetector(GeometryProfileConfig(BASELINE_CORRIDOR_WIDTH,LIDAR_MAX_RANGE))
+        # Legacy fusion remains visible for evaluation, but no longer actuates
+        # hold/braking or supplies the new detector's decision.
+        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile)
     return SimulationRunner(case_id,propulsion_mode)
 
 
