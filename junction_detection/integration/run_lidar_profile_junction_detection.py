@@ -24,7 +24,6 @@ from junction_detection.pointcloud.lidar_profile_junction_detector import (
     LidarProfileJunctionDetector,
 )
 from pygame_simulator.pre_exploration_general_pipeline_simulator import (
-    BASELINE_CORRIDOR_WIDTH,
     LIDAR_MAX_RANGE,
     MIN_SPEED,
     SimulationRunner,
@@ -43,7 +42,7 @@ def _write(path: Path, rows: list[dict], fieldnames=None) -> None:
 
 def _new_detector() -> LidarProfileJunctionDetector:
     """Create the fixed ideal/noiseless baseline configuration."""
-    return LidarProfileJunctionDetector(GeometryProfileConfig(BASELINE_CORRIDOR_WIDTH,LIDAR_MAX_RANGE))
+    return LidarProfileJunctionDetector(GeometryProfileConfig(LIDAR_MAX_RANGE))
 
 
 def run_case(case_id: str, frames: int) -> tuple[SimulationRunner,dict,dict|None]:
@@ -68,7 +67,7 @@ def timeline(rows: list[dict]) -> list[dict]:
     return [{
         "frame":row["frame"],"time":row["timestamp"],"map_case":row["map_case"],
         "lidar_x_eval":row["lidar_x_eval"],"lidar_y_eval":row["lidar_y_eval"],
-        "corridor_width":row["corridor_width"],"max_range":row["profile_max_range"],"local_lateral_offset":row["profile_lateral_offset"],
+        "estimated_corridor_width":row["estimated_corridor_width"],"max_range":row["profile_max_range"],"estimated_offset":row["estimated_offset"],
         "opening_group_count":row["opening_group_count"],"junction_detected":row["profile_junction_detected"],"detector_state":row["profile_detector_state"],
         "leader_speed":row["leader_speed"],"measured_profile_summary":json.dumps({"min":row["measured_profile_min"],"mean":row["measured_profile_mean"],"max":row["measured_profile_max"]},separators=(",",":")),
         "expected_profile_summary":json.dumps({"min":row["expected_profile_min"],"mean":row["expected_profile_mean"],"max":row["expected_profile_max"]},separators=(",",":")),
@@ -122,7 +121,7 @@ def main(argv=None) -> None:
     local_contract=set(LidarProfileJunctionDetector.RUNTIME_INPUTS)=={"angles_deg","ranges"}
     passed=summaries[0]["detection_count"]==0 and summaries[1]["detection_count"]>0 and summaries[1]["first_detection_leader_speed"]>=MIN_SPEED and all(row["max_nan_inf"]==0 for row in summaries) and local_contract
     verdict="LIDAR_PROFILE_BASELINE_VALID" if passed else "VALIDATION_FAILED"
-    _write(args.output/"lidar_profile_verdict.csv",[{"verdict":verdict,"runtime_inputs":"angles_deg,ranges","corridor_width_configuration":BASELINE_CORRIDOR_WIDTH,"max_range_configuration":LIDAR_MAX_RANGE,"legacy_shadow_dependency":False,"GT_dependency":False,"noise_std":0.0,"dropout":0.0,"occlusion":0.0}])
+    _write(args.output/"lidar_profile_verdict.csv",[{"verdict":verdict,"runtime_inputs":"angles_deg,ranges","corridor_width_configuration":"NONE_LOCAL_ESTIMATE","max_range_configuration":LIDAR_MAX_RANGE,"legacy_shadow_dependency":False,"GT_dependency":False,"noise_std":0.0,"dropout":0.0,"occlusion":0.0}])
     plot_profile(args.output/"lidar_profile_corridor.png",m0_corridor,"M0 ideal corridor")
     if m1_detection is not None: plot_profile(args.output/"lidar_profile_junction.png",m1_detection,"M1 first profile detection")
     print(f"verdict={verdict} output={args.output.resolve()}")

@@ -1034,7 +1034,7 @@ class SimulationRunner:
         if self.profile_detector is not None:
             profile=self.profile_detector.detect(observation.lidar_scan.angles_deg,observation.lidar_scan.ranges); self.last_profile_result=profile
             groups=profile["opening_groups"]
-            row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","corridor_width","profile_max_range","profile_lateral_offset","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
+            row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","opening_candidate_count","left_wall_range","right_wall_range","width_observation","offset_observation","estimated_corridor_width","estimated_offset","stable_left_wall","stable_right_wall","side_walls_valid","corridor_model_initialized","corridor_model_just_initialized","corridor_model_update_enabled","corridor_model_frozen","corridor_model_update_count","profile_max_range","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
             row["opening_groups_json"]=json.dumps(groups,separators=(",",":")); visual.update({"profile_open_candidate_mask":profile["open_candidate_mask"],"profile_confirmed_opening_mask":profile["confirmed_opening_mask"],"profile_expected_ranges":profile["expected_ranges"]})
         # Everything above this line is runtime-local. GT is appended only
         # after the profile detector has completed its decision.
@@ -1124,7 +1124,10 @@ class PygameRenderer:
         run_state="PAUSED" if self.paused else "RUNNING"
         latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays T trails C comm N support ESC quit"]
         if "profile_detector_state" in latest:
-            hud += [f"[LiDAR Profile Detector] mode=GEOMETRY_BASED state={latest['profile_detector_state']}",f"width={latest['corridor_width']:.1f} local offset={latest['profile_lateral_offset']:+.2f} max_range={latest['profile_max_range']:.1f} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
+            width_obs=(f"{latest['width_observation']:.2f}" if math.isfinite(latest['width_observation']) else "INVALID")
+            width_hat=(f"{latest['estimated_corridor_width']:.2f}" if math.isfinite(latest['estimated_corridor_width']) else "UNINITIALIZED")
+            offset_hat=(f"{latest['estimated_offset']:+.2f}" if math.isfinite(latest['estimated_offset']) else "UNINITIALIZED")
+            hud += [f"[LiDAR Profile Detector] mode=LOCAL_ESTIMATED state={latest['profile_detector_state']}",f"[Local Corridor Model] L/R={latest['left_wall_range']:.2f}/{latest['right_wall_range']:.2f} width obs={width_obs} hat={width_hat} offset={offset_hat}",f"initialized={latest['corridor_model_initialized']} update={latest['corridor_model_update_enabled']} frozen={latest['corridor_model_frozen']} candidates={latest['opening_candidate_count']} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
         if self.show_diagnostics and latest:
             second_size=round(latest['boundary_count']*latest['boundary_second_component_fraction'])
             counts=list(latest.get('boundary_component_count_vector',[])); ratios=list(latest.get('boundary_component_ratio_vector',[])); suffix="..." if len(counts)>5 else ""
@@ -1158,7 +1161,7 @@ def _new_gui_runner(case_id, propulsion_mode):
     if propulsion_mode == "local_forward":
         from junction_detection.integration.run_junction_shadow_detection import FROZEN_GUI_THRESHOLDS, ShadowJunctionDetector
         from junction_detection.pointcloud.lidar_profile_junction_detector import GeometryProfileConfig, LidarProfileJunctionDetector
-        profile=LidarProfileJunctionDetector(GeometryProfileConfig(BASELINE_CORRIDOR_WIDTH,LIDAR_MAX_RANGE))
+        profile=LidarProfileJunctionDetector(GeometryProfileConfig(LIDAR_MAX_RANGE))
         # Legacy fusion remains visible for evaluation, but no longer actuates
         # hold/braking or supplies the new detector's decision.
         return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile)
