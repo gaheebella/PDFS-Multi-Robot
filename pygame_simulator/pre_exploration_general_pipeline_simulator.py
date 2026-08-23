@@ -82,6 +82,22 @@ BASELINE_CORRIDOR_WIDTH = 84.0
 MIN_SPEED = 1.2
 ANCHOR_STATIONARY_DWELL_STEPS = max(1, round(SAMPLE_PERIOD / DT))
 
+
+@dataclass(frozen=True)
+class ActiveViewpointConfig:
+    """Bounded, local-only research policy for fixed-viewpoint rescans."""
+
+    step_fraction: float = 0.10
+    max_rescans: int = 3
+    stopping_distance_aware: bool = False
+    support_guard_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.step_fraction <= 0.0:
+            raise ValueError("viewpoint step fraction must be positive")
+        if self.max_rescans < 0:
+            raise ValueError("viewpoint max rescans must be non-negative")
+
 # Adapted from production's MOVE_TO_JUNCTION initialization protocol
 # (get_base_pressure_scale, adaptive_equilibrium_radius, compute_route_force,
 # and initial_pressure_release_active). Branch/event-specific terms are omitted.
@@ -404,7 +420,7 @@ class LidarSensor:
 
 class SimulatorWorld:
     """Global physics/world owner; branch metadata never leaves this class."""
-    def __init__(self, geometry: GeometryCase, propulsion_mode: str = "production_compression"):
+    def __init__(self, geometry: GeometryCase, propulsion_mode: str = "production_compression", active_viewpoint_config: ActiveViewpointConfig | None = None):
         if propulsion_mode not in PROPULSION_MODES:
             raise ValueError(f"unknown propulsion mode: {propulsion_mode}")
         self.geometry = geometry
@@ -461,6 +477,31 @@ class SimulatorWorld:
         self.anchor_entry_time = math.nan
         self.anchor_position: np.ndarray | None = None
         self.anchor_heading_rad = math.nan
+        self.active_viewpoint_config = active_viewpoint_config
+        self.active_viewpoint_state = "DISABLED" if active_viewpoint_config is None else "WAITING_INITIAL_SCAN"
+        self.viewpoint_scan_index = 0
+        self.viewpoint_step_target = 0.0
+        self.viewpoint_step_progress = 0.0
+        self.viewpoint_cumulative_advance = 0.0
+        self.trusted_corridor_width = math.nan
+        self.trusted_corridor_orientation_deg = math.nan
+        self.trusted_corridor_forward = np.array([math.nan, math.nan])
+        self.trusted_corridor_sign_source = "UNAVAILABLE"
+        self.anchor_history_eval: list[dict[str, float | int]] = []
+        self.viewpoint_predicted_stopping_distance = 0.0
+        self.viewpoint_brake_trigger_reason = "NONE"
+        self.viewpoint_step_actual_progress = 0.0
+        self.viewpoint_drive_phase_distance = 0.0
+        self.viewpoint_prebrake_distance = 0.0
+        self.viewpoint_braking_distance = 0.0
+        self.viewpoint_dwell_distance = 0.0
+        self.viewpoint_support_gap_start = math.nan
+        self.viewpoint_support_gap_at_brake = math.nan
+        self.viewpoint_speed_at_brake = math.nan
+        self.viewpoint_brake_start_progress = math.nan
+        self.viewpoint_predicted_stop_at_trigger = math.nan
+        self.viewpoint_motion_physics_rows: list[dict[str, float | int | bool | str]] = []
+        self.viewpoint_motion_step_records: list[dict[str, float | int | bool | str]] = []
 
     def _create_robots(self):
         half = self.geometry.incoming_width/2
@@ -631,6 +672,63 @@ class SimulatorWorld:
             ranges.append(min(hits) if hits else math.inf)
         return all(math.isfinite(value) for value in ranges) and sum(ranges) <= LOCAL_WALL_CONFINEMENT_MAX_WIDTH
 
+    def _predict_viewpoint_braking_distance(self, leader: RobotState) -> float:
+        """Roll out the unchanged local brake/filter dynamics deterministically."""
+        if not np.all(np.isfinite(self.trusted_corridor_forward)):
+            return 0.0
+        velocity=leader.velocity.copy(); acceleration=leader.acceleration.copy(); distance=0.0
+        # This is a local control-model rollout only: current proprioceptive
+        # velocity/acceleration, the frozen forward axis, and existing brake
+        # constants. It does not query geometry, pose, or ground truth.
+        dwell_steps=0
+        for _ in range(2000):
+            raw=_limit(-LEADER_BRAKE_DAMPING*velocity,MAX_ACCELERATION)
+            acceleration=(1.0-ACCELERATION_FILTER_ALPHA)*acceleration+ACCELERATION_FILTER_ALPHA*raw
+            velocity=velocity+acceleration*DT
+            distance += max(0.0,float(np.dot(velocity,self.trusted_corridor_forward)))*DT
+            if float(np.linalg.norm(velocity)) < MIN_SPEED:
+                dwell_steps += 1
+                if dwell_steps >= ANCHOR_STATIONARY_DWELL_STEPS:
+                    break
+            else:
+                dwell_steps = 0
+        return float(distance)
+
+    def _trigger_viewpoint_brake(self, reason: str, predicted_stop: float, support_gap: float) -> None:
+        """Cut leader drive and activate the existing brake in this step."""
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        self.active_viewpoint_state="VIEWPOINT_REBRAKING"; self.braking_active=True
+        self.braking_start_time=self.time; self.braking_start_position_eval=leader.position.copy()
+        self.stationary_dwell_steps=0; self.viewpoint_brake_trigger_reason=reason
+        self.viewpoint_support_gap_at_brake=float(support_gap)
+        self.viewpoint_speed_at_brake=float(np.linalg.norm(leader.velocity))
+        self.viewpoint_brake_start_progress=self.viewpoint_step_actual_progress
+        self.viewpoint_predicted_stop_at_trigger=float(predicted_stop)
+
+    def _apply_viewpoint_motion_guards(self) -> None:
+        """Apply opt-in local stopping and support guards before route force."""
+        config=self.active_viewpoint_config
+        if config is None or self.active_viewpoint_state!="VIEWPOINT_ADVANCE":
+            return
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        predicted=self._predict_viewpoint_braking_distance(leader)
+        self.viewpoint_predicted_stopping_distance=predicted
+        remaining=max(0.0,self.viewpoint_step_target-self.viewpoint_step_actual_progress)
+        gap=float(self.last_connectivity.get("leader_to_front_pack_gap",math.inf))
+        connected=bool(self.last_connectivity.get("leader_connected",False))
+        numerical_margin=max(EPSILON,np.finfo(float).eps*max(1.0,self.viewpoint_step_target)*64.0)
+        # The guard is evaluated once per physics step. Account for at most
+        # one current-velocity travel quantum without introducing a new gain.
+        control_margin=max(0.0,float(np.dot(leader.velocity,self.trusted_corridor_forward)))*DT
+        if config.support_guard_enabled and (not connected or not math.isfinite(gap)):
+            self._trigger_viewpoint_brake("DIRECT_SUPPORT_LOST",predicted,gap)
+        elif config.support_guard_enabled and gap+predicted+control_margin >= SMOOTHING_LENGTH-numerical_margin:
+            # SMOOTHING_LENGTH is the existing physical/SPH interaction
+            # radius. The predicted residual motion must fit inside it.
+            self._trigger_viewpoint_brake("DIRECT_SUPPORT_GUARD",predicted,gap)
+        elif config.stopping_distance_aware and remaining <= predicted+control_margin+numerical_margin:
+            self._trigger_viewpoint_brake("PREDICTED_STOPPING_DISTANCE",predicted,gap)
+
     def step(self):
         neighbors = self._neighbors(); self._densities(neighbors)
         production_mode = self.propulsion_mode == "production_compression"
@@ -642,6 +740,11 @@ class SimulatorWorld:
             else:
                 self._update_leader_gap(neighbors)
             self.local_graph_update_index += 1
+            self._apply_viewpoint_motion_guards()
+        viewpoint_state_for_forces=self.active_viewpoint_state
+        viewpoint_dwell_before=self.stationary_dwell_steps
+        viewpoint_drive_force_magnitude=0.0
+        viewpoint_brake_force_magnitude=0.0
         pressure_scale = _pressure_scale(self.time) if production_mode else SPH_PRESSURE_SCALE
         for robot in self.robots:
             ratio = robot.density/max(self.reference_density,EPSILON)
@@ -698,9 +801,18 @@ class SimulatorWorld:
             if not production_mode:
                 # The command is [forward, lateral]=[F, 0] in the robot body
                 # frame, transformed solely for physics integration.
-                route = np.zeros(2) if self.suspect_hold_active else np.array([
-                    math.cos(robot.body_yaw_rad), math.sin(robot.body_yaw_rad)
-                ]) * LOCAL_FORWARD_DRIVE_FORCE * robot.propulsion_weight
+                if self.active_viewpoint_state == "VIEWPOINT_ADVANCE":
+                    # Active sensing moves only the LiDAR leader. The vector
+                    # was frozen from the body-local corridor estimate and
+                    # pre-hold local motion; followers retain passive SPH.
+                    route = (self.trusted_corridor_forward * LOCAL_FORWARD_DRIVE_FORCE * robot.propulsion_weight
+                             if robot.robot_id == self.lidar_robot_id else np.zeros(2))
+                    if robot.robot_id == self.lidar_robot_id:
+                        viewpoint_drive_force_magnitude=float(np.linalg.norm(route))
+                else:
+                    route = np.zeros(2) if self.suspect_hold_active else np.array([
+                        math.cos(robot.body_yaw_rad), math.sin(robot.body_yaw_rad)
+                    ]) * LOCAL_FORWARD_DRIVE_FORCE * robot.propulsion_weight
             elif self.time < BASE_COMPRESSION_DURATION:
                 compression = self.compression_center - robot.position
                 distance = float(np.linalg.norm(compression))
@@ -723,7 +835,12 @@ class SimulatorWorld:
             # damping coefficient. It rejects ongoing contact/SPH disturbance
             # without changing those forces or any follower dynamics, and it
             # retains the normal acceleration filter instead of zeroing speed.
-            raw=_limit(-LEADER_BRAKE_DAMPING*robot.velocity if braking_leader else total,MAX_ACCELERATION)
+            if braking_leader:
+                brake_command=-LEADER_BRAKE_DAMPING*robot.velocity
+                viewpoint_brake_force_magnitude=float(np.linalg.norm(_limit(brake_command,MAX_ACCELERATION)))
+                raw=_limit(brake_command,MAX_ACCELERATION)
+            else:
+                raw=_limit(total,MAX_ACCELERATION)
             alpha = INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA
             accelerations[robot.robot_id]=(1-alpha)*robot.acceleration+alpha*raw
         self.last_mean_pressure_force=float(np.mean(pressure_magnitudes))
@@ -755,13 +872,71 @@ class SimulatorWorld:
                 # geometric projection, matching production's behavior.
                 self.wall_corrections += 1
             robot.observed_velocity=(robot.position-old)/DT
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        if viewpoint_state_for_forces in ("VIEWPOINT_ADVANCE","VIEWPOINT_REBRAKING"):
+            # Odometry-equivalent progress is the positive body-local forward
+            # velocity integral. The drive target uses only the ADVANCE part;
+            # cumulative reporting also includes residual re-braking motion.
+            # Global position never terminates the move or updates odometry.
+            increment=max(0.0,float(np.dot(leader.observed_velocity,self.trusted_corridor_forward)))*DT
+            self.viewpoint_cumulative_advance += increment
+            self.viewpoint_step_actual_progress += increment
+            if viewpoint_state_for_forces == "VIEWPOINT_ADVANCE":
+                self.viewpoint_drive_phase_distance += increment
+                self.viewpoint_step_progress += increment
+            elif self.braking_active and viewpoint_dwell_before>0:
+                self.viewpoint_dwell_distance += increment
+            elif self.braking_active:
+                self.viewpoint_braking_distance += increment
+            else:
+                self.viewpoint_prebrake_distance += increment
+            if self.active_viewpoint_state == "VIEWPOINT_ADVANCE" and self.viewpoint_step_actual_progress >= self.viewpoint_step_target:
+                predicted=self._predict_viewpoint_braking_distance(leader)
+                gap=float(self.last_connectivity.get("leader_to_front_pack_gap",math.inf))
+                reason=("TARGET_REACHED_BASELINE" if self.active_viewpoint_config is not None and not self.active_viewpoint_config.stopping_distance_aware and not self.active_viewpoint_config.support_guard_enabled else "TARGET_REACHED_FALLBACK")
+                self._trigger_viewpoint_brake(reason,predicted,gap)
+        self.viewpoint_predicted_stopping_distance=self._predict_viewpoint_braking_distance(leader) if self.active_viewpoint_state in ("VIEWPOINT_ADVANCE","VIEWPOINT_REBRAKING") else 0.0
         self._update_anchor_transition()
+        if viewpoint_state_for_forces in ("VIEWPOINT_ADVANCE","VIEWPOINT_REBRAKING"):
+            forward_speed=float(np.dot(leader.velocity,self.trusted_corridor_forward))
+            lateral_axis=np.array([-self.trusted_corridor_forward[1],self.trusted_corridor_forward[0]])
+            diagnostic_positions=np.array([robot.position for robot in self.robots]); diagnostic_velocities=np.array([robot.velocity for robot in self.robots])
+            diagnostic_nan_inf=int(diagnostic_positions.size-np.isfinite(diagnostic_positions).sum()+diagnostic_velocities.size-np.isfinite(diagnostic_velocities).sum())
+            self.viewpoint_motion_physics_rows.append({
+                "physics_frame":self.physics_frame_index,"timestamp":self.time+DT,"viewpoint_step_index":self.viewpoint_scan_index,
+                "state":viewpoint_state_for_forces,"state_after":self.active_viewpoint_state,"leader_speed":float(np.linalg.norm(leader.velocity)),
+                "leader_forward_speed":forward_speed,"leader_lateral_speed":float(np.dot(leader.velocity,lateral_axis)),
+                "drive_force_magnitude":viewpoint_drive_force_magnitude,"brake_force_magnitude":viewpoint_brake_force_magnitude,
+                "local_progress":self.viewpoint_step_actual_progress,"drive_phase_progress":self.viewpoint_step_progress,
+                "target_progress":self.viewpoint_step_target,"remaining_progress":max(0.0,self.viewpoint_step_target-self.viewpoint_step_actual_progress),
+                "predicted_stopping_distance":self.viewpoint_predicted_stopping_distance,"brake_trigger_reason":self.viewpoint_brake_trigger_reason,
+                "support_gap":float(self.last_connectivity.get("leader_to_front_pack_gap",math.inf)),"direct_support_present":bool(self.last_connectivity.get("leader_connected",False)),
+                "communication_connected":bool(self.last_connectivity.get("leader_communication_connected",False)),"communication_component_size":int(self.last_connectivity.get("leader_connected_component_size",0)),
+                "stationary_dwell":self.stationary_dwell_steps,"anchor_reached":self.provisional_fixed_anchor,
+                "nan_inf":diagnostic_nan_inf,"outside_robot_count":sum(not self.geometry.contains(robot.position) for robot in self.robots),
+            })
         self.time += DT
         self.physics_frame_index += 1
 
     def _update_anchor_transition(self) -> None:
         """Confirm local stationarity, then latch the current leader pose."""
         leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        if self.active_viewpoint_state == "VIEWPOINT_REBRAKING":
+            if not self.braking_active:
+                # Reuse the initial transition's one-step propulsion-off hold
+                # before enabling the unchanged local viscous brake.
+                self.braking_active=True; self.braking_start_time=self.time+DT
+                self.braking_start_position_eval=leader.position.copy()
+                return
+            if float(np.linalg.norm(leader.velocity)) < MIN_SPEED:
+                self.stationary_dwell_steps += 1
+            else:
+                self.stationary_dwell_steps = 0
+            if self.stationary_dwell_steps >= ANCHOR_STATIONARY_DWELL_STEPS:
+                self._latch_provisional_anchor(leader,rescan=True)
+            return
+        if self.active_viewpoint_state == "VIEWPOINT_ADVANCE":
+            return
         if not self.suspect_hold_active or self.provisional_fixed_anchor:
             self.braking_active=False
             return
@@ -778,16 +953,81 @@ class SimulatorWorld:
             self.stationary_dwell_steps = 0
         if self.stationary_dwell_steps < ANCHOR_STATIONARY_DWELL_STEPS:
             return
-        self.stationary_confirmed=True
-        self.stationary_confirmation_time=self.time+DT
+        self._latch_provisional_anchor(leader,rescan=False)
+
+    def _latch_provisional_anchor(self, leader: RobotState, rescan: bool) -> None:
+        """Freeze the current local pose after the unchanged dwell check."""
+        if rescan and self.active_viewpoint_config is not None:
+            actual=self.viewpoint_step_actual_progress; target=self.viewpoint_step_target
+            self.viewpoint_motion_step_records.append({
+                "step_index":self.viewpoint_scan_index,"target_advance":target,"drive_phase_distance":self.viewpoint_drive_phase_distance,
+                "prebrake_distance":self.viewpoint_prebrake_distance,"brake_start_progress":self.viewpoint_brake_start_progress,
+                "speed_at_brake_start":self.viewpoint_speed_at_brake,"predicted_stop_distance_at_trigger":self.viewpoint_predicted_stop_at_trigger,
+                "braking_distance":self.viewpoint_braking_distance,"dwell_distance":self.viewpoint_dwell_distance,"actual_advance":actual,
+                "absolute_error":abs(actual-target),"relative_error":abs(actual-target)/max(target,EPSILON),"overshoot_ratio":(actual-target)/max(target,EPSILON),
+                "support_gap_start":self.viewpoint_support_gap_start,"support_gap_at_brake":self.viewpoint_support_gap_at_brake,
+                "support_gap_at_anchor":float(self.last_connectivity.get("leader_to_front_pack_gap",math.inf)),"direct_support_at_anchor":bool(self.last_connectivity.get("leader_connected",False)),
+                "communication_component_at_anchor":int(self.last_connectivity.get("leader_connected_component_size",0)),"stop_reason":self.viewpoint_brake_trigger_reason,
+            })
+        self.stationary_confirmed=True; self.stationary_confirmation_time=self.time+DT
         self.provisional_fixed_anchor=True; self.braking_active=False
         self.anchor_entry_frame=self.physics_frame_index; self.anchor_entry_time=self.time+DT
         self.anchor_position=leader.position.copy(); self.anchor_heading_rad=leader.body_yaw_rad
-        # Local Anchor frame for the next Point Cloud stage. The world position
-        # is retained only by the simulator to enforce the fixed body pose.
         self.anchor_local_origin=np.zeros(2); self.anchor_local_heading_rad=leader.body_yaw_rad
         leader.velocity[:]=0.; leader.acceleration[:]=0.; leader.observed_velocity[:]=0.
-        self.pointcloud_ready=bool(self.stationary_confirmed and self.anchor_position is not None)
+        self.pointcloud_ready=True
+        if self.active_viewpoint_config is not None:
+            self.active_viewpoint_state="PROVISIONAL_RESCAN_ANCHOR" if rescan else "PROVISIONAL_FIXED_ANCHOR"
+            self.anchor_history_eval.append({"scan_index":self.viewpoint_scan_index,"x":float(leader.position[0]),"y":float(leader.position[1]),"yaw_deg":math.degrees(leader.body_yaw_rad)})
+
+    def freeze_trusted_corridor_frame(self, orientation_deg: float, width: float) -> None:
+        """Freeze a signed forward vector from local scan and motion history."""
+        if self.active_viewpoint_config is None or math.isfinite(self.trusted_corridor_width):
+            return
+        if not math.isfinite(orientation_deg) or not math.isfinite(width) or width <= 0.0:
+            return
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        angle=leader.body_yaw_rad+math.radians(orientation_deg)
+        candidate=np.array([math.cos(angle),math.sin(angle)])
+        motion=leader.observed_velocity.copy()
+        if float(np.linalg.norm(motion)) >= MIN_SPEED:
+            if float(np.dot(candidate,motion)) < 0.0:
+                candidate=-candidate
+            source="PRE_HOLD_LOCAL_MOTION"
+        else:
+            body_forward=np.array([math.cos(leader.body_yaw_rad),math.sin(leader.body_yaw_rad)])
+            if float(np.dot(candidate,body_forward)) < 0.0:
+                candidate=-candidate
+            source="BODY_FORWARD_FALLBACK"
+        self.trusted_corridor_width=float(width)
+        self.trusted_corridor_orientation_deg=float(orientation_deg)
+        self.trusted_corridor_forward=candidate
+        self.trusted_corridor_sign_source=source
+
+    def finish_viewpoint_scan(self) -> None:
+        """Start the next bounded local step after a completed fixed scan."""
+        config=self.active_viewpoint_config
+        if config is None:
+            return
+        if self.viewpoint_scan_index >= config.max_rescans:
+            self.active_viewpoint_state="VIEWPOINT_SEQUENCE_COMPLETE"
+            return
+        if not math.isfinite(self.trusted_corridor_width):
+            self.active_viewpoint_state="VIEWPOINT_SEQUENCE_BLOCKED_NO_LOCAL_SCALE"
+            return
+        self.viewpoint_scan_index += 1
+        self.viewpoint_step_target=config.step_fraction*self.trusted_corridor_width
+        self.viewpoint_step_progress=0.0
+        self.viewpoint_step_actual_progress=0.0
+        self.viewpoint_drive_phase_distance=0.0; self.viewpoint_prebrake_distance=0.0
+        self.viewpoint_braking_distance=0.0; self.viewpoint_dwell_distance=0.0
+        self.viewpoint_brake_trigger_reason="NONE"; self.viewpoint_predicted_stopping_distance=0.0
+        self.viewpoint_support_gap_start=float(self.last_connectivity.get("leader_to_front_pack_gap",math.inf))
+        self.viewpoint_support_gap_at_brake=math.nan; self.viewpoint_speed_at_brake=math.nan
+        self.viewpoint_brake_start_progress=math.nan; self.viewpoint_predicted_stop_at_trigger=math.nan
+        self.provisional_fixed_anchor=False; self.pointcloud_ready=False
+        self.stationary_confirmed=False; self.stationary_dwell_steps=0
+        self.active_viewpoint_state="VIEWPOINT_ADVANCE"
 
     def local_observation(self) -> LocalObservation:
         lidar=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
@@ -835,7 +1075,8 @@ class SimulatorWorld:
         hold_displacement=(float(np.linalg.norm(leader.position-self.suspect_entry_position)) if self.suspect_entry_position is not None else 0.0)
         detection_displacement=(float(np.linalg.norm(leader.position-self.detection_position_eval)) if self.detection_position_eval is not None else 0.0)
         braking_displacement=(float(np.linalg.norm(leader.position-self.braking_start_position_eval)) if self.braking_start_position_eval is not None else 0.0)
-        return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and not self.suspect_hold_active,
+        active_advancing=self.active_viewpoint_state=="VIEWPOINT_ADVANCE"
+        return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and (not self.suspect_hold_active or active_advancing),
             "leader_braking_active":self.braking_active,"leader_speed":leader_speed,"leader_stationary":leader_speed<MIN_SPEED,"stationary_speed_threshold":MIN_SPEED,
             "follower_mean_speed":float(np.mean([np.linalg.norm(robot.velocity) for robot in followers])),"follower_moving_fraction":float(np.mean([np.linalg.norm(robot.velocity)>=MIN_SPEED for robot in followers])),
             "stationary_dwell_steps":self.stationary_dwell_steps,"stationary_dwell_target":ANCHOR_STATIONARY_DWELL_STEPS,"provisional_fixed_anchor":self.provisional_fixed_anchor,
@@ -843,14 +1084,24 @@ class SimulatorWorld:
             "active_junction_phase":self.active_junction_phase(),"profile_detection_time":self.profile_detection_time,"detection_latch_time":self.detection_latch_time,"hold_entry_time":self.hold_entry_time,"braking_start_time":self.braking_start_time,"stationary_confirmation_time":self.stationary_confirmation_time,
             "suspect_entry_time":self.suspect_entry_time,"anchor_entry_frame":self.anchor_entry_frame,"anchor_entry_time":self.anchor_entry_time,
             "anchor_x_eval":float(self.anchor_position[0]) if self.anchor_position is not None else math.nan,"anchor_y_eval":float(self.anchor_position[1]) if self.anchor_position is not None else math.nan,
+            "anchor_heading_deg":math.degrees(self.anchor_heading_rad) if math.isfinite(self.anchor_heading_rad) else math.nan,
             "leader_displacement_since_hold":hold_displacement,"leader_displacement_since_detection_eval":detection_displacement,"leader_displacement_during_braking_eval":braking_displacement,
-            "leader_displacement_since_anchor":anchor_displacement,"leader_heading_change_since_anchor":heading_change}
+            "leader_displacement_since_anchor":anchor_displacement,"leader_heading_change_since_anchor":heading_change,
+            "active_viewpoint_state":self.active_viewpoint_state,"viewpoint_scan_index":self.viewpoint_scan_index,
+            "viewpoint_step_fraction":self.active_viewpoint_config.step_fraction if self.active_viewpoint_config is not None else math.nan,
+            "viewpoint_step_target":self.viewpoint_step_target,"viewpoint_step_progress":self.viewpoint_step_progress,
+            "viewpoint_step_actual_progress":self.viewpoint_step_actual_progress,"viewpoint_remaining_progress":max(0.0,self.viewpoint_step_target-self.viewpoint_step_actual_progress),
+            "viewpoint_predicted_stopping_distance":self.viewpoint_predicted_stopping_distance,"viewpoint_brake_trigger_reason":self.viewpoint_brake_trigger_reason,
+            "viewpoint_cumulative_advance":self.viewpoint_cumulative_advance,"trusted_corridor_width":self.trusted_corridor_width,
+            "trusted_corridor_orientation_deg":self.trusted_corridor_orientation_deg,"trusted_corridor_forward_x":float(self.trusted_corridor_forward[0]),
+            "trusted_corridor_forward_y":float(self.trusted_corridor_forward[1]),"trusted_corridor_sign_source":self.trusted_corridor_sign_source}
 
-    def activate_profile_junction_hold(self, detection_time: float) -> None:
+    def activate_profile_junction_hold(self, detection_time: float, corridor_orientation_deg: float = math.nan, corridor_width: float = math.nan) -> None:
         """Latch a scan-only profile detection into the active local control path."""
         if self.propulsion_mode!="local_forward" or self.junction_detection_latched:
             return
         leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        self.freeze_trusted_corridor_frame(corridor_orientation_deg,corridor_width)
         self.junction_detection_latched=True; self.junction_detection_source="LIDAR_PROFILE"
         self.profile_detection_time=float(detection_time); self.detection_latch_time=float(detection_time)
         self.hold_entry_time=float(detection_time); self.detection_position_eval=leader.position.copy()
@@ -866,6 +1117,11 @@ class SimulatorWorld:
 
     def active_junction_phase(self) -> str:
         """Return the localization-free active control phase."""
+        if self.active_viewpoint_state in {
+            "VIEWPOINT_ADVANCE","VIEWPOINT_REBRAKING","PROVISIONAL_RESCAN_ANCHOR",
+            "VIEWPOINT_SEQUENCE_COMPLETE","VIEWPOINT_SEQUENCE_BLOCKED_NO_LOCAL_SCALE",
+        }:
+            return self.active_viewpoint_state
         if self.provisional_fixed_anchor:
             return "PROVISIONAL_FIXED_ANCHOR"
         if self.braking_active:
@@ -1068,10 +1324,13 @@ class GroundTruthEvaluator:
 
 
 class SimulationRunner:
-    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False, profile_detector=None, hold_on_profile_detection=False):
-        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None; self.shadow_detector=shadow_detector; self.hold_on_suspect=hold_on_suspect
+    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False, profile_detector=None, hold_on_profile_detection=False, pointcloud_detector=None, active_viewpoint_config=None):
+        self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode,active_viewpoint_config); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None; self.shadow_detector=shadow_detector; self.hold_on_suspect=hold_on_suspect
         self.lidar_reason=(LidarGeometryReasonDiagnostics(shadow_detector.thresholds.lidar) if shadow_detector is not None else None)
         self.profile_detector=profile_detector; self.last_profile_result=None; self.hold_on_profile_detection=hold_on_profile_detection
+        self.pointcloud_detector=pointcloud_detector; self.primary_pointcloud_call_count=0; self.pointcloud_called_before_ready_count=0
+        self.last_pointcloud_openings=[]; self.last_pointcloud_scan=None; self.pointcloud_call_time=math.nan; self._pointcloud_ready_previous=False
+        self.pointcloud_call_count=0; self.pointcloud_history=[]
     def step(self, frame):
         self.world.step()
         if frame%max(1,round(SAMPLE_PERIOD/DT)): return None
@@ -1083,19 +1342,55 @@ class SimulationRunner:
             row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","opening_candidate_count","left_wall_range","right_wall_range","width_observation","offset_observation","estimated_corridor_width","estimated_offset","current_corridor_orientation_deg","stable_corridor_orientation_deg","left_wall_orientation_deg","right_wall_orientation_deg","parallel_error_deg","orientation_initialized","orientation_frozen","stable_left_wall","stable_right_wall","side_walls_valid","corridor_model_initialized","corridor_model_just_initialized","corridor_model_update_enabled","corridor_model_frozen","corridor_model_update_count","profile_max_range","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
             row["opening_groups_json"]=json.dumps(groups,separators=(",",":")); visual.update({"profile_open_candidate_mask":profile["open_candidate_mask"],"profile_confirmed_opening_mask":profile["confirmed_opening_mask"],"profile_expected_ranges":profile["expected_ranges"]})
             if self.hold_on_profile_detection and profile["profile_junction_detected"]:
-                self.world.activate_profile_junction_hold(float(row["timestamp"]))
+                self.world.activate_profile_junction_hold(float(row["timestamp"]),float(profile["stable_corridor_orientation_deg"]),float(profile["estimated_corridor_width"]))
                 # Reflect the immediate latch/propulsion gate in this same
                 # sampled row; physics braking starts on the following step.
                 row.update(self.world.connectivity_diagnostics())
                 row["initialization_phase"]=self.world.initialization_phase()
+        ready=bool(self.world.pointcloud_ready and self.world.provisional_fixed_anchor and self.world.anchor_position is not None)
+        ready_rising=ready and not self._pointcloud_ready_previous
+        pointcloud_called=False
+        allow_rescan=self.world.active_viewpoint_config is not None
+        if self.pointcloud_detector is not None and ready_rising and (allow_rescan or self.primary_pointcloud_call_count==0):
+            if not ready:
+                self.pointcloud_called_before_ready_count+=1
+            else:
+                # The fixed-Anchor detector receives only body/Anchor-local
+                # angle and range arrays. World geometry and pose stay here.
+                scan=observation.lidar_scan
+                self.last_pointcloud_openings=list(self.pointcloud_detector(scan.angles_deg.copy(),scan.ranges.copy()))
+                theta=np.deg2rad(scan.angles_deg); hit=scan.ranges<scan.max_range-np.finfo(float).eps*max(1.0,scan.max_range)*64.0
+                self.last_pointcloud_scan={"angles_deg":scan.angles_deg.copy(),"ranges":scan.ranges.copy(),"hit":hit,"local_x":scan.ranges*np.cos(theta),"local_y":scan.ranges*np.sin(theta),"max_range":scan.max_range,
+                    "anchor_position_eval":self.world.anchor_position.copy(),"anchor_heading_rad":self.world.anchor_heading_rad,"scan_index":self.world.viewpoint_scan_index}
+                self.pointcloud_call_count+=1
+                if self.primary_pointcloud_call_count==0:
+                    self.primary_pointcloud_call_count=1
+                self.pointcloud_call_time=float(row["timestamp"]); pointcloud_called=True
+                leader=next(robot for robot in self.world.robots if robot.robot_id==self.world.lidar_robot_id)
+                self.pointcloud_history.append({
+                    "scan_index":self.world.viewpoint_scan_index,"frame":frame,"timestamp":float(row["timestamp"]),
+                    "cumulative_local_advance":self.world.viewpoint_cumulative_advance,
+                    "estimated_corridor_width":self.world.trusted_corridor_width,
+                    "leader_speed_at_scan":float(np.linalg.norm(leader.velocity)),
+                    "angles_deg":scan.angles_deg.copy(),"ranges":scan.ranges.copy(),"hit":hit.copy(),"max_range":scan.max_range,
+                    "openings":[dict(opening) for opening in self.last_pointcloud_openings],
+                    "position_eval":leader.position.copy(),"yaw_eval":math.degrees(leader.body_yaw_rad),
+                    "sanity":dict(self.world.sanity()),"connectivity":dict(self.world.connectivity_diagnostics()),
+                })
+                self.world.finish_viewpoint_scan()
+        self._pointcloud_ready_previous=bool(self.world.pointcloud_ready)
+        row.update({"pointcloud_called":pointcloud_called,"pointcloud_observed":self.primary_pointcloud_call_count>0,"pointcloud_opening_count":len(self.last_pointcloud_openings),"primary_pointcloud_call_count":self.primary_pointcloud_call_count,"pointcloud_call_count":self.pointcloud_call_count,"pointcloud_called_before_ready_count":self.pointcloud_called_before_ready_count,"pointcloud_call_time":self.pointcloud_call_time})
+        row.update(self.world.connectivity_diagnostics())
+        if self.last_pointcloud_scan is not None:
+            visual.update({"pointcloud_scan":self.last_pointcloud_scan,"pointcloud_openings":self.last_pointcloud_openings})
         # Everything above this line is runtime-local. GT is appended only
-        # after the profile detector has completed its decision.
+        # after both profile and fixed-Anchor Point Cloud decisions complete.
         row.update(self.gt.evaluate(self.world,row,visual["local_mask"]))
         if self.shadow_detector is not None:
             from junction_detection.integration.run_junction_shadow_detection import runtime_features
             detected=self.shadow_detector.update(float(row["timestamp"]),runtime_features(row)); row.update(detected)
             if self.hold_on_suspect and detected["shadow_junction_suspected"]: self.world.activate_suspect_hold()
-            row["suspect_hold_active"]=self.world.suspect_hold_active; row["local_forward_propulsion_active"]=self.world.propulsion_mode=="local_forward" and not self.world.suspect_hold_active; row["initialization_phase"]=self.world.initialization_phase()
+            row.update(self.world.connectivity_diagnostics()); row["initialization_phase"]=self.world.initialization_phase()
             reasons,masks=self.lidar_reason.analyze(observation.lidar_scan,row); row.update(reasons); visual.update(masks)
         self.rows.append(row); self.last_visual=(observation,visual); return row
 
@@ -1121,7 +1416,7 @@ class PygameRenderer:
     def __init__(self, geometry, gui_scale=DEFAULT_GUI_SCALE, show_trails=False, show_gt=False):
         import pygame
         pygame.init(); self.pygame=pygame; self.screen=pygame.display.set_mode((1100,800)); self.clock=pygame.time.Clock(); self.font=pygame.font.Font(None,22)
-        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_trails=show_trails; self.show_communication_links=True; self.show_support_links=True; self.trails=[]; self.gui_scale=gui_scale
+        self.paused=False; self.show_gt=show_gt; self.show_diagnostics=True; self.show_lidar=False; self.show_pointcloud=True; self.show_trails=show_trails; self.show_communication_links=True; self.show_support_links=True; self.trails=[]; self.gui_scale=gui_scale
         self.configure_camera(geometry)
     def configure_camera(self,geometry):
         vertices=np.array([point for rect in geometry.free_rects for point in rect.vertices],dtype=float)
@@ -1162,6 +1457,22 @@ class PygameRenderer:
             if robot.robot_id in boundary: color=(255,100,100)
             if robot.robot_id==runner.world.lidar_robot_id: color=(255,230,40)
             pygame.draw.circle(self.screen,color,self.world_to_screen(robot.position),3)
+        if self.show_pointcloud and runner.last_pointcloud_scan is not None:
+            scan=runner.last_pointcloud_scan; yaw=scan["anchor_heading_rad"]; scan_anchor=scan["anchor_position_eval"]
+            rotation=np.array([[math.cos(yaw),-math.sin(yaw)],[math.sin(yaw),math.cos(yaw)]])
+            local_points=np.column_stack((scan["local_x"],scan["local_y"])); world_points=scan_anchor+local_points@rotation.T
+            for point in world_points[scan["hit"]][::2]:
+                pygame.draw.circle(self.screen,(90,225,245),self.world_to_screen(point),2)
+            for opening in runner.last_pointcloud_openings:
+                for key,color,width in (("start_angle",(245,160,60),1),("end_angle",(245,160,60),1),("center_angle",(245,70,220),3)):
+                    world_angle=yaw+math.radians(float(opening[key])); endpoint=scan_anchor+np.array([math.cos(world_angle),math.sin(world_angle)])*scan["max_range"]
+                    pygame.draw.line(self.screen,color,self.world_to_screen(scan_anchor),self.world_to_screen(endpoint),width)
+            for item in runner.world.anchor_history_eval:
+                point=np.array([item["x"],item["y"]]); pygame.draw.circle(self.screen,(255,190,40),self.world_to_screen(point),5,1)
+                label=self.font.render(f"A{item['scan_index']}",True,(255,210,80)); self.screen.blit(label,self.world_to_screen(point)+np.array([5,-8]))
+        trusted_forward=runner.world.trusted_corridor_forward
+        if np.all(np.isfinite(trusted_forward)):
+            pygame.draw.line(self.screen,(70,255,120),self.world_to_screen(lidar.position),self.world_to_screen(lidar.position+trusted_forward*24),4)
         pygame.draw.line(self.screen,(80,230,255),self.world_to_screen(lidar.position),self.world_to_screen(lidar.position+forward*18),3)
         if self.show_lidar and visual:
             scan=visual[0].lidar_scan
@@ -1183,7 +1494,7 @@ class PygameRenderer:
                 pygame.draw.line(self.screen,(255,210,70),self.world_to_screen(lidar.position-axis*18),self.world_to_screen(lidar.position+axis*18),3)
                 pygame.draw.line(self.screen,(190,90,255),self.world_to_screen(lidar.position-normal*12),self.world_to_screen(lidar.position+normal*12),2)
         run_state="PAUSED" if self.paused else "RUNNING"
-        latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays T trails C comm N support ESC quit"]
+        latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links} pointcloud={self.show_pointcloud}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays P pointcloud T trails C comm N support ESC quit"]
         if "profile_detector_state" in latest:
             width_obs=(f"{latest['width_observation']:.2f}" if math.isfinite(latest['width_observation']) else "INVALID")
             width_hat=(f"{latest['estimated_corridor_width']:.2f}" if math.isfinite(latest['estimated_corridor_width']) else "UNINITIALIZED")
@@ -1192,6 +1503,10 @@ class PygameRenderer:
             psi_stable=(f"{latest['stable_corridor_orientation_deg']:+.2f}" if math.isfinite(latest['stable_corridor_orientation_deg']) else "UNINITIALIZED")
             hud += [f"[LiDAR Profile Detector] mode=LOCAL_ESTIMATED state={latest['profile_detector_state']}",f"[Local Corridor Orientation] psi current/stable={psi_current}/{psi_stable} deg L/R angle={latest['left_wall_orientation_deg']:+.2f}/{latest['right_wall_orientation_deg']:+.2f} parallel err={latest['parallel_error_deg']:.3g}",f"orientation initialized={latest['orientation_initialized']} frozen={latest['orientation_frozen']}",f"[Local Corridor Geometry] L/R perp={latest['left_wall_range']:.2f}/{latest['right_wall_range']:.2f} width obs={width_obs} hat={width_hat} offset={offset_hat}",f"initialized={latest['corridor_model_initialized']} update={latest['corridor_model_update_enabled']} frozen={latest['corridor_model_frozen']} candidates={latest['opening_candidate_count']} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
             hud += [f"[Active Junction Control] detected={latest['profile_junction_detected']} latched={latest.get('junction_detection_latched',False)} phase={latest.get('active_junction_phase','LOCAL_FORWARD')}",f"propulsion={latest.get('local_forward_propulsion_active',False)} braking={latest.get('leader_braking_active',False)} leader speed={latest.get('leader_speed',0.0):.3f}",f"stationary={latest.get('leader_stationary',False)} dwell={latest.get('stationary_dwell_steps',0)}/{latest.get('stationary_dwell_target',0)} anchor={latest.get('provisional_fixed_anchor',False)} PointCloud ready={latest.get('pointcloud_ready',False)}"]
+            hud += [f"[Point Cloud] ready={latest.get('pointcloud_ready',False)} called={latest.get('pointcloud_called',False)} primary calls={latest.get('primary_pointcloud_call_count',0)} openings={latest.get('pointcloud_opening_count',0)}"]
+            hud += [f"[Viewpoint Motion] state={latest.get('active_viewpoint_state','DISABLED')} scan={latest.get('viewpoint_scan_index',0)} step fraction={latest.get('viewpoint_step_fraction',math.nan):.3f}",f"target/progress/remaining={latest.get('viewpoint_step_target',0.0):.3f}/{latest.get('viewpoint_step_actual_progress',0.0):.3f}/{latest.get('viewpoint_remaining_progress',0.0):.3f} predicted stop={latest.get('viewpoint_predicted_stopping_distance',0.0):.3f}",f"speed={latest.get('leader_speed',0.0):.3f} brake reason={latest.get('viewpoint_brake_trigger_reason','NONE')} DIRECT SUPPORT gap={latest.get('leader_to_front_pack_gap',math.inf):.3f} present={latest.get('leader_connected',False)}",f"cumulative={latest.get('viewpoint_cumulative_advance',0.0):.3f} width={latest.get('trusted_corridor_width',math.nan):.3f}"]
+            if runner.last_pointcloud_openings:
+                hud += ["PC openings: "+" | ".join(f"{index}: c={opening['center_angle']:+.1f} w={opening['width_deg']:.1f}" for index,opening in enumerate(runner.last_pointcloud_openings[:4]))]
         if self.show_diagnostics and latest:
             second_size=round(latest['boundary_count']*latest['boundary_second_component_fraction'])
             counts=list(latest.get('boundary_component_count_vector',[])); ratios=list(latest.get('boundary_component_ratio_vector',[])); suffix="..." if len(counts)>5 else ""
@@ -1220,15 +1535,16 @@ class PygameRenderer:
         pygame.display.flip(); self.clock.tick(60)
 
 
-def _new_gui_runner(case_id, propulsion_mode):
+def _new_gui_runner(case_id, propulsion_mode, active_viewpoint_config=None):
     """Create a GUI runner with the moving LiDAR-profile detector."""
     if propulsion_mode == "local_forward":
         from junction_detection.integration.run_junction_shadow_detection import FROZEN_GUI_THRESHOLDS, ShadowJunctionDetector
         from junction_detection.pointcloud.lidar_profile_junction_detector import GeometryProfileConfig, LidarProfileJunctionDetector
+        from junction_detection.pointcloud.pointcloud_junction_detector_sensor_enhanced import detect_openings as detect_pointcloud_openings
         profile=LidarProfileJunctionDetector(GeometryProfileConfig(LIDAR_MAX_RANGE))
         # Legacy fusion remains visible for evaluation, but no longer actuates
         # hold/braking or supplies the new detector's decision.
-        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile,hold_on_profile_detection=True)
+        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile,hold_on_profile_detection=True,pointcloud_detector=detect_pointcloud_openings,active_viewpoint_config=active_viewpoint_config)
     return SimulationRunner(case_id,propulsion_mode)
 
 
@@ -1240,23 +1556,24 @@ def _advance_gui_frame(runner, renderer, frame):
     return frame+1
 
 
-def run_gui(case_id,frames,show_trails=False,show_gt=False,propulsion_mode="production_compression",gui_scale=DEFAULT_GUI_SCALE):
+def run_gui(case_id,frames,show_trails=False,show_gt=False,propulsion_mode="production_compression",gui_scale=DEFAULT_GUI_SCALE,active_viewpoint_config=None):
     import pygame
-    cases=list(CASES); current=cases.index(case_id); runner=_new_gui_runner(case_id,propulsion_mode); renderer=PygameRenderer(runner.geometry,gui_scale,show_trails,show_gt); frame=0; running=True
+    cases=list(CASES); current=cases.index(case_id); runner=_new_gui_runner(case_id,propulsion_mode,active_viewpoint_config); renderer=PygameRenderer(runner.geometry,gui_scale,show_trails,show_gt); frame=0; running=True
     while running and (frames<=0 or frame<frames):
         for event in pygame.event.get():
             if event.type==pygame.QUIT: running=False
             elif event.type==pygame.KEYDOWN:
                 if event.key==pygame.K_ESCAPE: running=False
                 elif event.key==pygame.K_SPACE: renderer.paused=not renderer.paused
-                elif event.key==pygame.K_r: runner=_new_gui_runner(cases[current],propulsion_mode); frame=0; renderer.trails=[]
+                elif event.key==pygame.K_r: runner=_new_gui_runner(cases[current],propulsion_mode,active_viewpoint_config); frame=0; renderer.trails=[]
                 elif event.key==pygame.K_g: renderer.show_gt=not renderer.show_gt
                 elif event.key==pygame.K_d: renderer.show_diagnostics=not renderer.show_diagnostics
                 elif event.key==pygame.K_l: renderer.show_lidar=not renderer.show_lidar
+                elif event.key==pygame.K_p: renderer.show_pointcloud=not renderer.show_pointcloud
                 elif event.key==pygame.K_t: renderer.show_trails=not renderer.show_trails
                 elif event.key==pygame.K_c: renderer.show_communication_links=not renderer.show_communication_links
                 elif event.key==pygame.K_n: renderer.show_support_links=not renderer.show_support_links
-                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=_new_gui_runner(cases[current],propulsion_mode); renderer.configure_camera(runner.geometry); frame=0; renderer.trails=[]
+                elif pygame.K_1<=event.key<=pygame.K_6: current=event.key-pygame.K_1; runner=_new_gui_runner(cases[current],propulsion_mode,active_viewpoint_config); renderer.configure_camera(runner.geometry); frame=0; renderer.trails=[]
         frame=_advance_gui_frame(runner,renderer,frame)
         renderer.draw(runner,frame)
     pygame.quit(); return runner
@@ -1266,6 +1583,10 @@ def parse_args(argv=None):
     parser=argparse.ArgumentParser(description=__doc__); parser.add_argument("--map-case",choices=CASES); parser.add_argument("--frames",type=int,default=600)
     parser.add_argument("--propulsion-mode",choices=PROPULSION_MODES,default="production_compression")
     parser.add_argument("--gui-scale",type=float,default=DEFAULT_GUI_SCALE)
+    parser.add_argument("--active-viewpoint",action="store_true",help="enable bounded evaluation-only Point Cloud rescans")
+    parser.add_argument("--viewpoint-step-fraction",type=float,default=0.10)
+    parser.add_argument("--viewpoint-max-rescans",type=int,default=3)
+    parser.add_argument("--viewpoint-motion-control",choices=("baseline","improved"),default="baseline")
     modes=parser.add_mutually_exclusive_group(); modes.add_argument("--gui",action="store_true"); modes.add_argument("--headless",action="store_true")
     parser.add_argument("--output-dir",type=Path,default=Path(os.environ.get("PRE_EXPLORATION_OUTPUT",DEFAULT_OUTPUT))); parser.add_argument("--show-trails",action="store_true"); parser.add_argument("--show-gt",action="store_true")
     return parser.parse_args(argv)
@@ -1274,7 +1595,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args=parse_args(argv)
     if args.gui:
-        runner=run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt,args.propulsion_mode,args.gui_scale); save_case(runner,args.output_dir)
+        viewpoint=(ActiveViewpointConfig(args.viewpoint_step_fraction,args.viewpoint_max_rescans,args.viewpoint_motion_control=="improved",args.viewpoint_motion_control=="improved") if args.active_viewpoint else None)
+        runner=run_gui(args.map_case or "M1_CROSS_BASELINE",args.frames,args.show_trails,args.show_gt,args.propulsion_mode,args.gui_scale,viewpoint); save_case(runner,args.output_dir)
     else:
         case=args.map_case or "M1_CROSS_BASELINE"; runner=run_headless(case,args.frames,args.propulsion_mode); save_case(runner,args.output_dir); print(f"case={case} propulsion_mode={args.propulsion_mode} rows={len(runner.rows)} output={args.output_dir.resolve()}")
 
