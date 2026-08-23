@@ -30,7 +30,7 @@ from pygame_simulator.pre_exploration_general_pipeline_simulator import (
 )
 
 DEFAULT_OUTPUT=ROOT/"junction_detection/integration/output/lidar_profile_junction_detection"
-GROUP_FIELDS=("map_case","frame","time","group_id","start_angle_deg","end_angle_deg","center_angle_deg","angular_width_deg","beam_count","mean_range","max_range","mean_delta_range","max_delta_range","junction_detected")
+GROUP_FIELDS=("map_case","frame","time","group_id","start_angle_deg","end_angle_deg","center_angle_deg","angular_width_deg","beam_count","start_body_angle_deg","end_body_angle_deg","center_body_angle_deg","mean_range","max_range","mean_delta_range","max_delta_range","junction_detected")
 
 
 def _write(path: Path, rows: list[dict], fieldnames=None) -> None:
