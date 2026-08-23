@@ -49,6 +49,10 @@ SPH_PRESSURE_SCALE = 3.0
 STIFFNESS_EXPONENT = 0.5
 VISCOSITY_XI1, VISCOSITY_XI2 = 0.9, 1.2
 DAMPING = 4.0
+# Active Junction braking reuses one additional copy of the simulator's
+# existing viscous damping. It is local (-c*v), bounded by the normal force and
+# acceleration path, and does not introduce a map- or distance-tuned gain.
+LEADER_BRAKE_DAMPING = DAMPING
 CORRIDOR_LATERAL_VELOCITY_DAMPING = 12.0
 SAFE_RADIUS = 7.5 * MAP_SCALE
 REPULSION_GAIN = 260.0
@@ -436,12 +440,22 @@ class SimulatorWorld:
         self.last_mean_repulsion_force = 0.0
         self.last_mean_lateral_sph_force = 0.0
         self.suspect_hold_active = False
+        self.junction_detection_latched = False
+        self.junction_detection_source = "NONE"
+        self.profile_detection_time = math.nan
+        self.detection_latch_time = math.nan
+        self.hold_entry_time = math.nan
+        self.braking_start_time = math.nan
+        self.stationary_confirmation_time = math.nan
         self.braking_active = False
+        self.stationary_confirmed = False
         self.stationary_dwell_steps = 0
         self.provisional_fixed_anchor = False
         self.pointcloud_ready = False
         self.physics_frame_index = 0
         self.suspect_entry_position: np.ndarray | None = None
+        self.detection_position_eval: np.ndarray | None = None
+        self.braking_start_position_eval: np.ndarray | None = None
         self.suspect_entry_time = math.nan
         self.anchor_entry_frame = -1
         self.anchor_entry_time = math.nan
@@ -703,15 +717,14 @@ class SimulatorWorld:
             normalized_pressure=robot.pressure/max(PRESSURE_GAIN*robot.density,EPSILON)
             piston_magnitude=(min(BASE_PISTON_REACTION_FORCE_LIMIT,BASE_PISTON_REACTION_GAIN*normalized_pressure*_smoothstep(base_depth)*_base_piston_envelope(self.time)) if production_mode else 0.0)
             piston=np.array([0.0,piston_magnitude])
-            braking_leader=not production_mode and self.suspect_hold_active and not self.provisional_fixed_anchor and robot.robot_id==self.lidar_robot_id
+            braking_leader=not production_mode and self.braking_active and not self.provisional_fixed_anchor and robot.robot_id==self.lidar_robot_id
             total=pressure+viscosity+elastic+repulsion+route+piston-(DAMPING+(INITIAL_RELEASE_EXTRA_DAMPING if release_active else 0.0))*robot.velocity
-            raw=_limit(total,MAX_ACCELERATION)
-            if braking_leader:
-                # Local velocity cancellation, bounded by the existing
-                # acceleration scale. Bypassing the propulsion EMA prevents a
-                # non-zero equilibrium with persistent SPH contact forces.
-                raw=_limit(-robot.velocity/DT,MAX_ACCELERATION)
-            alpha = 1.0 if braking_leader else (INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA)
+            # The leader brake is a local velocity servo using the existing
+            # damping coefficient. It rejects ongoing contact/SPH disturbance
+            # without changing those forces or any follower dynamics, and it
+            # retains the normal acceleration filter instead of zeroing speed.
+            raw=_limit(-LEADER_BRAKE_DAMPING*robot.velocity if braking_leader else total,MAX_ACCELERATION)
+            alpha = INITIAL_RELEASE_ACCELERATION_FILTER_ALPHA if release_active else ACCELERATION_FILTER_ALPHA
             accelerations[robot.robot_id]=(1-alpha)*robot.acceleration+alpha*raw
         self.last_mean_pressure_force=float(np.mean(pressure_magnitudes))
         self.last_mean_repulsion_force=float(np.mean(repulsion_magnitudes))
@@ -752,17 +765,29 @@ class SimulatorWorld:
         if not self.suspect_hold_active or self.provisional_fixed_anchor:
             self.braking_active=False
             return
-        self.braking_active=True
+        if not self.braking_active:
+            # One physics step of JUNCTION_HOLD removes route propulsion before
+            # the controlled local viscous brake begins.
+            self.braking_active=True
+            self.braking_start_time=self.time+DT
+            self.braking_start_position_eval=leader.position.copy()
+            return
         if float(np.linalg.norm(leader.velocity)) < MIN_SPEED:
             self.stationary_dwell_steps += 1
         else:
             self.stationary_dwell_steps = 0
         if self.stationary_dwell_steps < ANCHOR_STATIONARY_DWELL_STEPS:
             return
-        self.provisional_fixed_anchor=True; self.braking_active=False; self.pointcloud_ready=True
+        self.stationary_confirmed=True
+        self.stationary_confirmation_time=self.time+DT
+        self.provisional_fixed_anchor=True; self.braking_active=False
         self.anchor_entry_frame=self.physics_frame_index; self.anchor_entry_time=self.time+DT
         self.anchor_position=leader.position.copy(); self.anchor_heading_rad=leader.body_yaw_rad
+        # Local Anchor frame for the next Point Cloud stage. The world position
+        # is retained only by the simulator to enforce the fixed body pose.
+        self.anchor_local_origin=np.zeros(2); self.anchor_local_heading_rad=leader.body_yaw_rad
         leader.velocity[:]=0.; leader.acceleration[:]=0.; leader.observed_velocity[:]=0.
+        self.pointcloud_ready=bool(self.stationary_confirmed and self.anchor_position is not None)
 
     def local_observation(self) -> LocalObservation:
         lidar=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
@@ -808,13 +833,28 @@ class SimulatorWorld:
         anchor_displacement=(float(np.linalg.norm(leader.position-self.anchor_position)) if self.anchor_position is not None else 0.0)
         heading_change=(abs(math.degrees((leader.body_yaw_rad-self.anchor_heading_rad+math.pi)%(2*math.pi)-math.pi)) if math.isfinite(self.anchor_heading_rad) else 0.0)
         hold_displacement=(float(np.linalg.norm(leader.position-self.suspect_entry_position)) if self.suspect_entry_position is not None else 0.0)
+        detection_displacement=(float(np.linalg.norm(leader.position-self.detection_position_eval)) if self.detection_position_eval is not None else 0.0)
+        braking_displacement=(float(np.linalg.norm(leader.position-self.braking_start_position_eval)) if self.braking_start_position_eval is not None else 0.0)
         return {**self.last_connectivity,"suspect_hold_active":self.suspect_hold_active,"local_forward_propulsion_active":self.propulsion_mode=="local_forward" and not self.suspect_hold_active,
             "leader_braking_active":self.braking_active,"leader_speed":leader_speed,"leader_stationary":leader_speed<MIN_SPEED,"stationary_speed_threshold":MIN_SPEED,
             "follower_mean_speed":float(np.mean([np.linalg.norm(robot.velocity) for robot in followers])),"follower_moving_fraction":float(np.mean([np.linalg.norm(robot.velocity)>=MIN_SPEED for robot in followers])),
             "stationary_dwell_steps":self.stationary_dwell_steps,"stationary_dwell_target":ANCHOR_STATIONARY_DWELL_STEPS,"provisional_fixed_anchor":self.provisional_fixed_anchor,
-            "pointcloud_ready":self.pointcloud_ready,"suspect_entry_time":self.suspect_entry_time,"anchor_entry_frame":self.anchor_entry_frame,"anchor_entry_time":self.anchor_entry_time,
+            "pointcloud_ready":self.pointcloud_ready,"junction_detection_latched":self.junction_detection_latched,"junction_detection_source":self.junction_detection_source,
+            "active_junction_phase":self.active_junction_phase(),"profile_detection_time":self.profile_detection_time,"detection_latch_time":self.detection_latch_time,"hold_entry_time":self.hold_entry_time,"braking_start_time":self.braking_start_time,"stationary_confirmation_time":self.stationary_confirmation_time,
+            "suspect_entry_time":self.suspect_entry_time,"anchor_entry_frame":self.anchor_entry_frame,"anchor_entry_time":self.anchor_entry_time,
             "anchor_x_eval":float(self.anchor_position[0]) if self.anchor_position is not None else math.nan,"anchor_y_eval":float(self.anchor_position[1]) if self.anchor_position is not None else math.nan,
-            "leader_displacement_since_hold":hold_displacement,"leader_displacement_since_anchor":anchor_displacement,"leader_heading_change_since_anchor":heading_change}
+            "leader_displacement_since_hold":hold_displacement,"leader_displacement_since_detection_eval":detection_displacement,"leader_displacement_during_braking_eval":braking_displacement,
+            "leader_displacement_since_anchor":anchor_displacement,"leader_heading_change_since_anchor":heading_change}
+
+    def activate_profile_junction_hold(self, detection_time: float) -> None:
+        """Latch a scan-only profile detection into the active local control path."""
+        if self.propulsion_mode!="local_forward" or self.junction_detection_latched:
+            return
+        leader=next(robot for robot in self.robots if robot.robot_id==self.lidar_robot_id)
+        self.junction_detection_latched=True; self.junction_detection_source="LIDAR_PROFILE"
+        self.profile_detection_time=float(detection_time); self.detection_latch_time=float(detection_time)
+        self.hold_entry_time=float(detection_time); self.detection_position_eval=leader.position.copy()
+        self.activate_suspect_hold()
 
     def activate_suspect_hold(self) -> None:
         """Latch LOCAL_FORWARD route suppression until the world is reset."""
@@ -824,13 +864,19 @@ class SimulatorWorld:
                 self.suspect_entry_position=leader.position.copy(); self.suspect_entry_time=self.time
             self.suspect_hold_active = True
 
-    def initialization_phase(self) -> str:
-        if self.propulsion_mode == "local_forward" and self.provisional_fixed_anchor:
+    def active_junction_phase(self) -> str:
+        """Return the localization-free active control phase."""
+        if self.provisional_fixed_anchor:
             return "PROVISIONAL_FIXED_ANCHOR"
-        if self.propulsion_mode == "local_forward" and self.suspect_hold_active:
-            return "SUSPECT_HOLD"
+        if self.braking_active:
+            return "LIDAR_BRAKING"
+        if self.suspect_hold_active:
+            return "JUNCTION_HOLD"
+        return "LOCAL_FORWARD"
+
+    def initialization_phase(self) -> str:
         if self.propulsion_mode == "local_forward":
-            return "LOCAL_FORWARD"
+            return self.active_junction_phase()
         if self.time < BASE_COMPRESSION_DURATION:
             return "INITIAL_COMPRESSION"
         if self.time < BASE_COMPRESSION_DURATION + BASE_EXPANSION_BOOST_DURATION:
@@ -1022,10 +1068,10 @@ class GroundTruthEvaluator:
 
 
 class SimulationRunner:
-    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False, profile_detector=None):
+    def __init__(self, case_id, propulsion_mode="production_compression", shadow_detector=None, hold_on_suspect=False, profile_detector=None, hold_on_profile_detection=False):
         self.geometry=GeometryBuilder.build(case_id); self.world=SimulatorWorld(self.geometry,propulsion_mode); self.swarm=SwarmDiagnostics(); self.lidar=CheapLidarDiagnostics(); self.gt=GroundTruthEvaluator(self.geometry); self.rows=[]; self.last_visual=None; self.shadow_detector=shadow_detector; self.hold_on_suspect=hold_on_suspect
         self.lidar_reason=(LidarGeometryReasonDiagnostics(shadow_detector.thresholds.lidar) if shadow_detector is not None else None)
-        self.profile_detector=profile_detector; self.last_profile_result=None
+        self.profile_detector=profile_detector; self.last_profile_result=None; self.hold_on_profile_detection=hold_on_profile_detection
     def step(self, frame):
         self.world.step()
         if frame%max(1,round(SAMPLE_PERIOD/DT)): return None
@@ -1034,8 +1080,14 @@ class SimulationRunner:
         if self.profile_detector is not None:
             profile=self.profile_detector.detect(observation.lidar_scan.angles_deg,observation.lidar_scan.ranges); self.last_profile_result=profile
             groups=profile["opening_groups"]
-            row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","opening_candidate_count","left_wall_range","right_wall_range","width_observation","offset_observation","estimated_corridor_width","estimated_offset","stable_left_wall","stable_right_wall","side_walls_valid","corridor_model_initialized","corridor_model_just_initialized","corridor_model_update_enabled","corridor_model_frozen","corridor_model_update_count","profile_max_range","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
+            row.update({key:profile[key] for key in ("profile_detector_state","profile_junction_detected","opening_group_count","opening_candidate_count","left_wall_range","right_wall_range","width_observation","offset_observation","estimated_corridor_width","estimated_offset","current_corridor_orientation_deg","stable_corridor_orientation_deg","left_wall_orientation_deg","right_wall_orientation_deg","parallel_error_deg","orientation_initialized","orientation_frozen","stable_left_wall","stable_right_wall","side_walls_valid","corridor_model_initialized","corridor_model_just_initialized","corridor_model_update_enabled","corridor_model_frozen","corridor_model_update_count","profile_max_range","profile_numerical_margin","profile_max_abs_valid_delta","measured_profile_min","measured_profile_mean","measured_profile_max","expected_profile_min","expected_profile_mean","expected_profile_max")})
             row["opening_groups_json"]=json.dumps(groups,separators=(",",":")); visual.update({"profile_open_candidate_mask":profile["open_candidate_mask"],"profile_confirmed_opening_mask":profile["confirmed_opening_mask"],"profile_expected_ranges":profile["expected_ranges"]})
+            if self.hold_on_profile_detection and profile["profile_junction_detected"]:
+                self.world.activate_profile_junction_hold(float(row["timestamp"]))
+                # Reflect the immediate latch/propulsion gate in this same
+                # sampled row; physics braking starts on the following step.
+                row.update(self.world.connectivity_diagnostics())
+                row["initialization_phase"]=self.world.initialization_phase()
         # Everything above this line is runtime-local. GT is appended only
         # after the profile detector has completed its decision.
         row.update(self.gt.evaluate(self.world,row,visual["local_mask"]))
@@ -1121,13 +1173,25 @@ class PygameRenderer:
                 color=((235,70,235) if profile_confirmed[index] else ((245,165,45) if profile_candidate[index] else ((235,90,55) if wall_loss[index] else ((55,225,235) if free_increase[index] else (90,90,55)))))
                 emphasized=profile_candidate[index] or wall_loss[index] or free_increase[index]
                 pygame.draw.line(self.screen,color,self.world_to_screen(lidar.position),self.world_to_screen(endpoint),2 if emphasized else 1)
+        if self.show_diagnostics and "stable_corridor_orientation_deg" in (runner.rows[-1] if runner.rows else {}):
+            latest=runner.rows[-1]
+            psi=latest["stable_corridor_orientation_deg"]
+            if math.isfinite(psi):
+                world_axis=math.radians(runner.world.lidar_yaw_deg+psi)
+                axis=np.array([math.cos(world_axis),math.sin(world_axis)])
+                normal=np.array([-axis[1],axis[0]])
+                pygame.draw.line(self.screen,(255,210,70),self.world_to_screen(lidar.position-axis*18),self.world_to_screen(lidar.position+axis*18),3)
+                pygame.draw.line(self.screen,(190,90,255),self.world_to_screen(lidar.position-normal*12),self.world_to_screen(lidar.position+normal*12),2)
         run_state="PAUSED" if self.paused else "RUNNING"
         latest=runner.rows[-1] if runner.rows else {}; hud=[f"{run_state} | Map {runner.geometry.case_id} mode={runner.world.propulsion_mode} frame={frame} t={runner.world.time:.2f}",f"GT phase={latest.get('gt_phase','-')} EVAL ONLY",f"LiDAR robot={runner.world.lidar_robot_id} initial offset={runner.world.initial_lidar_position[0]-runner.world.initial_front_center_x:.2f}",f"GUI scale={self.gui_scale:.2f} comm_links={self.show_communication_links} support_links={self.show_support_links}","SPACE pause/resume R reset 1-6 map G GT D diagnostics L rays T trails C comm N support ESC quit"]
         if "profile_detector_state" in latest:
             width_obs=(f"{latest['width_observation']:.2f}" if math.isfinite(latest['width_observation']) else "INVALID")
             width_hat=(f"{latest['estimated_corridor_width']:.2f}" if math.isfinite(latest['estimated_corridor_width']) else "UNINITIALIZED")
             offset_hat=(f"{latest['estimated_offset']:+.2f}" if math.isfinite(latest['estimated_offset']) else "UNINITIALIZED")
-            hud += [f"[LiDAR Profile Detector] mode=LOCAL_ESTIMATED state={latest['profile_detector_state']}",f"[Local Corridor Model] L/R={latest['left_wall_range']:.2f}/{latest['right_wall_range']:.2f} width obs={width_obs} hat={width_hat} offset={offset_hat}",f"initialized={latest['corridor_model_initialized']} update={latest['corridor_model_update_enabled']} frozen={latest['corridor_model_frozen']} candidates={latest['opening_candidate_count']} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
+            psi_current=(f"{latest['current_corridor_orientation_deg']:+.2f}" if math.isfinite(latest['current_corridor_orientation_deg']) else "INVALID")
+            psi_stable=(f"{latest['stable_corridor_orientation_deg']:+.2f}" if math.isfinite(latest['stable_corridor_orientation_deg']) else "UNINITIALIZED")
+            hud += [f"[LiDAR Profile Detector] mode=LOCAL_ESTIMATED state={latest['profile_detector_state']}",f"[Local Corridor Orientation] psi current/stable={psi_current}/{psi_stable} deg L/R angle={latest['left_wall_orientation_deg']:+.2f}/{latest['right_wall_orientation_deg']:+.2f} parallel err={latest['parallel_error_deg']:.3g}",f"orientation initialized={latest['orientation_initialized']} frozen={latest['orientation_frozen']}",f"[Local Corridor Geometry] L/R perp={latest['left_wall_range']:.2f}/{latest['right_wall_range']:.2f} width obs={width_obs} hat={width_hat} offset={offset_hat}",f"initialized={latest['corridor_model_initialized']} update={latest['corridor_model_update_enabled']} frozen={latest['corridor_model_frozen']} candidates={latest['opening_candidate_count']} groups={latest['opening_group_count']} Junction={latest['profile_junction_detected']}"]
+            hud += [f"[Active Junction Control] detected={latest['profile_junction_detected']} latched={latest.get('junction_detection_latched',False)} phase={latest.get('active_junction_phase','LOCAL_FORWARD')}",f"propulsion={latest.get('local_forward_propulsion_active',False)} braking={latest.get('leader_braking_active',False)} leader speed={latest.get('leader_speed',0.0):.3f}",f"stationary={latest.get('leader_stationary',False)} dwell={latest.get('stationary_dwell_steps',0)}/{latest.get('stationary_dwell_target',0)} anchor={latest.get('provisional_fixed_anchor',False)} PointCloud ready={latest.get('pointcloud_ready',False)}"]
         if self.show_diagnostics and latest:
             second_size=round(latest['boundary_count']*latest['boundary_second_component_fraction'])
             counts=list(latest.get('boundary_component_count_vector',[])); ratios=list(latest.get('boundary_component_ratio_vector',[])); suffix="..." if len(counts)>5 else ""
@@ -1164,7 +1228,7 @@ def _new_gui_runner(case_id, propulsion_mode):
         profile=LidarProfileJunctionDetector(GeometryProfileConfig(LIDAR_MAX_RANGE))
         # Legacy fusion remains visible for evaluation, but no longer actuates
         # hold/braking or supplies the new detector's decision.
-        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile)
+        return SimulationRunner(case_id,propulsion_mode,ShadowJunctionDetector(FROZEN_GUI_THRESHOLDS),hold_on_suspect=False,profile_detector=profile,hold_on_profile_detection=True)
     return SimulationRunner(case_id,propulsion_mode)
 
 
