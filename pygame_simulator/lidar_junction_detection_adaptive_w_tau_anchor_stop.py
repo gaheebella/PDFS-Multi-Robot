@@ -5,6 +5,7 @@ approximated by the locally observed incoming-corridor width.  It is not a
 general arbitrary-Junction geometry model.
 """
 
+
 from __future__ import annotations
 
 import argparse
