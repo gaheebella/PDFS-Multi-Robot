@@ -1,0 +1,10 @@
+event,timestamp_or_delta_s
+first_sustained_lateral_onset,2.116666666666664
+first_existing_expansion_ratio_onset,2.116666666666664
+first_positive_lateral_dwell,2.116666666666664
+frontmost_boundary_crossing,1.3166666666666669
+front_cohort_center_crossing,1.816666666666665
+observed_cohort_center_crossing,4.116666666666657
+delta_t_frontmost,0.7999999999999972
+delta_t_front_center,0.29999999999999893
+delta_t_observed_center,-1.9999999999999933

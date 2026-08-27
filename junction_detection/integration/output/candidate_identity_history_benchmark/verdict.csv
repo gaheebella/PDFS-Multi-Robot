@@ -1,0 +1,2 @@
+experiment_id,verdict,smoke_pass,main_sane,all_replay_exact,runtime_GT_map_used,map_specific_runtime_logic,orientation_specific_runtime_logic,detector_modified,SPH_motion_modified
+EXP-040,A_GENERAL_CANDIDATE_IDENTITY_RESOLVED,True,True,True,False,False,False,False,False

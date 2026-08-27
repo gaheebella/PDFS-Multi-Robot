@@ -1,0 +1,2 @@
+case,noise_model,threshold_alpha,threshold,junction_detected,current_junction_evidence,junction_confirmed,confirmation_frame,confirmation_time,system_state,state_transition,anchor_stop_on_detect,anchor_fixed,anchor_fix_frame,anchor_fix_time,anchor_fix_x_eval_only,anchor_fix_y_eval_only,post_fix_max_position_drift,post_fix_max_normal_motion
+M1_PRE_CORRIDOR_55PCT,truncated-gaussian,0.5,125.0,True,True,True,150,2.5166666666666626,FIXED_ANCHOR,FIXED_ANCHOR,True,True,150,2.5166666666666626,-1.761853853879204,-72.63658904805315,0.0,18.04874769945869

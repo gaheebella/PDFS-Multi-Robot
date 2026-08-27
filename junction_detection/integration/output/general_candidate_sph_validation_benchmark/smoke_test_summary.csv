@@ -1,0 +1,2 @@
+general_candidate_self_test,candidate_state_self_test,exp035_false_diagonal_pass,m0_candidate_count,m1_candidate_count,m1_side_candidates,m1_axial_candidate,m1_axial_complete,m1_axial_observed_robot_count,m1_axial_directional_sample_count,m1_false_candidate_count_eval_only,smoke_pass
+True,True,True,0,4,2,True,True,12,0,1,True

@@ -1,0 +1,2 @@
+case,first_detection_frame,first_detection_time,anchor_enter_frame,anchor_enter_time,stop_latency_frames,stop_latency_seconds,max_speed_after_anchor,position_drift_after_anchor,yaw_drift_after_anchor,opening_group_count_at_detection,detection_count,anchor_transition_count,lidar_samples_after_anchor,profile_updates_after_anchor,final_pipeline_state,gt_or_map_used_for_transition,pointcloud_detector_executed
+M1_CROSS_BASELINE,126,2.116666666666664,,,,,0.0,0.0,0.0,2,1,0,0,0,JUNCTION_SUSPECTED_STOPPING,False,False

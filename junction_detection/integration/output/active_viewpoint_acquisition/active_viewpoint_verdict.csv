@@ -1,0 +1,2 @@
+verdict,GT_used_for_control,global_position_used_for_control,fixed_world_step_used,detector_threshold_modified,final_fixed_anchor_promoted,deterministic_replay
+ACTIVE_VIEWPOINT_ACQUISITION_PHYSICS_UNSAFE,False,False,False,False,False,True

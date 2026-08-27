@@ -1,0 +1,16 @@
+case_id,raw_detection_frame,published_detection_frame,blocked_raw_detection_samples,altered_detector_output_samples,raw_detection_altered
+A_M0_CENTERED,,,0,0,False
+A_M0_OFFSET_LEFT,,,0,0,False
+A_M0_OFFSET_RIGHT,,,0,0,False
+A_M0_YAW_POS5,,,0,0,False
+A_M0_YAW_NEG5,,,0,0,False
+B_M1_VERY_NEAR_BASELINE,126,126,0,0,False
+B_M1_NEAR_HALF_W,0,0,0,0,False
+B_M1_MEDIUM_ONE_W,0,0,0,0,False
+B_M1_CLEAN_FAR_EXP042,36,36,0,0,False
+C_M2_DEFAULT,,,0,0,False
+C_M3_DEFAULT,0,0,0,0,False
+C_M4_DEFAULT,132,132,0,0,False
+C_M5_DEFAULT,126,126,0,0,False
+D_M0_LEFT_POS5,,,0,0,False
+D_M0_RIGHT_NEG5,,,0,0,False

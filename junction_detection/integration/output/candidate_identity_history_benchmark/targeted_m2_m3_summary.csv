@@ -1,0 +1,5 @@
+map_case,run_role,candidate_count,false_candidate_count
+M2_T_JUNCTION,MAIN_FIXED,2,0
+M3_ANGLED_Y,MAIN_FIXED,2,0
+M2_T_JUNCTION,REPLAY_FIXED,2,0
+M3_ANGLED_Y,REPLAY_FIXED,2,0

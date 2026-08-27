@@ -1,0 +1,10 @@
+view_set,all_orientations_valid,gt_union_count_eval,detector_union_count_eval,gt_union_branches_eval,detector_union_branches_eval,outgoing_total_eval,gt_full_union_eval,detector_full_union_eval,note
+[0],True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, 30]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, -30]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, 60]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, -60]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[60, -60]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, 60, -60]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[90, -90]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion
+"[0, 90, -90]",True,1,1,[0],[0],3,False,False,GT/detector branch-set union only; no point-cloud fusion

@@ -1,0 +1,2 @@
+experiment_id,verdict,baseline_exact_replay,selected_geometry,deterministic_replay,seed,M0_negative_control,runtime_GT_map_used,detector_modified,motion_threshold_modified,SPH_force_modified,candidate_direction_commanded
+EXP-035,C_TOPOLOGY_COMPLETES_BEFORE_MOTION_SUPPORT,True,M2_T_JUNCTION,True,N/A_DETERMINISTIC,True,False,False,False,False,False

@@ -1,0 +1,1 @@
+﻿timestamp,anchor_robot_id,fixed_x,fixed_y,current_x,current_y,position_drift,maximum_position_drift,nearby_robot_count,nearby_contact_count,nearby_mean_speed,connected_before_election,neighbors_before_election,connected_to_base,communication_neighbor_count

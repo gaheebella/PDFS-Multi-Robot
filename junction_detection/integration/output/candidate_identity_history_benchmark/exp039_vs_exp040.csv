@@ -1,0 +1,8 @@
+metric,EXP039,EXP040
+true_candidate_recall,1.0,1.0
+complete_recall,1.0,1.0
+motion_supported_recall,1.0,1.0
+false_candidate_count,6,0
+false_motion_supported_count,1,0
+incoming_false_count,5,0
+duplicate_false_count,1,0

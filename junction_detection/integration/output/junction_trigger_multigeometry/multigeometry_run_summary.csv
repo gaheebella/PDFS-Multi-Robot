@@ -1,0 +1,7 @@
+map_case,geometry_parameters,sample_count,frontmost_crossing,front_center_crossing,front_lateral_sustained_onset,delta_lateral_frontmost,delta_lateral_front_center,first_component_split,corridor_component_ge2_fraction,opening_component_ge2_fraction,corridor_largest_component_fraction,opening_largest_component_fraction,longest_corridor_split_duration,longest_opening_split_duration,qualitative_result
+M0_STRAIGHT,width=84.0;branches=[],299,nan,nan,4.2,nan,nan,nan,0.0,nan,1.0,nan,0.0,0.0,STRAIGHT_CONTROL
+M1_CROSS_BASELINE,"width=84.0;branches=[(0.0, 84.0, 126.0), (-90.0, 84.0, 126.0), (90.0, 84.0, 126.0)]",299,16.2,16.2,4.2,nan,nan,17.0,0.0,0.8666666666666667,1.0,0.5666666666666667,0.0,13.0,OBSERVED
+M2_T_JUNCTION,"width=84.0;branches=[(-90.0, 84.0, 126.0), (90.0, 84.0, 126.0)]",299,16.2,16.2,4.2,nan,nan,17.1,0.0,0.86,1.0,0.57,0.0,12.9,OBSERVED
+M3_ANGLED_Y,"width=84.0;branches=[(-60.0, 84.0, 126.0), (60.0, 84.0, 126.0)]",299,16.1,16.1,4.2,nan,nan,16.7,0.0,0.41333333333333333,1.0,0.8886895604395604,0.0,6.2,OBSERVED
+M4_ASYMMETRIC_CROSS,"width=84.0;branches=[(0.0, 84.0, 126.0), (-90.0, 63.0, 126.0), (90.0, 84.0, 126.0)]",299,16.2,16.2,4.2,nan,nan,17.0,0.0,0.8666666666666667,1.0,0.5666666666666667,0.0,13.0,OBSERVED
+M5_UNEQUAL_WIDTH,"width=84.0;branches=[(0.0, 54.6, 126.0), (-90.0, 84.0, 126.0), (90.0, 113.4, 126.0)]",299,16.2,16.2,4.2,nan,nan,17.0,0.0,0.8666666666666667,1.0,0.5715151515151515,0.0,13.0,OBSERVED

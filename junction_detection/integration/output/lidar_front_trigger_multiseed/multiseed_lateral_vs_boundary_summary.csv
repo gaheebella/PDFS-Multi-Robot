@@ -1,0 +1,14 @@
+metric,value
+run_count,10
+valid_run_count,10
+lateral_onset_detection_rate,1.0
+boundary_split_detection_rate,1.0
+delta_lateral_front_center_mean,0.29999999999999893
+delta_lateral_front_center_std,0.0
+delta_lateral_front_center_median,0.29999999999999893
+delta_split_front_center_mean,-0.6999999999999975
+delta_split_front_center_std,0.0
+delta_split_front_center_median,-0.6999999999999975
+delta_split_vs_lateral_mean,-0.9999999999999964
+delta_split_vs_lateral_std,0.0
+delta_split_vs_lateral_median,-0.9999999999999964

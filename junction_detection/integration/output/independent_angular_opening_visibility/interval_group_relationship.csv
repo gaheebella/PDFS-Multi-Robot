@@ -1,0 +1,6 @@
+viewpoint_id,viewpoint_role,branch_eval,raw_interval_id,raw_interval_center_deg,raw_interval_width_deg,raw_center_inside_branch_roi_eval,nearest_detector_group_id,detector_group_center_deg,detector_group_width_deg,angular_overlap_beams_in_branch_roi_eval,angular_gap_to_group_deg,center_separation_to_group_deg,same_contiguous_run,merged_by_gap_rule,minimum_width_pass
+F+0.000_L+0.000,A0,PLUS90,0,-1.0,49.0,False,0,-1.0,49.0,8,0.0,0.0,True,False,True
+F+0.000_L+0.000,A0,MINUS90,0,-1.0,49.0,False,0,-1.0,49.0,8,0.0,0.0,True,False,True
+F+0.600_L+0.000,FULL_MOUTH,PLUS90,0,-1.5,70.0,False,0,-1.5,70.0,18,0.0,0.0,True,False,True
+F+0.600_L+0.000,FULL_MOUTH,MINUS90,0,-1.5,70.0,False,0,-1.5,70.0,18,0.0,0.0,True,False,True
+F+0.000_L+0.000,A0,AXIAL_FORWARD,0,-1.0,49.0,True,0,-1.0,49.0,24,0.0,0.0,True,False,True

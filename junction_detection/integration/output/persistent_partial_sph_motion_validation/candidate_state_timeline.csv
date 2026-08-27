@@ -1,0 +1,1 @@
+time,candidate_id,topology_state,termination_count,opposite_termination_observed_eval,complete_gap_present,motion_support_robot_count,stable_support_count,reliability,dispersion,backflow,motion_condition_met,runtime_state,shadow_motion_only_state

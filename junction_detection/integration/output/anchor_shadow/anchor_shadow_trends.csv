@@ -1,0 +1,1 @@
+﻿timestamp,robot_id,motion_state,observation_count,radial_slope,slope_standard_error,ci_low,ci_high,residual_rmse,representative_bearing_deg,graph_component_id,cohort_id,exclusion_reason,range_input_unit

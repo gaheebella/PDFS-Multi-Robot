@@ -1,0 +1,2 @@
+case,replay_type,hit_count,max_range_count,angular_opening_count,valid_termination_count,accepted_gap_count,false_side_complete_count,passed
+M0_STRAIGHT,DETERMINISTIC_GEOMETRY_REPLAY_NO_PHYSICS,294,66,2,0,0,0,True

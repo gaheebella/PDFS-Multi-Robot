@@ -1,0 +1,2 @@
+experiment_id,verdict,M1_baseline_exact,M0_negative_control,all_deterministic_replays_equal,seed,runtime_GT_map_used,map_specific_algorithm_logic,detector_modified,motion_threshold_modified,SPH_force_modified,general_posthoc_match_audited
+EXP-036,B_GENERAL_PIPELINE_RECALL_INCOMPLETE,True,True,True,N/A_DETERMINISTIC,False,False,False,False,False,True

@@ -1,0 +1,4 @@
+case_id,raw_detection_frame,shadow_published_detection_frame,raw_positive_samples,published_positive_samples,blocked_raw_detection_samples,altered_detector_output_samples
+BASELINE_M1,126,126,1,1,0,0
+BOOTSTRAP_M1,36,36,16,16,0,0
+M0_NEGATIVE_CONTROL,,,0,0,0,0

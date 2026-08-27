@@ -1,0 +1,4 @@
+case_id,frame_first_current_model_valid,time_first_current_model_valid,frame_stable_model_initialized,time_stable_model_initialized,frame_readiness_true,time_readiness_true,frame_first_open,time_first_open,frame_first_junction_detection,time_first_junction_detection,readiness_to_open_latency_frames,readiness_to_detection_latency_frames
+BASELINE_M1,126,2.116666666666664,,,,,126,2.116666666666664,126,2.116666666666664,,
+BOOTSTRAP_M1,0,0.016666666666666666,6,0.11666666666666665,6,0.11666666666666665,30,0.5166666666666666,36,0.6166666666666669,24,30
+M0_NEGATIVE_CONTROL,0,0.016666666666666666,6,0.11666666666666665,6,0.11666666666666665,,,,,,

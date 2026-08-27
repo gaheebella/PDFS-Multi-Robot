@@ -1,0 +1,2 @@
+verdict,global_pose_used_for_control,GT_used_for_control,detectors_modified,m0_negative_control_pass,deterministic_replay_pass
+VIEWPOINT_MOVEMENT_PHYSICS_VALID,False,False,False,True,True

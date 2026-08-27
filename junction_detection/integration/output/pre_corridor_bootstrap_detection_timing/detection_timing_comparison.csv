@@ -1,0 +1,4 @@
+case_id,first_valid_model_frame,first_valid_model_time,stable_model_init_frame,stable_model_init_time,first_open_frame,first_open_time,first_open_group_frame,first_open_group_time,first_detection_frame,first_detection_time,opening_group_count_at_detection,expected_source_at_detection,stable_width_at_detection,stable_offset_at_detection,stable_orientation_at_detection
+BASELINE_M1,126,2.116666666666664,,,126,2.116666666666664,126,2.116666666666664,126,2.116666666666664,2,CURRENT_MODEL,nan,nan,nan
+BOOTSTRAP_M1,0,0.016666666666666666,6,0.11666666666666665,30,0.5166666666666666,36,0.6166666666666669,36,0.6166666666666669,2,CURRENT_MODEL,84.0,1.5570877890311081,0.0
+M0_NEGATIVE_CONTROL,0,0.016666666666666666,6,0.11666666666666665,,,,,,,0,NONE,,,

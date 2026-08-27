@@ -14,10 +14,7 @@ from typing import Any, Iterable, Optional, Sequence
 import numpy as np
 
 
-# =============================================================================
-# 1. Constants, map geometry, robot state, local-forward physics, LiDAR raycast
-# Extracted from pre_exploration_general_pipeline_simulator.py.
-# =============================================================================
+
 MAP_SCALE = 0.70
 # Production count is required to preserve longitudinal packing, density, and
 # support-neighborhood regime; the fidelity audit demonstrated that 240 does not.

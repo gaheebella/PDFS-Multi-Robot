@@ -1,0 +1,12 @@
+metric,detection_pose,provisional_anchor_pose,anchor_minus_detection
+opening_count,2,2,0
+matched_outgoing_count_eval_only,1,1,0
+missed_outgoing_count_eval_only,2,2,0
+incoming_opening_count_eval_only,1,1,0
+false_opening_count_eval_only,0,0,0
+mean_center_error_deg_eval_only,0.5,1.0,0.5
+valid_lidar_point_count,292,287,-5
+max_range_no_return_count,68,73,5
+wall_tangent_available_count,2,2,0
+total_fitted_wall_point_count,10,10,0
+mean_usable_wall_sides,2.0,2.0,0.0

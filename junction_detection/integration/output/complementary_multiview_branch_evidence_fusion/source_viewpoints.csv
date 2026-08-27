@@ -1,0 +1,4 @@
+view_id,view_role,forward_ratio_W,lateral_ratio_W,pose_x_local,pose_y_local,yaw_local,viewpoint_geometry_valid,movement_feasibility_proven,scan_source,hit_count,max_range_count,opening_count,left_topology,right_topology,incoming_topology,false_accepted_gap_count,scan_summary_equivalent,topology_equivalent,role_expectation_equivalent,source_equivalence_pass
+A0,A0,0.0,0.0,0.0,0.0,0.0,True,False,DETERMINISTIC_POSE_RECONSTRUCTION,287,73,2,PARTIAL_GAP_TOPOLOGY,PARTIAL_GAP_TOPOLOGY,COMPLETE_GAP_TOPOLOGY,0,True,True,True,True
+F+0.700_L-0.100,LEFT_COMPLETE,0.7,-0.1,58.8,-8.4,0.0,True,False,DETERMINISTIC_POSE_RECONSTRUCTION,267,93,2,COMPLETE_GAP_TOPOLOGY,PARTIAL_GAP_TOPOLOGY,COMPLETE_GAP_TOPOLOGY,1,True,True,True,True
+F+0.700_L+0.100,RIGHT_COMPLETE,0.7,0.1,58.8,8.4,0.0,True,False,DETERMINISTIC_POSE_RECONSTRUCTION,266,94,2,PARTIAL_GAP_TOPOLOGY,COMPLETE_GAP_TOPOLOGY,COMPLETE_GAP_TOPOLOGY,1,True,True,True,True

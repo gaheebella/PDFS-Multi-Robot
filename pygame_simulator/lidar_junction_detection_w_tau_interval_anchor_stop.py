@@ -1264,6 +1264,7 @@ def select_threshold_in_safe_interval(
     )
 
 
+# Main Algorithm of Junction detector
 def _detect_openings_w_tau_with_diagnostics(
     angles_deg: Sequence[float],
     ranges: Sequence[float],

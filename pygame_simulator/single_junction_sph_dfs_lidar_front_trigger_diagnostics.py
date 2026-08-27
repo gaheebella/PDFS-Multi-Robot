@@ -10,8 +10,10 @@ robot, or call Point Cloud confirmation as a trigger.
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 import os
+import random
 import runpy
 import sys
 from pathlib import Path
@@ -90,6 +92,9 @@ class DiagnosticCollector:
         self.boundary_robot_rows: list[dict] = []
         self.boundary_thresholds = (90, 120, 150, 180)
         self.previous_boundary_ids = {threshold: set() for threshold in self.boundary_thresholds}
+        self.boundary_component_rows: list[dict] = []
+        self.previous_components = {threshold: [] for threshold in self.boundary_thresholds}
+        self.component_lifetimes = {}
         self.front_maintenance_dwell = 0.0
         self.previous_frontmost_signed_boundary: float | None = None
         self.previous_observed_signed_boundary: float | None = None
@@ -97,6 +102,25 @@ class DiagnosticCollector:
         self.sample_interval_s = 0.1
         self.polygon, self.max_range, self.gt_center, self.opening_boundary = _cross_geometry()
         self.initial_setup_offset_y = float(os.environ.get("SPH_DFS_DIAGNOSTIC_START_OFFSET_Y", "20.0"))
+        self.seed = os.environ.get("SPH_DFS_SEED", "")
+        self.python_rng_state_digest = ""
+        self.numpy_rng_state_digest = ""
+        self.raw_initial_state_hash = ""
+        self.diagnostic_initial_state_hash = ""
+        self.first_update_state_hash = ""
+
+    @staticmethod
+    def _state_hash(robots):
+        """Stable SHA-256 of observable robot state, without consuming RNG."""
+        rows = []
+        for robot in sorted(robots, key=lambda item: item.robot_id):
+            values = [robot.robot_id, robot.position.x, robot.position.y,
+                      robot.previous_position.x, robot.previous_position.y,
+                      robot.velocity.x, robot.velocity.y,
+                      robot.observed_velocity.x, robot.observed_velocity.y,
+                      getattr(robot, "role", ""), getattr(robot, "connected_to_base", "")]
+            rows.append(",".join(str(value) if isinstance(value, (int, str, bool)) else format(float(value), ".12g") for value in values))
+        return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
     def _front_features(self, robots, globals_dict):
         """Recompute the existing local front/cohort geometry every sample."""
@@ -250,6 +274,49 @@ class DiagnosticCollector:
             self.previous_boundary_ids[threshold] = current
             boundary_sets[threshold] = (current, retention, new_fraction)
         return max_gaps, neighbor_counts, boundary_sets
+
+    def _boundary_components(self, timestamp, phase, globals_dict, boundary_rows, boundary_sets):
+        """Compute connected components using the unchanged SPH support scale."""
+        support = float(globals_dict.get("SMOOTHING_LENGTH", 22.0 * 0.70))
+        metrics = {}
+        by_id = {row["robot_id"]: row for row in boundary_rows}
+        for threshold in self.boundary_thresholds:
+            ids = set(boundary_sets[threshold][0])
+            remaining = set(ids); components = []
+            while remaining:
+                seed = remaining.pop(); group = {seed}; queue = [seed]
+                while queue:
+                    current = queue.pop()
+                    for candidate in tuple(remaining):
+                        a, b = by_id[current], by_id[candidate]
+                        if math.hypot(a["local_x"] - b["local_x"], a["local_y"] - b["local_y"]) <= support:
+                            remaining.remove(candidate); group.add(candidate); queue.append(candidate)
+                components.append(group)
+            previous = self.previous_components[threshold]
+            component_descriptors = []
+            for index, group in enumerate(sorted(components, key=lambda value: (-len(value), min(value) if value else -1)), 1):
+                rows = [by_id[robot_id] for robot_id in group]
+                cx = float(np.mean([r["local_x"] for r in rows])); cy = float(np.mean([r["local_y"] for r in rows]))
+                bearing = math.degrees(math.atan2(cy, cx)); radius = math.hypot(cx, cy)
+                bearings = [r["local_bearing_deg"] for r in rows]
+                span = math.hypot(max(r["local_x"] for r in rows) - min(r["local_x"] for r in rows), max(r["local_y"] for r in rows) - min(r["local_y"] for r in rows))
+                matches = [(j, len(group & old["ids"]) / len(group | old["ids"]) if group | old["ids"] else 1.0) for j, old in enumerate(previous)]
+                match_index, retention = max(matches, key=lambda item: item[1]) if matches else (None, 0.0)
+                component_id = f"{threshold}-{index}"
+                lifetime = 1
+                if match_index is not None and retention > 0.0:
+                    component_id = previous[match_index]["component_id"]; lifetime = previous[match_index]["lifetime"] + 1
+                previous_range = previous[match_index].get("range") if match_index is not None and retention > 0.0 else None
+                radial_rate = "" if previous_range is None else (radius - previous_range) / 0.1
+                descriptor = {"component_id": component_id, "ids": group, "lifetime": lifetime, "bearing": bearing, "range": radius}
+                component_descriptors.append(descriptor)
+                self.boundary_component_rows.append({"timestamp": float(timestamp), "phase": phase, "threshold": threshold, "component_id": component_id, "robot_count": len(group), "centroid_x": cx, "centroid_y": cy, "centroid_range": radius, "centroid_bearing_deg": bearing, "bearing_std_deg": float(np.std(bearings)) if len(bearings) > 1 else 0.0, "spatial_span": span, "forward_zero_count": sum(r["forward_neighbor_zero"] for r in rows), "front_cohort_count": sum(r["in_existing_front_cohort"] for r in rows), "retention_fraction": retention, "matched_previous_component_id": previous[match_index]["component_id"] if match_index is not None and retention > 0.0 else "", "lifetime_samples": lifetime, "radial_rate": radial_rate})
+            self.previous_components[threshold] = component_descriptors
+            bearings = sorted(item["bearing"] for item in component_descriptors)
+            separations = [((bearings[index + 1] - bearings[index]) % 360.0) for index in range(len(bearings) - 1)] if len(bearings) > 1 else []
+            if len(bearings) > 1: separations.append((bearings[0] + 360.0) - bearings[-1])
+            metrics[threshold] = {"component_count": len(component_descriptors), "largest": len(component_descriptors[0]["ids"]) if component_descriptors else 0, "sizes": sorted([len(item["ids"]) for item in component_descriptors], reverse=True), "min_sep": min(separations) if separations else "", "max_sep": max(separations) if separations else "", "mean_range": float(np.mean([math.hypot(item["bearing"], 0) for item in []])) if False else float(np.mean([next(row["centroid_range"] for row in self.boundary_component_rows[::-1] if row["timestamp"] == timestamp and row["threshold"] == threshold and row["component_id"] == item["component_id"]) for item in component_descriptors])) if component_descriptors else ""}
+        return metrics
 
     def _lateral_features(self, observed, forward, globals_dict, timestamp, state):
         """Apply the unchanged lateral math to one independent cohort state."""
@@ -481,6 +548,9 @@ class DiagnosticCollector:
         for item in self.boundary_robot_rows[-len(mobile):]:
             item["forward_neighbor_zero"] = item["robot_id"] in {robot.robot_id for robot in local_surface}
             item["in_existing_front_cohort"] = item["robot_id"] in {robot.robot_id for robot in front}
+        component_metrics = self._boundary_components(
+            timestamp, sph_phase, globals_dict, self.boundary_robot_rows[-len(mobile):], boundary_sets
+        )
         scan = self.simulate_lidar(
             polygon_points=self.polygon,
             anchor_xy=(lidar.position.x, lidar.position.y),
@@ -590,6 +660,12 @@ class DiagnosticCollector:
             row[f"{prefix}_retention_fraction"] = retention
             row[f"{prefix}_new_fraction"] = new_fraction
             row[f"{prefix}_max_gap_mean"] = float(np.mean([max_gaps[robot_id] for robot_id in max_gaps])) if max_gaps else ""
+            row[f"{prefix}_component_count"] = component_metrics[threshold]["component_count"]
+            row[f"{prefix}_largest_component_size"] = component_metrics[threshold]["largest"]
+            row[f"{prefix}_second_component_size"] = component_metrics[threshold]["sizes"][1] if len(component_metrics[threshold]["sizes"]) > 1 else 0
+            row[f"{prefix}_third_component_size"] = component_metrics[threshold]["sizes"][2] if len(component_metrics[threshold]["sizes"]) > 2 else 0
+            row[f"{prefix}_min_component_angular_separation_deg"] = component_metrics[threshold]["min_sep"]
+            row[f"{prefix}_max_component_angular_separation_deg"] = component_metrics[threshold]["max_sep"]
         for cohort_name, values in cohort_features.items():
             prefix = cohort_name.lower()
             row.update({
@@ -636,6 +712,9 @@ class DiagnosticCollector:
 
     def save(self):
         OUTPUT.mkdir(parents=True, exist_ok=True)
+        with (OUTPUT / "seed_effectiveness_run_metadata.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["requested_seed", "received_seed", "applied_seed", "python_rng_state_digest", "numpy_rng_state_digest", "raw_initial_state_hash", "diagnostic_initial_state_hash", "first_update_state_hash"])
+            writer.writeheader(); writer.writerow({"requested_seed": self.seed, "received_seed": os.environ.get("SPH_DFS_SEED", ""), "applied_seed": self.seed, "python_rng_state_digest": self.python_rng_state_digest, "numpy_rng_state_digest": self.numpy_rng_state_digest, "raw_initial_state_hash": self.raw_initial_state_hash, "diagnostic_initial_state_hash": self.diagnostic_initial_state_hash, "first_update_state_hash": self.first_update_state_hash})
         fields = list(self.rows[0]) if self.rows else ["timestamp"]
         with (OUTPUT / "lidar_front_trigger_timeline.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
@@ -652,6 +731,7 @@ class DiagnosticCollector:
         self._save_local_front_audit()
         self._save_surface_peak_audit()
         self._save_sph_boundary_audit()
+        self._save_boundary_component_audit()
         time = np.asarray([r["timestamp"] for r in self.rows])
         variance = np.asarray([r["lateral_variance"] for r in self.rows])
         scan_change = np.asarray([float(r["cheap_lidar_scan_change"] or 0.0) for r in self.rows])
@@ -1057,6 +1137,50 @@ class DiagnosticCollector:
             axis.set_ylabel(ylabel); axis.legend(loc="best")
         axes[-1].set_xlabel("local x / phase"); fig.suptitle("Local SPH angular-gap boundary audit (evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_sph_boundary_audit.png", dpi=150); plt.close(fig)
 
+    def _save_boundary_component_audit(self):
+        """Persist spatial component topology and retrospective split evidence."""
+        timeline_fields = ["timestamp", "evaluation_only_sph_phase", "forward_zero_neighbor_count", "forward_zero_neighbor_fraction"]
+        for threshold in (120, 150):
+            timeline_fields.extend([f"boundary_gap{threshold}_{suffix}" for suffix in ("count", "fraction", "component_count", "largest_component_size", "second_component_size", "third_component_size", "min_component_angular_separation_deg", "max_component_angular_separation_deg")])
+        with (OUTPUT / "local_sph_boundary_component_timeline.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=timeline_fields); writer.writeheader(); writer.writerows({field: row.get(field, "") for field in timeline_fields} for row in self.rows)
+        component_fields = list(self.boundary_component_rows[0]) if self.boundary_component_rows else ["timestamp"]
+        with (OUTPUT / "local_sph_boundary_components.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=component_fields); writer.writeheader(); writer.writerows(self.boundary_component_rows)
+        phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
+        fields = ["threshold", "phase", "sample_count", "component_count_mean", "component_count_std", "component_count_max", "largest_component_size_mean", "largest_component_fraction_mean", "component_lifetime_mean", "component_retention_mean", "angular_separation_mean", "angular_separation_max"]
+        with (OUTPUT / "local_sph_boundary_component_phase_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()
+            for threshold in (120, 150):
+                for phase in phases:
+                    rows = [row for row in self.rows if row["evaluation_only_sph_phase"] == phase]
+                    comps = [row for row in self.boundary_component_rows if row["threshold"] == threshold and row["phase"] == phase]
+                    counts = [row[f"boundary_gap{threshold}_component_count"] for row in rows]
+                    writer.writerow({"threshold": threshold, "phase": phase, "sample_count": len(rows), "component_count_mean": float(np.mean(counts)) if counts else "", "component_count_std": float(np.std(counts)) if counts else "", "component_count_max": max(counts) if counts else "", "largest_component_size_mean": float(np.mean([row[f"boundary_gap{threshold}_largest_component_size"] for row in rows])) if rows else "", "largest_component_fraction_mean": float(np.mean([row[f"boundary_gap{threshold}_largest_component_size"] / max(row[f"boundary_gap{threshold}_count"], 1) for row in rows])) if rows else "", "component_lifetime_mean": float(np.mean([row["lifetime_samples"] for row in comps])) if comps else "", "component_retention_mean": float(np.mean([row["retention_fraction"] for row in comps])) if comps else "", "angular_separation_mean": float(np.mean([row[f"boundary_gap{threshold}_min_component_angular_separation_deg"] for row in rows if row[f"boundary_gap{threshold}_min_component_angular_separation_deg"] != ""])) if any(row[f"boundary_gap{threshold}_min_component_angular_separation_deg"] != "" for row in rows) else "", "angular_separation_max": max([row[f"boundary_gap{threshold}_max_component_angular_separation_deg"] for row in rows if row[f"boundary_gap{threshold}_max_component_angular_separation_deg"] != ""], default="")})
+        split_rows = []
+        for threshold in (120, 150):
+            previous = 0
+            for row in self.rows:
+                count = row[f"boundary_gap{threshold}_component_count"]
+                if count >= 2 and previous < 2:
+                    split_rows.append({"timestamp": row["timestamp"], "phase": row["evaluation_only_sph_phase"], "threshold": threshold, "component_count": count, "component_sizes": ";".join(map(str, [row[f"boundary_gap{threshold}_largest_component_size"], row[f"boundary_gap{threshold}_second_component_size"], row[f"boundary_gap{threshold}_third_component_size"]])) , "min_angular_separation": row[f"boundary_gap{threshold}_min_component_angular_separation_deg"], "max_angular_separation": row[f"boundary_gap{threshold}_max_component_angular_separation_deg"], "lateral_ratio": row["lateral_expansion_ratio"], "surface_count": row["forward_zero_neighbor_count"], "front_center_boundary_distance": row["evaluation_only_front_cohort_center_distance_to_opening_boundary"]})
+                previous = count
+        with (OUTPUT / "local_sph_boundary_split_events.csv").open("w", newline="", encoding="utf-8") as handle:
+            split_fields = list(split_rows[0]) if split_rows else ["timestamp"]
+            writer = csv.DictWriter(handle, fieldnames=split_fields); writer.writeheader(); writer.writerows(split_rows)
+        fig, axes = plt.subplots(6, 1, figsize=(11, 15), sharex=True); time = np.asarray([row["timestamp"] for row in self.rows])
+        for threshold, color in ((120, "tab:blue"), (150, "tab:orange")):
+            axes[0].plot(time, [row[f"boundary_gap{threshold}_component_count"] for row in self.rows], color=color, label=f"components {threshold}°")
+            axes[1].plot(time, [row[f"boundary_gap{threshold}_largest_component_size"] for row in self.rows], color=color, label=f"largest {threshold}°")
+            axes[1].plot(time, [row[f"boundary_gap{threshold}_second_component_size"] for row in self.rows], linestyle="--", color=color, label=f"second {threshold}°")
+            axes[2].plot(time, [row[f"boundary_gap{threshold}_min_component_angular_separation_deg"] if row[f"boundary_gap{threshold}_min_component_angular_separation_deg"] != "" else np.nan for row in self.rows], color=color, label=f"min separation {threshold}°")
+            axes[3].plot(time, [row[f"boundary_gap{threshold}_mean_component_range"] if f"boundary_gap{threshold}_mean_component_range" in row else np.nan for row in self.rows], color=color, label=f"range {threshold}°")
+        axes[4].plot(time, [row["lateral_expansion_ratio"] for row in self.rows], label="lateral ratio")
+        axes[5].plot(time, [row["forward_zero_neighbor_count"] for row in self.rows], label="forward-zero surface")
+        for axis, ylabel in zip(axes, ("component count", "component size", "angular separation", "centroid range", "lateral ratio", "forward-zero count")):
+            axis.set_ylabel(ylabel); axis.legend(loc="best")
+        axes[-1].set_xlabel("time [s]"); fig.suptitle("Local SPH boundary component audit (evaluation-only)"); fig.tight_layout(); fig.savefig(OUTPUT / "local_sph_boundary_component_audit.png", dpi=150); plt.close(fig)
+
     def _save_phase_summary(self):
         """Summarize actual cohort phases and descriptive false onsets."""
         phases = ("SPH_CORRIDOR", "SPH_OPENING_APPROACH", "SPH_BOUNDARY_CROSSING", "SPH_JUNCTION_REGION", "SPH_POST_BOUNDARY")
@@ -1145,17 +1269,27 @@ def run() -> None:
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/pdfs_mpl_cache")
     os.environ.setdefault("SPH_DFS_HEADLESS_FAST", "1")
     os.environ.setdefault("SPH_DFS_MAX_FRAMES", "250")
+    seed_value = os.environ.get("SPH_DFS_SEED")
+    if seed_value not in (None, ""):
+        # Evaluation wrapper seed hook: production initialization already uses
+        # Python's random module; no new stochastic path is introduced here.
+        random.seed(int(seed_value))
+        np.random.seed(int(seed_value))
     os.environ["SPH_DFS_ANCHOR_SHADOW"] = "1"
     os.environ["SPH_DFS_PROVISIONAL_CONFIRMATION"] = "0"
     from junction_detection.integration.anchor_pointcloud_junction_confirmation import simulate_polygon_lidar
 
     collector = DiagnosticCollector(simulate_polygon_lidar)
+    collector.python_rng_state_digest = hashlib.sha256(repr(random.getstate()).encode("utf-8")).hexdigest()
+    collector.numpy_rng_state_digest = hashlib.sha256(repr(np.random.get_state()).encode("utf-8")).hexdigest()
     target_name = str(TARGET)
     initial_offset_y = collector.initial_setup_offset_y
 
     def local_trace(frame, event, arg):
         if event == "return":
             local = frame.f_locals
+            if not collector.first_update_state_hash:
+                collector.first_update_state_hash = collector._state_hash(local["robots"])
             collector.sample(
                 local["self"], local["robots"], local["timestamp"],
                 local["dt"], frame.f_globals,
@@ -1181,12 +1315,14 @@ def run() -> None:
     def initialization_trace(frame, event, arg):
         if event == "return" and isinstance(arg, tuple) and arg and isinstance(arg[0], list):
             robots = arg[0]
+            collector.raw_initial_state_hash = collector._state_hash(robots)
             # Evaluation-only setup: translate the initial swarm along the
             # known incoming-corridor axis without changing geometry, width,
             # forces, or production simulator code.
             for robot in robots:
                 robot.position.y += initial_offset_y
                 robot.previous_position.y += initial_offset_y
+            collector.diagnostic_initial_state_hash = collector._state_hash(robots)
             return None
         return initialization_trace
 

@@ -1,0 +1,3 @@
+viewpoint_role,candidate_id,forward_ratio_W,lateral_ratio_W,candidate_valid,plus90_mouth_point_los_fraction_eval,minus90_mouth_point_los_fraction_eval,plus90_axis_los_eval,minus90_axis_los_eval,plus90_detected_eval,minus90_detected_eval
+A0,F+0.000_L+0.000,0.0,0.0,True,0.38095238095238093,0.42857142857142855,False,False,False,False
+FULL_MOUTH,F+0.600_L+0.000,0.6,0.0,True,1.0,1.0,False,False,False,False

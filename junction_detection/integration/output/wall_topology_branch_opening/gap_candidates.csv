@@ -1,0 +1,2 @@
+case,gap_id,endpoint_a,endpoint_b,gap_center_x,gap_center_y,gap_width,gap_width_ratio_W,gap_orientation_deg,free_space_continuation,continuation_depth,candidate_valid,rejection_reason
+M1_A0,0,1,3,109.43386625940892,-1.7620542030563833,84.02980706814161,1.0003548460493048,88.47386337170872,True,40.55194876336671,True,NONE

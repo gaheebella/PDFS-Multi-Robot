@@ -1,0 +1,13 @@
+item,production_rule,source_function,role
+robot_count,ROBOT_COUNT=680,create_grid_robots,"680 required for the same rows, density, and support-neighborhood regime"
+placement,GRID_SPACING=4*0.70; GRID_ROW_SPACING=3.8*0.70,create_grid_robots,deterministic packed grid at the same entrance-relative Base depth
+initial_velocity,zero,Robot.__init__,velocity/acceleration/filter zero
+compression,0.65 s center-directed envelope,compute_route_force/get_base_compression_envelope,physical initialization protocol
+pressure,0.35 -> 5.20 -> 3.00,get_base_pressure_scale,state-timed pressure activation
+equilibrium,0.60 -> 1.48 SAFE_RADIUS scale,adaptive_equilibrium_radius,packed then released spacing
+release,3.20 s timed fallback plus event decay,initial_pressure_release_active,branch event excluded in clean
+viscosity,always; 1.35 multiplier during release,compute_sph_forces,velocity consensus plus approaching-pair artificial viscosity
+base_piston,depth-weighted stored-pressure reaction,compute_base_piston_reaction_force,Base release physics retained; branch event decay excluded
+connectivity,communication-parent spring/guard,compute_connectivity_force,excluded because communication/DFS-coupled
+wall,axis-separated is_walkable; 0/0.18 response,Robot.update/wall_collision_velocity,no geometric projection
+integration,density->pressure->forces->filter->velocity->lateral damping->clamp->axis position,main loop/Robot.update,one substep

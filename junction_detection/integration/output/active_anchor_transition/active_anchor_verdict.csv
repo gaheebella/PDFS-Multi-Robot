@@ -1,0 +1,2 @@
+verdict,m0_false_transition,m1_anchor_ready,runtime_inputs,runtime_local_contract,pointcloud_detector_executed
+ACTIVE_ANCHOR_TRANSITION_VALID,False,True,"angles_deg,ranges,leader_local_velocity,body_heading,local_physics",True,False

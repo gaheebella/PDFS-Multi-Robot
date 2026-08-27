@@ -1,0 +1,3 @@
+candidate_id,topology_type,supporting_robot_count,observed_robot_count,motion_duration,mean_displacement,median_displacement,motion_direction_local,direction_dispersion,forward_progress,backflow_ratio,motion_supported,motion_reliability,final_state,matched_branch_eval_only
+C0,COMPLETE,13,198,0.6999999999999975,23.76780604954937,23.76780604954937,-16.67613449826049,0.00011345253310435233,6.855382905020388,0.0,True,0.9998865474668956,MOTION_SUPPORTED,LEFT
+C1,COMPLETE,11,202,0.6999999999999975,22.972414856084097,22.972414856084097,18.226788850158478,0.008114779211414458,7.005473013274958,0.0,True,0.9918852207885855,MOTION_SUPPORTED,RIGHT

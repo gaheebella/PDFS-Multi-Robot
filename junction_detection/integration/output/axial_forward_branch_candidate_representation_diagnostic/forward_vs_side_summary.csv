@@ -1,0 +1,15 @@
+metric,left,forward,right
+LiDAR free evidence,True,True,True
+Angular opening shadow,False,True,False
+Wall segment support,True,True,True
+WALL_TERMINATION count,1,0,1
+Valid termination count,1,2,1
+Second termination,False,True,False
+Endpoint pair,True,True,True
+Gap constructed,True,True,True
+Gap accepted,True,True,True
+PARTIAL topology,True,False,True
+COMPLETE topology,True,False,True
+Candidate created,True,False,True
+First failure stage,NONE,CANDIDATE_CONSTRUCTION_SAME_LATERAL_SIDE_GATE,NONE
+Deterministic replay,True,True,True

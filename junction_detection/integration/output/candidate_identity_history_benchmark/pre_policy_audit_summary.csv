@@ -1,0 +1,6 @@
+map_case,exp039_candidate_count,accepted_observation_count,pairwise_comparison_count
+M1_CROSS_BASELINE,4,97,342
+M2_T_JUNCTION,3,16,15
+M3_ANGLED_Y,4,69,194
+M4_ASYMMETRIC_CROSS,4,101,355
+M5_UNEQUAL_WIDTH,4,180,660

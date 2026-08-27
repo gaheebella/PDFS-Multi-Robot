@@ -1,0 +1,13 @@
+case,candidate,local_forward_offset,local_lateral_offset,step_width_ratio,candidate_valid,candidate_point_inside_free_space,opening_count,outgoing_match_count,outgoing_total,plus90_visible_eval,minus90_visible_eval,incoming_match,false_opening_count,lateral_false_opening_count,valid_lidar_hits,max_range_count,total_wall_fitted_points,mean_center_error_eval,visibility_gain_vs_anchor,opening_count_gain_vs_anchor,new_side_branch_count
+M1_CROSS_BASELINE,A0,0.0,0.0,0.0,True,True,2,1,3,False,False,1,0,0,287,73,10,1.0,0,0,0
+M1_CROSS_BASELINE,F,8.4,0.0,0.1,True,True,2,1,3,False,False,1,0,0,283,77,10,1.0,0,0,0
+M1_CROSS_BASELINE,L,0.0,8.4,0.1,True,True,2,1,3,False,False,1,0,0,285,75,10,4.5,0,0,0
+M1_CROSS_BASELINE,R,0.0,-8.4,0.1,True,True,2,1,3,False,False,1,0,0,287,73,10,3.0,0,0,0
+M1_CROSS_BASELINE,FL,5.939696961966999,5.939696961966999,0.1,True,True,2,1,3,False,False,1,0,0,283,77,9,3.5,0,0,0
+M1_CROSS_BASELINE,FR,5.939696961966999,-5.939696961966999,0.1,True,True,2,1,3,False,False,1,0,0,285,75,10,2.0,0,0,0
+M0_STRAIGHT,A0,0.0,0.0,0.0,True,True,2,0,0,False,False,1,1,0,296,64,12,nan,0,0,0
+M0_STRAIGHT,F,8.4,0.0,0.1,True,True,2,0,0,False,False,1,1,0,296,64,12,nan,0,0,0
+M0_STRAIGHT,L,0.0,8.4,0.1,True,True,2,0,0,False,False,1,1,0,294,66,12,nan,0,0,0
+M0_STRAIGHT,R,0.0,-8.4,0.1,True,True,2,0,0,False,False,1,1,0,296,64,12,nan,0,0,0
+M0_STRAIGHT,FL,5.939696961966999,5.939696961966999,0.1,True,True,2,0,0,False,False,1,1,0,294,66,10,nan,0,0,0
+M0_STRAIGHT,FR,5.939696961966999,-5.939696961966999,0.1,True,True,2,0,0,False,False,1,1,0,296,64,12,nan,0,0,0

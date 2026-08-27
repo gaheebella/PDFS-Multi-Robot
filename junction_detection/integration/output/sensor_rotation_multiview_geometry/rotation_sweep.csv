@@ -1,0 +1,14 @@
+experiment_id,case,orientation_deg,orientation_valid,orientation_validity_reason,gt_visible_outgoing_count_eval,detected_outgoing_count_eval,opening_group_count,false_opening_count_eval,incoming_detected_eval,valid_lidar_hits,max_range_count
+EXP-029,M1_CROSS_BASELINE,-90,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,-75,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,-60,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,-45,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,-30,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,-15,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,0,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,15,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,30,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,45,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,60,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,75,True,valid_full_360_circular_scan,1,1,2,0,True,287,73
+EXP-029,M1_CROSS_BASELINE,90,True,valid_full_360_circular_scan,1,1,2,0,True,287,73

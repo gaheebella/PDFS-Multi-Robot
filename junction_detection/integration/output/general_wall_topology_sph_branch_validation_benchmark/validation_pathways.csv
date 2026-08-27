@@ -1,0 +1,7 @@
+map_case,complete_before_motion_count,motion_before_complete_count,persistent_partial_motion_count,complete_only_count,partial_no_support_count,direct_complete_count,false_candidate_count
+M0_STRAIGHT,0,0,0,0,0,0,0
+M1_CROSS_BASELINE,2,0,0,0,0,0,0
+M2_T_JUNCTION,2,0,0,0,0,0,0
+M3_ANGLED_Y,2,0,0,0,0,0,0
+M4_ASYMMETRIC_CROSS,2,0,0,0,0,0,0
+M5_UNEQUAL_WIDTH,2,0,0,0,0,0,0

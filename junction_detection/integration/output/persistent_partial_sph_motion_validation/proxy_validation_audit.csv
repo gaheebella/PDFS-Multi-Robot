@@ -1,0 +1,2 @@
+geometry_id,selection_status,proxy_topology_result,left_complete_time,right_complete_time,motion_support_time,used_for_final_verdict
+M2_T_JUNCTION,REJECTED_AFTER_EXACT_COMPLETE_EQUIVALENCE_AUDIT,COMPLETE_BEFORE_MOTION,4.416666666666656,4.9166666666666545,6.416666666666649,False

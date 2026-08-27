@@ -1,0 +1,2 @@
+verdict,evaluation_only,production_viewpoint_threshold,pointcloud_detector_modified,profile_detector_modified,braking_modified,final_fixed_anchor_promoted
+PROVISIONAL_ANCHOR_VIEWPOINT_INSUFFICIENT,True,False,False,False,False,False

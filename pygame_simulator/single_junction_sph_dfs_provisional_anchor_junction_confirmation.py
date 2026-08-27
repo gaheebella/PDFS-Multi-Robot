@@ -2667,20 +2667,29 @@ ANCHOR_SHADOW_SAMPLE_INTERVAL_S = float(
 )
 if ANCHOR_SHADOW_SAMPLE_INTERVAL_S <= 0.0:
     raise ValueError("SPH_DFS_ANCHOR_SAMPLE_INTERVAL_S must be positive seconds")
-ANCHOR_SHADOW_OUTPUT_DIR = Path(
-    os.environ.get(
-        "SPH_DFS_ANCHOR_OUTPUT_DIR",
-        "junction_detection/integration/output/anchor_shadow",
-    )
+
+
+def _resolve_output_dir(env_name: str, default_relative_path: str) -> Path:
+    """Resolve logging output independently of the process working directory.
+
+    The simulator is often launched from an IDE or another directory.  Keeping
+    relative output paths relative to ``PROJECT_ROOT`` prevents a valid live
+    confirmation from being written to a different, stale CSV tree.
+    """
+    configured = Path(os.environ.get(env_name, default_relative_path)).expanduser()
+    return configured if configured.is_absolute() else PROJECT_ROOT / configured
+
+
+ANCHOR_SHADOW_OUTPUT_DIR = _resolve_output_dir(
+    "SPH_DFS_ANCHOR_OUTPUT_DIR",
+    "junction_detection/integration/output/anchor_shadow",
 )
 PROVISIONAL_CONFIRMATION_ENABLED = _anchor_shadow_env_flag(
     "SPH_DFS_PROVISIONAL_CONFIRMATION"
 )
-PROVISIONAL_CONFIRMATION_OUTPUT_DIR = Path(
-    os.environ.get(
-        "SPH_DFS_PROVISIONAL_CONFIRMATION_OUTPUT_DIR",
-        "junction_detection/integration/output/provisional_anchor_confirmation",
-    )
+PROVISIONAL_CONFIRMATION_OUTPUT_DIR = _resolve_output_dir(
+    "SPH_DFS_PROVISIONAL_CONFIRMATION_OUTPUT_DIR",
+    "junction_detection/integration/output/provisional_anchor_confirmation",
 )
 
 # The pre-election path must span enough simulated time to reject a single

@@ -1,0 +1,7 @@
+map_case,gt_outgoing_count_eval,angular_match_at_first_candidate,angular_recall_at_first_candidate,angular_max_outgoing_match,integrated_candidate_count,integrated_motion_supported_count
+M0_STRAIGHT,0.0,0.0,0.0,0.0,0,0
+M1_CROSS_BASELINE,3.0,1.0,0.3333333333333333,3.0,2,2
+M2_T_JUNCTION,2.0,0.0,0.0,2.0,2,2
+M3_ANGLED_Y,2.0,0.0,0.0,2.0,2,2
+M4_ASYMMETRIC_CROSS,3.0,1.0,0.3333333333333333,3.0,2,2
+M5_UNEQUAL_WIDTH,3.0,1.0,0.3333333333333333,3.0,2,2

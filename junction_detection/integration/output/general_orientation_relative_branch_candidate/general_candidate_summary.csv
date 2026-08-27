@@ -1,0 +1,4 @@
+case,true_branch_count_eval_only,old_candidate_count,new_candidate_count,true_candidate_count_eval_only,false_candidate_count_eval_only,axial_recovered_eval_only,deterministic_replay
+M0_STRAIGHT,0,0,0,0,0,False,True
+M1_CROSS_BASELINE,3,2,3,3,0,True,True
+EXP035_F+0.700_L+0.100,1,1,1,1,0,False,True

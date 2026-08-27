@@ -1,0 +1,6 @@
+case,estimated_corridor_width,wall_segment_count,endpoint_count,valid_endpoint_count,gap_candidate_count,accepted_gap_count,wall_topology_matched_outgoing_count,true_outgoing_branch_mouths_eval,left_detected_eval,right_detected_eval,forward_detected_eval,false_candidate_count_eval,existing_angular_outgoing_match,existing_angular_outgoing_total,false_side_branch_count_eval,branch_eval,observed_mouth_boundary_count_eval,nearest_endpoint_error_a_eval,nearest_endpoint_error_b_eval,topology_class_eval,accepted_candidate_eval
+M1_A0,84.0,2,4,2,1,1,0,3,False,False,False,0,1,3,,,,,,,
+M0_STRAIGHT,84.0,2,4,0,0,0,,,,,,,,,0,,,,,,
+M1_A0_BRANCH,,,,,,,,,,,,,,,,FORWARD,0,84.4576485622698,82.22033077115128,NO_GAP_TOPOLOGY,False
+M1_A0_BRANCH,,,,,,,,,,,,,,,,RIGHT,1,82.22033077115128,2.9702568994276635,PARTIAL_GAP_TOPOLOGY,False
+M1_A0_BRANCH,,,,,,,,,,,,,,,,LEFT,1,4.864159049675965,84.4576485622698,PARTIAL_GAP_TOPOLOGY,False

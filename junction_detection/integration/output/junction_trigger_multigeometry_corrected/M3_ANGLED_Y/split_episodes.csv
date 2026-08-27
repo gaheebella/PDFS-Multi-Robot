@@ -1,0 +1,2 @@
+phase,start_time,end_time,duration,max_component_count,mean_largest_fraction,max_second_fraction,mean_boundary_fraction,mean_min_angular_separation,mean_retention
+JUNCTION_REGION,28.200000000000003,29.900000000000002,1.8,3,0.4152576489533012,0.30434782608695654,0.9976851851851853,105.04400379980217,1.0

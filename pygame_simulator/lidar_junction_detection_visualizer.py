@@ -1,9 +1,4 @@
-"""Read-only Pygame visualizer for the frozen moving-LiDAR Junction detector.
 
-The simulation and detector live in their production/frozen modules.  This
-module only copies their outputs into immutable display snapshots and renders
-them; it contains no Junction-detection implementation.
-"""
 
 from __future__ import annotations
 

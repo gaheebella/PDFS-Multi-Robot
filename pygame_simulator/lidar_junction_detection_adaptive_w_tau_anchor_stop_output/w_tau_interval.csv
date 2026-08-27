@@ -1,0 +1,2 @@
+map_case,fallback_W,adaptive_W,tau,adaptive_margin_ratio,lower,upper,valid,selected_T,threshold_alpha,runtime_gt_map_used
+M1_PRE_CORRIDOR_55PCT,100.0,94.76588562241088,7.5,0.1,104.24247418465197,142.5,True,106.15535047541937,0.05,False

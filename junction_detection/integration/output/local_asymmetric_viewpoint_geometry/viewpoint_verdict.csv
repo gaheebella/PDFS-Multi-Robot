@@ -1,0 +1,2 @@
+verdict,deterministic_replay,m0_candidate_false_regression,m0_lateral_false_regression,GT_map_leakage
+NO_BOUNDED_NON_FORWARD_VIEWPOINT_GAIN,True,False,False,False

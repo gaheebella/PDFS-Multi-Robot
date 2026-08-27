@@ -1,0 +1,8 @@
+case,gt_branch_count,general_candidate_count,true_candidate_count,false_candidate_count,candidate_recall,complete_count,complete_recall,motion_supported_count,motion_supported_recall,false_motion_supported_count,main_replay_exact,raw_general_candidate_count,new_outgoing_candidate_count,known_parent_path_count,merged_duplicate_observation_count
+M0_STRAIGHT,0,0,0,0,0.0,0,0.0,0,0.0,0,True,0,0,0,0
+M1_CROSS_BASELINE,3,3,3,0,1.0,3,1.0,3,1.0,0,True,4,3,1,0
+M2_T_JUNCTION,2,2,2,0,1.0,2,1.0,2,1.0,0,True,3,2,1,0
+M3_ANGLED_Y,2,2,2,0,1.0,2,1.0,2,1.0,0,True,4,2,1,1
+M4_ASYMMETRIC_CROSS,3,3,3,0,1.0,3,1.0,3,1.0,0,True,4,3,1,0
+M5_UNEQUAL_WIDTH,3,3,3,0,1.0,3,1.0,3,1.0,0,True,4,3,1,0
+ALL,13,13,13,0,1.0,13,1.0,13,1.0,0,True,19,13,5,1

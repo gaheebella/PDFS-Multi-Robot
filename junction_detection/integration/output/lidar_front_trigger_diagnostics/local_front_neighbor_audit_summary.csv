@@ -1,0 +1,6 @@
+phase,sample_count,diagnostic_neighbor_mean,physics_neighbor_mean,jaccard_mean,jaccard_median,jaccard_p10,jaccard_min,diagnostic_only_fraction,physics_only_fraction,exact_match_fraction
+SPH_CORRIDOR,8160,97.18357843137255,97.18357843137255,1.0,1.0,1.0,1.0,0.0,0.0,1.0
+SPH_OPENING_APPROACH,19015,42.93389429397844,42.93389429397844,1.0,1.0,1.0,1.0,0.0,0.0,1.0
+SPH_BOUNDARY_CROSSING,679,31.823269513991164,31.823269513991164,1.0,1.0,1.0,1.0,0.0,0.0,1.0
+SPH_JUNCTION_REGION,39382,25.82591031435681,25.82591031435681,1.0,1.0,1.0,1.0,0.0,0.0,1.0
+SPH_POST_BOUNDARY,0,,,,,,,0.0,0.0,

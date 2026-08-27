@@ -1,0 +1,4 @@
+case_id,detection_frame,detection_time,leader_x_eval_only,leader_y_eval_only,distance_to_junction_entry_eval_only,progress_relative_to_junction_entry_eval_only
+BASELINE_M1,126,2.116666666666664,-2.2048559153023706,67.390883345553,-109.390883345553,109.390883345553
+BOOTSTRAP_M1,36,0.6166666666666669,-1.690422239914758,-172.89124605212714,130.89124605212714,-130.89124605212714
+M0_NEGATIVE_CONTROL,,,,,,

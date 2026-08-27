@@ -1,0 +1,2 @@
+﻿provisional_time,decision,decision_time,anchor_id,final_pointcloud_opening_count,opening_directions_deg,confirmation_reason,release_reason,anchor_position_drift,range_input_unit
+1.6400000000000008,REJECTED,1.6400000000000008,293,2,"[0.0, 178.5]",pointcloud_topological_degree_le_2,pointcloud_topological_degree_le_2_release,0.0,pygame_world_unit

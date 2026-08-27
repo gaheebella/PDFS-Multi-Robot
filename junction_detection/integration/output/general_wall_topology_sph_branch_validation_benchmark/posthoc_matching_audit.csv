@@ -1,0 +1,3 @@
+map_case,candidate_id,old_label,new_label,branch_edge_distance,free_axis_alignment,evaluation_tolerance,runtime_changed
+M3_ANGLED_Y,C0,FALSE,BRANCH_1,4.139584530175066,0.8660254037844386,10.08,False
+M3_ANGLED_Y,C1,FALSE,BRANCH_0,2.7908340128491984,0.8660254037844386,10.08,False

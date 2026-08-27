@@ -1,0 +1,109 @@
+case_id,transform_deg,gap_id,stage_name,pass_fail,measured_value,reference_value_if_existing,reason
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.00001548209046,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,INCIDENT_WALL_AVAILABLE,PASS,4,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,0.04976805720922073,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,OPENING_NORMAL_VALID,PASS,0.9999999999999999,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,0,0,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,MOUTH_GEOMETRY_NONDEGENERATE,PASS,119.10530638747512,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,GAP_TANGENT_AXIAL_WALL_SUPPORT,FAIL,44.85041147442536,<= 20.0 deg,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,0,1,GENERAL_CANDIDATE_CREATED,FAIL,False,descriptor.rejection_reason == NONE,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.51355316852936,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,1.146180960631682e-05,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,0,2,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.00001548209046,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,INCIDENT_WALL_AVAILABLE,PASS,4,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,0.04976805720920652,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,OPENING_NORMAL_VALID,PASS,0.9999999999999999,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,90,0,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,MOUTH_GEOMETRY_NONDEGENERATE,PASS,119.10530638747514,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,GAP_TANGENT_AXIAL_WALL_SUPPORT,FAIL,44.850411474425414,<= 20.0 deg,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,90,1,GENERAL_CANDIDATE_CREATED,FAIL,False,descriptor.rejection_reason == NONE,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.51355316852936,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,1.1461809663160238e-05,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,90,2,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.00001548209046,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,INCIDENT_WALL_AVAILABLE,PASS,4,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,0.04976805720922073,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,OPENING_NORMAL_VALID,PASS,0.9999999999999999,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,180,0,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,MOUTH_GEOMETRY_NONDEGENERATE,PASS,119.10530638747514,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,GAP_TANGENT_AXIAL_WALL_SUPPORT,FAIL,44.850411474425385,<= 20.0 deg,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,180,1,GENERAL_CANDIDATE_CREATED,FAIL,False,descriptor.rejection_reason == NONE,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.51355316852936,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,1.1461809634738529e-05,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,180,2,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.00001548209046,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,INCIDENT_WALL_AVAILABLE,PASS,4,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,0.04976805720929178,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,OPENING_NORMAL_VALID,PASS,0.9999999999999999,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,270,0,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,MOUTH_GEOMETRY_NONDEGENERATE,PASS,119.10530638747514,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,GAP_TANGENT_AXIAL_WALL_SUPPORT,FAIL,44.850411474425385,<= 20.0 deg,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,270,1,GENERAL_CANDIDATE_CREATED,FAIL,False,descriptor.rejection_reason == NONE,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,UPSTREAM_PHYSICAL_GAP_ACCEPTED,PASS,True,candidate_valid=True,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,MOUTH_GEOMETRY_NONDEGENERATE,PASS,84.51355316852937,> 1e-12 (_unit requirement),endpoint-to-endpoint mouth vector
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,ENDPOINT_VALID_FLAG_GATE,NOT_APPLICABLE,"True,True",none,General Candidate builder consumes endpoint geometry/types but does not gate endpoint.valid
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,INCIDENT_WALL_AVAILABLE,PASS,3,> 0 (otherwise boundary error is infinity),incident segment axes from both mouth endpoints
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,GAP_TANGENT_AXIAL_WALL_SUPPORT,PASS,1.146180960631682e-05,<= 20.0 deg,NONE
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,OPENING_NORMAL_VALID,PASS,1.0,unit vector from existing _unit,normal selected by free-space alignment
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,TOPOLOGY_TYPE_GATE,NOT_APPLICABLE,COMPLETE,none,topology_type is stored on candidate but not an acceptance gate
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,DUPLICATE_IDENTITY_GATE,NOT_APPLICABLE,not evaluated,none,identity is downstream of General Candidate creation
+M1_PRE_CORRIDOR_BOOTSTRAP,270,2,GENERAL_CANDIDATE_CREATED,PASS,True,descriptor.rejection_reason == NONE,NONE

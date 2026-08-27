@@ -1,0 +1,18 @@
+phase,status
+Adaptive LiDAR,PASS
+Junction detection,PASS
+Anchor fixation,PASS
+Opening detection,PASS
+Branch candidate creation,FAIL
+Branch selection,PASS
+Shepherd localization trigger,PASS
+Shepherd candidates,BLOCKED
+Shepherd ID election,BLOCKED
+Unselected Branch blocking,BLOCKED
+Selected Branch exploration,BLOCKED
+Dead-end detection,BLOCKED
+Shepherd Backtracking,BLOCKED
+Junction return,BLOCKED
+Next Branch,BLOCKED
+All Branches visited,BLOCKED
+DONE,BLOCKED

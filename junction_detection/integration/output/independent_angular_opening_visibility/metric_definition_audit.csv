@@ -1,0 +1,7 @@
+metric,definition,source,used_by_detector
+MOUTH_POINT_LOS_FRACTION,fraction of 21 physical mouth-segment samples with unobstructed LOS,GT_POSTHOC,False
+ANGULAR_FREE_INTERVAL,global contiguous run in the frozen pre-gap candidate mask,LIDAR_ONLY,False
+RAW_INDEPENDENT_INTERVAL,global raw run whose center lies inside the post-hoc branch mouth angular ROI,SCAN_TOPOLOGY_THEN_GT_LABEL,False
+BRANCH_AXIS_SUPPORT,exact circular inclusion of evaluation-only GT branch axis in a precomputed interval,GT_POSTHOC,False
+DETECTOR_INDEPENDENT_GROUP,frozen accepted gap-filled group whose center lies in the post-hoc branch ROI,DETECTOR_TOPOLOGY_THEN_GT_LABEL,True
+FINAL_DETECTOR_OPENING,unchanged public Point Cloud detector output,LIDAR_ONLY,True

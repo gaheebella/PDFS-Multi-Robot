@@ -1,0 +1,2 @@
+﻿timestamp,state,anchor_robot_id,election_reason,fixed_x,fixed_y,reference_yaw_deg,reference_direction_source,reference_history_duration_s,reference_displacement,activation_reason,release_reason,range_input_unit
+0.016666666666666666,SEARCHING,,,,,,,0.0,0.0,,,pygame_world_unit

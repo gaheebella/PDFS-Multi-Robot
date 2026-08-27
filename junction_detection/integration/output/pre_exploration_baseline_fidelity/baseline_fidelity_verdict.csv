@@ -1,0 +1,5 @@
+category,verdict,basis
+INITIAL_PACKING_FIDELITY,REASONABLE,"spacing, density, spans, overlap, and neighbor degree match at numerical precision"
+EARLY_DYNAMICS_FIDELITY,REASONABLE,"production-derived compression yields the same overlap, distance, and speed regime"
+PRE_JUNCTION_SHAPE_FIDELITY,REASONABLE,"GT-selected pre-entrance snapshot has comparable front fraction, span, variance, and local-front fraction"
+OVERALL,F1. BASELINE_FIDELITY_REASONABLE,qualitative production-relative audit; no detector/runtime threshold was introduced

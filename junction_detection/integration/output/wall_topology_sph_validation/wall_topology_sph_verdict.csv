@@ -1,0 +1,2 @@
+experiment_id,verdict,m0_candidate_count,m0_motion_supported_count,m1_candidate_count,m1_motion_supported_count,runtime_inputs,GT_map_used_for_runtime,SPH_force_modified,detector_threshold_modified
+EXP-034,CASE_E_COMPLETE_TOPOLOGY_AND_MOTION_SUPPORT,0,0,2,2,"local_scan,W_hat,local_corridor_axis,wall_segments,wall_terminations,relative_robot_motion",False,False,False

@@ -1,0 +1,4 @@
+case_id,first_valid_model_frame,stable_init_frame,readiness_frame,readiness_time,first_open_frame,first_detection_frame,gated_detection_frame,false_readiness_eval,false_junction_count,raw_detection_count,gated_detection_count,final_readiness_state,max_stable_width_change_after_ready,max_stable_orientation_change_after_ready,max_stable_offset_change_after_ready
+BASELINE_M1,126,,,,126,126,,False,0,1,0,MODEL_BOOTSTRAPPING,nan,nan,nan
+BOOTSTRAP_M1,0,6,6,0.11666666666666665,30,36,36,False,0,16,16,MODEL_READY,0.0,0.0,0.14796884394228016
+M0_NEGATIVE_CONTROL,0,6,6,0.11666666666666665,,,,False,0,0,0,MODEL_READY,0.0,0.0,0.3843645195637251

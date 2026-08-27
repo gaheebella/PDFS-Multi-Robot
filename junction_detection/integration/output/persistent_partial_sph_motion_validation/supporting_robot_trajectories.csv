@@ -1,0 +1,1 @@
+candidate_id,robot_id,entry_time,initial_relative_x,initial_relative_y,free_space_crossing_time,trajectory_tangent,progress_distance,stable_support_boolean,backflow_boolean

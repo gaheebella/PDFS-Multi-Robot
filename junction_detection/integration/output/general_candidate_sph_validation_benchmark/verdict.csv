@@ -1,0 +1,2 @@
+experiment_id,verdict,smoke_pass,main_sane,all_replay_exact,runtime_GT_map_used,map_specific_runtime_logic,orientation_specific_runtime_logic,detector_modified,SPH_motion_modified
+EXP-039,C_AXIAL_RECOVERED_WITH_FALSE_REGRESSION,True,True,True,False,False,False,False,False

@@ -1,0 +1,5 @@
+metric,production_mean,new_mean,absolute_difference,note
+reference_front_fraction,0.32058823529411773,0.32083333333333336,0.0002450980392156299,normalized cohort size
+reference_front_lateral_span,66.55880932468447,80.92783754963018,14.369028224945708,same spatial unit
+reference_front_lateral_variance,407.8567321204818,560.2173330900457,152.3606009695639,same spatial unit squared
+local_front_fraction,0.09791666666666667,0.3175,0.21958333333333335,normalized; definitions aligned but harness differs

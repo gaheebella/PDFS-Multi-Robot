@@ -1,0 +1,2 @@
+verdict,runtime_inputs,global_yaw_runtime,known_width_runtime,map_runtime,GT_runtime,noise_std,dropout,occlusion
+LOCAL_CORRIDOR_ORIENTATION_VALID,"angles_deg,ranges",False,False,False,False,0.0,0.0,0.0

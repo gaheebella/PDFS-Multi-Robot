@@ -1,0 +1,4 @@
+distance_tolerance_W,termination_cluster_count,fused_candidate_count,left_supporting_view_count,right_supporting_view_count,incoming_complete_support_count,false_candidate_count,maximum_false_supporting_view_count
+0.05,5,5,3,3,3,2,3
+0.075,5,5,3,3,3,2,3
+0.1,5,5,3,3,3,2,3

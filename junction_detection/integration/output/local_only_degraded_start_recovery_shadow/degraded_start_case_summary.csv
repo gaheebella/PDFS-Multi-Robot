@@ -1,0 +1,4 @@
+case_id,first_valid_current_model_frame,model_ready_frame,degraded_start_suspected_frame,degraded_start_suspected_time,first_open_frame,raw_detection_frame,published_detection_frame,raw_detection_preserved_all_samples,degraded_false_positive_count_eval,final_recovery_shadow_state,final_readiness_state
+BASELINE_M1,126,,6,0.11666666666666665,126,126,126,True,0,DEGRADED_START_SUSPECTED,MODEL_BOOTSTRAPPING
+BOOTSTRAP_M1,0,6,,,30,36,36,True,0,MODEL_READY,MODEL_READY
+M0_NEGATIVE_CONTROL,0,6,,,,,,True,0,MODEL_READY,MODEL_READY

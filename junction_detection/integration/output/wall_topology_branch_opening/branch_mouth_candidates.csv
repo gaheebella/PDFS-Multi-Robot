@@ -1,0 +1,2 @@
+case,candidate_id,gap_id,candidate_type,center_x_local,center_y_local,estimated_width,estimated_direction_local,boundary_support_left,boundary_support_right,free_space_support,accepted
+M1_A0,M1_A0_C0,0,TWO_BOUNDARY_FREE_CONTINUATION,109.43386625940892,-1.7620542030563833,84.02980706814161,-0.922470795484766,142,145,40.55194876336671,True

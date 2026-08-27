@@ -1,0 +1,5 @@
+result_type,candidate_1,candidate_2,distance_or_cost_W,exists
+NEAREST_PLUS90_DETECTOR,,,,False
+NEAREST_MINUS90_DETECTOR,,,,False
+NEAREST_SINGLE_VIEW_3OF3,,,,False
+BEST_TWO_VIEW_3OF3,,,,False

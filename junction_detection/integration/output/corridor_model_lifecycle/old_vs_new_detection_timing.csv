@@ -1,0 +1,3 @@
+variant,implementation_status,timing_change_frames,frame120_expected_source,frame120_expected_min,frame120_expected_max,first_open_frame,first_detection_frame
+OLD_CURRENT_DETECTOR,EXECUTED,0,MAX_RANGE_FALLBACK,150.0,150.0,126,126
+PROPOSED_LAST_VALID_PERSISTENCE,NOT_IMPLEMENTED_NO_PRIOR_VALID_MODEL,0,MAX_RANGE_FALLBACK,150.0,150.0,126,126

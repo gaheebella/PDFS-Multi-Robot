@@ -1,0 +1,5 @@
+map_case,scan_context,opening_id,start_angle_deg,end_angle_deg,center_angle_deg,angular_width_deg,confidence,wall_tangent_deg,usable_wall_sides,fitted_wall_point_count,line_fit_residual,wall_estimate_mode,matched_GT_branch_eval_only,center_error_deg_eval_only
+M1_CROSS_BASELINE,DETECTION_POSE_EVAL_ONLY,0,161.5,-160.5,-179.5,38.0,0.9363953781148968,179.9999999999999,2,6,3.3962268904101155e-14,two_wall_parallel,INCOMING,0.5
+M1_CROSS_BASELINE,DETECTION_POSE_EVAL_ONLY,1,-20.5,19.5,-0.5,40.0,0.9398287528676765,-1.1368683772161603e-13,2,4,1.4747690800977857e-29,two_wall_parallel,0,0.5
+M1_CROSS_BASELINE,PROVISIONAL_ANCHOR,0,161.5,-160.5,-179.5,38.0,0.9363853748788096,179.9999999999999,2,6,3.304743322323415e-14,two_wall_parallel,INCOMING,0.5
+M1_CROSS_BASELINE,PROVISIONAL_ANCHOR,1,-23.5,21.5,-1.0,45.0,0.955129169385331,2.842170943040401e-14,2,4,2.512147933894047e-15,two_wall_parallel,0,1.0

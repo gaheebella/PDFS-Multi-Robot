@@ -1,0 +1,2 @@
+experiment_id,primary_verdict,secondary_findings,deterministic_replay,A0_scan_exact_equivalence,local_cartesian_test,line_fit_segment_test,endpoint_extraction_test,gap_geometry_test,GT_used_for_candidate_generation_or_acceptance,GT_used_posthoc_only,production_detector_modified
+EXP-033,B_PARTIAL_SIDE_TOPOLOGY_RECOVERED,"[""ONE_BOUNDARY_VISIBLE_OPPOSITE_BOUNDARY_OCCLUDED"", ""M0_NO_FALSE_GAP"", ""NO_COMPLETE_OUTGOING_MOUTH""]",True,True,True,True,True,True,False,True,False

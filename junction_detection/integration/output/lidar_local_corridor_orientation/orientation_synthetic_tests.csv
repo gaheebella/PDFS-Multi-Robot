@@ -1,0 +1,9 @@
+test,truth_deg,estimate_deg,error_deg,parallel_error_deg,passed
+ideal_yaw_+0,0.0,0.0,0.0,0.0,True
+ideal_yaw_+5,5.0,5.0,0.0,0.0,True
+ideal_yaw_-5,-5.0,-5.0,0.0,0.0,True
+ideal_yaw_+10,10.0,10.0,0.0,0.0,True
+ideal_yaw_-10,-10.0,-10.0,0.0,0.0,True
+ideal_yaw_+15,15.0,15.0,0.0,0.0,True
+ideal_yaw_-15,-15.0,-14.999999999999986,1.4210854715202004e-14,2.842170943040401e-14,True
+axial_5_minus175,5.0,5.0,0.0,0.0,True

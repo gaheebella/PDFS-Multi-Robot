@@ -1,0 +1,8 @@
+viewpoint_id,viewpoint_role,branch_eval,raw_candidate_run_count_in_ROI,raw_candidate_run_lengths,filled_group_count_overlapping_ROI,filled_group_ids_overlapping_ROI,all_filled_group_widths_deg,axis_group_id,axis_group_accepted,final_opening_count,side_final_opening_detected,rejection_reason
+F+0.000_L+0.000,A0,PLUS90,1,[8],1,[0],"[49.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.000_L+0.000,A0,MINUS90,1,[8],1,[0],"[49.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.600_L+0.000,PLUS90_FULL_MOUTH,PLUS90,1,[18],1,[0],"[70.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.600_L+0.000,PLUS90_FULL_MOUTH,MINUS90,1,[18],1,[0],"[70.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.600_L+0.000,MINUS90_FULL_MOUTH,PLUS90,1,[18],1,[0],"[70.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.600_L+0.000,MINUS90_FULL_MOUTH,MINUS90,1,[18],1,[0],"[70.0, 49.0]",-1,False,2,False,AXIS_NOT_SUPPORTED_BY_ACCEPTED_GROUP
+F+0.000_L+0.000,A0,AXIAL_FORWARD,1,[24],1,[0],"[49.0, 49.0]",0,True,2,True,NONE_FINAL_OPENING_PASS

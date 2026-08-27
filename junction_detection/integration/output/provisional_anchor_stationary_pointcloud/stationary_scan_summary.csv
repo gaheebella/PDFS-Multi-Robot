@@ -1,0 +1,3 @@
+case_id,anchor_frame,analysis_start_frame,analysis_start_time,num_stationary_scans,inference_source_scan_count,num_points,stationary_scan_signatures_identical,anchor_local_frame_used,runtime_gt_used,detector_name,angular_opening_count,pointcloud_invocation_count,pointcloud_invoked_before_hold_count
+M1_PRE_CORRIDOR_BOOTSTRAP,221,222,3.7166666666666583,3,1,228,True,True,False,detect_openings + EXP033_wall_topology + EXP038_039_GeneralBranchCandidate,4,1,0
+M0_STRAIGHT,,,,0,0,0,False,False,False,detect_openings + EXP033_wall_topology + EXP038_039_GeneralBranchCandidate,0,0,0

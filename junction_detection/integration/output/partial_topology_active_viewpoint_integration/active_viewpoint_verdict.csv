@@ -1,0 +1,2 @@
+experiment_id,verdict,runtime_inputs,GT_map_used_for_control,fixed_displacement_stop_used,detector_threshold_modified,wall_topology_threshold_modified,production_simulator_modified
+EXP-034,A_PARTIAL_TO_COMPLETE_ACTIVE_VIEWPOINT_SUCCESS,"local_angles_ranges,corridor_orientation,W_hat,wall_segments,terminations,gaps,local_motion",False,False,False,False,False

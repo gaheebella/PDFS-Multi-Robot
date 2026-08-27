@@ -1,0 +1,13 @@
+base_gap_id,rotation_deg,candidate_created,rejection_reason,matches_base_decision,geometry_equivalent
+0,0,True,NONE,True,True
+1,0,False,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT,True,True
+2,0,True,NONE,True,True
+0,90,True,NONE,True,True
+1,90,False,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT,True,True
+2,90,True,NONE,True,True
+0,180,True,NONE,True,True
+1,180,False,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT,True,True
+2,180,True,NONE,True,True
+0,270,True,NONE,True,True
+1,270,False,NO_INCIDENT_WALL_SUPPORT_ALONG_GAP_TANGENT,True,True
+2,270,True,NONE,True,True

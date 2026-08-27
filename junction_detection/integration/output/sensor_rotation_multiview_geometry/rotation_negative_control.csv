@@ -1,0 +1,8 @@
+case,orientation_deg,orientation_valid,opening_group_count,false_opening_count_eval,axial_false_opening_count_eval,lateral_false_opening_count_eval,rotation_false_positive_regression_eval
+M0_STRAIGHT,-90,True,2,1,1,0,False
+M0_STRAIGHT,-60,True,2,1,1,0,False
+M0_STRAIGHT,-30,True,2,1,1,0,False
+M0_STRAIGHT,0,True,2,1,1,0,False
+M0_STRAIGHT,30,True,2,1,1,0,False
+M0_STRAIGHT,60,True,2,1,1,0,False
+M0_STRAIGHT,90,True,2,1,1,0,False

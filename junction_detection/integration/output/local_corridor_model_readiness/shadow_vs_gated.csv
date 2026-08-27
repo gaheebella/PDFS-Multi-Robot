@@ -1,0 +1,4 @@
+case_id,raw_detector_detection_frame,readiness_gated_detection_frame,readiness_blocked_samples,readiness_false_positive_count,readiness_false_negative_count_eval,shadow_detector_output_changed
+BASELINE_M1,126,,1,0,1,False
+BOOTSTRAP_M1,36,36,0,0,0,False
+M0_NEGATIVE_CONTROL,,,0,0,0,False

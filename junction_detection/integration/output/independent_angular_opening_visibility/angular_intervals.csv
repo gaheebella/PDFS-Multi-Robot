@@ -1,0 +1,5 @@
+viewpoint_id,viewpoint_role,interval_id,start_angle_deg,end_angle_deg,center_angle_deg,width_deg,beam_count,raw_independent,nearest_detector_group_id,angular_gap_to_nearest_group_deg,merged_by_gap_rule,plus90_axis_inside_eval,minus90_axis_inside_eval,forward_axis_inside_eval
+F+0.000_L+0.000,A0,0,-25.5,23.5,-1.0,49.0,49,True,0,0.0,False,False,False,True
+F+0.000_L+0.000,A0,1,156.5,-154.5,-179.0,49.0,49,True,1,0.0,False,False,False,False
+F+0.600_L+0.000,FULL_MOUTH,0,-36.5,33.5,-1.5,70.0,70,True,0,0.0,False,False,False,True
+F+0.600_L+0.000,FULL_MOUTH,1,156.5,-154.5,-179.0,49.0,49,True,1,0.0,False,False,False,False

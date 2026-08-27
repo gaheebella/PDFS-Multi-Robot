@@ -1,0 +1,2 @@
+verdict,frames,leader_max_gap,leader_disconnected_duration,leader_min_component_size,before_max_overlap_pairs,after_max_overlap_pairs,overlap_regression,lateral_expansion_retention,m0_frozen_fusion_episode_count,m1_frozen_fusion_episode_count,m1_frozen_fusion_first_time,max_nan_inf,max_outside,frozen_sph_threshold,frozen_boundary_threshold,frozen_lidar_threshold
+E. UNSTABLE,600,11.832205386749948,0.0,680,68.0,70,True,1.0091304689580662,0,5,2.3166666666666633,0,0,0.05190502225289483,0.08701475362117486,0.012338797689551723

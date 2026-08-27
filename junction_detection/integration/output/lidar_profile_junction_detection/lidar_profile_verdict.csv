@@ -1,0 +1,2 @@
+verdict,runtime_inputs,corridor_width_configuration,max_range_configuration,legacy_shadow_dependency,GT_dependency,noise_std,dropout,occlusion
+LIDAR_PROFILE_BASELINE_VALID,"angles_deg,ranges",84.0,150.0,False,False,0.0,0.0,0.0

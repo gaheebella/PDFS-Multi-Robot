@@ -1,0 +1,2 @@
+verdict,runtime_inputs,known_corridor_width_runtime,GT_dependency,map_dependency,legacy_shadow_dependency,rear_start_shift_eval_only,noise_std,dropout,occlusion
+LOCAL_CORRIDOR_ESTIMATION_VALID,"angles_deg,ranges",False,False,False,False,160.0,0.0,0.0,0.0

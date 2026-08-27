@@ -1,0 +1,2 @@
+verdict,reason
+BASELINE_FIDELITY_WEAK,"bounded 240-robot cohort omits production initial compression pulse, communication guards, and state-coupled ingress forces; smoke also shows sub-diameter minimum spacing"

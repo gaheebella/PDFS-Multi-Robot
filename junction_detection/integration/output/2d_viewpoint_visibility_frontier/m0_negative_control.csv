@@ -1,0 +1,8 @@
+case,candidate_id,grid_stage,forward_ratio_W,lateral_ratio_W,distance_ratio_W,candidate_valid,plus90_axis_los_eval,minus90_axis_los_eval,plus90_mouth_visible_fraction_eval,minus90_mouth_visible_fraction_eval,plus90_detected_eval,minus90_detected_eval,forward_detected_eval,incoming_detected_eval,opening_count,outgoing_match_count_eval,outgoing_total_eval,false_opening_count_eval,axial_false_opening_count_eval,lateral_false_opening_count_eval
+M0_STRAIGHT,F+0.000_L+0.000,M0_REPRESENTATIVE,0.0,0.0,0.0,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.000_L+0.300,M0_REPRESENTATIVE,0.0,0.3,0.3,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.000_L-0.300,M0_REPRESENTATIVE,0.0,-0.3,0.3,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.300_L+0.300,M0_REPRESENTATIVE,0.3,0.3,0.4242640687119285,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.300_L-0.300,M0_REPRESENTATIVE,0.3,-0.3,0.4242640687119285,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.500_L+0.400,M0_REPRESENTATIVE,0.5,0.4,0.6403124237432849,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0
+M0_STRAIGHT,F+0.500_L-0.400,M0_REPRESENTATIVE,0.5,-0.4,0.6403124237432849,True,False,False,0.0,0.0,False,False,False,True,2,0,0,1,1,0

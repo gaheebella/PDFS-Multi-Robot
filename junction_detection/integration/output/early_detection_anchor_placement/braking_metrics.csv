@@ -1,0 +1,4 @@
+case_id,detection_frame,detection_time,detection_speed,brake_start_frame,brake_start_time,brake_start_speed,stop_frame,stop_time,stop_distance_from_detection,stop_distance_from_brake,stop_latency_frames,stop_latency_sec,detection_to_anchor_distance,detection_to_anchor_latency_frames
+M1_BASELINE,126,2.116666666666664,50.21234141962963,127,2.1333333333333306,49.66191980662256,163,2.7333333333333285,11.832457199316808,11.004758536236704,37,0.6166666666666645,11.87209343014496,42
+M1_PRE_CORRIDOR_BOOTSTRAP,36,0.6166666666666669,85.79494863914204,37,0.6333333333333336,84.74923141310178,75,1.266666666666667,20.112779366692276,18.700301451056845,39,0.6500000000000001,20.142523653043746,44
+M0_NEGATIVE_CONTROL,,,,,,,,,nan,nan,,,nan,

@@ -1,0 +1,2 @@
+verdict,benchmark_case_count,regression_timings_pass,representative_deterministic_replay_match,clean_cases,expected_degraded_cases,ambiguous_cases,false_degraded,missed_degraded,precision,recall,blocked_raw_detection_samples,altered_detector_output_samples,exp044_rule_imported_unchanged,new_numeric_threshold_added,runtime_gt_or_map_used,production_changed,detector_changed,simulator_changed
+C_MISSED_DEGRADED_STARTS,15,True,True,8,7,0,0,3,1.0,0.5714285714285714,0,0,True,False,False,False,False,False

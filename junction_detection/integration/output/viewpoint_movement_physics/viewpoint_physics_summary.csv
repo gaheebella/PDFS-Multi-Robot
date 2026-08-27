@@ -1,0 +1,6 @@
+mode,active_sample_count,min_inter_robot_distance,max_overlap_pair_count,wall_contacts_added,max_outside,max_nan_inf,leader_max_speed,follower_mean_speed_max,direct_support_all_active,communication_connected_all_active,minimum_communication_component,maximum_support_gap,pointcloud_call_count_secondary,m0_negative_control_pass,deterministic_replay_pass,baseline_mean_abs_overshoot_ratio,improved_mean_abs_overshoot_ratio,support_guard_count
+BASELINE,33,2.842080354395528,0,12576,0,0,43.66387439782541,6.878322991731382,False,True,680,inf,4,,,,,
+IMPROVED_SINGLE_STEP,9,2.842080354395528,0,2731,0,0,25.413288820536117,6.878322991731382,True,True,680,7.1681100899199075,2,,,,,
+IMPROVED,27,2.842080354395528,0,9923,0,0,25.413288820536117,6.878322991731382,True,True,680,7.571081635437423,4,,,,,
+M0_NEGATIVE_CONTROL,0,,0,0,0,0,0.0,0.0,True,True,680,,,,,,,
+M0_ASSERTIONS,,,,,,,,,,,,,,True,True,1.2036149110562786,0.04192164540183324,0

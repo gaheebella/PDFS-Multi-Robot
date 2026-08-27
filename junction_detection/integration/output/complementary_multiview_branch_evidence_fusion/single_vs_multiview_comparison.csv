@@ -1,0 +1,6 @@
+candidate_eval,single_view_support_pattern,multiview_support_count,complete_support_count,partial_support_count,termination_support_count,multiview_consistent,GT_class_eval,false_positive_single_view,false_positive_after_consistency_rule_eval
+F0,"[""A0"", ""F+0.700_L+0.100"", ""F+0.700_L-0.100""]",3,3,0,6,True,INCOMING,False,False
+F1,"[""F+0.700_L-0.100""]",3,1,2,4,True,LEFT,False,False
+F2,"[""F+0.700_L-0.100""]",3,1,2,4,True,FALSE_0,True,True
+F3,"[""F+0.700_L+0.100""]",3,1,2,4,True,FALSE_1,True,True
+F4,"[""F+0.700_L+0.100""]",3,1,2,4,True,RIGHT,False,False

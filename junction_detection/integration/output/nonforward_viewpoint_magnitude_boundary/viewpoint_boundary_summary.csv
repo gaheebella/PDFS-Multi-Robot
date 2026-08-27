@@ -1,0 +1,5 @@
+direction,first_gain_ratio,first_gain_absolute,first_plus90_ratio_eval,first_minus90_ratio_eval,max_outgoing_match_eval,best_ratio,single_view_3of3_possible_eval,tested_max_ratio,valid_max_ratio,status
+L,,,,,1,,False,0.6,0.4,NO_GAIN_WITHIN_VALID_TESTED_RANGE
+R,,,,,1,,False,0.6,0.5,NO_GAIN_WITHIN_VALID_TESTED_RANGE
+FL,,,,,1,,False,0.7,0.6,NO_GAIN_WITHIN_VALID_TESTED_RANGE
+FR,,,,,1,,False,0.7,0.7,NO_GAIN_WITHIN_VALID_TESTED_RANGE

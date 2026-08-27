@@ -1,0 +1,8 @@
+viewpoint_id,viewpoint_role,branch_eval,detector_wall_support_stage_present,detector_tangent_stage_present,detector_rejection_can_be_wall_or_tangent,posthoc_GT_ROI_estimate_mode_eval,posthoc_GT_ROI_usable_wall_sides_eval,posthoc_GT_ROI_fitted_point_count_eval,posthoc_GT_ROI_line_residual_eval,posthoc_GT_ROI_tangent_available_eval,posthoc_GT_ROI_tangent_deg_eval,note
+F+0.000_L+0.000,A0,PLUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.000_L+0.000,A0,MINUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.600_L+0.000,PLUS90_FULL_MOUTH,PLUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.600_L+0.000,PLUS90_FULL_MOUTH,MINUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.600_L+0.000,MINUS90_FULL_MOUTH,PLUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.600_L+0.000,MINUS90_FULL_MOUTH,MINUS90,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage
+F+0.000_L+0.000,A0,AXIAL_FORWARD,False,False,False,unavailable,0,0,,False,,Post-hoc ROI estimator is not an opening acceptance stage

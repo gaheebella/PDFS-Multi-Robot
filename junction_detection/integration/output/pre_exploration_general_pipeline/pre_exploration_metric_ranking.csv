@@ -1,0 +1,11 @@
+metric,classification,reason
+local_front_lateral_span,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+local_front_lateral_velocity_variance,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+motion_bearing_spread,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+boundary_angular_spread,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+mean_neighbor_degree,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+lidar_left_wall_support,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+lidar_right_wall_support,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+lidar_forward_range,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+lidar_free_space_angular_span,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable
+lidar_range_profile_change,NOT_EVALUATED_FIDELITY_WEAK,generality inference deferred until M1 baseline fidelity is reasonable

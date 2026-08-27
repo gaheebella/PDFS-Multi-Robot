@@ -1,0 +1,4 @@
+case_id,anchor_x_eval_only,anchor_y_eval_only,inside_junction_region_eval_only,distance_to_entry_eval_only,distance_to_center_eval_only,longitudinal_offset_from_center_eval_only,lateral_offset_from_center_eval_only
+M1_BASELINE,-2.204879440379115,79.26297677567464,False,-121.26297677567464,79.29363770623557,79.26297677567464,-2.204879440379115
+M1_PRE_CORRIDOR_BOOTSTRAP,-1.7620542030564665,-152.74884977027222,False,110.74884977027222,152.75901263478923,-152.74884977027222,-1.7620542030564665
+M0_NEGATIVE_CONTROL,nan,nan,False,nan,nan,nan,nan

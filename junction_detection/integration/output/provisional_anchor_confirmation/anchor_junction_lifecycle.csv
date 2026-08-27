@@ -1,0 +1,5 @@
+﻿timestamp,anchor_id,state,transition,transition_reason,local_reference_yaw,pointcloud_opening_count
+0.04,,NO_ANCHOR,NO_ANCHOR->NO_ANCHOR,awaiting_lateral_expansion_candidate,,
+1.6400000000000008,293,PROVISIONAL_ANCHOR,NO_ANCHOR->PROVISIONAL_ANCHOR,lateral_expansion_junction_candidate,-89.63298601520763,
+1.6400000000000008,293,REJECTED,PROVISIONAL_ANCHOR->REJECTED,pointcloud_topological_degree_le_2,-89.63298601520763,2
+1.6400000000000008,293,RELEASED,REJECTED->RELEASED,pointcloud_topological_degree_le_2_release,-89.63298601520763,2

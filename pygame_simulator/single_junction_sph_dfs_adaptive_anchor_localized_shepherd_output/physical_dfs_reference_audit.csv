@@ -1,0 +1,22 @@
+function,purpose,localization_gt_dependency,action
+shepherd_candidates,capture-region candidates,"YES: region, pose, progress",PARTIAL_REUSE
+capture_region_ready_for_shepherd,candidate quorum,YES: capture rectangle,PARTIAL_REUSE
+adaptive_shepherd_count,width-scaled count,YES: fixture corridor_width constant,PARTIAL_REUSE
+assign_shepherd_slots,deterministic nearest-slot auction,YES: pose-to-global-slot distance,DO_NOT_REUSE
+select_adaptive_shepherds,elect and assign global anchors,YES: build_shepherd_slots/global targets,DO_NOT_REUSE
+build_shepherd_slots,legacy Shepherd targets,YES: BRANCH_DIRECTIONS/entrance/width,DO_NOT_REUSE
+descriptor_local_basis,observed Branch t/n basis,NO fixture dependency in function,REUSE
+branch_local_coordinates,world-to-observed local frame,NO fixture dependency in function,REUSE
+local_coordinates_to_world,observed local-to-world frame,NO fixture dependency in function,REUSE
+build_local_junction_guard_slots,observed-mouth Guard row,LOCAL descriptor; walkability adapter optional,REUSE
+build_frontier_line_local_slots,observed moving frontier row,LOCAL descriptor; walkability adapter,REUSE
+frontier_row_snapshot,local physical row evidence,LOCAL descriptor/robot observations,REUSE
+junction_guards_formed,physical Guard readiness,mostly LOCAL; callers retain fixture keys,PARTIAL_REUSE
+promote_existing_frontier_line,frontier-to-piston handoff,LOCAL descriptor/contact depth,REUSE
+get_robot_region,fixture region classifier,YES: global rectangles,PARTIAL_REUSE: ELECTION ONLY
+branch_depth_from_junction,fixture axial depth,YES: center/branch label,DO_NOT_REUSE
+get_branch_tip_target,fixture terminal target,YES: branch terminal coordinate,DO_NOT_REUSE
+DeadEndInferenceTracker.update,contact/stall/density dead end,LOCAL evidence,REUSE
+update_dead_end_saturation,packed/stalled dwell,LOCAL physical evidence,REUSE
+normal_backtracking_metrics,reverse-flow evidence,MIXED: legacy branch classifier,PARTIAL_REUSE
+FLOW_BACKTRACK transition,branch clear/Junction return,YES: get_robot_region,DO_NOT_REUSE

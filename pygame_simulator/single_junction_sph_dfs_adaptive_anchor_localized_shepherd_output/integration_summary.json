@@ -1,0 +1,121 @@
+{
+  "experiment": "Adaptive Anchor + Localized Shepherd Election Physical DFS Baseline",
+  "map_case": "M1_PRE_CORRIDOR_55PCT",
+  "frames": 300,
+  "margin_ratio": 0.05,
+  "alpha": 0.5,
+  "noise_model": "none",
+  "tau": 7.5,
+  "first_junction_confirmation_frame": 156,
+  "anchor_fix_frame": 156,
+  "anchor_fix_position": [
+    -1.765729984175145,
+    -68.38789655811775
+  ],
+  "adaptive_w": 94.76099641696113,
+  "tmin": 99.4990462378092,
+  "selected_threshold": 120.99952311890459,
+  "opening_count": 3,
+  "detected_opening_groups": [
+    {
+      "start_angle": 161.5,
+      "end_angle": -160.5,
+      "center_angle": -179.5,
+      "width_deg": 38.0,
+      "mean_range_m": 146.38852365289316,
+      "peak_range_m": 150.0,
+      "confidence": 0.9757540036938872,
+      "start_refined": 1.0,
+      "end_refined": 1.0
+    },
+    {
+      "start_angle": -60.5,
+      "end_angle": 17.5,
+      "center_angle": -21.5,
+      "width_deg": 78.0,
+      "mean_range_m": 142.58452357513704,
+      "peak_range_m": 150.0,
+      "confidence": 0.9502154806719616,
+      "start_refined": 1.0,
+      "end_refined": 1.0
+    },
+    {
+      "start_angle": 24.5,
+      "end_angle": 58.5,
+      "center_angle": 41.5,
+      "width_deg": 34.0,
+      "mean_range_m": 139.6781418504734,
+      "peak_range_m": 150.0,
+      "confidence": 0.7797808649564919,
+      "start_refined": 0.0,
+      "end_refined": 1.0
+    }
+  ],
+  "branch_candidates": [
+    {
+      "uid": "LIDAR_BRANCH_00",
+      "start_angle_deg": -60.5,
+      "end_angle_deg": 17.5,
+      "center_angle_deg": -21.5,
+      "angular_width_deg": 78.0,
+      "confidence": 0.9502154806719616,
+      "local_direction_x": 0.9304175679820246,
+      "local_direction_y": -0.3665012267242973,
+      "visit_state": "UNVISITED"
+    },
+    {
+      "uid": "LIDAR_BRANCH_01",
+      "start_angle_deg": 24.5,
+      "end_angle_deg": 58.5,
+      "center_angle_deg": 41.5,
+      "angular_width_deg": 34.0,
+      "confidence": 0.7797808649564919,
+      "local_direction_x": 0.7489557207890021,
+      "local_direction_y": 0.6626200482157375,
+      "visit_state": "UNVISITED"
+    }
+  ],
+  "expected_child_count_eval_only": 3,
+  "selected_branch_uid": "LIDAR_BRANCH_00",
+  "elections": [
+    {
+      "branch_uid": "LIDAR_BRANCH_01",
+      "fixture_adapter": "ANGLE_+90.0_CAPTURE",
+      "candidate_count": 0,
+      "required_count": 17,
+      "selected_ids": [],
+      "election_frame": 299,
+      "purpose": "ID_ELECTION",
+      "localization_disabled_after_election": false
+    }
+  ],
+  "phase_status": {
+    "Adaptive LiDAR": "PASS",
+    "Junction detection": "PASS",
+    "Anchor fixation": "PASS",
+    "Opening detection": "PASS",
+    "Branch candidate creation": "FAIL",
+    "Branch selection": "PASS",
+    "Shepherd localization trigger": "PASS",
+    "Shepherd candidates": "BLOCKED",
+    "Shepherd ID election": "BLOCKED",
+    "Unselected Branch blocking": "BLOCKED",
+    "Selected Branch exploration": "BLOCKED",
+    "Dead-end detection": "BLOCKED",
+    "Shepherd Backtracking": "BLOCKED",
+    "Junction return": "BLOCKED",
+    "Next Branch": "BLOCKED",
+    "All Branches visited": "BLOCKED",
+    "DONE": "BLOCKED"
+  },
+  "largest_blocker": "Reference FLOW_BACKTRACK/JUNCTION return/DFS completion reads fixture regions and global Branch geometry outside ID election.",
+  "source_hash_before": {
+    "adaptive": "f5e16234a549b19c6b193d12e67b4d29987ca92d6605338acad17b18516527c9",
+    "reference": "5278a196e3e776e0e1918eb70f1105ce1d2d6087b9002e0c392d0504ca149bcb"
+  },
+  "source_hash_after": {
+    "adaptive": "f5e16234a549b19c6b193d12e67b4d29987ca92d6605338acad17b18516527c9",
+    "reference": "5278a196e3e776e0e1918eb70f1105ce1d2d6087b9002e0c392d0504ca149bcb"
+  },
+  "source_hash_unchanged": true
+}

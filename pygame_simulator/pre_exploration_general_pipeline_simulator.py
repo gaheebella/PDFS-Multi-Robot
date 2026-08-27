@@ -1,14 +1,4 @@
-"""Clean evaluation/research simulator for the pre-exploration pipeline.
 
-This module does not import the legacy multi-geometry evaluator.  It implements
-a small, general world around the production pre-Junction SPH equations while
-excluding DFS, Guards, Shepherds, and branch routing. Its optional clean-GUI
-path can latch a shadow suspicion into a provisional fixed observation Anchor.
-
-The runtime diagnostics consume :class:`LocalObservation` only. They require
-neither a global map, global localization, GPS, nor SLAM-based poses. Global
-coordinates and branch metadata remain confined to the world and GT evaluator.
-"""
 
 from __future__ import annotations
 

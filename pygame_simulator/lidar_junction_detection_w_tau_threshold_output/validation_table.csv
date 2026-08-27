@@ -1,0 +1,3 @@
+case,noise,detector,first_detection_frame,max_openings,false_positive,threshold
+M1_PRE_CORRIDOR_55PCT,bounded,FROZEN_55PCT,180,4,False,103.21214292576053
+M1_PRE_CORRIDOR_55PCT,bounded,W_TAU_NOISE_AWARE,156,4,False,125.0

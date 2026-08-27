@@ -1,0 +1,3 @@
+branch_eval,initial_state,first_observed_complete_viewpoint,first_observed_complete_displacement,first_observed_complete_ratio_W,previous_sample_viewpoint,previous_sample_ratio_W,transition_bracket_low_W,transition_bracket_high_W,transition_found,movement_safety_class
+LEFT,PARTIAL_GAP_TOPOLOGY,,,,,,,,False,
+RIGHT,PARTIAL_GAP_TOPOLOGY,,,,,,,,False,

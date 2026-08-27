@@ -1,0 +1,7 @@
+map_case,front_lateral_sustained_onset,first_component_split,first_boundary_crossing,geometry_dependent_note
+M0_STRAIGHT,4.2,nan,nan,M0 has no GT crossing
+M1_CROSS_BASELINE,4.2,17.0,16.2,retrospective only
+M2_T_JUNCTION,4.2,17.1,16.2,retrospective only
+M3_ANGLED_Y,4.2,16.7,16.1,retrospective only
+M4_ASYMMETRIC_CROSS,4.2,17.0,16.2,retrospective only
+M5_UNEQUAL_WIDTH,4.2,17.0,16.2,retrospective only

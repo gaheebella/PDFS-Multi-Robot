@@ -1,0 +1,4 @@
+case_id,map_case,initial_offset_description,pre_corridor_length_world,pre_corridor_length_over_W,pre_corridor_length_over_lidar_range,junction_geometry_changed,detector_changed,seed
+BASELINE_M1,M1_CROSS_BASELINE,repository default initial pose,0.0,0.0,0.0,False,False,0
+BOOTSTRAP_M1,M1_CROSS_BASELINE,existing REAR_START_SHIFT and extended incoming straight corridor,160.0,1.9047619047619047,1.0666666666666667,False,False,0
+M0_NEGATIVE_CONTROL,M0_STRAIGHT,repository default long straight corridor,0.0,0.0,0.0,False,False,0
