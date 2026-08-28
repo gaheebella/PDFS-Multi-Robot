@@ -691,6 +691,14 @@ COHORT_FLOW_POLICY_VERSION = "LANE_PRESERVING_DENSITY_CONTINUITY_V4"
 FLOW_BACKTRACK_FORCE = 46.0 * MOTION_SPEED_MULTIPLIER
 FINAL_GATHER_FORCE = 58.0 * MOTION_SPEED_MULTIPLIER
 PRESSURE_BACKTRACK_BODY_FORCE = 8.0 * MOTION_SPEED_MULTIPLIER
+
+# Cross-branch momentum carry.  When a completed branch returns to the Junction,
+# the measured residual NORMAL speed is converted into a short, decaying route
+# boost along the newly selected branch.  No virtual wall/force plane is used.
+CROSS_BRANCH_CARRY_DURATION = 0.90
+CROSS_BRANCH_CARRY_MIN_SCALE = 1.35
+CROSS_BRANCH_CARRY_MAX_SCALE = 2.80
+CROSS_BRANCH_CARRY_SPEED_REFERENCE = 42.0
 CENTERING_GAIN = 1.2
 
 MAX_SPEED = 78.0 * MOTION_SPEED_MULTIPLIER
@@ -874,34 +882,25 @@ SHEPHERD_RELEASE_SPEED = 32.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_FORM_TOLERANCE = 3.0 * MAP_SCALE
 SHEPHERD_FORM_TIMEOUT = 1.25
 
-# Continuous virtual Shepherd curtain.  The selected robots still form the
-# visible SPH boundary, but this full-width virtual plane becomes active
-# immediately after election.  It closes the temporary gaps between moving
-# Shepherds so ordinary robots cannot leak toward the dead-end wall.
-SHEPHERD_CURTAIN_CLEARANCE = max(ROBOT_RADIUS * 2.5, 6.0 * MAP_SCALE)
-SHEPHERD_CURTAIN_INTERACTION_DEPTH = 24.0 * MAP_SCALE
-SHEPHERD_CURTAIN_FORCE = 180.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_CURTAIN_MAX_FORCE = 220.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_CURTAIN_VELOCITY_DAMPING = 12.0
-SHEPHERD_CURTAIN_RECOVERY_SPEED = 6.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_CURTAIN_DRAW_HALF_WIDTH = 3
+# Physical clearance used only when estimating branch-fill capacity.
+SHEPHERD_LINE_CLEARANCE = max(ROBOT_RADIUS * 2.5, 6.0 * MAP_SCALE)
 
 # Piston motion: Shepherd boundary advances toward the parent junction.
-SHEPHERD_PISTON_SPEED = 8.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_PISTON_SPEED = 18.0 * MOTION_SPEED_MULTIPLIER
 SHEPHERD_PISTON_MAX_TRAVEL = 42.0 * MAP_SCALE
-SHEPHERD_LINE_BACKTRACK_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_SPEED_RAMP_TIME = 0.55
+SHEPHERD_LINE_BACKTRACK_SPEED = 30.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_SPEED_RAMP_TIME = 0.35
 SHEPHERD_JUNCTION_DEPTH_TOLERANCE = max(ROBOT_RADIUS, 0.75)
 SHEPHERD_JUNCTION_RELEASE_INSET = max(
     ROBOT_RADIUS * 2.5,
     2.0 * MAP_SCALE,
 )
-SHEPHERD_JUNCTION_RELEASE_SPEED = 12.0 * MOTION_SPEED_MULTIPLIER
-SHEPHERD_POLICY_VERSION = "DENSITY_RELEASE_CURTAIN_V3"
+SHEPHERD_JUNCTION_RELEASE_SPEED = 30.0 * MOTION_SPEED_MULTIPLIER
+SHEPHERD_POLICY_VERSION = "DENSITY_RELEASE_PHYSICAL_LINE_V4"
 SHEPHERD_PIPELINE_POLICY_VERSION = "PACK_READY_IMMEDIATE_HANDOFF_V3"
 PIPELINE_SOURCE_STRAGGLER_LIMIT = 6
 PRE_SHEPHERD_PACK_DWELL_TIME = 0.08
-SHEPHERD_PRESSURE_FACTOR = 4.0
+SHEPHERD_PRESSURE_FACTOR = 7.5
 VIRTUAL_PRESSURE_RADIUS = 60.0 * MAP_SCALE
 VIRTUAL_PRESSURE_FORCE = 110.0
 SHEPHERD_VIRTUAL_FORCE_LIMIT = 140.0 * MOTION_SPEED_MULTIPLIER
@@ -1086,6 +1085,8 @@ STIFFNESS_EXPONENT_PRESSURE_PUSH = max(STIFFNESS_EXPONENT_RIGID, 0.62)
 BRANCH_STIFFNESS_RECOVERY_TIME = 1.20
 selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
 branch_entry_timer = 0.0
+cross_branch_carry_until = float("-inf")
+cross_branch_carry_peak_scale = 1.0
 return_trunk_release_pending = False
 return_trunk_retract_timer = 0.0
 return_trunk_last_released_id = None
@@ -1618,6 +1619,40 @@ def get_shepherd_boundary_depth(branch: str) -> float:
     return max(0.0, BRANCH_LENGTHS[branch] - SHEPHERD_BOUNDARY_WALL_CLEARANCE)
 
 
+def get_shepherd_line_depth(branch: str) -> float:
+    """Current target depth of the real Shepherd robot line."""
+    depth = get_shepherd_boundary_depth(branch)
+
+    if (
+        phase == SimulationPhase.EXPLORE_BRANCH
+        and frontier_line_branch == branch
+    ):
+        depth = frontier_line_depth
+
+    elif phase == SimulationPhase.PRESSURE_PUSH:
+        travel = min(
+            SHEPHERD_PISTON_MAX_TRAVEL,
+            ramped_travel(
+                pressure_push_timer,
+                SHEPHERD_PISTON_SPEED,
+                SHEPHERD_SPEED_RAMP_TIME,
+            ),
+        )
+        depth -= travel
+
+    elif phase == SimulationPhase.FLOW_BACKTRACK:
+        depth = (
+            shepherd_flow_start_depth
+            - ramped_travel(
+                shepherd_flow_timer,
+                SHEPHERD_LINE_BACKTRACK_SPEED,
+                SHEPHERD_SPEED_RAMP_TIME,
+            )
+        )
+
+    return max(0.0, depth)
+
+
 def get_shepherd_fill_target(branch: str) -> pygame.Vector2:
     return branch_point_at_depth(
         branch,
@@ -1642,57 +1677,6 @@ def get_saturation_rect(branch: str) -> pygame.Rect:
     return pygame.Rect(int(left), center_y - half_width, int(right - left), corridor_width)
 
 
-
-def shepherd_curtain_active() -> bool:
-    """Whether the continuous full-width Shepherd gate must be enforced."""
-    if phase == SimulationPhase.EXPLORE_BRANCH:
-        return (
-            frontier_line_branch == active_branch
-            and frontier_line_depth > 0.0
-        )
-    return phase in {
-        SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-        SimulationPhase.FILL_BEHIND_SHEPHERD,
-        SimulationPhase.PRESSURE_PUSH,
-        SimulationPhase.FLOW_BACKTRACK,
-    }
-
-
-def get_shepherd_curtain_depth(branch: str) -> float:
-    """Current gate depth from the Junction mouth.
-
-    During formation/filling, the gate is already closed at the planned
-    Shepherd line.  During pressure push it follows the moving piston toward
-    the Junction so robots cannot slip around or through individual Shepherds.
-    """
-    depth = get_shepherd_boundary_depth(branch)
-    if (
-        phase == SimulationPhase.EXPLORE_BRANCH
-        and frontier_line_branch == branch
-    ):
-        depth = frontier_line_depth
-    elif phase == SimulationPhase.PRESSURE_PUSH:
-        travel = min(
-            SHEPHERD_PISTON_MAX_TRAVEL,
-            ramped_travel(
-                pressure_push_timer,
-                SHEPHERD_PISTON_SPEED,
-                SHEPHERD_SPEED_RAMP_TIME,
-            ),
-        )
-        depth -= travel
-    elif phase == SimulationPhase.FLOW_BACKTRACK:
-        depth = (
-            shepherd_flow_start_depth
-            - ramped_travel(
-                shepherd_flow_timer,
-                SHEPHERD_LINE_BACKTRACK_SPEED,
-                SHEPHERD_SPEED_RAMP_TIME,
-            )
-        )
-    return max(0.0, depth)
-
-
 def shepherd_slot_position_at_depth(
     anchor: pygame.Vector2,
     branch: str,
@@ -1707,10 +1691,17 @@ def shepherd_slot_position_at_depth(
     return pygame.Vector2(center_x + half_width + depth, anchor.y)
 
 
-def get_shepherd_normal_limit_depth(branch: str) -> float:
+
+def get_shepherd_pack_limit_depth(branch: str) -> float:
+    """Numerical depth limit used only for branch fill/continuity measurement.
+
+    This is not a virtual wall: it applies no force, no position projection,
+    and no collision constraint.  It only defines the longitudinal interval
+    over which NORMAL packing/continuity statistics are evaluated.
+    """
     return max(
         0.0,
-        get_shepherd_curtain_depth(branch) - SHEPHERD_CURTAIN_CLEARANCE,
+        get_shepherd_line_depth(branch) - SHEPHERD_LINE_CLEARANCE,
     )
 
 
@@ -1750,7 +1741,7 @@ def calculate_branch_fill_quota(robots, branch: str) -> int:
     usable_depth = max(
         spacing,
         get_shepherd_boundary_depth(branch)
-        - SHEPHERD_CURTAIN_CLEARANCE,
+        - SHEPHERD_LINE_CLEARANCE,
     )
     axial_pitch = max(
         GRID_SPACING,
@@ -1781,177 +1772,6 @@ def calculate_branch_fill_quota(robots, branch: str) -> int:
             max(1, mobile_count - reserve_count),
         )
     )
-
-
-def compute_shepherd_curtain_force(robot: "Robot") -> pygame.Vector2:
-    """Continuous repulsion from the full-width virtual Shepherd curtain."""
-    if (
-        not shepherd_curtain_active()
-        or robot.role != "NORMAL"
-        or get_robot_region(robot.position) != active_branch
-    ):
-        return pygame.Vector2()
-
-    depth = branch_depth_from_junction(robot.position, active_branch)
-    limit_depth = get_shepherd_normal_limit_depth(active_branch)
-    activation_depth = limit_depth - SHEPHERD_CURTAIN_INTERACTION_DEPTH
-    if depth <= activation_depth:
-        return pygame.Vector2()
-
-    ratio = clamp(
-        (depth - activation_depth)
-        / max(SHEPHERD_CURTAIN_INTERACTION_DEPTH, EPSILON),
-        0.0,
-        1.5,
-    )
-    forward_speed = max(
-        0.0,
-        robot.velocity.dot(BRANCH_DIRECTIONS[active_branch]),
-    )
-    magnitude = min(
-        SHEPHERD_CURTAIN_MAX_FORCE,
-        (
-            SHEPHERD_CURTAIN_FORCE * ratio**2
-            + SHEPHERD_CURTAIN_VELOCITY_DAMPING
-            * forward_speed
-        ),
-    )
-    return get_backtrack_direction(active_branch) * magnitude
-
-
-def constrain_normal_behind_shepherd_curtain(robot: "Robot") -> None:
-    """Hard safety projection preventing leakage through Shepherd gaps.
-
-    The force above provides smooth behaviour.  This projection is the final
-    guard against a fast particle crossing the virtual plane in one time step.
-    """
-    if (
-        not shepherd_curtain_active()
-        or robot.role != "NORMAL"
-        or get_robot_region(robot.position) != active_branch
-    ):
-        return
-
-    limit_depth = get_shepherd_normal_limit_depth(active_branch)
-    depth = branch_depth_from_junction(robot.position, active_branch)
-    if depth <= limit_depth:
-        return
-
-    penetration = depth - limit_depth
-    if active_branch == "UP":
-        robot.position.y = center_y - half_width - limit_depth
-    elif active_branch == "LEFT":
-        robot.position.x = center_x - half_width - limit_depth
-    else:
-        robot.position.x = center_x + half_width + limit_depth
-
-    forward_direction = BRANCH_DIRECTIONS[active_branch]
-    forward_speed = robot.velocity.dot(forward_direction)
-    if forward_speed > 0.0:
-        robot.velocity -= forward_direction * forward_speed
-    robot.velocity += get_backtrack_direction(active_branch) * min(
-        SHEPHERD_CURTAIN_RECOVERY_SPEED,
-        penetration * 2.0,
-    )
-
-
-def enforce_shepherd_curtain_for_swarm(robots) -> None:
-    for robot in robots:
-        constrain_normal_behind_shepherd_curtain(robot)
-
-
-def pre_shepherd_curtain_active() -> bool:
-    return (
-        pre_shepherd_branch is not None
-        and phase in {
-            SimulationPhase.PRESSURE_PUSH,
-            SimulationPhase.FLOW_BACKTRACK,
-            SimulationPhase.EXPLORE_BRANCH,
-        }
-    )
-
-
-def get_pre_shepherd_normal_limit_depth(branch: str) -> float:
-    return max(
-        0.0,
-        get_shepherd_boundary_depth(branch)
-        - SHEPHERD_CURTAIN_CLEARANCE,
-    )
-
-
-def compute_pre_shepherd_curtain_force(
-    robot: "Robot",
-) -> pygame.Vector2:
-    """Static full-width shield formed early in the transfer branch."""
-    branch = pre_shepherd_branch
-    if (
-        not pre_shepherd_curtain_active()
-        or branch is None
-        or robot.role != "NORMAL"
-        or get_robot_region(robot.position) != branch
-    ):
-        return pygame.Vector2()
-    limit_depth = get_pre_shepherd_normal_limit_depth(branch)
-    depth = branch_depth_from_junction(robot.position, branch)
-    activation_depth = (
-        limit_depth - SHEPHERD_CURTAIN_INTERACTION_DEPTH
-    )
-    if depth <= activation_depth:
-        return pygame.Vector2()
-    ratio = clamp(
-        (depth - activation_depth)
-        / max(SHEPHERD_CURTAIN_INTERACTION_DEPTH, EPSILON),
-        0.0,
-        1.5,
-    )
-    forward_speed = max(
-        0.0,
-        robot.velocity.dot(BRANCH_DIRECTIONS[branch]),
-    )
-    magnitude = min(
-        SHEPHERD_CURTAIN_MAX_FORCE,
-        SHEPHERD_CURTAIN_FORCE * ratio**2
-        + SHEPHERD_CURTAIN_VELOCITY_DAMPING * forward_speed,
-    )
-    return get_backtrack_direction(branch) * magnitude
-
-
-def constrain_normal_behind_pre_shepherd_curtain(
-    robot: "Robot",
-) -> None:
-    """Hard guard preventing normals from passing the prepared shield."""
-    branch = pre_shepherd_branch
-    if (
-        not pre_shepherd_curtain_active()
-        or branch is None
-        or robot.role != "NORMAL"
-        or get_robot_region(robot.position) != branch
-    ):
-        return
-    limit_depth = get_pre_shepherd_normal_limit_depth(branch)
-    depth = branch_depth_from_junction(robot.position, branch)
-    if depth <= limit_depth:
-        return
-    penetration = depth - limit_depth
-    if branch == "UP":
-        robot.position.y = center_y - half_width - limit_depth
-    elif branch == "LEFT":
-        robot.position.x = center_x - half_width - limit_depth
-    else:
-        robot.position.x = center_x + half_width + limit_depth
-    forward_direction = BRANCH_DIRECTIONS[branch]
-    forward_speed = robot.velocity.dot(forward_direction)
-    if forward_speed > 0.0:
-        robot.velocity -= forward_direction * forward_speed
-    robot.velocity += get_backtrack_direction(branch) * min(
-        SHEPHERD_CURTAIN_RECOVERY_SPEED,
-        penetration * 2.0,
-    )
-
-
-def enforce_pre_shepherd_curtain_for_swarm(robots) -> None:
-    for robot in robots:
-        constrain_normal_behind_pre_shepherd_curtain(robot)
 
 
 def angle_between(a: pygame.Vector2, b: pygame.Vector2) -> float:
@@ -2179,6 +1999,9 @@ class Robot:
         self.shepherd_anchor: Optional[pygame.Vector2] = None
         self.shepherd_origin: Optional[pygame.Vector2] = None
         self.shepherd_branch: Optional[str] = None
+        # Local backtracking direction assigned only when this robot becomes
+        # a Shepherd. This is a direction vector, not an absolute position.
+        self.shepherd_return_direction: Optional[pygame.Vector2] = None
         # Lateral slot in the Branch's observed local frame. It is the only
         # frontier-line geometry a robot keeps while the line advances.
         self.frontier_local_lateral: Optional[float] = None
@@ -2421,7 +2244,7 @@ class Robot:
                 target = shepherd_slot_position_at_depth(
                     self.shepherd_anchor,
                     active_branch,
-                    get_shepherd_curtain_depth(active_branch),
+                    get_shepherd_line_depth(active_branch),
                 )
             else:
                 target = None
@@ -2495,11 +2318,6 @@ class Robot:
             self.velocity.y = wall_collision_velocity(self.velocity.y)
 
         constrain_final_return_gate_crossing(self, old_position)
-        # Smooth virtual pressure is backed by a hard one-step guard so a fast
-        # ordinary robot cannot pass through a temporary gap while Shepherds
-        # are still moving laterally into their slots.
-        constrain_normal_behind_shepherd_curtain(self)
-        constrain_normal_behind_pre_shepherd_curtain(self)
         constrain_base_reserve_to_bottom(self)
         constrain_communication_parent_separation(self, old_position)
         self.observed_velocity = (
@@ -4809,6 +4627,9 @@ def promote_existing_frontier_line(
         robot.shepherd_anchor = slot.copy()
         robot.shepherd_origin = slot.copy()
         robot.shepherd_branch = branch
+        local_return = descriptor.local_return_direction.copy()
+        if local_return.length_squared() > EPSILON:
+            robot.shepherd_return_direction = local_return.normalize()
         # Keep the same local lateral identity through the handoff. Backflow
         # may still use its legacy geometry after this stationary boundary is
         # formed, but the transition itself does not rotate, shrink, or
@@ -9293,6 +9114,7 @@ def choose_next_branch(robots, reference_density: float):
     global detected_branch_candidates, collision_points
     global effective_branch_widths
     global selected_branch_entry_lambda, branch_entry_timer
+    global cross_branch_carry_until, cross_branch_carry_peak_scale
 
     selected_uid = distributed_consensus_branch
     selected = branch_fixture_for_uid(selected_uid)
@@ -10516,7 +10338,7 @@ class BranchContinuityTracker:
         self.wait_time += dt
         maximum_depth = max(
             BRANCH_CONTINUITY_SLICE_DEPTH,
-            get_shepherd_normal_limit_depth(branch),
+            get_shepherd_pack_limit_depth(branch),
         )
         slice_count = max(
             1,
@@ -10791,6 +10613,7 @@ def reset_shepherd_roles(robots):
             robot.shepherd_origin = None
             robot.frontier_local_lateral = None
             robot.shepherd_branch = None
+            robot.shepherd_return_direction = None
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_branch_uid = None
@@ -10823,6 +10646,7 @@ def release_transient_roles_for_final_return(robots):
             robot.shepherd_origin = None
             robot.frontier_local_lateral = None
             robot.shepherd_branch = None
+            robot.shepherd_return_direction = None
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_branch_uid = None
@@ -11022,7 +10846,6 @@ def select_pre_shepherds(robots, branch: str, grid):
             f"[Pre-Shepherd] branch={branch}, "
             f"robot={robot.robot_id}, score={score:.3f}"
         )
-    enforce_pre_shepherd_curtain_for_swarm(robots)
     print(
         f"[Pre-Shepherd] shield elected: "
         f"branch={branch}, count={len(selected)}"
@@ -11036,7 +10859,7 @@ def update_pre_shepherd_pack_readiness(
     reference_density: float,
     dt: float,
 ) -> bool:
-    """Track packed mass behind the prepared next-branch curtain."""
+    """Track packed mass behind the prepared physical pre-Shepherd line."""
     global pre_shepherd_pack_dwell, pre_shepherd_pack_ready
     tip = tip_robots(robots, branch)
     required_count = max(
@@ -11119,8 +10942,7 @@ def update_pre_shepherd_pipeline(
     ):
         select_pre_shepherds(robots, branch, grid)
     if get_pre_shepherds(robots, branch):
-        enforce_pre_shepherd_curtain_for_swarm(robots)
-        update_pre_shepherd_pack_readiness(
+            update_pre_shepherd_pack_readiness(
             robots,
             branch,
             reference_density,
@@ -11192,7 +11014,7 @@ def normal_backtracking_metrics(robots, branch):
 def release_shepherds_into_flow(robots):
     """Start continuous line-preserving backtracking to the Junction."""
     global shepherd_flow_timer, shepherd_flow_start_depth
-    shepherd_flow_start_depth = get_shepherd_curtain_depth(active_branch)
+    shepherd_flow_start_depth = get_shepherd_line_depth(active_branch)
     shepherd_flow_timer = 0.0
     retained = 0
     for robot in robots:
@@ -11212,7 +11034,7 @@ def release_shepherd_line_at_junction(robots) -> int:
     """Turn the intact line back into NORMAL robots inside the Junction."""
     if (
         phase != SimulationPhase.FLOW_BACKTRACK
-        or get_shepherd_curtain_depth(active_branch)
+        or get_shepherd_line_depth(active_branch)
         > SHEPHERD_JUNCTION_DEPTH_TOLERANCE
     ):
         return 0
@@ -11240,6 +11062,7 @@ def release_shepherd_line_at_junction(robots) -> int:
         robot.shepherd_origin = None
         robot.frontier_local_lateral = None
         robot.shepherd_branch = None
+        robot.shepherd_return_direction = None
         robot.velocity = (
             direction * SHEPHERD_JUNCTION_RELEASE_SPEED
         )
@@ -11306,7 +11129,7 @@ def robot_is_in_shepherd_packing_zone(
         or get_robot_region(robot.position) != branch
     ):
         return False
-    boundary_depth = get_shepherd_curtain_depth(branch)
+    boundary_depth = get_shepherd_line_depth(branch)
     depth = branch_depth_from_junction(robot.position, branch)
     near_depth = max(
         0.0,
@@ -12281,6 +12104,22 @@ def compute_pebble_flow_guidance(
     return guided_force
 
 
+
+def get_cross_branch_carry_scale() -> float:
+    """Short decaying propulsion boost from the previous return flow."""
+    if simulation_time >= cross_branch_carry_until:
+        return 1.0
+    remaining = clamp(
+        (cross_branch_carry_until - simulation_time)
+        / max(CROSS_BRANCH_CARRY_DURATION, EPSILON),
+        0.0,
+        1.0,
+    )
+    return 1.0 + (
+        max(1.0, cross_branch_carry_peak_scale) - 1.0
+    ) * smoothstep01(remaining)
+
+
 def compute_route_force(robot):
     region = get_robot_region(robot.position)
     junction_target = pygame.Vector2(center_x, center_y)
@@ -12384,6 +12223,7 @@ def compute_route_force(robot):
                 JUNCTION_STAGING_POSITION,
             ) * WEAK_BRANCH_BIAS_FORCE
     elif phase == SimulationPhase.EXPLORE_BRANCH:
+        carry_scale = get_cross_branch_carry_scale()
         if (
             transfer_branch == active_branch
             and robot.transfer_target != active_branch
@@ -12405,6 +12245,7 @@ def compute_route_force(robot):
                 )
                 * OUTLET_FORCE
                 * quota_feed_scale
+                * carry_scale
             )
         else:
             force = (
@@ -12412,8 +12253,9 @@ def compute_route_force(robot):
                     robot,
                     active_branch,
                 )
-                * WEAK_BRANCH_BIAS_FORCE
+                * ROUTE_FORCE
                 * relay_motion_scale
+                * carry_scale
             )
     elif phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
         if (
@@ -13179,10 +13021,6 @@ def compute_sph_forces(
             robot_i,
             communication_grid,
         )
-        shepherd_curtain_force = compute_shepherd_curtain_force(robot_i)
-        pre_shepherd_curtain_force = (
-            compute_pre_shepherd_curtain_force(robot_i)
-        )
         initial_junction_wall_force = (
             compute_initial_junction_soft_wall_force(robot_i)
         )
@@ -13193,11 +13031,7 @@ def compute_sph_forces(
         robot_i.last_compression_release_force = (
             compression_release_force.length()
         )
-        robot_i.last_shepherd_force = (
-            virtual_force
-            + shepherd_curtain_force
-            + pre_shepherd_curtain_force
-        ).length()
+        robot_i.last_shepherd_force = virtual_force.length()
         robot_i.last_base_piston_force = base_piston_force.length()
         robot_i.last_edf_force = edf_force.length()
         pressure_phase_normal = (
@@ -13263,8 +13097,6 @@ def compute_sph_forces(
             + gap_attraction_force
             + decision_guidance_force
             + connectivity_force
-            + shepherd_curtain_force
-            + pre_shepherd_curtain_force
             + initial_junction_wall_force
             + base_piston_force
             - (
@@ -13684,8 +13516,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                     "Branch continuity fill starts before piston push"
                 )
             else:
-                enforce_pre_shepherd_curtain_for_swarm(robots)
-            return
+                        return
 
         # Contact/density inference triggers a role transition of the same
         # entrance-guard IDs.  Never discard that line and elect unrelated
@@ -13743,10 +13574,6 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 )
                 phase = SimulationPhase.FORM_SHEPHERD_BOUNDARY
                 shepherd_form_timer = 0.0
-                # Close a continuous full-width virtual gate immediately.  Any
-                # ordinary robot already beyond the planned line is moved to
-                # its safe Junction side before the next physics frame.
-                enforce_shepherd_curtain_for_swarm(robots)
                 print(
                     f"[Shepherd] original frontier line flattened at dead-end: "
                     f"branch={active_branch}, count={len(selected)}"
@@ -14323,81 +14150,6 @@ def draw_proxy_robot_assignments(surface, robots):
     surface.blit(overlay, (0, 0))
 
 
-def draw_shepherd_curtain(surface):
-    """Visualize the continuous gate that seals gaps between Shepherd robots."""
-    if not shepherd_curtain_active():
-        return
-    depth = get_shepherd_curtain_depth(active_branch)
-    color = BRANCH_COLORS[active_branch]
-    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-    if active_branch == "UP":
-        y = round(center_y - half_width - depth)
-        pygame.draw.line(
-            overlay,
-            (*color, 235),
-            (center_x - half_width + 2, y),
-            (center_x + half_width - 2, y),
-            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
-        )
-    elif active_branch == "LEFT":
-        x = round(center_x - half_width - depth)
-        pygame.draw.line(
-            overlay,
-            (*color, 235),
-            (x, center_y - half_width + 2),
-            (x, center_y + half_width - 2),
-            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
-        )
-    else:
-        x = round(center_x + half_width + depth)
-        pygame.draw.line(
-            overlay,
-            (*color, 235),
-            (x, center_y - half_width + 2),
-            (x, center_y + half_width - 2),
-            SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
-        )
-    surface.blit(overlay, (0, 0))
-
-
-def draw_pre_shepherd_curtain(surface):
-    """Visualize the prepared next-branch shield before activation."""
-    branch = pre_shepherd_branch
-    if not pre_shepherd_curtain_active() or branch is None:
-        return
-    depth = get_shepherd_boundary_depth(branch)
-    color = BRANCH_COLORS[branch]
-    overlay = pygame.Surface(
-        (SCREEN_WIDTH, SCREEN_HEIGHT),
-        pygame.SRCALPHA,
-    )
-    if branch == "UP":
-        y = round(center_y - half_width - depth)
-        endpoints = (
-            (center_x - half_width + 2, y),
-            (center_x + half_width - 2, y),
-        )
-    elif branch == "LEFT":
-        x = round(center_x - half_width - depth)
-        endpoints = (
-            (x, center_y - half_width + 2),
-            (x, center_y + half_width - 2),
-        )
-    else:
-        x = round(center_x + half_width + depth)
-        endpoints = (
-            (x, center_y - half_width + 2),
-            (x, center_y + half_width - 2),
-        )
-    pygame.draw.line(
-        overlay,
-        (*color, 170),
-        endpoints[0],
-        endpoints[1],
-        SHEPHERD_CURTAIN_DRAW_HALF_WIDTH * 2,
-    )
-    surface.blit(overlay, (0, 0))
-
 
 # =========================================================
 # 17. Initialization
@@ -14557,6 +14309,8 @@ def reset_dfs_state():
     last_flow_rollout_scores = {}
     selected_branch_entry_lambda = STIFFNESS_EXPONENT_RIGID
     branch_entry_timer = 0.0
+    cross_branch_carry_until = float("-inf")
+    cross_branch_carry_peak_scale = 1.0
     return_trunk_release_pending = False
     return_trunk_retract_timer = 0.0
     return_trunk_last_released_id = None
@@ -14848,8 +14602,6 @@ while running:
                     4,
                     width=2,
                 )
-        draw_shepherd_curtain(screen)
-        draw_pre_shepherd_curtain(screen)
         draw_relay_plan(screen, robots)
 
     pygame.draw.circle(screen, JUNCTION_COLOR, (center_x, center_y), 5)
@@ -14894,7 +14646,7 @@ while running:
                 shepherd_slot_position_at_depth(
                     robot.shepherd_anchor,
                     active_branch,
-                    get_shepherd_curtain_depth(active_branch),
+                    get_shepherd_line_depth(active_branch),
                 )
             )
             for robot in get_shepherds(robots)
@@ -15443,7 +15195,7 @@ while running:
             f"{RETURN_DONE_DWELL_TIME:.2f}"
         ),
         (
-            f"Shepherd line depth={get_shepherd_curtain_depth(active_branch):.1f} "
+            f"Shepherd line depth={get_shepherd_line_depth(active_branch):.1f} "
             f"| max slot error={shepherd_line_error:.2f}"
         ),
         f"Distance total={sum(robot.total_distance for robot in robots):.0f} | disconnect robot-s={metrics.disconnected_robot_seconds:.1f}",
