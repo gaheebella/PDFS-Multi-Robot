@@ -2382,7 +2382,14 @@ class Robot:
 
         if self.role == "PRE_SHEPHERD" and self.shepherd_anchor is not None:
             error = self.shepherd_anchor - self.position
-            step = SHEPHERD_FORM_SPEED * dt
+            if phase == SimulationPhase.PRESSURE_PUSH:
+                shepherd_move_speed = SHEPHERD_PISTON_SPEED
+            elif phase == SimulationPhase.FLOW_BACKTRACK:
+                shepherd_move_speed = SHEPHERD_LINE_BACKTRACK_SPEED
+            else:
+                shepherd_move_speed = SHEPHERD_FORM_SPEED
+
+            step = shepherd_move_speed * motion_scale * dt
             next_position = (
                 self.shepherd_anchor.copy()
                 if error.length() <= step

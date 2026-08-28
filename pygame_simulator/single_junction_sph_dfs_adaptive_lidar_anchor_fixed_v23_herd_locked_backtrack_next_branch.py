@@ -108,13 +108,16 @@ GUARD_WHO_PATH_WEIGHT = 1.0
 GUARD_CAPTURE_UPSTREAM_WIDTH_RATIO = 0.32
 GUARD_CAPTURE_DOWNSTREAM_WIDTH_RATIO = 0.28
 GUARD_CAPTURE_LATERAL_MARGIN_RATIO = 0.10
-GUARD_ASSIGN_MAX_AXIAL_WIDTH_RATIO = 0.62
-GUARD_ASSIGN_MAX_LATERAL_WIDTH_RATIO = 0.45
-GUARD_ASSIGN_MAX_PATH_WIDTH_RATIO = 0.65
+GUARD_ASSIGN_MAX_AXIAL_WIDTH_RATIO = 1.20
+GUARD_ASSIGN_MAX_LATERAL_WIDTH_RATIO = 1.20
+GUARD_ASSIGN_MAX_PATH_WIDTH_RATIO = 1.50
 GUARD_LATERAL_COVERAGE_BINS = 9
 GUARD_READINESS_LOG_PERIOD = 10
 GUARD_EDGE_SEAL_MARGIN_RATIO = 0.25
 GUARD_LATERAL_OVERLAP_RATIO = 0.90
+PROVISIONAL_WALL_SETTLED_RATIO = 0.95
+PROVISIONAL_WALL_STABILITY_DWELL = 0.18
+JUNCTION_ARRIVAL_RATIO_THRESHOLD = 0.45
 ANCHOR_ENTRANCE_STOP_TOLERANCE = 80.0
 ENTRANCE_STABILITY_FRAMES = 1
 
@@ -220,6 +223,12 @@ class ProvisionalGuardGeometry:
     local_branch_key: str | None = None
     opening_start_local: pygame.Vector2 | None = None
     opening_end_local: pygame.Vector2 | None = None
+    mouth_start_world: pygame.Vector2 | None = None
+    mouth_end_world: pygame.Vector2 | None = None
+    mouth_center_world: pygame.Vector2 | None = None
+    mouth_lateral_unit: pygame.Vector2 | None = None
+    branch_tangent_unit: pygame.Vector2 | None = None
+    mouth_span: float = 0.0
 
 
 def _load_physical_definitions() -> types.ModuleType:
@@ -438,6 +447,13 @@ class AdaptivePerception:
         self.physical = physical
         self.sensor = PhysicalMapLidar(physical)
         self.state = PerceptionState.MOVING
+        self.guard_activation_stage = "WAIT_GROUP"
+        self.guard_activation_groups: list[list[ProvisionalGuardGeometry]] = []
+        self.guard_current_group_index = 0
+        self.guard_all_groups_activated = False
+        self.integration_detected_branch_order: list[str] = []
+        self.guard_side_pair_activation_frame: int | None = None
+        self.guard_up_activation_frame: int | None = None
         self.frame = 0
         self.yaw_deg = -90.0
         self.last_valid_w: float | None = None
@@ -570,7 +586,7 @@ class AdaptivePerception:
             if len(track.observations) >= MIN_PERSISTENT_OBSERVATIONS
             and track.persistence_ratio(self.stationary_samples) >= 0.60
         ]
-        if len(persistent) < 3 or self.stationary_samples < STATIONARY_WINDOW:
+        if len(persistent) < 2:
             return False
         rear_candidates = [
             track for track in persistent
@@ -591,9 +607,9 @@ class AdaptivePerception:
             self.parent_source = self.parent.source
             children = list(persistent)
         children.sort(key=lambda track: track.center_angle)
-        if len(children) < 3:
+        if not children:
             return False
-        self.outgoing = children[:3]
+        self.outgoing = list(children)
         for index, track in enumerate(self.outgoing):
             track.persistent_id = f"J0-B{index}"
         return True
@@ -724,6 +740,9 @@ class AdaptivePerception:
             if self.state == PerceptionState.FIXED_ACCUMULATING and self._persistent_ready():
                 self.state = PerceptionState.BRANCHES_READY
                 self.topology_ready_frame = self.frame
+                self.integration_detected_branch_order = [
+                    track.persistent_id for track in self.outgoing
+                ]
                 print(f"[Topology] parent={self.parent.persistent_id}")
                 print(f"[Topology] parent_source={self.parent_source}")
                 print(f"[Topology] outgoing={[track.persistent_id for track in self.outgoing]}")
@@ -776,6 +795,50 @@ def _range_at_local_angle(frame: LidarFrame, angle_deg: float) -> float:
     return float(frame.smoothed[index])
 
 
+def _nearest_wall_side_endpoint(
+    frame: LidarFrame,
+    perception: AdaptivePerception,
+    boundary_angle: float,
+    *,
+    search_direction: int,
+    max_search_deg: float = 8.0,
+) -> tuple[pygame.Vector2, float, float]:
+    """Return the nearest CLOSED/wall hit immediately outside an opening.
+
+    Opening start/end rays are OPEN-support threshold crossings, not physical
+    mouth corners.  Guard WHERE must use the adjacent wall-side LiDAR hit.
+    The returned vector is already world-oriented relative to the Anchor
+    because ``_body_local_unit`` already includes ``perception.yaw_deg``.
+    """
+    if search_direction not in {-1, 1}:
+        raise ValueError("search_direction must be -1 or +1")
+    n = len(frame.angles)
+    boundary_index = min(
+        range(n),
+        key=lambda item: circular_error(float(frame.angles[item]), boundary_angle),
+    )
+    if n <= 1:
+        raise RuntimeError("LiDAR frame has insufficient angular samples")
+    angular_step = 360.0 / n
+    max_steps = max(1, int(math.ceil(max_search_deg / angular_step)))
+
+    for offset in range(1, max_steps + 1):
+        index = (boundary_index + search_direction * offset) % n
+        if bool(frame.support[index]):
+            continue
+        raw_range = float(frame.raw[index])
+        if not math.isfinite(raw_range) or raw_range >= MAX_RANGE - 1.0e-6:
+            continue
+        angle = float(frame.angles[index])
+        point = _body_local_unit(perception, angle) * raw_range
+        return point, angle, raw_range
+
+    # Fail visibly instead of silently placing a Guard on an OPEN ray.
+    raise RuntimeError(
+        f"no finite wall-side LiDAR hit near opening boundary {boundary_angle:+.1f}deg"
+    )
+
+
 def _lidar_estimated_mouth_width(
     frame: LidarFrame,
     opening: dict[str, float],
@@ -820,7 +883,7 @@ def build_provisional_guard_descriptors_from_lidar(
     if len(outgoing) < 3:
         parent = None
         outgoing = openings
-    outgoing = sorted(outgoing, key=lambda item: float(item["center_angle"]))[:3]
+    outgoing = sorted(outgoing, key=lambda item: float(item["center_angle"]))
     keys = []
     for item in outgoing:
         angle = float(item["center_angle"])
@@ -856,13 +919,20 @@ def build_provisional_guard_descriptors_from_lidar(
         start = float(opening["start_angle"])
         end = float(opening["end_angle"])
         center = float(opening["center_angle"])
-        start_point = (
-            _body_local_unit(perception, start)
-            * _range_at_local_angle(frame, start)
+        # The detector's opening start/end are threshold-support edges.
+        # They are NOT the physical mouth endpoints.  Use the immediately
+        # adjacent CLOSED wall rays so the Guard sits on the actual LiDAR
+        # opening mouth instead of deep inside the branch.
+        start_point, start_wall_angle, start_wall_range = _nearest_wall_side_endpoint(
+            frame, perception, start, search_direction=-1
         )
-        end_point = (
-            _body_local_unit(perception, end)
-            * _range_at_local_angle(frame, end)
+        end_point, end_wall_angle, end_wall_range = _nearest_wall_side_endpoint(
+            frame, perception, end, search_direction=+1
+        )
+        print(
+            f"[GuardWallEndpoint] center={center:+.1f} "
+            f"start_open={start:+.1f} start_wall={start_wall_angle:+.1f} r={start_wall_range:.2f} "
+            f"end_open={end:+.1f} end_wall={end_wall_angle:+.1f} r={end_wall_range:.2f}"
         )
         boundary_chord = end_point - start_point
         radial = _body_local_unit(perception, center)
@@ -926,6 +996,45 @@ def build_provisional_guard_descriptors_from_lidar(
             discovered_at=physical.simulation_time,
         )
         branch_key = keys[index]
+        # The wall-side rays are useful evidence for width/diagnostics, but their
+        # connecting chord is perspective-skewed for LEFT/RIGHT openings.  Do
+        # not use that chord as the Guard row.  The branch axis above is already
+        # inferred from the Anchor-local LiDAR sector; construct the physical
+        # mouth as a cross-section perpendicular to that axis from the start.
+        mouth_normal = pygame.Vector2(-axis.y, axis.x).normalize()
+        raw_chord = end_point - start_point
+        projected_span = (
+            abs(float(raw_chord.dot(mouth_normal)))
+            if raw_chord.length_squared() > physical.EPSILON
+            else 0.0
+        )
+
+        # The adjacent CLOSED rays are the local wall-side evidence for the
+        # corridor cross-section.  In v13 their projected wall-to-wall span was
+        # incorrectly capped by the conservative W-derived width estimate.
+        # That made LEFT/RIGHT Guards only 9 columns wide even though the
+        # physical passage was wider.  Trust the projected wall endpoints when
+        # they form a valid cross-section; W is only a fallback, never an upper
+        # bound on Shepherd width.
+        minimum_physical_span = 4.0 * physical.ROBOT_RADIUS
+        if projected_span >= minimum_physical_span:
+            mouth_span = projected_span
+            width_source = "LIDAR_WALL_ENDPOINT_CROSS_SECTION"
+        else:
+            mouth_span = max(estimated_width, minimum_physical_span)
+            width_source = "ADAPTIVE_W_FALLBACK"
+
+        # Re-center the straight cross-section laterally between the two
+        # observed wall-side points while preserving its axial mouth depth.
+        # This removes a second source of LEFT/RIGHT shortening: an off-centre
+        # nominal mouth would otherwise spend part of the available span on one
+        # wall and leave a gap on the other side.
+        wall_mid_world = perception.anchor_position + 0.5 * (start_point + end_point)
+        lateral_center_shift = float((wall_mid_world - mouth).dot(mouth_normal))
+        mouth = mouth + mouth_normal * lateral_center_shift
+
+        straight_start = mouth - mouth_normal * (0.5 * mouth_span)
+        straight_end = mouth + mouth_normal * (0.5 * mouth_span)
         geometries.append(ProvisionalGuardGeometry(
             provisional_uid=uid,
             opening=opening,
@@ -936,7 +1045,21 @@ def build_provisional_guard_descriptors_from_lidar(
             local_branch_key=branch_key,
             opening_start_local=start_point.copy(),
             opening_end_local=end_point.copy(),
+            mouth_start_world=straight_start.copy(),
+            mouth_end_world=straight_end.copy(),
+            mouth_center_world=mouth.copy(),
+            mouth_lateral_unit=mouth_normal.copy(),
+            branch_tangent_unit=axis.copy(),
+            mouth_span=float(mouth_span),
         ))
+        print(
+            f"[GuardPerpendicularFrame] uid={uid} branch={branch_key} "
+            f"t=({axis.x:.3f},{axis.y:.3f}) "
+            f"n=({mouth_normal.x:.3f},{mouth_normal.y:.3f}) "
+            f"raw_chord={raw_chord.length():.3f} projected_span={projected_span:.3f} "
+            f"used_span={mouth_span:.3f} width_source={width_source} "
+            f"lateral_center_shift={lateral_center_shift:.3f} perpendicular=True"
+        )
         print(
             f"[GuardGeometryBasis] uid={uid} source={axis_source} "
             f"chord_axis_alignment={chord_axis_alignment:.3f} "
@@ -990,50 +1113,92 @@ def build_sealing_aware_slots(
     geometry: ProvisionalGuardGeometry | None = None,
     perception: AdaptivePerception | None = None,
 ) -> list[pygame.Vector2]:
+    """Build every Guard row perpendicular to the detected branch axis.
+
+    The old implementation re-derived ``t`` from the LiDAR mouth chord.  Side
+    openings see that chord in perspective, so LEFT/RIGHT Guards were diagonal
+    and later had to rotate before moving.  Here ``t`` is the already-frozen
+    Anchor-local outgoing direction and ``n`` is exactly perpendicular to it.
+    Wall-side endpoints only contribute width diagnostics; they never rotate the
+    Guard/Frontier/Shepherd transport frame.
+    """
     tangent, normal = physical.descriptor_local_basis(descriptor)
-    segment_start = segment_end = None
-    if geometry is not None and perception is not None:
-        assert geometry.opening_start_local is not None
-        assert geometry.opening_end_local is not None
-        assert perception.anchor_position is not None
-        segment_start = perception.anchor_position + geometry.opening_start_local.rotate(perception.yaw_deg)
-        segment_end = perception.anchor_position + geometry.opening_end_local.rotate(perception.yaw_deg)
-        lateral = segment_end - segment_start
-        if lateral.length_squared() > physical.EPSILON:
-            lateral = lateral.normalize()
-            center_ray = _body_local_unit(perception, float(geometry.opening.get("center_angle", 0.0)))
-            tangent = pygame.Vector2(-lateral.y, lateral.x)
-            if tangent.dot(center_ray) < 0.0:
-                tangent = -tangent
-            normal = lateral
-            descriptor.observed_mouth_position = (segment_start + segment_end) * 0.5
-            descriptor.observed_width = segment_start.distance_to(segment_end)
-            descriptor.observed_physical_width = descriptor.observed_width
-    lateral_min, lateral_max = compute_guard_lateral_interval(
-        physical, descriptor
-    )
-    if segment_start is not None:
-        edge_margin = physical.ROBOT_RADIUS + 0.5
-        lateral_min = edge_margin
-        lateral_max = max(edge_margin, segment_start.distance_to(segment_end) - edge_margin)
+    tangent = tangent.normalize()
+    normal = pygame.Vector2(-tangent.y, tangent.x).normalize()
+
+    # Preserve the prior lateral sign when one was already frozen so robot slot
+    # ordering does not flip between Guard election and persistent UID binding.
+    if geometry is not None and geometry.mouth_lateral_unit is not None:
+        prior_n = geometry.mouth_lateral_unit
+        if prior_n.length_squared() > physical.EPSILON and normal.dot(prior_n) < 0.0:
+            normal = -normal
+
+    mouth_center = descriptor.observed_mouth_position.copy()
+    mouth_span = float(descriptor.observed_physical_width or descriptor.observed_width)
+    if geometry is not None:
+        if geometry.mouth_center_world is not None:
+            mouth_center = geometry.mouth_center_world.copy()
+        if geometry.mouth_span > physical.EPSILON:
+            mouth_span = float(geometry.mouth_span)
+
+    # Freeze the same straight t/n frame into every downstream object now, not
+    # later at Guard->Frontier promotion.
+    descriptor.observed_mouth_position = mouth_center.copy()
+    descriptor.local_outgoing_direction = tangent.copy()
+    descriptor.local_return_direction = -tangent
+    descriptor.direction_last_estimate = tangent.copy()
+    descriptor.direction_stability_reference = tangent.copy()
+    descriptor.motion_t = tangent.copy()
+    descriptor.motion_n = normal.copy()
+    descriptor.motion_frame_locked = True
+    descriptor.motion_frame_source = "LIDAR_PERPENDICULAR_GUARD_FRAME"
+    descriptor.observed_width = mouth_span
+    descriptor.observed_physical_width = mouth_span
+
+    if geometry is not None:
+        geometry.mouth_center_world = mouth_center.copy()
+        geometry.mouth_lateral_unit = normal.copy()
+        geometry.branch_tangent_unit = tangent.copy()
+        geometry.mouth_span = mouth_span
+        geometry.mouth_start_world = mouth_center - normal * (0.5 * mouth_span)
+        geometry.mouth_end_world = mouth_center + normal * (0.5 * mouth_span)
+
+    lateral_min, lateral_max = compute_guard_lateral_interval(physical, descriptor)
+    if lateral_max < lateral_min:
+        lateral_min = lateral_max = 0.0
+    spacing = (lateral_max - lateral_min) / max(columns - 1, 1)
     order = build_edge_sealing_slot_order(columns)
     slots: list[pygame.Vector2] = []
-    center = ((segment_start + segment_end) * 0.5 + tangent * physical.JUNCTION_GUARD_BRANCH_INSET) if segment_start is not None else descriptor.observed_mouth_position + tangent * physical.JUNCTION_GUARD_BRANCH_INSET
-    spacing = (lateral_max - lateral_min) / max(columns - 1, 1)
+
     for layer in range(layers):
-        row_center = center + tangent * (layer * physical.THICK_MOUTH_GUARD_LAYER_SPACING)
-        lateral_positions = [
-            lateral_min + spacing * index for index in order
+        row_center = (
+            mouth_center
+            + tangent
+            * (
+                physical.JUNCTION_GUARD_BRANCH_INSET
+                + layer * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+            )
+        )
+        # Keep natural left-to-right column order in the slot array because the
+        # lifecycle stores slot_index % cols and later reconstructs the same 3xN
+        # wall from that index.  Election may still use edge-priority separately.
+        row = [
+            row_center + normal * (lateral_min + spacing * index)
+            for index in range(columns)
         ]
-        slots.extend(row_center + normal * lateral for lateral in lateral_positions)
+        slots.extend(row)
         print(
             f"[GuardSlotOrder] uid={descriptor.uid} layer={layer} "
-            f"order={order}"
+            f"order={order} perpendicular=True "
+            f"t=({tangent.x:.3f},{tangent.y:.3f}) "
+            f"n=({normal.x:.3f},{normal.y:.3f})"
         )
+
     return slots
 
 
 def build_provisional_multilayer_slots(
+
     physical: types.ModuleType,
     robots: Sequence[Any],
     geometries: Sequence[ProvisionalGuardGeometry],
@@ -1042,6 +1207,9 @@ def build_provisional_multilayer_slots(
     """Create every LiDAR-derived layer at once; robot positions are unread."""
     for geometry in geometries:
         descriptor = geometry.descriptor
+        if geometry.mouth_span > 0.0:
+            descriptor.observed_width = geometry.mouth_span
+            descriptor.observed_physical_width = geometry.mouth_span
         columns, lateral_min, lateral_max, slot_spacing = (
             compute_sealing_aware_column_count(physical, descriptor)
         )
@@ -1073,6 +1241,13 @@ def build_provisional_multilayer_slots(
         print(f"[GuardGeometry] center={float(opening['center_angle']):.3f}")
         print(f"[GuardGeometry] width_deg={float(opening['width_deg']):.3f}")
         print(f"[GuardGeometry] estimated_mouth_width={descriptor.observed_physical_width:.3f}")
+        print(
+            f"[GuardAutoWidth] uid={geometry.provisional_uid} "
+            f"wall_to_wall_span={geometry.mouth_span:.3f} "
+            f"usable_span={max(0.0, lateral_max - lateral_min):.3f} "
+            f"columns={columns} layers={layers} "
+            "source=LIDAR_WALL_ENDPOINT_CROSS_SECTION_OR_W_FALLBACK"
+        )
         print(f"[GuardGeometry] usable_half={physical.local_physical_usable_half_width(descriptor):.3f}")
         print(f"[GuardGeometry] sealing_lateral_min={lateral_min:.3f}")
         print(f"[GuardGeometry] sealing_lateral_max={lateral_max:.3f}")
@@ -1117,6 +1292,7 @@ def initialize_provisional_guard_geometry_after_detection(
             "ready_frame": None,
         }
     perception.provisional_guards = list(geometries)
+    print("[GuardBranchMap] " + " ".join(f"{g.provisional_uid}={g.local_branch_key}" for g in geometries))
     perception.provisional_guard_started = True
     perception.guard_geometry_frame = perception.confirmation_frame
     physical.integration_provisional_guard_groups = {}
@@ -1249,11 +1425,15 @@ def collect_shallow_guard_candidates_with_localization(
 ) -> list[Any]:
     """Localization-allowed shallow mouth cohort collection; geometry is read-only."""
     descriptor = geometry.descriptor
-    width = descriptor.observed_physical_width
-    usable_half = physical.local_physical_usable_half_width(descriptor)
-    lateral_limit = (
-        usable_half + GUARD_CAPTURE_LATERAL_MARGIN_RATIO * width
-    )
+    width = geometry.mouth_span or descriptor.observed_physical_width
+    tangent = geometry.branch_tangent_unit or physical.descriptor_local_basis(descriptor)[0]
+    lateral_axis = geometry.mouth_lateral_unit or physical.descriptor_local_basis(descriptor)[1]
+    center = geometry.mouth_center_world or descriptor.observed_mouth_position
+    layers = max(geometry.layers, 1)
+    wall_depth = physical.JUNCTION_GUARD_BRANCH_INSET + (layers - 1) * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+    upstream = max(GUARD_CAPTURE_UPSTREAM_WIDTH_RATIO * width, wall_depth + 2.0 * physical.ROBOT_RADIUS)
+    downstream = max(GUARD_CAPTURE_DOWNSTREAM_WIDTH_RATIO * width, wall_depth + physical.ROBOT_RADIUS)
+    lateral_limit = 0.5 * width + physical.ROBOT_RADIUS + 0.5
     candidates = []
     for robot in robots:
         if (
@@ -1263,17 +1443,24 @@ def collect_shallow_guard_candidates_with_localization(
             or not physical.is_walkable(robot.position, robot.radius)
         ):
             continue
-        axial, lateral = physical.branch_local_coordinates(
-            robot.position, descriptor
-        )
+        delta = robot.position - center
+        axial, lateral = delta.dot(tangent), delta.dot(lateral_axis)
         if (
-            -GUARD_CAPTURE_UPSTREAM_WIDTH_RATIO * width
+            -upstream
             <= axial
-            <= GUARD_CAPTURE_DOWNSTREAM_WIDTH_RATIO * width
+            <= downstream
             and abs(lateral) <= lateral_limit
         ):
             candidates.append(robot)
     return sorted(candidates, key=lambda robot: robot.robot_id)
+
+
+def guard_mouth_coordinates(point: pygame.Vector2, geometry: ProvisionalGuardGeometry) -> tuple[float, float]:
+    center = geometry.mouth_center_world or geometry.descriptor.observed_mouth_position
+    tangent = geometry.branch_tangent_unit or geometry.descriptor.local_outgoing_direction
+    lateral = geometry.mouth_lateral_unit or geometry.descriptor.motion_n
+    delta = point - center
+    return float(delta.dot(tangent)), float(delta.dot(lateral))
 
 
 def compute_full_guard_slot_assignment(
@@ -1283,26 +1470,26 @@ def compute_full_guard_slot_assignment(
 ) -> tuple[list[tuple[Any, pygame.Vector2, int]], dict[str, Any]]:
     """Run deterministic full bipartite feasibility and branch-local WHO cost."""
     descriptor = geometry.descriptor
+    tangent = geometry.branch_tangent_unit or physical.descriptor_local_basis(descriptor)[0]
+    lateral_axis = geometry.mouth_lateral_unit or physical.descriptor_local_basis(descriptor)[1]
+    center = geometry.mouth_center_world or descriptor.observed_mouth_position
+    def mouth_coords(point: pygame.Vector2) -> tuple[float, float]:
+        delta = point - center
+        return float(delta.dot(tangent)), float(delta.dot(lateral_axis))
     width = descriptor.observed_physical_width
     required = len(geometry.slots)
     options: dict[int, list[tuple[float, Any]]] = {}
     candidate_laterals = []
     candidate_axials = []
     for robot in candidates:
-        axial, lateral = physical.branch_local_coordinates(
-            robot.position, descriptor
-        )
+        axial, lateral = mouth_coords(robot.position)
         candidate_axials.append(float(axial))
         candidate_laterals.append(float(lateral))
     for slot_index, slot in enumerate(geometry.slots):
-        slot_axial, slot_lateral = physical.branch_local_coordinates(
-            slot, descriptor
-        )
+        slot_axial, slot_lateral = mouth_coords(slot)
         ranked = []
         for robot in candidates:
-            axial, lateral = physical.branch_local_coordinates(
-                robot.position, descriptor
-            )
+            axial, lateral = mouth_coords(robot.position)
             axial_delta = abs(axial - slot_axial)
             lateral_delta = abs(lateral - slot_lateral)
             path_distance = robot.position.distance_to(slot)
@@ -1341,9 +1528,10 @@ def compute_full_guard_slot_assignment(
                 return True
         return False
 
-    slot_order = sorted(
-        range(required), key=lambda index: (len(options[index]), index)
-    )
+    priority = build_edge_sealing_slot_order(geometry.columns)
+    slot_order = [layer * geometry.columns + col for layer in range(geometry.layers) for col in priority]
+    rank = {index: rank for rank, index in enumerate(slot_order)}
+    slot_order.sort(key=lambda index: (len(options[index]), rank[index]))
     for slot_index in slot_order:
         augment(slot_index, set())
 
@@ -1379,10 +1567,7 @@ def compute_full_guard_slot_assignment(
     else:
         coverage_ratio = 0.0
         occupied_bins = 0
-    assigned_laterals = [
-        physical.branch_local_coordinates(robot.position, descriptor)[1]
-        for robot, _, _ in assignment
-    ]
+    assigned_laterals = [guard_mouth_coordinates(robot.position, geometry)[1] for robot, _, _ in assignment]
     left_edge_gap = max(
         0.0,
         (min(assigned_laterals) - geometry.sealing_lateral_min)
@@ -1435,7 +1620,6 @@ def branch_guard_cohort_ready(
     return bool(
         diagnostics["candidate_count"] >= len(geometry.slots)
         and diagnostics["full_slot_assignment_possible"]
-        and diagnostics["outer_edge_sealed"]
     )
 
 
@@ -1567,8 +1751,58 @@ def update_guard_readiness_and_activation(
     """Independently activate each branch when its natural shallow cohort fits."""
     if not perception.provisional_guard_started:
         return
+    by_key = {g.local_branch_key: g for g in perception.provisional_guards}
+    pending: dict[str, tuple[list[Any], dict[str, Any], set[int]]] = {}
+    stage = perception.guard_activation_stage
+    if not perception.guard_activation_groups:
+        ordered = sorted(perception.provisional_guards, key=lambda g: -abs(float(g.opening.get("center_angle", 0.0))))
+        groups: list[list[ProvisionalGuardGeometry]] = []
+        for geometry in ordered:
+            priority = abs(float(geometry.opening.get("center_angle", 0.0)))
+            if not groups or abs(priority - abs(float(groups[-1][0].opening.get("center_angle", 0.0)))) > ASSOCIATION_TOLERANCE_DEG:
+                groups.append([geometry])
+            else:
+                groups[-1].append(geometry)
+        perception.guard_activation_groups = groups
+        print(f"[GuardActivationPlan] branch_count={len(ordered)} group_count={len(groups)}")
+        for index, group in enumerate(groups):
+            print(f"[GuardActivationPlan] group={index} members={[g.provisional_uid for g in group]} priorities={[abs(float(g.opening.get('center_angle', 0.0))) for g in group]}")
+    if not perception.guard_activation_groups:
+        return
+    groups = perception.guard_activation_groups
+    if stage == "SETTLING_ALL":
+        assert perception.guard_current_group_index >= len(groups)
+        ready_count = sum(bool(physical.integration_wall_status.get(g.provisional_uid, {}).get("ready", False)) for g in perception.provisional_guards)
+        print(f"[GuardSettlingAll] frame={getattr(physical, 'integration_frame', -1)} ready_count={ready_count} total_count={len(perception.provisional_guards)}")
+        cohorts_complete = all(
+            geometry.cohort_ready
+            and len(geometry.selected_ids) == len(geometry.slots)
+            for geometry in perception.provisional_guards
+        )
+        if ready_count == len(perception.provisional_guards) or cohorts_complete:
+            perception.guard_activation_stage = "COMPLETE"
+            print(
+                f"[GuardFormationComplete] frame={getattr(physical, 'integration_frame', -1)} "
+                f"cohorts_complete={cohorts_complete} walls_ready={ready_count}/"
+                f"{len(perception.provisional_guards)}"
+            )
+        return
+    if stage == "COMPLETE":
+        assert perception.guard_current_group_index >= len(groups)
+        return
+    assert stage == "WAIT_GROUP"
+    if perception.guard_current_group_index >= len(groups):
+        perception.guard_all_groups_activated = True
+        perception.guard_activation_stage = "SETTLING_ALL"
+        print(f"[AllGuardGroupsActivated] frame={getattr(physical, 'integration_frame', -1)} groups={len(groups)}")
+        return
+    current_group = perception.guard_activation_groups[perception.guard_current_group_index]
+    for future in perception.guard_activation_groups[perception.guard_current_group_index + 1:]:
+        assert all(not g.selected_ids for g in future)
     for geometry in perception.provisional_guards:
         if geometry.cohort_ready:
+            continue
+        if geometry not in current_group:
             continue
         physical.integration_guard_who_localization_enabled = True
         candidates = collect_shallow_guard_candidates_with_localization(
@@ -1637,35 +1871,43 @@ def update_guard_readiness_and_activation(
                 f"{diagnostics['mean_assignment_distance']:.3f} "
                 f"ready={branch_guard_cohort_ready(geometry, diagnostics)}"
             )
+        if frame % GUARD_READINESS_LOG_PERIOD == 0 or branch_guard_cohort_ready(geometry, diagnostics):
+            print(f"[GuardPreActivationGate] frame={frame} uid={geometry.provisional_uid} group_index={perception.guard_current_group_index} candidate_count={diagnostics['candidate_count']} required={required} full_assignment={diagnostics['full_slot_assignment_possible']} outer_edge_sealed={diagnostics['outer_edge_sealed']} left_edge_gap={diagnostics.get('left_edge_gap', 0.0):.3f} right_edge_gap={diagnostics.get('right_edge_gap', 0.0):.3f} activation_allowed={branch_guard_cohort_ready(geometry, diagnostics)}")
         if branch_guard_cohort_ready(geometry, diagnostics):
-            perception.guard_who_frame = (
-                frame if perception.guard_who_frame is None
-                else min(perception.guard_who_frame, frame)
-            )
+            pending[geometry.local_branch_key] = (assignment, diagnostics, critical_ids)
+            continue
+    if stage == "WAIT_GROUP" or stage == "WAIT_SIDE_PAIR":
+        if len(pending) == len(current_group):
+            for geometry in current_group:
+                assignment, diagnostics, critical_ids = pending[geometry.local_branch_key]
+                activate_guard_cohort(physical, perception, robots, geometry, assignment, critical_ids, diagnostics)
+            index = perception.guard_current_group_index
+            perception.guard_current_group_index += 1
+            if perception.guard_current_group_index >= len(perception.guard_activation_groups):
+                perception.guard_all_groups_activated = True
+                all_guard_cohorts_complete = all(
+                    geometry.cohort_ready
+                    and len(geometry.selected_ids) == len(geometry.slots)
+                    for geometry in perception.provisional_guards
+                )
+                perception.guard_activation_stage = (
+                    "COMPLETE" if all_guard_cohorts_complete else "SETTLING_ALL"
+                )
+                print(f"[AllGuardGroupsActivated] frame={getattr(physical, 'integration_frame', -1)}")
+                if all_guard_cohorts_complete:
+                    print(
+                        f"[GuardFormationComplete] frame={getattr(physical, 'integration_frame', -1)} "
+                        "cohorts_complete=True walls_diagnostic_only=True"
+                    )
+            else:
+                perception.guard_activation_stage = "WAIT_GROUP"
+                print(f"[GuardActivationAdvance] frame={getattr(physical, 'integration_frame', -1)} from_group={index} to_group={perception.guard_current_group_index}")
             physical.integration_guard_who_localization_enabled = False
-            activate_guard_cohort(
-                physical,
-                perception,
-                robots,
-                geometry,
-                assignment,
-                critical_ids,
-                diagnostics,
-            )
-            if perception.guard_motion_start_frame is None:
-                perception.guard_motion_start_frame = frame
+            return
+        physical.integration_guard_who_localization_enabled = False
+        return
     physical.integration_guard_who_localization_enabled = False
-    if (
-        perception.provisional_guards
-        and all(item.cohort_ready for item in perception.provisional_guards)
-    ):
-        print(
-            "[Timeline] ALL_GUARD_COHORTS_ACTIVE "
-            f"frame={getattr(physical, 'integration_frame', -1)}"
-        ) if not getattr(
-            physical, "integration_all_guard_cohorts_logged", False
-        ) else None
-        physical.integration_all_guard_cohorts_logged = True
+    return
 
 
 def update_provisional_wall_settling_audit(
@@ -1691,18 +1933,19 @@ def update_provisional_wall_settling_audit(
             ) <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
             for robot in guards
         )
-        usable_half = physical.local_physical_usable_half_width(
-            geometry.descriptor
-        )
         complete_rows = 0
         minimum_span_ratio = 1.0
         maximum_edge_gap = 0.0
         maximum_internal_gap = 0.0
+        expected_span_max = 0.0
+        actual_span_max = 0.0
+        left_edge_gap_max = 0.0
+        right_edge_gap_max = 0.0
         for layer in range(geometry.layers):
+            expected_slots = geometry.slots[layer * geometry.columns:(layer + 1) * geometry.columns]
+            expected_laterals = sorted(guard_mouth_coordinates(slot, geometry)[1] for slot in expected_slots)
             laterals = sorted(
-                physical.branch_local_coordinates(
-                    robot.position, geometry.descriptor
-                )[1]
+                guard_mouth_coordinates(robot.position, geometry)[1]
                 for robot in guards
                 if robot.junction_guard_layer == layer
             )
@@ -1710,16 +1953,17 @@ def update_provisional_wall_settling_audit(
                 minimum_span_ratio = 0.0
                 continue
             complete_rows += 1
+            expected_span = expected_laterals[-1] - expected_laterals[0]
             span = laterals[-1] - laterals[0]
+            expected_span_max = max(expected_span_max, expected_span)
+            actual_span_max = max(actual_span_max, span)
+            left_edge_gap_max = max(left_edge_gap_max, max(0.0, laterals[0] - expected_laterals[0]))
+            right_edge_gap_max = max(right_edge_gap_max, max(0.0, expected_laterals[-1] - laterals[-1]))
             minimum_span_ratio = min(
                 minimum_span_ratio,
-                span / max(2.0 * usable_half, physical.EPSILON),
+                span / max(expected_span, physical.EPSILON),
             )
-            maximum_edge_gap = max(
-                maximum_edge_gap,
-                max(0.0, laterals[0] + usable_half),
-                max(0.0, usable_half - laterals[-1]),
-            )
+            maximum_edge_gap = max(maximum_edge_gap, left_edge_gap_max, right_edge_gap_max)
             maximum_internal_gap = max(
                 maximum_internal_gap,
                 max(
@@ -1731,9 +1975,8 @@ def update_provisional_wall_settling_audit(
                 ),
             )
         settled_ratio = settled / max(len(guards), 1)
-        ready = (
+        structurally_sealed = (
             len(guards) == len(geometry.slots)
-            and settled_ratio >= 1.0
             and complete_rows == geometry.layers
             and minimum_span_ratio
             >= physical.FRONTIER_LINE_MIN_SPAN_RATIO
@@ -1742,13 +1985,38 @@ def update_provisional_wall_settling_audit(
             and maximum_internal_gap
             <= physical.FRONTIER_LINE_MAX_INTERNAL_GAP
         )
+        if structurally_sealed and settled_ratio >= PROVISIONAL_WALL_SETTLED_RATIO:
+            status["wall_ready_dwell"] = min(
+                float(status.get("wall_ready_dwell", 0.0)) +
+                float(getattr(physical, "NORMAL_PHYSICS_MAX_DT", 1.0 / 60.0)),
+                PROVISIONAL_WALL_STABILITY_DWELL,
+            )
+        else:
+            status["wall_ready_dwell"] = 0.0
+        ready = status["wall_ready_dwell"] >= PROVISIONAL_WALL_STABILITY_DWELL
         status.update({
             "settled_ratio": settled_ratio,
+            "settled_count": settled,
+            "structurally_sealed": structurally_sealed,
             "min_span_ratio": minimum_span_ratio,
             "max_edge_gap": maximum_edge_gap,
             "max_internal_gap": maximum_internal_gap,
+            "expected_span": expected_span_max,
+            "actual_span": actual_span_max,
+            "left_edge_gap": left_edge_gap_max,
+            "right_edge_gap": right_edge_gap_max,
             "ready": ready,
         })
+        reasons = []
+        if settled_ratio < PROVISIONAL_WALL_SETTLED_RATIO: reasons.append("settled_ratio")
+        if complete_rows != geometry.layers: reasons.append("complete_rows")
+        if minimum_span_ratio < physical.FRONTIER_LINE_MIN_SPAN_RATIO: reasons.append("span_ratio")
+        if maximum_edge_gap > physical.FRONTIER_LINE_MAX_EDGE_GAP: reasons.append("edge_gap")
+        if maximum_internal_gap > physical.FRONTIER_LINE_MAX_INTERNAL_GAP: reasons.append("internal_gap")
+        if structurally_sealed and settled_ratio >= PROVISIONAL_WALL_SETTLED_RATIO and not ready:
+            reasons.append("stable_dwell")
+        if getattr(physical, "integration_frame", 0) % 10 == 0 or ready:
+            print(f"[WallReadyBlocker] uid={geometry.provisional_uid} guard_count={len(guards)} expected={len(geometry.slots)} settled={settled}/{len(guards)} settled_ratio={settled_ratio:.3f} complete_rows={complete_rows}/{geometry.layers} expected_span={expected_span_max:.3f} actual_span={actual_span_max:.3f} span_ratio={minimum_span_ratio:.3f} left_edge_gap={left_edge_gap_max:.3f} right_edge_gap={right_edge_gap_max:.3f} max_edge_gap={maximum_edge_gap:.3f} max_internal_gap={maximum_internal_gap:.3f} structurally_sealed={structurally_sealed} stable_dwell={status['wall_ready_dwell']:.3f} ready={ready} blocking_reasons={reasons}")
         if ready and status.get("ready_frame") is None:
             status["ready_frame"] = getattr(
                 physical, "integration_frame", -1
@@ -1871,9 +2139,11 @@ def install_thick_wall_readiness_audit(physical: types.ModuleType) -> None:
             maximum_edge_gap = 0.0
             complete_rows = 0
             usable_half = physical.local_physical_usable_half_width(descriptor)
+            branch_tangent, branch_lateral = physical.descriptor_local_basis(descriptor)
+            mouth_center = descriptor.observed_mouth_position
             for layer in range(rows):
                 laterals = sorted(
-                    physical.branch_local_coordinates(robot.position, descriptor)[1]
+                    float((robot.position - mouth_center).dot(branch_lateral))
                     for robot in guards
                     if robot.junction_guard_layer == layer
                 )
@@ -1890,10 +2160,8 @@ def install_thick_wall_readiness_audit(physical: types.ModuleType) -> None:
                     ),
                 )
                 span = laterals[-1] - laterals[0]
-                minimum_span_ratio = min(
-                    minimum_span_ratio,
-                    span / max(2.0 * usable_half, physical.EPSILON),
-                )
+                expected_span = max(2.0 * usable_half, physical.EPSILON)
+                minimum_span_ratio = min(minimum_span_ratio, span / expected_span)
                 maximum_edge_gap = max(
                     maximum_edge_gap,
                     max(0.0, laterals[0] + usable_half),
@@ -1915,7 +2183,7 @@ def install_thick_wall_readiness_audit(physical: types.ModuleType) -> None:
                 and columns >= physical.JUNCTION_GUARD_MIN_COUNT
                 and len(guards) >= rows * columns
                 and complete_rows == rows
-                and branch_stats["settled_ratio"] >= 1.0
+                and branch_stats["settled_ratio"] >= PROVISIONAL_WALL_SETTLED_RATIO
                 and minimum_span_ratio
                 >= physical.FRONTIER_LINE_MIN_SPAN_RATIO
                 and maximum_edge_gap
@@ -2023,7 +2291,16 @@ def install_thick_wall_readiness_audit(physical: types.ModuleType) -> None:
                 )
         return ready
 
-    physical.junction_guards_formed = audited_ready
+    def ready_or_handoff_bypass(robots: Sequence[Any]) -> bool:
+        # The integration handoff occurs only after every provisional wall has
+        # passed the physical readiness audit.  Let the authoritative DFS
+        # state machine consume those already-formed walls without launching
+        # a second formation pass.
+        if getattr(physical, "integration_ready_guard_handoff", False):
+            return True
+        return audited_ready(robots)
+
+    physical.junction_guards_formed = ready_or_handoff_bypass
 
 
 def install_continuous_guard_settling(physical: types.ModuleType) -> None:
@@ -2035,12 +2312,20 @@ def install_continuous_guard_settling(physical: types.ModuleType) -> None:
         proposed: pygame.Vector2,
         old_position: pygame.Vector2,
     ) -> pygame.Vector2:
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(
+            getattr(robot, "junction_guard_branch", None),
+            {},
+        )
+        restoring_persistent_wall = (
+            lifecycle.get("state") == "RESTORING_GUARD"
+        )
         if (
             (
                 physical.phase == physical.SimulationPhase.FORM_JUNCTION_GUARDS
                 or getattr(
                     physical, "integration_provisional_guard_active", False
                 )
+                or restoring_persistent_wall
             )
             and robot.role == "JUNCTION_GUARD"
             and robot.junction_guard_anchor is not None
@@ -2049,6 +2334,18 @@ def install_continuous_guard_settling(physical: types.ModuleType) -> None:
             # walkable-mask collision, and one-frame stepping.  Only the Base
             # parent-link clamp is suspended during this permitted initial
             # wall-placement interval.
+            return proposed
+        if (
+            physical.phase in {
+                physical.SimulationPhase.FORM_JUNCTION_GUARDS,
+                physical.SimulationPhase.EXPLORE_BRANCH,
+            }
+            and robot.role == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch in getattr(physical, "integration_wall_lifecycle", {})
+        ):
+            # The selected thick wall is the physical branch boundary; its
+            # bounded slot motion must not be clamped by the old Base parent
+            # link, which otherwise leaves the entire Frontier curtain still.
             return proposed
         return original_limit(robot, proposed, old_position)
 
@@ -2102,17 +2399,123 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     original_update_state = physical.update_simulation_state
     original_transfer_control = physical.update_transfer_continuity_control
     original_prepare_scores = physical.prepare_branch_candidate_scores
+    original_get_shepherd_curtain_depth = physical.get_shepherd_curtain_depth
+    original_compute_route_force = physical.compute_route_force
+    # Preserve the working Physical-DFS Shepherd piston mechanics before any
+    # integration overrides.  The reference behavior that visibly carries the
+    # NORMAL body back to the Junction is not just a route force: it uses a
+    # full-width curtain force plus a one-step leakage constraint colocated with
+    # the Shepherd line.  Earlier integration revisions accidentally disabled
+    # these functions globally, so the kinematic Shepherd line could run ahead
+    # while the swarm lagged behind.
+    original_compute_shepherd_curtain_force = physical.compute_shepherd_curtain_force
+    original_constrain_normal_behind_shepherd_curtain = (
+        physical.constrain_normal_behind_shepherd_curtain
+    )
+    original_enforce_shepherd_curtain_for_swarm = (
+        physical.enforce_shepherd_curtain_for_swarm
+    )
+    original_start_shepherd_pressure_push = physical.start_shepherd_pressure_push
+
+    # The reference simulator multiplies all motion speeds by
+    # MOTION_SPEED_MULTIPLIER.  In the LiDAR integration that made the return
+    # piston visually race across the short branch.  Keep the *reference* timer
+    # trajectory, but use its nominal pre-multiplier return rates (8 px/s piston,
+    # 12 px/s line, 12 px/s release for the current parameters).  Only Shepherd
+    # return timing is normalized; SPH/Frontier/Guard motion is unchanged.
+    return_speed_scale = 1.0 / max(float(physical.MOTION_SPEED_MULTIPLIER), 1.0)
+    physical.integration_reference_return_speed_scale = return_speed_scale
+    physical.integration_reference_return_original_piston_speed = float(
+        physical.SHEPHERD_PISTON_SPEED
+    )
+    physical.integration_reference_return_original_line_speed = float(
+        physical.SHEPHERD_LINE_BACKTRACK_SPEED
+    )
+    physical.integration_reference_return_original_release_speed = float(
+        physical.SHEPHERD_JUNCTION_RELEASE_SPEED
+    )
+    physical.SHEPHERD_PISTON_SPEED *= return_speed_scale
+    physical.SHEPHERD_LINE_BACKTRACK_SPEED *= return_speed_scale
+    physical.SHEPHERD_JUNCTION_RELEASE_SPEED *= return_speed_scale
+    physical.integration_return_curtain_active = False
+
     diagnostics = LocalSaturationDiagnostics()
     physical.integration_saturation = diagnostics
     physical.integration_saturation_events = []
     physical.integration_backflow_events = []
     physical.integration_frontier_lineage_events = []
     physical.integration_shepherd_anchor_offsets = {}
+    # Backtracking is pack-coupled: the physical Shepherd piston may advance
+    # only as fast as the rear surface of the returning NORMAL cohort moves.
+    # This prevents the kinematic Shepherd controller from racing through the
+    # SPH body while still allowing a slight physical compression at contact.
+    physical.integration_backtrack_command_depth = None
+    physical.integration_backtrack_pack_rear_depth = None
+    physical.integration_backtrack_support_depth = None
+    physical.integration_backtrack_support_count = 0
+    physical.integration_backtrack_lateral_coverage = 0.0
+    physical.integration_backtrack_pacer_last_log_frame = -1
+    # Reference-style Shepherd return gating.  The original Physical DFS does
+    # not begin its piston return merely because the dead-end was detected; it
+    # first fills a NORMAL pack immediately in front of the Shepherd boundary.
+    # Keep that invariant explicitly in the integration layer.
+    physical.integration_shepherd_pack_ready_dwell = 0.0
+    physical.integration_shepherd_pack_ready_required_dwell = max(
+        0.18, physical.SATURATION_DWELL_TIME
+    )
+    physical.integration_shepherd_return_bias_scale = 1.00
+
+    def reference_start_shepherd_pressure_push(
+        robots: Sequence[Any], branch: str
+    ) -> None:
+        """Start return with the Shepherd target locked to the actual herd rear."""
+        # IMPORTANT: initialize the command from the *current physical line*,
+        # not from a timer-derived future depth.  Robot.update() may move a
+        # Shepherd kinematically at SHEPHERD_FORM_SPEED, so any large target jump
+        # here looks like a solo sprint.  From this frame onward the command is
+        # advanced only by update_pack_coupled_backtrack_depth().
+        descriptor = descriptor_for(branch)
+        current_line = (
+            shepherd_line_leading_depth(robots, branch, descriptor)
+            if descriptor is not None else None
+        )
+        if current_line is None:
+            current_line = float(original_get_shepherd_curtain_depth(branch))
+        physical.integration_backtrack_command_depth = float(current_line)
+        physical.integration_backtrack_pack_rear_depth = None
+        physical.integration_backtrack_support_depth = None
+        physical.integration_backtrack_support_count = 0
+        physical.integration_backtrack_lateral_coverage = 0.0
+        physical.integration_return_curtain_active = True
+        original_start_shepherd_pressure_push(robots, branch)
+        print(
+            f"[HerdLockedReturnStart] branch={branch} "
+            f"command_depth={float(current_line):.3f} "
+            f"piston_speed={physical.SHEPHERD_PISTON_SPEED:.3f} "
+            f"line_speed={physical.SHEPHERD_LINE_BACKTRACK_SPEED:.3f}"
+        )
+
+    def frozen_lifecycle_coordinates(
+        point: pygame.Vector2,
+        lifecycle: dict[str, Any],
+        descriptor: Any | None = None,
+    ) -> tuple[float, float]:
+        """Coordinates in the exact frozen LiDAR mouth frame used by Guards."""
+        center = lifecycle.get("mouth_center_world")
+        tangent = lifecycle.get("branch_tangent_unit")
+        lateral = lifecycle.get("mouth_lateral_unit")
+        if center is not None and tangent is not None and lateral is not None:
+            delta = point - center
+            return float(delta.dot(tangent)), float(delta.dot(lateral))
+        if descriptor is None:
+            return 0.0, 0.0
+        return physical.branch_local_coordinates(point, descriptor)
+
 
     def thick_frontier_slot_target(
         robot: Any, centroid_depth: float
     ) -> pygame.Vector2 | None:
-        """Move a stored 3x9 local formation without world-slot reuse."""
+        """Move the complete frozen LiDAR Guard wall without changing its shape."""
         lifecycle = getattr(
             physical, "integration_wall_lifecycle", {}
         ).get(robot.shepherd_branch)
@@ -2123,16 +2526,30 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         if offset is None:
             return None
         axial_offset, lateral_offset = offset
+
+        center = lifecycle.get("mouth_center_world")
+        tangent = lifecycle.get("branch_tangent_unit")
+        lateral = lifecycle.get("mouth_lateral_unit")
+        if center is not None and tangent is not None and lateral is not None:
+            return (
+                center
+                + tangent * (centroid_depth + axial_offset)
+                + lateral * lateral_offset
+            )
+
+        # Compatibility fallback only.  Normal integration runs should always
+        # have the frozen LiDAR mouth frame above.
         return physical.local_coordinates_to_world(
             descriptor,
-            max(0.0, centroid_depth + axial_offset),
+            centroid_depth + axial_offset,
             physical.frontier_line_lateral_center + lateral_offset,
         )
+
 
     def audited_commit_guard_roles(
         robots: Sequence[Any], selected_branch: str
     ) -> None:
-        """Promote the complete READY 3x9 wall without re-election."""
+        """Promote the complete READY multi-row wall without re-election."""
         uid = physical.branch_uid_for_fixture(selected_branch)
         lifecycle = physical.integration_wall_lifecycle[selected_branch]
         ready_ids = set(lifecycle["robot_ids"])
@@ -2148,27 +2565,30 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 "selected thick Guard wall was incomplete before promotion"
             )
         descriptor = descriptor_for(selected_branch)
-        coordinates = {
-            robot.robot_id: physical.branch_local_coordinates(
-                robot.position, descriptor
-            )
-            for robot in frontiers
-        }
-        centroid_axial = float(np.mean([
-            axial for axial, _ in coordinates.values()
-        ]))
-        centroid_lateral = float(np.mean([
-            lateral for _, lateral in coordinates.values()
-        ]))
+        if descriptor is None:
+            raise RuntimeError(f"missing descriptor for selected branch {selected_branch}")
+        lock_branch_transport_frame(selected_branch, lifecycle, descriptor)
+        centroid_axial, centroid_lateral, regularized_offsets = (
+            regularized_thick_wall_offsets(selected_branch, frontiers, lifecycle, descriptor)
+        )
         lifecycle["centroid_axial"] = centroid_axial
         lifecycle["centroid_lateral"] = centroid_lateral
-        lifecycle["relative_offsets"] = {
-            robot_id: (
-                axial - centroid_axial,
-                lateral - centroid_lateral,
+        lifecycle["relative_offsets"] = regularized_offsets
+        axial_offsets = [value[0] for value in lifecycle["relative_offsets"].values()]
+        wall_axial_span = (
+            max(axial_offsets) - min(axial_offsets)
+            if axial_offsets else 0.0
+        )
+        # A multi-row Frontier must move far enough for its trailing row to
+        # uncover the selected mouth.  Otherwise the wall blocks the NORMAL
+        # body and support-based progress deadlocks at the entrance.
+        lifecycle["frontier_bootstrap_target_depth"] = (
+            centroid_axial
+            + max(
+                physical.FRONTIER_LINE_LEAD_GAP,
+                wall_axial_span + 2.0 * physical.ROBOT_RADIUS,
             )
-            for robot_id, (axial, lateral) in coordinates.items()
-        }
+        )
         before = {
             robot.robot_id: robot.position.copy() for robot in frontiers
         }
@@ -2201,7 +2621,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         physical.frontier_line_last_diagnostic_time = float("-inf")
         physical.junction_guard_groups[selected_branch] = sorted(ready_ids)
         physical.junction_guard_status = (
-            f"FRONTIER_THICK={selected_branch};3x9;robots={len(frontiers)}"
+            f"FRONTIER_THICK={selected_branch};"
+            f"{lifecycle['rows']}x{lifecycle['cols']};robots={len(frontiers)}"
         )
         lifecycle["state"] = "FRONTIER"
         frontier_ids = {robot.robot_id for robot in frontiers}
@@ -2232,6 +2653,13 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             f"rows={lifecycle['rows']} cols={lifecycle['cols']} "
             f"robots={len(frontier_ids)} "
             f"max_role_transition_jump={transition_jump:.6f}"
+        )
+        print(
+            f"[FrontierStraighten] branch={selected_branch} uid={uid} "
+            f"rows={lifecycle['rows']} cols={lifecycle['cols']} "
+            f"usable_half={lifecycle.get('regularized_usable_half', 0.0):.3f} "
+            f"transport={lifecycle.get('transport_frame_source')} "
+            "targets_perpendicular_to_branch=True"
         )
 
     def pebble_filtered_candidate_scores(
@@ -2275,6 +2703,246 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             else None
         )
 
+    def transport_basis(
+        branch: str,
+        lifecycle: dict[str, Any] | None = None,
+        descriptor: Any | None = None,
+    ) -> tuple[pygame.Vector2, pygame.Vector2, str]:
+        """Return a corridor-aligned transport frame for Frontier/Shepherd motion.
+
+        The reference Physical DFS moves LEFT/RIGHT/UP Shepherds on the actual
+        corridor axis and preserves only the transverse slot during backtracking.
+        This integration keeps that behavior.  On the present cross-map the
+        legacy fixture direction is used strictly as the physics adapter already
+        acknowledged by BranchDescriptor; a future fixture-less branch falls
+        back to the LiDAR-frozen descriptor direction.
+        """
+        descriptor = descriptor or descriptor_for(branch)
+        lifecycle = lifecycle or getattr(
+            physical, "integration_wall_lifecycle", {}
+        ).get(branch, {})
+
+        fixture_axis = getattr(physical, "BRANCH_DIRECTIONS", {}).get(branch)
+        if fixture_axis is not None and fixture_axis.length_squared() > physical.EPSILON:
+            tangent = fixture_axis.normalize()
+            source = "LEGACY_FIXTURE_PHYSICS_ADAPTER"
+        else:
+            candidate = None
+            if lifecycle:
+                candidate = lifecycle.get("branch_tangent_unit")
+            if (
+                candidate is None
+                or candidate.length_squared() <= physical.EPSILON
+            ) and descriptor is not None:
+                candidate = getattr(descriptor, "motion_t", None)
+                if candidate is None:
+                    candidate = getattr(descriptor, "local_outgoing_direction", None)
+            if candidate is None or candidate.length_squared() <= physical.EPSILON:
+                raise RuntimeError(f"no transport tangent for branch {branch}")
+            tangent = candidate.normalize()
+            source = "LIDAR_FROZEN_FALLBACK"
+
+        lateral = pygame.Vector2(-tangent.y, tangent.x)
+        old_lateral = lifecycle.get("mouth_lateral_unit") if lifecycle else None
+        if (
+            old_lateral is not None
+            and old_lateral.length_squared() > physical.EPSILON
+            and lateral.dot(old_lateral) < 0.0
+        ):
+            lateral = -lateral
+        return tangent, lateral.normalize(), source
+
+    def lock_branch_transport_frame(
+        branch: str,
+        lifecycle: dict[str, Any],
+        descriptor: Any,
+    ) -> tuple[pygame.Vector2, pygame.Vector2]:
+        """Lock one straight corridor frame before the Guard becomes Frontier."""
+        tangent, lateral, source = transport_basis(branch, lifecycle, descriptor)
+        lifecycle["branch_tangent_unit"] = tangent.copy()
+        lifecycle["mouth_lateral_unit"] = lateral.copy()
+        lifecycle["transport_frame_source"] = source
+
+        descriptor.local_outgoing_direction = tangent.copy()
+        descriptor.local_return_direction = -tangent
+        descriptor.direction_last_estimate = tangent.copy()
+        descriptor.direction_stability_reference = tangent.copy()
+        descriptor.motion_t = tangent.copy()
+        descriptor.motion_n = lateral.copy()
+        descriptor.motion_frame_locked = True
+        descriptor.motion_frame_source = source
+
+        print(
+            f"[BranchTransportFrame] branch={branch} uid={descriptor.uid} "
+            f"source={source} t=({tangent.x:.3f},{tangent.y:.3f}) "
+            f"n=({lateral.x:.3f},{lateral.y:.3f}) straight=True"
+        )
+        return tangent, lateral
+
+    def regularized_thick_wall_offsets(
+        branch: str,
+        frontiers: Sequence[Any],
+        lifecycle: dict[str, Any],
+        descriptor: Any,
+    ) -> tuple[float, float, dict[int, tuple[float, float]]]:
+        """Flatten the selected 3xN wall into rows perpendicular to the branch.
+
+        The Guard WHO IDs are preserved.  Only their Frontier targets are
+        regularized, so a perspective-skewed LiDAR mouth chord cannot make a
+        horizontal branch travel diagonally and scrape one side wall.
+        """
+        center = lifecycle.get("mouth_center_world")
+        tangent = lifecycle.get("branch_tangent_unit")
+        lateral_axis = lifecycle.get("mouth_lateral_unit")
+        if center is None or tangent is None or lateral_axis is None:
+            raise RuntimeError("regularized wall requires a locked transport frame")
+
+        rows = max(1, int(lifecycle.get("rows", 1)))
+        cols = max(1, int(lifecycle.get("cols", 1)))
+        layer_by_id = lifecycle.get("guard_layer_by_id", {})
+        slot_by_id = lifecycle.get("guard_slot_index_by_id", {})
+
+        actual = {}
+        for robot in frontiers:
+            delta = robot.position - center
+            actual[robot.robot_id] = (
+                float(delta.dot(tangent)),
+                float(delta.dot(lateral_axis)),
+            )
+
+        usable_half = float(physical.local_physical_usable_half_width(descriptor))
+        sealed_min = lifecycle.get("sealing_lateral_min")
+        sealed_max = lifecycle.get("sealing_lateral_max")
+        if sealed_min is not None and sealed_max is not None:
+            sealed_half = 0.5 * max(0.0, float(sealed_max) - float(sealed_min))
+            if sealed_half > physical.EPSILON:
+                usable_half = sealed_half
+        # On the present fixture, cap the LiDAR-measured width only by the actual
+        # collision-mask corridor width.  This is a physics-adapter safeguard,
+        # not a Junction/dead-end decision input.
+        if branch in getattr(physical, "BRANCH_DIRECTIONS", {}):
+            fixture_half = max(
+                0.0,
+                0.5 * float(physical.corridor_width)
+                - float(physical.ROBOT_RADIUS)
+                - float(getattr(physical, "FRONTIER_LINE_EDGE_CLEARANCE", 0.0)),
+            )
+            if fixture_half > 0.0:
+                usable_half = min(usable_half, fixture_half) if usable_half > 0.0 else fixture_half
+        if usable_half <= physical.EPSILON:
+            lateral_values = [value[1] for value in actual.values()]
+            usable_half = max(
+                physical.ROBOT_RADIUS,
+                0.5 * (max(lateral_values) - min(lateral_values))
+                if lateral_values else physical.ROBOT_RADIUS,
+            )
+
+        row_spacing = float(physical.THICK_MOUTH_GUARD_LAYER_SPACING)
+        mean_layer = 0.5 * (rows - 1)
+        relative: dict[int, tuple[float, float]] = {}
+
+        # Use the stored slot index when available.  Fall back to the observed
+        # lateral order within each row without changing robot IDs.
+        fallback_columns: dict[int, int] = {}
+        for layer in range(rows):
+            members = [
+                robot for robot in frontiers
+                if int(layer_by_id.get(robot.robot_id, -1)) == layer
+            ]
+            members.sort(key=lambda robot: actual[robot.robot_id][1])
+            for column, robot in enumerate(members):
+                fallback_columns[robot.robot_id] = column
+
+        for robot in frontiers:
+            layer = int(layer_by_id.get(robot.robot_id, 0))
+            slot_index = int(slot_by_id.get(robot.robot_id, -1))
+            column = slot_index % cols if slot_index >= 0 else fallback_columns.get(robot.robot_id, 0)
+            column = int(np.clip(column, 0, cols - 1))
+            axial_offset = (layer - mean_layer) * row_spacing
+            if sealed_min is not None and sealed_max is not None and cols > 1:
+                lateral_offset = (
+                    float(sealed_min)
+                    + (float(sealed_max) - float(sealed_min)) * column / (cols - 1)
+                )
+            else:
+                lateral_offset = (
+                    0.0
+                    if cols <= 1
+                    else -usable_half + 2.0 * usable_half * column / (cols - 1)
+                )
+            relative[robot.robot_id] = (float(axial_offset), float(lateral_offset))
+
+        # Choose the scalar centroid depth that minimizes the initial correction
+        # when the skewed Guard becomes the straight Frontier.
+        centroid_candidates = [
+            actual[robot.robot_id][0] - relative[robot.robot_id][0]
+            for robot in frontiers
+        ]
+        centroid_axial = float(np.median(centroid_candidates))
+        centroid_lateral = 0.0
+        lifecycle["regularized_usable_half"] = usable_half
+        lifecycle["regularized_wall"] = True
+        return centroid_axial, centroid_lateral, relative
+
+    def lifecycle_target(
+        lifecycle: dict[str, Any],
+        centroid_depth: float,
+        axial_offset: float,
+        lateral_offset: float,
+    ) -> pygame.Vector2:
+        center = lifecycle.get("mouth_center_world")
+        tangent = lifecycle.get("branch_tangent_unit")
+        lateral_axis = lifecycle.get("mouth_lateral_unit")
+        if center is None or tangent is None or lateral_axis is None:
+            raise RuntimeError("lifecycle target requires a transport frame")
+        return (
+            center
+            + tangent * (centroid_depth + axial_offset)
+            + lateral_axis * lateral_offset
+        )
+
+    def resolve_common_shepherd_centroid_depth(
+        branch: str,
+        lifecycle: dict[str, Any],
+        desired_centroid_depth: float,
+    ) -> float | None:
+        """Find the deepest common 3xN cross-section that is fully walkable."""
+        relative = lifecycle.get("relative_offsets", {})
+        if not relative:
+            return None
+
+        def formation_is_walkable(centroid_depth: float) -> bool:
+            return all(
+                physical.is_walkable(
+                    lifecycle_target(lifecycle, centroid_depth, axial, lateral),
+                    physical.ROBOT_RADIUS,
+                )
+                for axial, lateral in relative.values()
+            )
+
+        desired_centroid_depth = max(0.0, float(desired_centroid_depth))
+        if formation_is_walkable(desired_centroid_depth):
+            return desired_centroid_depth
+
+        # Search continuously back toward the Junction until the complete 3xN
+        # formation fits.  v13 limited this search to only ~10 robot radii; when
+        # the dead-end contact was oblique or the three rows were compressed,
+        # saturation could be TRUE while promotion returned [] forever, leaving
+        # the phase stuck in EXPLORE_BRANCH.  The current robot positions are
+        # already physically inside the corridor, so a common safe cross-section
+        # must be sought over the whole traversed branch, not an arbitrary short
+        # retreat window.
+        step = max(0.20, float(physical.ROBOT_RADIUS) * 0.20)
+        candidate = desired_centroid_depth - step
+        while candidate >= -physical.EPSILON:
+            candidate = max(0.0, candidate)
+            if formation_is_walkable(candidate):
+                return candidate
+            if candidate <= physical.EPSILON:
+                break
+            candidate -= step
+        return None
+
     def local_frontier_progress(
         robots: Sequence[Any], branch: str, dt: float
     ) -> None:
@@ -2288,13 +2956,57 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         ):
             return
         physical.refresh_frontier_row_readiness(robots, branch)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        if lifecycle is not None:
+            expected_wall = int(lifecycle.get("rows", 0)) * int(lifecycle.get("cols", 0))
+            if len(frontiers) == expected_wall:
+                # The handoff lifecycle is the frozen physical formation. Do
+                # not let the legacy single-row descriptor audit disable the
+                # already-created thick Frontier wall.
+                physical.frontier_line_row_ready = True
+                physical.frontier_line_continuous = True
         if physical.frontier_line_row_ready:
             physical.update_frontier_lateral_center(
                 robots, branch, descriptor, dt
             )
             physical.refresh_frontier_row_readiness(robots, branch)
+            if lifecycle is not None and len(frontiers) == expected_wall:
+                physical.frontier_line_row_ready = True
+                physical.frontier_line_continuous = True
         if not physical.frontier_line_row_ready:
             return
+
+        # Before translating down the branch, let the selected Guard IDs settle
+        # onto the straight corridor cross-section at the current scalar depth.
+        # Without this bounded settle, LEFT/RIGHT rows can begin moving while
+        # still carrying the perspective skew of the mouth chord and the lower
+        # edge can scrape the side wall.
+        if lifecycle is not None and lifecycle.get("regularized_wall"):
+            target_errors = []
+            for robot in frontiers:
+                target = thick_frontier_slot_target(
+                    robot, physical.frontier_line_depth
+                )
+                if target is not None:
+                    target_errors.append(robot.position.distance_to(target))
+            max_straighten_error = max(target_errors, default=0.0)
+            straighten_tolerance = max(
+                float(physical.JUNCTION_GUARD_POSITION_TOLERANCE),
+                1.25 * float(physical.ROBOT_RADIUS),
+            )
+            if max_straighten_error > straighten_tolerance:
+                if getattr(physical, "integration_frame", 0) % 20 == 0:
+                    print(
+                        f"[FrontierAlignmentCorrection] branch={branch} "
+                        f"max_error={max_straighten_error:.3f} "
+                        f"tol={straighten_tolerance:.3f} "
+                        "advance=True coupled_translation=True"
+                    )
+                # Do NOT return. The Guard was already generated perpendicular;
+                # any residual error is only physical settling.  Advancing the
+                # scalar centroid at the same time keeps this wall at the front
+                # instead of letting the NORMAL SPH body pass it.
+
         usable_half = physical.local_physical_usable_half_width(descriptor)
         normal_depths = []
         for robot in robots:
@@ -2312,14 +3024,101 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
             if normal_depths else 0.0
         )
+        axial_offsets = (
+            [float(value[0]) for value in lifecycle.get("relative_offsets", {}).values()]
+            if lifecycle is not None else []
+        )
+        trailing_offset = min(axial_offsets, default=0.0)
+        # Keep the trailing edge of the complete multi-row wall ahead of the
+        # NORMAL support front, not merely the wall centroid.
+        supported_target = (
+            supported_front
+            + physical.FRONTIER_LINE_LEAD_GAP
+            - trailing_offset
+        )
+        bootstrap_target = (
+            float(lifecycle.get("frontier_bootstrap_target_depth", physical.frontier_line_depth))
+            if lifecycle is not None
+            else physical.frontier_line_depth
+        )
         desired = max(
             physical.frontier_line_depth,
-            supported_front + physical.FRONTIER_LINE_LEAD_GAP,
+            supported_target,
+            bootstrap_target,
         )
-        physical.frontier_line_depth = min(
+
+        # Advance the complete multi-row Frontier monotonically.  The former
+        # contact handler could lower ``frontier_line_depth`` after a single
+        # leading robot reported a bumper hit.  A side/edge false-positive then
+        # moved every target backward for a few frames, which looked like the
+        # Shepherd/Frontier was being pushed away before the swarm touched it.
+        #
+        # Instead, predict the *next* rigid-wall target and freeze at the
+        # current depth only when a spatially distributed subset of the leading
+        # row would become non-walkable.  The scalar depth is never decreased.
+        next_depth = min(
             desired,
             physical.frontier_line_depth
             + physical.FRONTIER_LINE_ADVANCE_SPEED * dt,
+        )
+        if lifecycle is not None and axial_offsets:
+            frozen_depth = lifecycle.get("frontier_contact_centroid_depth")
+            if frozen_depth is not None:
+                # A confirmed dead-end contact is sticky for this branch.
+                next_depth = physical.frontier_line_depth
+            else:
+                layer_by_id = lifecycle.get("guard_layer_by_id", {})
+                leading_layer = max(layer_by_id.values(), default=-1)
+                leading_ids = [
+                    robot_id for robot_id, layer in layer_by_id.items()
+                    if layer == leading_layer
+                ]
+                center = lifecycle.get("mouth_center_world")
+                tangent = lifecycle.get("branch_tangent_unit")
+                lateral_axis = lifecycle.get("mouth_lateral_unit")
+                blocked_leading = []
+                if (
+                    leading_ids
+                    and center is not None
+                    and tangent is not None
+                    and lateral_axis is not None
+                    and next_depth > physical.frontier_line_depth + physical.EPSILON
+                ):
+                    for robot_id in leading_ids:
+                        axial_offset, lateral_offset = lifecycle["relative_offsets"].get(
+                            robot_id, (0.0, 0.0)
+                        )
+                        probe_target = lifecycle_target(
+                            lifecycle, next_depth, axial_offset, lateral_offset
+                        )
+                        if not physical.is_walkable(
+                            probe_target, physical.ROBOT_RADIUS
+                        ):
+                            blocked_leading.append(robot_id)
+
+                # One edge robot grazing a side wall is not a dead-end.  Require
+                # at least half of the leading row (and at least two robots) to
+                # agree in the same predicted step before freezing the entire
+                # 3-row formation.
+                required_contact = max(2, int(math.ceil(0.5 * len(leading_ids))))
+                if blocked_leading and len(blocked_leading) >= required_contact:
+                    lifecycle["frontier_contact_centroid_depth"] = float(
+                        physical.frontier_line_depth
+                    )
+                    next_depth = physical.frontier_line_depth
+                    print(
+                        f"[FrontierRigidContact] branch={branch} "
+                        f"centroid_depth={physical.frontier_line_depth:.3f} "
+                        f"leading_blocked={len(blocked_leading)}/{len(leading_ids)} "
+                        f"rows={lifecycle.get('rows', 0)} "
+                        f"cols={lifecycle.get('cols', 0)} "
+                        "freeze_complete_wall=True monotonic_depth=True"
+                    )
+
+        # Never command a backward axial target during EXPLORE_BRANCH.
+        physical.frontier_line_depth = max(
+            physical.frontier_line_depth,
+            next_depth,
         )
 
     def sample_local_state(
@@ -2476,20 +3275,38 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         }
         diagnostics.cross_section_fill = len(occupied) / max(bin_count, 1)
         travelled = diagnostics.maximum_depth - diagnostics.start_depth
-        conditions = (
+        # There are two valid local saturation paths.  The original density path
+        # remains available, but a physically confirmed rigid Frontier contact
+        # is stronger dead-end evidence than a small density-ratio rise.  In the
+        # latter case the 3-row leading layer has already found the map wall with
+        # majority contact, so do not leave EXPLORE_BRANCH waiting forever for
+        # rho_ratio >= 1.02 while the packed body is visibly stalled behind it.
+        contact_confirmed = bool(
+            lifecycle is not None
+            and lifecycle.get("frontier_contact_centroid_depth") is not None
+        )
+        common_saturation_evidence = (
             len(cohort) >= physical.SATURATION_MIN_TIP_ROBOTS
             and travelled >= max(
                 physical.JUNCTION_COHORT_MIN_TRAVEL,
                 descriptor.observed_physical_width,
             )
             and diagnostics.frontier_stalled
-            and diagnostics.local_density_ratio
-            >= physical.SATURATION_DENSITY_RATIO
             and diagnostics.local_pressure_ratio
             >= LOCAL_SATURATION_PRESSURE_RATIO
             and diagnostics.cross_section_fill
             >= physical.SATURATION_PACKED_LATERAL_COVERAGE_RATIO
         )
+        density_saturation = (
+            common_saturation_evidence
+            and diagnostics.local_density_ratio
+            >= physical.SATURATION_DENSITY_RATIO
+        )
+        contact_saturation = (
+            common_saturation_evidence
+            and contact_confirmed
+        )
+        conditions = density_saturation or contact_saturation
         diagnostics.dwell = diagnostics.dwell + dt if conditions else 0.0
         diagnostics.saturated = (
             diagnostics.dwell >= physical.SATURATION_DWELL_TIME
@@ -2507,6 +3324,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"pressure={diagnostics.local_pressure:.2f} "
                 f"pressure_ratio={diagnostics.local_pressure_ratio:.2f} "
                 f"cross_fill={diagnostics.cross_section_fill:.2f} "
+                f"contact={contact_confirmed} "
+                f"mode={'CONTACT' if contact_saturation else ('DENSITY' if density_saturation else '-')} "
                 f"dwell={diagnostics.dwell:.2f} "
                 f"saturated={diagnostics.saturated}"
             )
@@ -2557,67 +3376,574 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             return descriptor.local_return_direction.normalize()
         return pygame.Vector2()
 
+    def shepherd_line_leading_depth(
+        robots: Sequence[Any], branch: str, descriptor: Any
+    ) -> float | None:
+        """Estimate the current dead-end-side depth of the intact Shepherd wall."""
+        estimates: list[float] = []
+        for robot in physical.get_shepherds(robots):
+            if robot.shepherd_branch != branch or robot.shepherd_anchor is None:
+                continue
+            axial = physical.observed_branch_axial_depth(robot.position, descriptor)
+            stored = physical.integration_shepherd_anchor_offsets.get(
+                id(robot.shepherd_anchor)
+            )
+            axial_offset = float(stored[0]) if stored is not None else 0.0
+            estimates.append(float(axial - axial_offset))
+        if not estimates:
+            return None
+        return float(np.median(estimates))
+
+    def backtrack_pack_support(
+        robots: Sequence[Any], branch: str
+    ) -> tuple[float | None, float | None, int, float]:
+        """Return a *full-cross-section* NORMAL rear surface for the piston.
+
+        The previous implementation used a single 95th percentile over all
+        NORMAL depths.  A thin handful of robots near the Shepherd could move
+        first, drag that percentile toward the Junction, and let the rigid
+        Shepherd wall follow while most of the swarm was still behind.
+
+        The working Physical DFS behaves like a width-filling piston.  Recreate
+        that semantics without the old invisible curtain: split the physical
+        corridor width into Shepherd-column bins, require broad lateral support,
+        and derive the return target from the rear surface of those occupied
+        bins.  If the cross-section loses support, the Shepherd holds position.
+        """
+        descriptor = descriptor_for(branch)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        if descriptor is None or lifecycle is None:
+            return None, None, 0, 0.0
+        leading_depth = shepherd_line_leading_depth(robots, branch, descriptor)
+        if leading_depth is None:
+            return None, None, 0, 0.0
+
+        relative = lifecycle.get("relative_offsets", {})
+        raw_axial_offsets = [float(value[0]) for value in relative.values()]
+        # The return scalar is the dead-end-side leading row. Promotion stores
+        # each row relative to max(raw_axial_offset), so the Junction-facing row
+        # is min(raw)-max(raw). Earlier pack-coupled revisions used min(raw)
+        # directly, which shifted the contact plane and could let the line run
+        # ahead of the actual herd.
+        minimum_axial_offset = (
+            min(raw_axial_offsets) - max(raw_axial_offsets)
+            if raw_axial_offsets else 0.0
+        )
+        junction_face_depth = float(leading_depth + minimum_axial_offset)
+        usable_half = max(
+            physical.local_physical_usable_half_width(descriptor),
+            float(lifecycle.get("usable_half_width", 0.0)),
+        )
+        if usable_half <= physical.EPSILON:
+            return None, None, 0, 0.0
+
+        cols = max(1, int(lifecycle.get("cols", 1)))
+        bin_count = max(5, cols)
+        face_tolerance = 0.65 * physical.ROBOT_RADIUS
+        contact_window = max(
+            physical.SHEPHERD_LOCAL_FLOW_DEPTH,
+            6.0 * physical.ROBOT_RADIUS,
+        )
+        lateral_limit = usable_half + physical.ROBOT_RADIUS
+        per_bin_depths: list[list[float]] = [[] for _ in range(bin_count)]
+        contact_samples: list[tuple[float, float]] = []
+
+        for robot in robots:
+            if robot.role != "NORMAL" or robot.base_reserve:
+                continue
+            axial, lateral = physical.branch_local_coordinates(robot.position, descriptor)
+            axial = float(axial)
+            lateral = float(lateral)
+            if not (
+                junction_face_depth - contact_window <= axial
+                <= junction_face_depth + face_tolerance
+                and abs(lateral) <= lateral_limit
+            ):
+                continue
+            contact_samples.append((axial, lateral))
+            u = (lateral + usable_half) / max(2.0 * usable_half, physical.EPSILON)
+            index = int(physical.clamp(u * bin_count, 0, bin_count - 1))
+            per_bin_depths[index].append(axial)
+
+        occupied = [values for values in per_bin_depths if values]
+        coverage = len(occupied) / max(bin_count, 1)
+        if not occupied:
+            return None, None, 0, coverage
+
+        # One rear surface estimate per lateral lane.  Using lane maxima rather
+        # than one global robot percentile prevents one narrow stream from
+        # pulling the whole 3xN Shepherd wall through the rest of the body.
+        lane_rears = [max(values) for values in occupied]
+        rear_depth = (
+            float(np.quantile(lane_rears, 0.90))
+            if len(lane_rears) >= 5
+            else float(max(lane_rears))
+        )
+        rear_band = max(3.0 * physical.ROBOT_RADIUS, physical.SAFE_RADIUS * 0.55)
+        support_count = sum(
+            1 for axial, _ in contact_samples if axial >= rear_depth - rear_band
+        )
+
+        contact_center_gap = 2.05 * physical.ROBOT_RADIUS
+        support_depth = (
+            rear_depth + contact_center_gap - minimum_axial_offset
+        )
+        support_depth = max(0.0, float(support_depth))
+
+        # A rigid full-width Shepherd may advance only with a broad physical rear
+        # surface.  Otherwise return None so the caller holds the current depth.
+        minimum_coverage = max(
+            0.70,
+            float(physical.SATURATION_PACKED_LATERAL_COVERAGE_RATIO),
+        )
+        minimum_support = max(
+            physical.FLOW_MIN_NORMAL_COUNT,
+            int(math.ceil(cols * 0.90)),
+        )
+        if coverage < minimum_coverage or support_count < minimum_support:
+            return rear_depth, None, support_count, coverage
+        return rear_depth, support_depth, support_count, coverage
+
+    def shepherd_pack_contact_state(
+        robots: Sequence[Any], branch: str
+    ) -> dict[str, float | int | bool]:
+        """Strict pre-return gate matching the reference fill-before-push order."""
+        descriptor = descriptor_for(branch)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        if descriptor is None or lifecycle is None:
+            return {
+                "ready": False, "rear_depth": -1.0, "junction_face_depth": -1.0,
+                "gap": float("inf"), "support_count": 0, "pack_count": 0,
+                "coverage": 0.0,
+            }
+        shepherds = [
+            robot for robot in physical.get_shepherds(robots)
+            if robot.shepherd_branch == branch
+        ]
+        if not shepherds:
+            return {
+                "ready": False, "rear_depth": -1.0, "junction_face_depth": -1.0,
+                "gap": float("inf"), "support_count": 0, "pack_count": 0,
+                "coverage": 0.0,
+            }
+
+        relative = lifecycle.get("relative_offsets", {})
+        raw_axial_offsets = [float(value[0]) for value in relative.values()]
+        # The return scalar is the dead-end-side leading row. Promotion stores
+        # each row relative to max(raw_axial_offset), so the Junction-facing row
+        # is min(raw)-max(raw). Earlier pack-coupled revisions used min(raw)
+        # directly, which shifted the contact plane and could let the line run
+        # ahead of the actual herd.
+        minimum_axial_offset = (
+            min(raw_axial_offsets) - max(raw_axial_offsets)
+            if raw_axial_offsets else 0.0
+        )
+        leading_depth = shepherd_line_leading_depth(robots, branch, descriptor)
+        if leading_depth is None:
+            return {
+                "ready": False, "rear_depth": -1.0, "junction_face_depth": -1.0,
+                "gap": float("inf"), "support_count": 0, "pack_count": 0,
+                "coverage": 0.0,
+            }
+        junction_face_depth = max(0.0, float(leading_depth + minimum_axial_offset))
+        rear_depth, support_depth, support_count, coverage = backtrack_pack_support(
+            robots, branch
+        )
+
+        usable_half = max(
+            physical.local_physical_usable_half_width(descriptor),
+            float(lifecycle.get("usable_half_width", 0.0)),
+        )
+        pack_window = max(
+            physical.SHEPHERD_LOCAL_FLOW_DEPTH,
+            6.0 * physical.ROBOT_RADIUS,
+        )
+        pack_count = 0
+        for robot in robots:
+            if robot.role != "NORMAL" or robot.base_reserve:
+                continue
+            axial, lateral = physical.branch_local_coordinates(robot.position, descriptor)
+            if (
+                junction_face_depth - pack_window <= axial
+                <= junction_face_depth + 0.65 * physical.ROBOT_RADIUS
+                and abs(lateral) <= usable_half + physical.ROBOT_RADIUS
+            ):
+                pack_count += 1
+
+        gap = (
+            float(junction_face_depth - rear_depth)
+            if rear_depth is not None else float("inf")
+        )
+        cols = max(1, int(lifecycle.get("cols", 1)))
+        min_pack_count = max(
+            physical.SATURATION_MIN_TIP_ROBOTS,
+            int(math.ceil(cols * 2.0)),
+        )
+        max_contact_gap = max(
+            3.0 * physical.ROBOT_RADIUS,
+            0.50 * physical.SAFE_RADIUS,
+        )
+        ready = bool(
+            support_depth is not None
+            and pack_count >= min_pack_count
+            and -1.5 * physical.ROBOT_RADIUS <= gap <= max_contact_gap
+        )
+        return {
+            "ready": ready,
+            "rear_depth": rear_depth if rear_depth is not None else -1.0,
+            "junction_face_depth": junction_face_depth,
+            "gap": gap,
+            "support_count": support_count,
+            "pack_count": pack_count,
+            "coverage": coverage,
+        }
+
+
+ #브랜치 안쪽에 있는 NORMAL 로봇 무리가 실제로 Junction 방향으로 밀려나오는 만큼만 Shepherd 대열도 뒤따라오게 하는 제어기
+    def update_pack_coupled_backtrack_depth(
+        robots: Sequence[Any], branch: str, dt: float
+    ) -> None:
+       
+        """Move the return piston only as the physical SPH pack yields.
+
+        v15 paced only ``FLOW_BACKTRACK``.  Most of the apparent solo sprint
+        actually happened one phase earlier in ``PRESSURE_PUSH``, where the
+        legacy time-driven Shepherd curtain was still shrinking toward the
+        Junction.  This controller owns BOTH phases.  While NORMAL robots
+        remain in front of the line, the target is determined by their rear
+        surface only; elapsed time can no longer drag the Shepherd through the
+        pack.  Once the branch body is genuinely clear, the intact line is
+        allowed to finish its return to the Junction.
+        """
+        if physical.phase not in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }:
+            return
+        
+        descriptor = descriptor_for(branch)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        if descriptor is None or lifecycle is None:
+            return
+
+        # 현재 shepherd line의 dead-end-side depth를 추정. 만약 None이면, 즉 현재 shepherd line이 존재하지 않으면 함수 종료
+        # 즉, 현재 shepherd line이 Junction 에서 얼마나 떨어져 있는지를 측정
+        current_line = shepherd_line_leading_depth(robots, branch, descriptor)
+        if current_line is None:
+            return
+        previous_command = getattr(
+            physical, "integration_backtrack_command_depth", None
+        )
+        if previous_command is None:
+            previous_command = current_line
+
+        rear_depth, support_depth, support_count, lateral_coverage = (
+            backtrack_pack_support(robots, branch)
+        )
+        active_branch_normals = 0
+        for robot in robots:
+            if robot.role != "NORMAL" or robot.base_reserve:
+                continue
+            axial, lateral = physical.branch_local_coordinates(robot.position, descriptor)
+            if (
+                axial > 0.0
+                and abs(lateral)
+                <= max(
+                    physical.local_physical_usable_half_width(descriptor),
+                    float(lifecycle.get("usable_half_width", 0.0)),
+                ) + 2.0 * physical.ROBOT_RADIUS
+            ):
+                active_branch_normals += 1
+
+        cols = max(1, int(lifecycle.get("cols", 1)))
+        min_support = max(
+            physical.FLOW_MIN_NORMAL_COUNT,
+            int(math.ceil(cols * 0.90)),
+        )
+        pack_present = bool(
+            support_depth is not None
+            and support_count >= min_support
+            and lateral_coverage >= max(
+                0.70, physical.SATURATION_PACKED_LATERAL_COVERAGE_RATIO
+            )
+        )
+
+        if pack_present:
+            # STRICT CONTACT COUPLING: no timer target here.  If the rear
+            # surface of the pack does not move toward the Junction, the
+            # Shepherd target does not move either.
+            desired = float(support_depth)
+            mode = "PACK_CONTACT"
+        elif active_branch_normals > physical.BRANCH_CLEAR_LIMIT:
+            # The branch still contains a body but the rear cross-section is
+            # temporarily sparse.  Hold the line rather than chasing isolated
+            # robots through the pack.
+            desired = float(previous_command) # shepherd 가 normal 로봇을 뚫고 지나가는 것을 막는 안전장치
+            mode = "HOLD_FOR_PACK"
+        else:
+            # The body has cleared the branch.  Only now may the Shepherd line
+            # finish the last short trip to the Junction on its own.
+            desired = 0.0
+            mode = "BRANCH_CLEAR_FINISH"
+
+        # Command motion is deliberately bounded in both directions.  A small
+        # dead-end-side backoff is allowed if the viscoelastic body rebounds
+        # into the Shepherd; this prevents the kinematic Shepherd row from
+        # numerically tunnelling through NORMAL robots.
+        # The target itself is the speed limiter.  Do not use the old
+        # ROBOT_RADIUS-per-frame floor: Robot.update() chases its target with the
+        # much larger SHEPHERD_FORM_SPEED, so even a modest target jump can look
+        # like teleportation.  The piston now advances only a few pixels/second
+        # and, more importantly, only when the NORMAL rear surface advances.
+        herd_return_speed_scale = 0.65 # Shepherd 의 복귀 속도를 65%로 제한
+        forward_speed = min(
+            physical.SHEPHERD_LINE_BACKTRACK_SPEED,
+            physical.SHEPHERD_PISTON_SPEED,
+        ) * herd_return_speed_scale
+        max_forward_step = max(0.0, forward_speed * dt)
+        max_backoff_step = max_forward_step * 0.50
+        if desired < float(previous_command):
+            command = max(float(desired), float(previous_command) - max_forward_step)
+        elif desired > float(previous_command):
+            command = min(float(desired), float(previous_command) + max_backoff_step)
+        else:
+            command = float(previous_command)
+        command = max(0.0, command)
+
+        physical.integration_backtrack_command_depth = command
+        physical.integration_backtrack_pack_rear_depth = rear_depth
+        physical.integration_backtrack_support_depth = support_depth
+        physical.integration_backtrack_support_count = support_count
+        physical.integration_backtrack_lateral_coverage = lateral_coverage
+
+        relative = lifecycle.get("relative_offsets", {})
+        raw_axial_offsets = [float(value[0]) for value in relative.values()]
+        # The return scalar is the dead-end-side leading row. Promotion stores
+        # each row relative to max(raw_axial_offset), so the Junction-facing row
+        # is min(raw)-max(raw). Earlier pack-coupled revisions used min(raw)
+        # directly, which shifted the contact plane and could let the line run
+        # ahead of the actual herd.
+        minimum_axial_offset = (
+            min(raw_axial_offsets) - max(raw_axial_offsets)
+            if raw_axial_offsets else 0.0
+        )
+        junction_face_depth = command + minimum_axial_offset
+        pack_gap = (
+            junction_face_depth - rear_depth
+            if rear_depth is not None else float("nan")
+        )
+        frame = getattr(physical, "integration_frame", -1)
+        if frame % 10 == 0:
+            print(
+                f"[ReturnPistonContact] frame={frame} phase={physical.phase.name} "
+                f"branch={branch} command_depth={command:.3f} "
+                f"pack_rear={rear_depth if rear_depth is not None else -1.0:.3f} "
+                f"support_depth={support_depth if support_depth is not None else -1.0:.3f} "
+                f"support_count={support_count} coverage={lateral_coverage:.3f} "
+                f"branch_normals={active_branch_normals} pack_gap={pack_gap:.3f} "
+                f"mode={mode}"
+            )
+
+    def pack_coupled_shepherd_curtain_depth(branch: str) -> float:
+        """Return the physical contact-piston depth in both return phases."""
+        if physical.phase in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }:
+            command = getattr(
+                physical, "integration_backtrack_command_depth", None
+            )
+            if command is not None and branch == physical.active_branch:
+                return max(0.0, float(command))
+        return float(original_get_shepherd_curtain_depth(branch))
+
+
+
+    def pack_coupled_route_force(robot: Any) -> pygame.Vector2:
+        """Keep active-branch NORMALs moving to the Junction during return.
+
+        The legacy transfer controller may start steering toward the next child
+        while the old branch is still draining.  During PRESSURE_PUSH and
+        FLOW_BACKTRACK we instead keep robots physically in the active branch
+        moving along the observed return axis.  Once they reach the Junction,
+        the original controller resumes.
+        """
+        if (
+            physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
+            and robot.role == "NORMAL"
+            and not robot.base_reserve
+        ):
+            branch = physical.active_branch
+            descriptor = descriptor_for(branch)
+            if descriptor is not None:
+                axial, lateral = physical.branch_local_coordinates(
+                    robot.position, descriptor
+                )
+                usable_half = physical.local_physical_usable_half_width(descriptor)
+                if (
+                    axial > 0.0
+                    and abs(lateral)
+                    <= usable_half + 2.5 * physical.ROBOT_RADIUS
+                ):
+                    # Match the working reference Physical DFS: NORMAL robots in
+                    # the source branch receive the full return-body drive while
+                    # the real Shepherd robots supply the finite-radius piston
+                    # pressure.  The previous 0.10 scaling made the kinematic
+                    # Shepherd target much faster than the SPH body and is the
+                    # direct reason the Shepherd appeared to sprint home alone.
+                    gain = (
+                        physical.PRESSURE_BACKTRACK_BODY_FORCE
+                        if physical.phase == physical.SimulationPhase.PRESSURE_PUSH
+                        else physical.FLOW_BACKTRACK_FORCE
+                    ) * physical.integration_shepherd_return_bias_scale
+                    return descriptor.local_return_direction.normalize() * gain
+        return original_compute_route_force(robot)
+
     def local_slot_at_depth(
         anchor: pygame.Vector2, branch: str, depth: float
     ) -> pygame.Vector2:
+        """Reference-style backtracking: keep transverse slot, reduce depth only."""
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
         descriptor = descriptor_for(branch)
-        if descriptor is None:
+        if lifecycle is None or descriptor is None:
             return anchor.copy()
         stored = physical.integration_shepherd_anchor_offsets.get(id(anchor))
         if stored is None:
-            _, lateral = physical.branch_local_coordinates(anchor, descriptor)
+            center = lifecycle.get("mouth_center_world")
+            tangent = lifecycle.get("branch_tangent_unit")
+            lateral_axis = lifecycle.get("mouth_lateral_unit")
+            if center is None or tangent is None or lateral_axis is None:
+                return anchor.copy()
+            delta = anchor - center
+            # Without a stored leading-edge offset, keep the anchor's own
+            # cross-section identity and treat it as the leading row.
             axial_offset = 0.0
+            lateral = float(delta.dot(lateral_axis))
         else:
             axial_offset, lateral = stored
-        return physical.local_coordinates_to_world(
-            descriptor, depth + axial_offset, lateral
+        return lifecycle_target(
+            lifecycle, max(0.0, float(depth)), float(axial_offset), float(lateral)
         )
 
     def promote_thick_frontier_wall(
         robots: Sequence[Any], branch: str,
         observed_boundary_depth: float | None = None,
     ) -> list[Any]:
-        """Role-only SAME-27 Frontier-to-Shepherd transition."""
+        """Flatten SAME Frontier IDs onto a full-width 3xN dead-end piston.
+
+        This mirrors the working Physical DFS handoff: the same Frontier IDs are
+        retained, a deepest common walkable cross-section is found, and every
+        Shepherd keeps its transverse slot while the scalar line depth later
+        moves back toward the Junction.
+        """
         lifecycle = physical.integration_wall_lifecycle[branch]
         frontiers = physical.get_frontier_shepherds(robots, branch)
-        expected = lifecycle["rows"] * lifecycle["cols"]
+        expected = int(lifecycle["rows"]) * int(lifecycle["cols"])
         if len(frontiers) != expected:
-            raise RuntimeError("thick Frontier wall lost members")
+            raise RuntimeError(
+                f"thick Frontier wall lost members: {len(frontiers)}/{expected}"
+            )
+        descriptor = descriptor_for(branch)
+        if descriptor is None:
+            raise RuntimeError(f"missing descriptor for Shepherd promotion {branch}")
+        lock_branch_transport_frame(branch, lifecycle, descriptor)
+
+        relative = lifecycle.get("relative_offsets", {})
+        if set(relative) != {robot.robot_id for robot in frontiers}:
+            raise RuntimeError("Shepherd promotion lost regularized Frontier offsets")
         maximum_axial_offset = max(
-            lifecycle["relative_offsets"][robot.robot_id][0]
-            for robot in frontiers
+            float(relative[robot.robot_id][0]) for robot in frontiers
         )
-        promoted = []
+
+        centroid_candidates = []
+        center = lifecycle["mouth_center_world"]
+        tangent = lifecycle["branch_tangent_unit"]
         for robot in frontiers:
-            axial_offset, lateral_offset = lifecycle[
-                "relative_offsets"
-            ][robot.robot_id]
+            actual_axial = float((robot.position - center).dot(tangent))
+            axial_offset, _ = relative[robot.robot_id]
+            centroid_candidates.append(actual_axial - axial_offset)
+        formation_centroid_depth = float(np.median(centroid_candidates))
+
+        if lifecycle.get("frontier_contact_centroid_depth") is not None:
+            formation_centroid_depth = min(
+                formation_centroid_depth,
+                float(lifecycle["frontier_contact_centroid_depth"]),
+            )
+        if observed_boundary_depth is not None and math.isfinite(observed_boundary_depth):
+            # observed_boundary_depth is the line median in the locked t-axis.
+            formation_centroid_depth = min(
+                formation_centroid_depth, float(observed_boundary_depth)
+            )
+
+        safe_centroid_depth = resolve_common_shepherd_centroid_depth(
+            branch, lifecycle, formation_centroid_depth
+        )
+        if safe_centroid_depth is None:
+            print(
+                f"[ShepherdCommonDepthWait] branch={branch} "
+                f"candidate={formation_centroid_depth:.3f} reason=NO_COMMON_WALKABLE_3XN"
+            )
+            return []
+
+        promoted = []
+        target_errors = []
+        for robot in frontiers:
+            axial_offset, lateral_offset = relative[robot.robot_id]
+            target = lifecycle_target(
+                lifecycle, safe_centroid_depth, axial_offset, lateral_offset
+            )
+            if not physical.is_walkable(target, robot.radius):
+                raise RuntimeError(
+                    f"non-walkable Shepherd target after common-depth solve: "
+                    f"branch={branch} robot={robot.robot_id}"
+                )
+            target_errors.append(robot.position.distance_to(target))
             robot.role = "SHEPHERD"
-            # Current position is the stationary formation target. During
-            # return, id(anchor) retrieves only the stored local offsets.
-            robot.shepherd_anchor = robot.position.copy()
+            robot.shepherd_anchor = target.copy()
             robot.shepherd_origin = robot.position.copy()
             robot.shepherd_branch = branch
-            physical.integration_shepherd_anchor_offsets[
-                id(robot.shepherd_anchor)
-            ] = (
-                # Reference curtain depth denotes the leading edge. Shift the
-                # centroid-relative offset so the outward-most layer reaches
-                # depth zero while all three rows retain their separation
-                # inside the walkable Junction.
-                axial_offset - maximum_axial_offset,
-                lifecycle["centroid_lateral"] + lateral_offset,
+            # get_shepherd_curtain_depth() is a leading-edge scalar.  Store each
+            # row relative to that leading edge, exactly like the reference DFS
+            # preserves anchor.y/x while depth decreases.
+            physical.integration_shepherd_anchor_offsets[id(robot.shepherd_anchor)] = (
+                float(axial_offset - maximum_axial_offset),
+                float(lateral_offset),
             )
             robot.junction_guard_anchor = None
             robot.velocity.update(0.0, 0.0)
             robot.acceleration.update(0.0, 0.0)
             robot.filtered_acceleration.update(0.0, 0.0)
             promoted.append(robot)
+
+        leading_edge_depth = safe_centroid_depth + maximum_axial_offset
+        physical.observed_dead_end_depths[branch] = float(leading_edge_depth)
+        lifecycle["shepherd_centroid_depth"] = safe_centroid_depth
+        lifecycle["shepherd_leading_edge_depth"] = leading_edge_depth
+        lifecycle["shepherd_shape_locked"] = True
         lifecycle["state"] = "SHEPHERD"
+
         physical.frontier_line_branch = None
         physical.frontier_line_depth = 0.0
         physical.frontier_line_lateral_center = 0.0
         physical.frontier_line_row_ready = False
+
+        print(
+            f"[ShepherdCommonDepth] branch={branch} "
+            f"candidate={formation_centroid_depth:.3f} safe_centroid={safe_centroid_depth:.3f} "
+            f"leading_edge={leading_edge_depth:.3f} "
+            f"rows={lifecycle['rows']} cols={lifecycle['cols']} robots={len(promoted)} "
+            f"full_width=True all_targets_walkable=True"
+        )
+        print(
+            f"[ShepherdShapeLock] branch={branch} "
+            f"rows={lifecycle['rows']} cols={lifecycle['cols']} "
+            f"robots={len(promoted)} "
+            f"max_settle_distance={max(target_errors, default=0.0):.3f} "
+            "straight_cross_section=True same_ids=True position_jump=0"
+        )
         print(
             f"[Frontier -> Shepherd] retained thick wall IDs="
             f"{sorted(robot.robot_id for robot in promoted)}; "
@@ -2626,15 +3952,51 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         return promoted
 
+    def returned_guard_wall_ready(robots: Sequence[Any], branch: str) -> bool:
+        """True only when the returned SAME-ID wall is back on its frozen mouth slots."""
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        if lifecycle is None:
+            return False
+        expected_ids = set(lifecycle.get("robot_ids", []))
+        anchors = lifecycle.get("guard_anchor_by_id", {})
+        if not expected_ids or set(anchors) != expected_ids:
+            return False
+        guards = {
+            robot.robot_id: robot
+            for robot in robots
+            if robot.robot_id in expected_ids
+            and robot.role == "JUNCTION_GUARD"
+            and robot.junction_guard_branch == branch
+        }
+        if set(guards) != expected_ids:
+            return False
+        return all(
+            guards[robot_id].position.distance_to(anchors[robot_id])
+            <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
+            for robot_id in expected_ids
+        )
+
     def continuous_release_line(robots: Sequence[Any]) -> int:
+        """Dissolve a returned Shepherd line at the Junction, as in baseline DFS.
+
+        The explored branch no longer keeps a persistent Guard/Shepherd wall.
+        Once the intact Shepherd formation has physically returned to the
+        Junction, one Pebble may be staged by the existing Physical-DFS helper
+        and every remaining Shepherd becomes NORMAL at its current position.
+        No position snap is performed.
+        """
         if physical.phase != physical.SimulationPhase.FLOW_BACKTRACK:
             return 0
-        descriptor = descriptor_for(physical.active_branch)
+        branch = physical.active_branch
+        descriptor = descriptor_for(branch)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
         shepherds = [
             robot for robot in physical.get_shepherds(robots)
-            if robot.shepherd_branch == physical.active_branch
+            if robot.shepherd_branch == branch
         ]
-        if descriptor is None or not shepherds:
+        if descriptor is None or lifecycle is None or not shepherds:
+            if not shepherds:
+                physical.integration_return_curtain_active = False
             return 0
         maximum_depth = max(
             physical.observed_branch_axial_depth(robot.position, descriptor)
@@ -2642,36 +4004,523 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         if maximum_depth > physical.SHEPHERD_JUNCTION_DEPTH_TOLERANCE:
             return 0
-        # Pebble staging remains the existing topological completion action;
-        # only the direct coordinate snap from the reference release helper is
-        # removed.  The robots are released exactly where physics delivered them.
-        physical.stage_pebble_from_returned_shepherd_line(
-            robots, physical.active_branch
+
+        # Do not dissolve the Shepherd line just because it reached the mouth.
+        # It is the physical rear piston and must remain intact until the NORMAL
+        # body it was herding has also cleared the active branch.
+        remaining_branch_normals = 0
+        usable_half = max(
+            physical.local_physical_usable_half_width(descriptor),
+            float(lifecycle.get("usable_half_width", 0.0)),
         )
-        direction = descriptor.local_return_direction.normalize()
-        for robot in shepherds:
+        for candidate in robots:
+            if candidate.role != "NORMAL" or candidate.base_reserve:
+                continue
+            axial, lateral = physical.branch_local_coordinates(
+                candidate.position, descriptor
+            )
+            if (
+                axial > physical.ROBOT_RADIUS
+                and abs(lateral) <= usable_half + 2.0 * physical.ROBOT_RADIUS
+            ):
+                remaining_branch_normals += 1
+        if remaining_branch_normals > physical.BRANCH_CLEAR_LIMIT:
+            frame = getattr(physical, "integration_frame", -1)
+            if frame % 15 == 0:
+                print(
+                    f"[ShepherdReleaseWait] frame={frame} branch={branch} "
+                    f"remaining_normals={remaining_branch_normals} "
+                    "reason=HERD_NOT_CLEAR"
+                )
+            return 0
+
+        # Preserve the original topological visit marker, but do not preserve
+        # the physical Shepherd wall on an already-explored branch.
+        physical.stage_pebble_from_returned_shepherd_line(robots, branch)
+        remaining_shepherds = [
+            robot for robot in physical.get_shepherds(robots)
+            if robot.shepherd_branch == branch
+        ]
+        return_direction = descriptor.local_return_direction.normalize()
+        before = {
+            robot.robot_id: robot.position.copy()
+            for robot in remaining_shepherds
+        }
+        # Match each released Shepherd to the nearby NORMAL flow instead of
+        # assigning the exact same velocity to the whole 3xN row.  Equal release
+        # velocities preserve a conspicuously straight line even after the role
+        # and virtual curtain are gone, which looks like an invisible wall.
+        release_velocity_by_id: dict[int, pygame.Vector2] = {}
+        ordinary_normals = [
+            candidate for candidate in robots
+            if candidate.role == "NORMAL" and not candidate.base_reserve
+        ]
+        flow_radius_sq = (2.0 * physical.SMOOTHING_LENGTH) ** 2
+        for shepherd in remaining_shepherds:
+            neighbors = sorted(
+                (
+                    candidate for candidate in ordinary_normals
+                    if candidate.position.distance_squared_to(shepherd.position)
+                    <= flow_radius_sq
+                ),
+                key=lambda candidate: candidate.position.distance_squared_to(
+                    shepherd.position
+                ),
+            )[:10]
+            if neighbors:
+                velocity = pygame.Vector2()
+                for candidate in neighbors:
+                    velocity += candidate.velocity
+                velocity /= len(neighbors)
+            else:
+                velocity = return_direction * min(
+                    4.0, physical.SHEPHERD_JUNCTION_RELEASE_SPEED
+                )
+            release_velocity_by_id[shepherd.robot_id] = velocity
+
+        for robot in remaining_shepherds:
             robot.role = "NORMAL"
             robot.shepherd_anchor = None
             robot.shepherd_origin = None
             robot.frontier_local_lateral = None
             robot.shepherd_branch = None
-            robot.velocity = direction * physical.SHEPHERD_JUNCTION_RELEASE_SPEED
+            robot.junction_guard_anchor = None
+            robot.junction_guard_branch = None
+            robot.junction_guard_branch_uid = None
+            robot.junction_guard_hop = -1
+            robot.junction_guard_parent_id = None
+            robot.junction_guard_layer = -1
+            robot.is_branch_leader = False
+            robot.velocity = release_velocity_by_id[robot.robot_id].copy()
             robot.acceleration.update(0.0, 0.0)
             robot.filtered_acceleration.update(0.0, 0.0)
-        lifecycle = physical.integration_wall_lifecycle.get(
-            physical.active_branch
+
+        released_ids = {robot.robot_id for robot in remaining_shepherds}
+        physical.viscoelastic_rest_lengths = {
+            pair: value
+            for pair, value in physical.viscoelastic_rest_lengths.items()
+            if not released_ids.intersection(pair)
+        }
+        physical.viscoelastic_last_seen = {
+            pair: value
+            for pair, value in physical.viscoelastic_last_seen.items()
+            if not released_ids.intersection(pair)
+        }
+        physical.junction_guard_groups[branch] = []
+        # The baseline shepherd_curtain_active() is phase-only, so FLOW_BACKTRACK
+        # would otherwise keep an invisible full-width plane alive after the
+        # visible Shepherd robots were dissolved.  Explicitly disarm it here.
+        physical.integration_return_curtain_active = False
+        lifecycle["state"] = "VISITED_RELEASED"
+        lifecycle["released_frame"] = getattr(
+            physical, "integration_frame", -1
         )
-        if lifecycle is not None:
-            lifecycle["state"] = "VISITED"
+        physical.frontier_line_branch = None
+        physical.frontier_line_depth = 0.0
+        physical.frontier_line_lateral_center = 0.0
+        physical.frontier_line_row_ready = False
+        transition_jump = max(
+            (
+                robot.position.distance_to(before[robot.robot_id])
+                for robot in remaining_shepherds
+            ),
+            default=0.0,
+        )
         print(
-            f"[Shepherd] Junction reached continuously; released={len(shepherds)}"
+            f"[ShepherdRelease] branch={branch} "
+            f"released_to_normal={len(remaining_shepherds)} "
+            f"pebbles={len(physical.get_pebbles(robots))} "
+            f"position_jump={transition_jump:.6f} "
+            "visited_wall_persisted=False"
         )
-        return len(shepherds)
+        return len(remaining_shepherds)
+
+    def remaining_dfs_branch_uids(robots: Sequence[Any]) -> tuple[set[str], set[str], list[str]]:
+        """Return discovered, visited and still-unvisited branch UIDs."""
+        discovered = set(getattr(physical, "integration_detected_branch_order", []))
+        if not discovered:
+            discovered = set(physical.discovered_branch_uids())
+        visited = set(physical.observed_visited_branch_uids(robots))
+        order = getattr(physical, "integration_detected_branch_order", [])
+        remaining = [uid for uid in order if uid not in visited]
+        if not order:
+            remaining = sorted(discovered - visited)
+        return discovered, visited, remaining
+
+    def commit_branch_uid_to_frontier(
+        robots: Sequence[Any],
+        reference_density: float,
+        branch_uid: str,
+        *,
+        context: str,
+    ) -> str:
+        """Commit exactly one UID and promote that same fixture's Guard wall.
+
+        ``record_distributed_consensus`` only records diagnostics; it does NOT set
+        ``distributed_consensus_branch``.  The legacy ``choose_next_branch`` reads
+        that global.  Keeping those two states separate allowed active_branch to
+        become RIGHT while the LEFT Guard wall was promoted.  Lock both sides to
+        the same UID here and fail loudly on any future mismatch.
+        """
+        requested_fixture = physical.branch_fixture_for_uid(branch_uid)
+        if requested_fixture is None:
+            raise RuntimeError(
+                f"{context}: no fixture adapter for requested branch UID {branch_uid}"
+            )
+
+        # Single source of truth for the legacy chooser.
+        physical.distributed_consensus_branch = branch_uid
+        physical.record_distributed_consensus(branch_uid)
+        selected = physical.choose_next_branch(robots, reference_density)
+        if selected is None:
+            raise RuntimeError(
+                f"{context}: choose_next_branch returned None for UID {branch_uid} "
+                f"fixture={requested_fixture}"
+            )
+
+        selected_uid = physical.branch_uid_for_fixture(selected)
+        if selected != requested_fixture or selected_uid != branch_uid:
+            raise RuntimeError(
+                f"{context}: branch identity divergence: requested_uid={branch_uid} "
+                f"requested_fixture={requested_fixture} selected_fixture={selected} "
+                f"selected_uid={selected_uid}"
+            )
+        if physical.active_branch != selected or physical.active_branch_uid != branch_uid:
+            raise RuntimeError(
+                f"{context}: active branch divergence after choose: "
+                f"active_branch={physical.active_branch} "
+                f"active_uid={physical.active_branch_uid} expected={selected}/{branch_uid}"
+            )
+
+        # No other branch may already own a live Frontier at selection time.
+        stale = [
+            robot
+            for robot in robots
+            if robot.role == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch != selected
+        ]
+        if stale:
+            raise RuntimeError(
+                f"{context}: stale Frontier exists on another branch: "
+                f"{sorted({robot.shepherd_branch for robot in stale})}"
+            )
+
+        physical.commit_junction_guard_roles(robots, selected)
+        if physical.frontier_line_branch != selected:
+            raise RuntimeError(
+                f"{context}: promoted Frontier branch={physical.frontier_line_branch} "
+                f"but active branch={selected}"
+            )
+        live_frontier_ids = {
+            robot.robot_id
+            for robot in robots
+            if robot.role == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch == selected
+        }
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(selected, {})
+        expected_ids = set(lifecycle.get("robot_ids", []))
+        if not live_frontier_ids or live_frontier_ids != expected_ids:
+            raise RuntimeError(
+                f"{context}: active branch Guard/Frontier lineage mismatch: "
+                f"selected={selected} live={sorted(live_frontier_ids)} "
+                f"expected={sorted(expected_ids)}"
+            )
+        print(
+            f"[BranchIdentityLock] context={context} uid={branch_uid} "
+            f"fixture={selected} active={physical.active_branch} "
+            f"frontier={physical.frontier_line_branch} robots={len(live_frontier_ids)} "
+            "consistent=True"
+        )
+        return selected
+
+    def start_final_return_pipeline(robots: Sequence[Any], reason: str) -> None:
+        """Enter the authoritative final gather -> base return lifecycle once."""
+        if getattr(physical, "integration_final_return_requested", False):
+            return
+        physical.integration_final_return_requested = True
+        discovered, visited, remaining = remaining_dfs_branch_uids(robots)
+        if remaining:
+            raise RuntimeError(
+                f"final return requested with unvisited branches remaining: {remaining}"
+            )
+        physical.pending_branch_start = None
+        physical.integration_ready_guard_handoff = False
+        physical.integration_handoff_dwell = 0.0
+        physical.junction_consensus_tracker.reset()
+        physical.begin_final_gather()
+        print(
+            f"[DFSAllBranchesVisited] frame={getattr(physical, 'integration_frame', -1)} "
+            f"visited={len(visited)}/{len(discovered)} reason={reason}"
+        )
+        print(
+            f"[FinalReturnPipeline] frame={getattr(physical, 'integration_frame', -1)} "
+            "FINAL_JUNCTION_GATHER -> RETURN_TO_BASE -> DONE"
+        )
 
     def integrated_update_state(
         robots: Sequence[Any], dt: float, reference_density: float,
         spatial_grid: Any,
     ) -> None:
+        # Adaptive-LiDAR handoff already has every detected physical Guard wall.
+        # Mirror the authoritative Physical DFS start lifecycle explicitly:
+        # vote -> choose -> SAME Guard IDs become Frontier -> pending dwell.
+        if (
+            physical.phase == physical.SimulationPhase.FORM_JUNCTION_GUARDS
+            and getattr(physical, "integration_ready_guard_handoff", False)
+            and physical.pending_branch_start is None
+        ):
+            _, _, remaining_uids = remaining_dfs_branch_uids(robots)
+            if not remaining_uids:
+                physical.begin_final_gather()
+                return
+            voted_branch = remaining_uids[0]
+            selected = commit_branch_uid_to_frontier(
+                robots,
+                reference_density,
+                voted_branch,
+                context="INITIAL_DFS_START",
+            )
+            physical.pending_branch_start = selected
+            physical.junction_guard_formation_timer = 0.0
+            physical.junction_guard_stable_dwell = 0.0
+            physical.integration_handoff_dwell = 0.0
+            print(
+                f"[DFSBranchSelected] frame={getattr(physical, 'integration_frame', -1)} "
+                f"voted_uid={voted_branch} selected={selected} "
+                "same_guard_ids_to_frontier=True"
+            )
+            return
+
+        if (
+            physical.phase == physical.SimulationPhase.FORM_JUNCTION_GUARDS
+            and getattr(physical, "integration_ready_guard_handoff", False)
+            and physical.pending_branch_start is not None
+        ):
+            # Mirror the reference lifecycle: a branch is selected first,
+            # then its Frontier wall and the remaining Guard walls must remain
+            # physically present for the short formation dwell before flow is
+            # released into EXPLORE_BRANCH.
+            selected = physical.pending_branch_start
+            lifecycle = getattr(physical, "integration_wall_lifecycle", {})
+            visited_uids = physical.observed_visited_branch_uids(robots)
+            unvisited_branches = [
+                branch
+                for branch in physical.detected_branch_candidates
+                if physical.branch_uid_for_fixture(branch) not in visited_uids
+            ]
+            selected_frontiers = [
+                robot for robot in robots
+                if robot.role == "FRONTIER_SHEPHERD"
+                and robot.shepherd_branch == selected
+            ]
+            selected_lifecycle = lifecycle.get(selected, {})
+            selected_ready = len(selected_frontiers) == (
+                int(selected_lifecycle.get("rows", 0))
+                * int(selected_lifecycle.get("cols", 0))
+            )
+            remaining_guard_walls_ready = True
+            for branch in unvisited_branches:
+                if branch == selected:
+                    continue
+                item = lifecycle.get(branch, {})
+                expected_count = int(item.get("rows", 0)) * int(item.get("cols", 0))
+                live_count = sum(
+                    robot.role == "JUNCTION_GUARD"
+                    and robot.junction_guard_branch == branch
+                    for robot in robots
+                )
+                if expected_count <= 0 or live_count != expected_count:
+                    remaining_guard_walls_ready = False
+                    break
+            walls_ready = selected_ready and remaining_guard_walls_ready
+            if walls_ready:
+                dwell = float(getattr(physical, "integration_handoff_dwell", 0.0)) + dt
+                physical.integration_handoff_dwell = dwell
+            else:
+                physical.integration_handoff_dwell = 0.0
+                return
+            if physical.integration_handoff_dwell < physical.THICK_MOUTH_GUARD_FORM_DWELL:
+                return
+            physical.pending_branch_start = None
+            physical.junction_guard_status = (
+                f"FRONTIER={selected};OTHERS=THICK_KHOP_WALLS_READY"
+            )
+            physical.phase = physical.SimulationPhase.EXPLORE_BRANCH
+            physical.integration_ready_guard_handoff = False
+            physical.integration_handoff_dwell = 0.0
+            print(
+                f"[EXPLORE_BRANCH] selected={selected} "
+                f"wall_dwell={physical.THICK_MOUTH_GUARD_FORM_DWELL:.2f} "
+                "second_guard_formation=False"
+            )
+            return
+        # Baseline-style branch return: once the Shepherd line reaches the
+        # Junction it is dissolved into NORMAL robots (plus the existing Pebble
+        # marker).  Already-explored branches therefore keep no Shepherd/Guard
+        # wall.  The remaining unvisited branch Guards are left untouched and
+        # are sufficient for the next DFS branch selection.
+        if physical.phase == physical.SimulationPhase.FLOW_BACKTRACK:
+            branch = physical.active_branch
+            lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+            physical.shepherd_flow_timer += dt
+            # Herd-locked return: elapsed time is bookkeeping only.  The actual
+            # Shepherd target depth follows the rear surface of the NORMAL body.
+            # If that body stops, the Shepherd line holds instead of running to
+            # the Junction alone.
+            update_pack_coupled_backtrack_depth(robots, branch, dt)
+            physical.release_shepherd_line_at_junction(robots)
+            physical.update_relay_retraction(robots, dt)
+
+            remaining_mobile = sum(
+                robot.role != "PEBBLE"
+                and physical.get_robot_region(robot.position) == branch
+                for robot in robots
+            )
+            in_junction = sum(
+                robot.role != "PEBBLE"
+                and physical.get_robot_region(robot.position) == "JUNCTION"
+                for robot in robots
+            )
+            source_relays = physical.get_relays_inside_branch(robots, branch)
+            branch_shepherds = [
+                robot for robot in physical.get_shepherds(robots)
+                if robot.shepherd_branch == branch
+            ]
+            if not branch_shepherds:
+                physical.integration_return_curtain_active = False
+
+            if getattr(physical, "integration_frame", 0) % 15 == 0:
+                print(
+                    f"[ReturnReleaseGate] frame={getattr(physical, 'integration_frame', -1)} "
+                    f"branch={branch} remaining_mobile={remaining_mobile} "
+                    f"junction_mobile={in_junction} source_relays={len(source_relays)} "
+                    f"branch_shepherds={len(branch_shepherds)}"
+                )
+
+            return_ready = (
+                remaining_mobile <= physical.BRANCH_CLEAR_LIMIT
+                and not source_relays
+                and not branch_shepherds
+                and in_junction >= physical.JUNCTION_SWITCH_COUNT
+            )
+            if not return_ready:
+                return
+
+            completed_branch = branch
+            if not physical.complete_active_branch(
+                completed_branch,
+                robots,
+                True,
+            ):
+                return
+            if lifecycle is not None:
+                lifecycle["state"] = "VISITED_RELEASED"
+                lifecycle["visited_release_frame"] = getattr(
+                    physical, "integration_frame", -1
+                )
+            print(
+                f"[VisitedBranchReleased] branch={completed_branch} "
+                "shepherds=0 guards=0 persistent_wall=False"
+            )
+
+            discovered, visited, remaining_uids = remaining_dfs_branch_uids(robots)
+            completed_count = len(visited)
+            total_count = len(discovered)
+            print(
+                f"[DFSBranchCompleteSequence] frame={getattr(physical, 'integration_frame', -1)} "
+                f"completed={completed_count}/{total_count} "
+                f"remaining={remaining_uids}"
+            )
+            if discovered and not remaining_uids:
+                # Every LiDAR-discovered outgoing branch is now VISITED.
+                # Gather the whole swarm at this Junction, then reuse the
+                # authoritative RETURN_TO_BASE controller.  No fixed branch
+                # count is assumed here.
+                start_final_return_pipeline(robots, "LAST_BRANCH_COMPLETED")
+                return
+
+            # At least one LiDAR-discovered branch remains UNVISITED.
+            # Return to Junction switching and promote one existing unvisited
+            # Guard wall to the next Frontier.  This is identical for N branches.
+            physical.integration_backtrack_command_depth = None
+            physical.integration_backtrack_pack_rear_depth = None
+            physical.integration_backtrack_support_depth = None
+            physical.integration_backtrack_support_count = 0
+            physical.integration_backtrack_lateral_coverage = 0.0
+            physical.phase = physical.SimulationPhase.JUNCTION_SWITCH
+            physical.junction_switch_timer = 0.0
+            physical.junction_consensus_tracker.reset()
+            print(
+                f"[DFSNextBranchPending] frame={getattr(physical, 'integration_frame', -1)} "
+                f"completed={completed_count}/{total_count} remaining={remaining_uids}"
+            )
+            return
+
+        if physical.phase == physical.SimulationPhase.JUNCTION_SWITCH:
+            # Reuse the previously working LiDAR-DFS switch path (v14): the
+            # visited wall is already gone, while UNVISITED LiDAR Guard walls
+            # are still physically present.  Do NOT call the baseline
+            # begin_junction_guard_formation() here; that path re-enters the
+            # map-era guard election lifecycle and can stall/re-align NORMALs.
+            physical.integration_return_curtain_active = False
+            physical.junction_switch_timer += dt
+            discovered, visited, remaining_uids = remaining_dfs_branch_uids(robots)
+            if discovered and not remaining_uids:
+                start_final_return_pipeline(robots, "JUNCTION_SWITCH_NO_REMAINING")
+                return
+
+            unvisited_branches = [
+                candidate
+                for candidate in physical.detected_branch_candidates
+                if physical.branch_uid_for_fixture(candidate) in remaining_uids
+            ]
+            guard_counts = {
+                candidate: sum(
+                    robot.role == "JUNCTION_GUARD"
+                    and robot.junction_guard_branch == candidate
+                    for robot in robots
+                )
+                for candidate in unvisited_branches
+            }
+            missing_guard_walls = [
+                candidate for candidate in unvisited_branches
+                if guard_counts.get(candidate, 0) <= 0
+            ]
+            if missing_guard_walls:
+                if getattr(physical, "integration_frame", 0) % 15 == 0:
+                    print(
+                        f"[NextBranchWait] frame={getattr(physical, 'integration_frame', -1)} "
+                        f"reason=MISSING_UNVISITED_GUARD missing={missing_guard_walls} "
+                        f"guard_counts={guard_counts}"
+                    )
+                return
+
+            voted_branch = remaining_uids[0]
+            selected = commit_branch_uid_to_frontier(
+                robots,
+                reference_density,
+                voted_branch,
+                context="JUNCTION_SWITCH",
+            )
+            selected_uid = physical.branch_uid_for_fixture(selected)
+            if selected_uid in visited:
+                raise RuntimeError(
+                    f"visited branch re-selected during Junction switch: {selected_uid}"
+                )
+            physical.pending_branch_start = selected
+            physical.junction_guard_formation_timer = 0.0
+            physical.junction_guard_stable_dwell = 0.0
+            physical.integration_handoff_dwell = 0.0
+            physical.integration_ready_guard_handoff = True
+            physical.phase = physical.SimulationPhase.FORM_JUNCTION_GUARDS
+            print(
+                f"[JunctionSwitchSelect] frame={getattr(physical, 'integration_frame', -1)} "
+                f"visited={len(visited)}/{len(discovered)} voted_uid={voted_branch} "
+                f"selected={selected} selected_uid={selected_uid} "
+                f"guard_counts={guard_counts} next_frontier_committed=True"
+            )
+            return
+
         branch = physical.active_branch
         if physical.phase == physical.SimulationPhase.EXPLORE_BRANCH:
             physical.branch_entry_timer += dt
@@ -2693,6 +4542,26 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 selected = physical.promote_existing_frontier_line(
                     robots, branch, boundary_depth
                 )
+                if not selected:
+                    # Saturation is already latched.  Staying silently in
+                    # EXPLORE_BRANCH here is a lifecycle failure, not a reason
+                    # to resume exploration.  Keep the rigid Frontier frozen at
+                    # the confirmed contact and retry the common-depth solve on
+                    # subsequent frames with an explicit diagnostic.
+                    if lifecycle := getattr(physical, "integration_wall_lifecycle", {}).get(branch):
+                        lifecycle["frontier_contact_centroid_depth"] = float(
+                            lifecycle.get(
+                                "frontier_contact_centroid_depth",
+                                physical.frontier_line_depth,
+                            )
+                        )
+                    if getattr(physical, "integration_frame", 0) % 15 == 0:
+                        print(
+                            f"[BacktrackPromotionWait] branch={branch} "
+                            f"saturated=True boundary_depth={boundary_depth:.3f} "
+                            "reason=NO_COMMON_SHEPHERD_CROSS_SECTION "
+                            "frontier_frozen=True"
+                        )
                 if selected:
                     state.shepherd_ids = sorted(
                         robot.robot_id for robot in selected
@@ -2755,52 +4624,135 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                         "localization=False position_overwrite=False"
                     )
             return
-        if physical.phase == physical.SimulationPhase.FILL_BEHIND_SHEPHERD:
-            physical.branch_entry_timer += dt
+        if physical.phase == physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY:
+            # Keep the SAME thick Shepherd wall and let it settle continuously
+            # onto its frozen targets.  Do not fall through to the legacy timeout
+            # path, which can reset Shepherd roles and bounce back to EXPLORE_BRANCH
+            # when force_complete_shepherd_boundary is intentionally disabled to
+            # avoid position teleportation.
             physical.update_relay_deployment(robots, dt)
-            state = sample_local_state(robots, branch, reference_density, dt)
-            if state.saturated:
-                physical.start_shepherd_pressure_push(robots, branch)
+            physical.shepherd_form_timer += dt
+            shepherds = [
+                robot for robot in physical.get_shepherds(robots)
+                if robot.shepherd_branch == branch
+            ]
+            lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch, {})
+            expected = int(lifecycle.get("rows", 0)) * int(lifecycle.get("cols", 0))
+            formed = (
+                expected > 0
+                and len(shepherds) == expected
+                and all(
+                    robot.shepherd_anchor is not None
+                    and robot.position.distance_to(robot.shepherd_anchor)
+                    <= physical.SHEPHERD_FORM_TOLERANCE
+                    for robot in shepherds
+                )
+            )
+            anchors_walkable = (
+                expected > 0
+                and len(shepherds) == expected
+                and all(
+                    robot.shepherd_anchor is not None
+                    and physical.is_walkable(robot.shepherd_anchor, robot.radius)
+                    for robot in shepherds
+                )
+            )
+            timed_settle_ready = (
+                anchors_walkable
+                and physical.shepherd_form_timer >= physical.SHEPHERD_FORM_TIMEOUT
+            )
+            if formed or timed_settle_ready:
+                # Do not let a tiny residual position error trap the lifecycle
+                # forever in FORM_SHEPHERD_BOUNDARY.  FILL keeps the same
+                # shepherd_anchor targets, so the wall continues converging
+                # physically while the NORMAL pack forms behind it.
+                physical.phase = physical.SimulationPhase.FILL_BEHIND_SHEPHERD
+                physical.saturation_tracker.reset(branch)
+                physical.branch_continuity_tracker.reset(branch)
+                # IMPORTANT: reset the integration-local saturation latch too.
+                # Before this fix, EXPLORE's already-saturated diagnostics were
+                # carried into FILL and PRESSURE_PUSH started immediately, before
+                # NORMAL robots had physically packed against the Shepherd.
+                current_shepherd_depth = float(np.median([
+                    physical.observed_branch_axial_depth(robot.position, descriptor_for(branch))
+                    for robot in shepherds
+                ])) if shepherds and descriptor_for(branch) is not None else 0.0
+                diagnostics.reset(branch, current_shepherd_depth)
+                physical.integration_shepherd_pack_ready_dwell = 0.0
+                max_error = max(
+                    (
+                        robot.position.distance_to(robot.shepherd_anchor)
+                        for robot in shepherds
+                        if robot.shepherd_anchor is not None
+                    ),
+                    default=0.0,
+                )
                 print(
-                    "[Timeline] PRESSURE_PUSH_START "
-                    f"frame={getattr(physical, 'integration_frame', -1)}"
+                    f"[ShepherdBoundaryReady] frame={getattr(physical, 'integration_frame', -1)} "
+                    f"branch={branch} robots={len(shepherds)}/{expected} "
+                    f"max_error={max_error:.3f} "
+                    f"bounded_timeout={timed_settle_ready and not formed} "
+                    "teleport=False -> FILL_BEHIND_SHEPHERD"
+                )
+            elif (
+                physical.shepherd_form_timer >= physical.SHEPHERD_FORM_TIMEOUT
+                and getattr(physical, "integration_frame", 0) % 30 == 0
+            ):
+                max_error = max(
+                    (
+                        robot.position.distance_to(robot.shepherd_anchor)
+                        for robot in shepherds
+                        if robot.shepherd_anchor is not None
+                    ),
+                    default=float("inf"),
+                )
+                print(
+                    f"[ShepherdBoundaryWait] frame={getattr(physical, 'integration_frame', -1)} "
+                    f"branch={branch} robots={len(shepherds)}/{expected} "
+                    f"max_error={max_error:.3f} anchors_walkable={anchors_walkable} "
+                    "destructive_reset=False"
                 )
             return
+        if physical.phase == physical.SimulationPhase.FILL_BEHIND_SHEPHERD:
+            # v20: delegate this phase to the authoritative Physical DFS.
+            # No integration-local ShepherdPackGate or custom piston controller.
+            phase_before = physical.phase
+            original_update_state(robots, dt, reference_density, spatial_grid)
+            if phase_before != physical.phase:
+                print(
+                    f"[ReferenceReturnState] frame={getattr(physical, 'integration_frame', -1)} "
+                    f"{phase_before.name}->{physical.phase.name} source=AUTHORITATIVE_PHYSICAL_DFS"
+                )
+            return
+
         if physical.phase == physical.SimulationPhase.PRESSURE_PUSH:
-            physical.pressure_push_timer += dt
-            ratio, speed, count = local_backflow_metrics(robots, branch)
-            diagnostics.return_flow_ratio = ratio
-            diagnostics.mean_return_speed = speed
-            established = (
-                physical.pressure_push_timer >= physical.SHEPHERD_MIN_PUSH_TIME
-                and count >= physical.FLOW_MIN_NORMAL_COUNT
-                and ratio >= physical.FLOW_RATIO_THRESHOLD
-                and speed >= physical.FLOW_AVERAGE_SPEED_THRESHOLD
-            )
-            diagnostics.return_dwell = (
-                diagnostics.return_dwell + dt if established else 0.0
-            )
-            if diagnostics.return_dwell >= physical.FLOW_ESTABLISH_DWELL_TIME:
-                physical.release_shepherds_into_flow(robots)
-                physical.phase = physical.SimulationPhase.FLOW_BACKTRACK
-                event = {
-                    "branch": branch,
-                    "uid": descriptor_for(branch).uid,
-                    "frame": getattr(physical, "integration_frame", -1),
-                    "ratio": ratio,
-                    "mean_speed": speed,
-                    "duration": diagnostics.return_dwell,
-                }
-                physical.integration_backflow_events.append(event)
-                diagnostics.backflow_confirmed = True
+            # Keep the authoritative flow-establishment/state transition logic,
+            # but replace its timer-driven Shepherd *position* with the herd rear.
+            update_pack_coupled_backtrack_depth(robots, branch, dt)
+            phase_before = physical.phase
+            original_update_state(robots, dt, reference_density, spatial_grid)
+            if phase_before != physical.phase:
                 print(
-                    "[Timeline] BACKFLOW_CONFIRMED "
-                    f"frame={event['frame']} uid={event['uid']} "
-                    f"ratio={ratio:.3f} mean_speed={speed:.3f} "
-                    f"duration={diagnostics.return_dwell:.3f}"
+                    f"[ReferenceReturnState] frame={getattr(physical, 'integration_frame', -1)} "
+                    f"{phase_before.name}->{physical.phase.name} source=AUTHORITATIVE_PHYSICAL_DFS"
                 )
             return
+
+        phase_before_original = physical.phase
         original_update_state(robots, dt, reference_density, spatial_grid)
+        if physical.phase != phase_before_original and phase_before_original in {
+            physical.SimulationPhase.FINAL_JUNCTION_GATHER,
+            physical.SimulationPhase.RETURN_TO_BASE,
+        }:
+            print(
+                f"[FinalReturnTransition] frame={getattr(physical, 'integration_frame', -1)} "
+                f"{phase_before_original.name}->{physical.phase.name}"
+            )
+        if (
+            getattr(physical, "integration_ready_guard_handoff", False)
+            and physical.phase != physical.SimulationPhase.FORM_JUNCTION_GUARDS
+        ):
+            physical.integration_ready_guard_handoff = False
 
     physical.update_frontier_line_progress = local_frontier_progress
     physical.commit_junction_guard_roles = audited_commit_guard_roles
@@ -2808,11 +4760,136 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     physical.promote_existing_frontier_line = promote_thick_frontier_wall
     physical.update_transfer_continuity_control = saturation_aware_transfer_control
     physical.prepare_branch_candidate_scores = pebble_filtered_candidate_scores
+    # v20: keep only the LiDAR geometry adapter.  The return controller itself
+    # is the authoritative Physical DFS, not the v15-v19 integration hybrid.
     physical.get_backtrack_direction = local_return_direction
-    physical.normal_backtracking_metrics = local_backflow_metrics
     physical.shepherd_slot_position_at_depth = local_slot_at_depth
+    # Critical v23 change: Robot.update(), Shepherd pressure and the return-only
+    # curtain all read this same herd-coupled scalar.  A timer can no longer pull
+    # the visible Shepherd line away from the NORMAL body.
+    physical.get_shepherd_curtain_depth = pack_coupled_shepherd_curtain_depth
+    physical.compute_route_force = original_compute_route_force
+    physical.start_shepherd_pressure_push = reference_start_shepherd_pressure_push
+    # normal_backtracking_metrics intentionally remains the original reference
+    # function loaded from single_junction_sph_dfs_environment.py.
     physical.release_shepherd_line_at_junction = continuous_release_line
-    physical.enforce_shepherd_curtain_for_swarm = lambda robots: None
+    # Restore the *working reference* Shepherd piston only during the actual
+    # return phases.  This is the mechanism the old Physical DFS used to make
+    # the NORMAL body move with the Shepherd instead of letting the kinematic
+    # Shepherd line sprint through it.
+    #
+    # Crucially, it stays OFF during MOVE/Guard/EXPLORE/FORM/FILL, so the old
+    # invisible-wall problem at branch entrances does not come back.  During
+    # PRESSURE_PUSH/FLOW_BACKTRACK the curtain is colocated with the real
+    # Shepherd line because the reference functions resolve the already-patched
+    # get_shepherd_curtain_depth(), which is pack-coupled in this integration.
+    def return_only_shepherd_curtain_force(robot: Any) -> pygame.Vector2:
+        if (
+            physical.integration_return_curtain_active
+            and physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
+        ):
+            force = original_compute_shepherd_curtain_force(robot)
+            frame = getattr(physical, "integration_frame", -1)
+            if (
+                robot.role == "NORMAL"
+                and frame % 15 == 0
+                and getattr(physical, "integration_return_curtain_log_frame", None) != frame
+            ):
+                physical.integration_return_curtain_log_frame = frame
+                print(
+                    f"[ReferenceReturnCurtain] frame={frame} "
+                    f"phase={physical.phase.name} branch={physical.active_branch} "
+                    f"depth={physical.get_shepherd_curtain_depth(physical.active_branch):.3f} "
+                    f"force={force.length():.3f} enabled=True"
+                )
+            return force
+        return pygame.Vector2()
+
+    def return_only_constrain_normal_behind_shepherd(robot: Any) -> None:
+        if (
+            physical.integration_return_curtain_active
+            and physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
+        ):
+            original_constrain_normal_behind_shepherd_curtain(robot)
+
+    def return_only_enforce_shepherd_curtain(robots: Sequence[Any]) -> None:
+        if (
+            physical.integration_return_curtain_active
+            and physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
+        ):
+            original_enforce_shepherd_curtain_for_swarm(robots)
+
+    physical.compute_shepherd_curtain_force = return_only_shepherd_curtain_force
+    physical.constrain_normal_behind_shepherd_curtain = (
+        return_only_constrain_normal_behind_shepherd
+    )
+    physical.enforce_shepherd_curtain_for_swarm = (
+        return_only_enforce_shepherd_curtain
+    )
+
+    # Keep every other legacy virtual barrier disabled.  In particular, the
+    # pre-Shepherd curtain must remain OFF so unselected branch mouths never
+    # acquire an invisible wall before physical Shepherd backtracking begins.
+    physical.compute_pre_shepherd_curtain_force = lambda robot: pygame.Vector2()
+    physical.constrain_normal_behind_pre_shepherd_curtain = lambda robot: None
+    physical.enforce_pre_shepherd_curtain_for_swarm = lambda robots: None
+
+    # The pre-DFS probe soft wall is also non-physical.  Guard/Frontier robot
+    # formations and the actual map collision mask are the only spatial
+    # barriers retained by this integration.
+    physical.compute_initial_junction_soft_wall_force = (
+        lambda robot: pygame.Vector2()
+    )
+
+    # Keep logical gate state for DFS bookkeeping/consensus, but remove any
+    # legacy virtual-valve force from both runtime and rollout evaluation.
+    physical.compute_virtual_valve_force = lambda robot: pygame.Vector2()
+    physical.rollout_virtual_valve_force = (
+        lambda position, open_branch: pygame.Vector2()
+    )
+
+    # This is already a compatibility no-op in the baseline; override it as
+    # well so no future reference-file change can reintroduce a hard gate.
+    physical.constrain_final_return_gate_crossing = (
+        lambda robot, old_position: None
+    )
+
+    physical.integration_virtual_walls_disabled = False
+    physical.integration_return_only_reference_curtain = True
+    print(
+        "[IntegrationPolicy] version=V23_HERD_LOCKED_BACKTRACK_NEXT_BRANCH "
+        "guard_width=LIDAR_WALL_ENDPOINT_CROSS_SECTION "
+        "dead_end_promotion=FULL_DEPTH_SEARCH "
+        "branch_cycle=EXPLORE_BACKTRACK_REPEAT_TO_BASE return_drive=HERD_REAR_LOCKED cross_section_lock=True return_curtain=REFERENCE_LIVE_SHEPHERD_ONLY next_branch=V14_EXISTING_GUARD_PROMOTION"
+    )
+    print(
+        "[ReferenceReturnAudit] "
+        "fill_handler=ORIGINAL update_simulation_state; "
+        "pressure_handler=ORIGINAL update_simulation_state; "
+        "flow_depth=HERD_COUPLED pack_coupled_shepherd_curtain_depth; "
+        "route_force=ORIGINAL compute_route_force; "
+        "flow_metrics=ORIGINAL normal_backtracking_metrics; "
+        "only_geometry_adapter=LiDAR_local_slot; "
+        "junction_switch=V14_EXISTING_GUARD_TO_FRONTIER; "
+        f"return_speed_scale={physical.integration_reference_return_speed_scale:.3f}"
+    )
+    print(
+        "[VirtualWallAudit] return_only_reference_shepherd_curtain=True "
+        "auto_disarm_when_no_shepherd=True "
+        "disabled=pre_shepherd_force,pre_shepherd_hard_projection,"
+        "initial_junction_soft_wall,virtual_valve,rollout_virtual_valve,"
+        "final_return_gate_projection"
+    )
+
     physical.force_complete_shepherd_boundary = lambda robots: False
     physical.update_pre_shepherd_pipeline = lambda *args, **kwargs: None
     physical.update_simulation_state = integrated_update_state
@@ -2823,57 +4900,53 @@ def refine_guard_geometry_from_persistent_lidar(
     perception: AdaptivePerception,
     robots: Sequence[Any],
 ) -> None:
-    """Associate persistent openings and refine WHERE without re-electing WHO."""
-    if perception.last_frame is None:
-        raise RuntimeError("persistent refinement requires a LiDAR frame")
-    representative_openings = []
-    for track in perception.outgoing:
-        representative_openings.append({
-            "start_angle": float(np.mean([
-                observation["start_angle"] for observation in track.observations
-            ])),
-            "end_angle": float(np.mean([
-                observation["end_angle"] for observation in track.observations
-            ])),
-            "center_angle": track.center_angle,
-            "width_deg": track.mean_width,
-            "confidence": track.confidence,
-        })
-    refinement_frame = replace(
-        perception.last_frame,
-        openings=tuple(representative_openings),
-    )
-    refined = build_provisional_guard_descriptors_from_lidar(
-        physical, perception, refinement_frame
-    )
-    provisional = list(perception.provisional_guards)
-    refined_by_key = {item.local_branch_key: item for item in refined}
+    """Bind persistent UIDs to the already-frozen LiDAR Guard geometry.
+
+    Spatial WHERE is immutable after Guard election.  Persistent accumulation
+    may name the branch, but it must never rebuild descriptors, slots, or robot
+    targets; doing so mixes two mouth frames and deforms the UP wall at DFS
+    handoff.
+    """
+    if not perception.outgoing:
+        raise RuntimeError("persistent UID binding requires outgoing openings")
+
     track_by_key = {
-        ("UP" if abs(track.center_angle) < 30.0 else ("LEFT" if track.center_angle < 0.0 else "RIGHT")): track
+        (
+            "UP"
+            if abs(track.center_angle) < 30.0
+            else ("LEFT" if track.center_angle < 0.0 else "RIGHT")
+        ): track
         for track in perception.outgoing
     }
-    association = [refined_by_key[item.local_branch_key] for item in provisional]
-    tracks_by_old = [track_by_key[item.local_branch_key] for item in provisional]
-    forward = _body_local_unit(perception, 0.0)
-    lateral = pygame.Vector2(-forward.y, forward.x)
-    all_ids = {robot.robot_id for robot in robots if robot is not perception.leader}
+    if set(track_by_key) != {"LEFT", "UP", "RIGHT"}:
+        raise RuntimeError(
+            f"persistent outgoing identities are incomplete: {sorted(track_by_key)}"
+        )
+
+    all_ids = {
+        robot.robot_id for robot in robots if robot is not perception.leader
+    }
     physical.branch_descriptors_by_uid.clear()
     physical.fixture_key_to_branch_uid.clear()
     physical.branch_uid_to_fixture_key.clear()
     physical.detected_branch_candidates = set()
     physical.junction_guard_groups.clear()
+
     remapped_status: dict[str, dict[str, Any]] = {}
     associations: dict[str, dict[str, float | str]] = {}
-    for old, new, track in zip(provisional, association, tracks_by_old):
-        descriptor = new.descriptor
-        axis = physical.descriptor_local_basis(descriptor)[0]
-        if axis.dot(forward) > abs(axis.dot(lateral)):
-            fixture = "UP"
-        elif axis.dot(lateral) < 0.0:
-            fixture = "LEFT"
-        else:
-            fixture = "RIGHT"
+
+    for geometry in perception.provisional_guards:
+        # Keep the frozen provisional identity through persistent binding;
+        # never re-quantize the refined tangent into a different fixture.
+        fixture = geometry.local_branch_key
+        if fixture not in track_by_key:
+            raise RuntimeError(f"no persistent track for frozen Guard {fixture}")
+        track = track_by_key[fixture]
         uid = track.persistent_id
+        descriptor = geometry.descriptor
+
+        # Identity/metadata update only.  Do NOT replace the descriptor spatial
+        # frame and do NOT regenerate slots from persistent means.
         descriptor.uid = uid
         descriptor.fixture_key = fixture
         descriptor.cohort_member_ids = set(all_ids)
@@ -2881,80 +4954,74 @@ def refine_guard_geometry_from_persistent_lidar(
             physical.JUNCTION_COHORT_MIN_ROBOTS, len(all_ids)
         )
         descriptor.direction_downstream_travel = physical.JUNCTION_COHORT_MIN_TRAVEL
-        descriptor.motion_frame_source = "PERSISTENT_LIDAR_REFINED"
+        descriptor.motion_frame_source = "LIDAR_FROZEN_MOUTH_UID_BOUND"
         descriptor.motion_frame_sample_count = len(track.observations)
         descriptor.physical_boundary_sample_count = len(track.observations)
-        # Preserve the original runtime-computed wall cardinality. Refinement
-        # changes only the LiDAR WHERE targets, never the elected WHO set.
-        columns = old.columns
-        layers = old.layers
-        required = columns * layers
-        slots = [slot.copy() for slot in old.slots]
-        old.descriptor = descriptor
-        old.opening = new.opening
-        old.slots = [slot.copy() for slot in slots]
-        old.fixture_key = fixture
-        old.persistent_uid = uid
+
+        geometry.fixture_key = fixture
+        geometry.persistent_uid = uid
+
         physical.branch_descriptors_by_uid[uid] = descriptor
         physical.fixture_key_to_branch_uid[fixture] = uid
         physical.branch_uid_to_fixture_key[uid] = fixture
         physical.branch_local_uids[fixture] = uid
         physical.detected_branch_candidates.add(fixture)
-        physical.junction_guard_groups[fixture] = list(old.selected_ids)
-        physical.thick_mouth_guard_columns[fixture] = columns
-        physical.thick_mouth_guard_layers[fixture] = layers
+        physical.junction_guard_groups[fixture] = list(geometry.selected_ids)
+        physical.thick_mouth_guard_columns[fixture] = geometry.columns
+        physical.thick_mouth_guard_layers[fixture] = geometry.layers
         physical.junction_guard_frontier_depths[fixture] = (
             physical.JUNCTION_GUARD_BRANCH_INSET
-            + (layers - 1) * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+            + (geometry.layers - 1) * physical.THICK_MOUTH_GUARD_LAYER_SPACING
         )
+
         selected = {
-            robot.robot_id: robot for robot in robots
-            if robot.robot_id in old.selected_ids
+            robot.robot_id: robot
+            for robot in robots
+            if robot.robot_id in geometry.selected_ids
         }
-        for robot_id in old.selected_ids:
+        for robot_id in geometry.selected_ids:
             robot = selected[robot_id]
-            slot_index = int(robot.integration_guard_slot_index)
-            slot = old.slots[slot_index]
-            robot.integration_guard_waypoints = [slot.copy()]
-            robot.integration_guard_final_anchor = slot.copy()
-            robot.junction_guard_anchor = robot.integration_guard_waypoints[0].copy()
+            # Keep the exact world target/slot already reached; only bind IDs.
             robot.junction_guard_branch = fixture
             robot.junction_guard_branch_uid = uid
-            robot.junction_guard_layer = slot_index // columns
             robot.local_branch_uid_by_key[fixture] = uid
-        descriptor.leader_id = min(old.selected_ids)
+
+        descriptor.leader_id = min(geometry.selected_ids)
         status = physical.integration_wall_status.pop(
-            old.provisional_uid, {}
+            geometry.provisional_uid, {}
         )
         status.update({
-            "assigned": len(old.selected_ids),
-            "edge_selected": len(old.selected_ids),
-            "rows": layers,
-            "slots_per_row": columns,
+            "assigned": len(geometry.selected_ids),
+            "edge_selected": len(geometry.selected_ids),
+            "rows": geometry.layers,
+            "slots_per_row": geometry.columns,
             "slots_walkable": sum(
                 physical.is_walkable(slot, physical.ROBOT_RADIUS)
-                for slot in old.slots
+                for slot in geometry.slots
             ),
-            "slots_total": len(old.slots),
+            "slots_total": len(geometry.slots),
         })
         remapped_status[uid] = status
+
         angular_error = circular_error(
-            float(old.opening["center_angle"]), track.center_angle
+            float(geometry.opening["center_angle"]), track.center_angle
         )
         associations[uid] = {
             "opening_center": track.center_angle,
             "matched_mouth": fixture,
-            "mouth_local_angle": math.degrees(math.atan2(
-                axis.dot(lateral), axis.dot(forward)
-            )),
+            "mouth_local_angle": float(geometry.opening["center_angle"]),
             "angular_error": angular_error,
-            "provisional_uid": old.provisional_uid,
+            "provisional_uid": geometry.provisional_uid,
         }
         print(
-            f"[GuardRefine] provisional={old.provisional_uid} uid={uid} "
-            f"fixture_adapter={fixture} same_ids=True robots={len(old.selected_ids)} "
-            f"columns={columns} layers={layers} angular_error={angular_error:.3f}"
+            f"[GuardFreeze] provisional={geometry.provisional_uid} uid={uid} "
+            f"fixture_adapter={fixture} same_ids=True "
+            f"robots={len(geometry.selected_ids)} "
+            f"columns={geometry.columns} layers={geometry.layers} "
+            "spatial_retarget=False slot_regeneration=False "
+            f"angular_error={angular_error:.3f}"
         )
+
     physical.integration_wall_status.update(remapped_status)
     physical.integration_opening_mouth_associations = associations
 
@@ -2967,7 +5034,7 @@ def log_wall_ready_blockers(physical: types.ModuleType, perception: AdaptivePerc
         status = physical.integration_wall_status.get(geometry.provisional_uid, {})
         guards = [r for r in robots if r.robot_id in geometry.selected_ids]
         complete = sum(sum(1 for r in guards if r.junction_guard_layer == layer) >= geometry.columns for layer in range(geometry.layers))
-        checks = [("settled_ratio", float(status.get("settled_ratio", 0.0)) >= 1.0), ("span_ratio", float(status.get("min_span_ratio", 0.0)) >= float(physical.FRONTIER_LINE_MIN_SPAN_RATIO)), ("edge_gap", float(status.get("max_edge_gap", float("inf"))) <= float(physical.FRONTIER_LINE_MAX_EDGE_GAP)), ("internal_gap", float(status.get("max_internal_gap", float("inf"))) <= float(physical.FRONTIER_LINE_MAX_INTERNAL_GAP)), ("slots_walkable", int(status.get("slots_walkable", 0)) >= len(geometry.slots)), ("complete_rows", complete == geometry.layers)]
+        checks = [("settled_ratio", float(status.get("settled_ratio", 0.0)) >= PROVISIONAL_WALL_SETTLED_RATIO), ("span_ratio", float(status.get("min_span_ratio", 0.0)) >= float(physical.FRONTIER_LINE_MIN_SPAN_RATIO)), ("edge_gap", float(status.get("max_edge_gap", float("inf"))) <= float(physical.FRONTIER_LINE_MAX_EDGE_GAP)), ("internal_gap", float(status.get("max_internal_gap", float("inf"))) <= float(physical.FRONTIER_LINE_MAX_INTERNAL_GAP)), ("slots_walkable", int(status.get("slots_walkable", 0)) >= len(geometry.slots)), ("complete_rows", complete == geometry.layers)]
         reasons = [name for name, ok in checks if not ok]
         print(f"[WallReadyBlocker] branch={geometry.local_branch_key or geometry.provisional_uid} guard_count={len(guards)} expected={len(geometry.slots)} rows={geometry.layers} columns={geometry.columns} complete_rows={complete} settled_ratio={status.get('settled_ratio', 0.0):.3f} min_span_ratio={status.get('min_span_ratio', 0.0):.3f} max_edge_gap={status.get('max_edge_gap', float('inf')):.3f} max_internal_gap={status.get('max_internal_gap', float('inf')):.3f} slots_walkable={status.get('slots_walkable', 0)} ready={bool(status.get('ready', False))} blocking_reasons={reasons}")
 
@@ -2978,25 +5045,47 @@ def handoff_to_physical_dfs(
     robots: Sequence[Any],
 ) -> None:
     """Refine LiDAR WHERE, retain provisional WHO, and enable Physical DFS."""
-    if (
-        perception.handoff_complete
-        or perception.anchor_position is None
-        or perception.topology_ready_frame is None
-        or not perception.provisional_guard_started
-        or not perception.provisional_guards
-        or not all(geometry.cohort_ready for geometry in perception.provisional_guards)
-        or not all(bool(physical.integration_wall_status.get(g.provisional_uid, {}).get("ready", False)) for g in perception.provisional_guards)
-    ):
+    eligible = [r for r in robots if r.role == "NORMAL" and not r.base_reserve]
+    centers = [g.mouth_center_world for g in perception.provisional_guards if g.mouth_center_world is not None]
+    scale = float(np.median([g.mouth_span for g in perception.provisional_guards if g.mouth_span > 0.0]) if perception.provisional_guards else 1.0)
+    junction_center = sum(centers, pygame.Vector2()) / max(len(centers), 1)
+    local_count = sum(r.position.distance_to(junction_center) <= 2.0 * scale for r in eligible)
+    arrival_ratio = local_count / max(len(eligible), 1)
+    junction_arrived = arrival_ratio >= JUNCTION_ARRIVAL_RATIO_THRESHOLD
+    all_guard_cohorts_complete = all(
+        geometry.cohort_ready
+        and len(geometry.selected_ids) == len(geometry.slots)
+        for geometry in perception.provisional_guards
+    )
+    gate_checks = {
+        "topology_ready": perception.topology_ready_frame is not None,
+        "all_groups_activated": perception.guard_all_groups_activated,
+        "guard_complete": (
+            perception.guard_all_groups_activated
+            and all_guard_cohorts_complete
+        ),
+        "all_guard_cohorts_complete": all_guard_cohorts_complete,
+        "junction_arrived": junction_arrived,
+    }
+    if perception.handoff_complete or perception.anchor_position is None or not perception.provisional_guard_started or not perception.provisional_guards:
+        gate_checks["handoff_inputs"] = False
+    allowed = all(gate_checks.values())
+    print(f"[DFSStartGate] frame={getattr(physical, 'integration_frame', -1)} topology_ready={gate_checks['topology_ready']} all_groups_activated={gate_checks['all_groups_activated']} all_guard_cohorts_complete={gate_checks['all_guard_cohorts_complete']} guard_complete={gate_checks['guard_complete']} junction_local_count={local_count} eligible_count={len(eligible)} junction_arrival_ratio={arrival_ratio:.3f} junction_arrived={junction_arrived} blocking_reasons={[name for name, ok in gate_checks.items() if not ok]} allowed={allowed}")
+    if not allowed:
         return
+    for geometry in perception.provisional_guards:
+        physical.integration_wall_status.setdefault(geometry.provisional_uid, {})["ready"] = True
     refine_guard_geometry_from_persistent_lidar(
         physical, perception, robots
     )
-    guard_keys = {geometry.local_branch_key for geometry in perception.provisional_guards}
-    if guard_keys != {"LEFT", "UP", "RIGHT"}:
-        raise RuntimeError(f"invalid outgoing Guard identities: {guard_keys}")
+    if len(perception.provisional_guards) != len(perception.outgoing):
+        raise RuntimeError("provisional Guard count does not match outgoing topology")
     guard_id_sets = [set(geometry.selected_ids) for geometry in perception.provisional_guards]
     assert all(a.isdisjoint(b) for i, a in enumerate(guard_id_sets) for b in guard_id_sets[i + 1:])
     physical.branch_discovery_counter = len(perception.outgoing)
+    physical.integration_detected_branch_order = [
+        track.persistent_id for track in perception.outgoing
+    ]
     physical.junction_inference_tracker.confirmed = True
     physical.junction_inference_tracker.confirmed_at = (
         physical.simulation_time - physical.JUNCTION_DISCOVERY_SETTLE_TIME
@@ -3012,8 +5101,64 @@ def handoff_to_physical_dfs(
     physical.branch_gate_states.update({
         branch: "CLOSED" for branch in physical.BRANCHES
     })
+    # The walls were physically elected before handoff, so materialize their
+    # lifecycle records here instead of waiting for the legacy formation pass.
+    physical.integration_wall_lifecycle = {}
+    for geometry in perception.provisional_guards:
+        branch = geometry.local_branch_key
+        descriptor = physical.branch_motion_descriptor(branch)
+        members = [r for r in robots if r.robot_id in geometry.selected_ids]
+        coordinates = [guard_mouth_coordinates(r.position, geometry) for r in members]
+        centroid_axial = float(np.mean([value[0] for value in coordinates]))
+        centroid_lateral = float(np.mean([value[1] for value in coordinates]))
+        physical.integration_wall_lifecycle[branch] = {
+            "uid": descriptor.uid,
+            "state": "GUARD",
+            "rows": geometry.layers,
+            "cols": geometry.columns,
+            "robot_ids": sorted(geometry.selected_ids),
+            "centroid_axial": centroid_axial,
+            "centroid_lateral": centroid_lateral,
+            "mouth_center_world": geometry.mouth_center_world.copy(),
+            "branch_tangent_unit": geometry.branch_tangent_unit.copy(),
+            "mouth_lateral_unit": geometry.mouth_lateral_unit.copy(),
+            "measured_mouth_span": float(geometry.mouth_span),
+            "sealing_lateral_min": float(geometry.sealing_lateral_min),
+            "sealing_lateral_max": float(geometry.sealing_lateral_max),
+            "slot_spacing": float(geometry.slot_spacing),
+            # Freeze the original LiDAR mouth Guard anchors before any branch
+            # is promoted to Frontier.  A returned Shepherd wall comes back to
+            # these exact physical targets and remains there until every child
+            # branch of this Junction has been explored.
+            "guard_anchor_by_id": {
+                robot.robot_id: (
+                    robot.integration_guard_final_anchor.copy()
+                    if getattr(robot, "integration_guard_final_anchor", None) is not None
+                    else (
+                        robot.junction_guard_anchor.copy()
+                        if robot.junction_guard_anchor is not None
+                        else robot.position.copy()
+                    )
+                )
+                for robot in members
+            },
+            "guard_layer_by_id": {
+                robot.robot_id: int(getattr(robot, "junction_guard_layer", -1))
+                for robot in members
+            },
+            "guard_slot_index_by_id": {
+                robot.robot_id: int(getattr(robot, "integration_guard_slot_index", -1))
+                for robot in members
+            },
+            "relative_offsets": {
+                robot.robot_id: (axial - centroid_axial, lateral - centroid_lateral)
+                for robot, (axial, lateral) in zip(members, coordinates)
+            },
+        }
     physical.record_distributed_consensus(clear_selection=True)
     physical.phase = physical.SimulationPhase.FORM_JUNCTION_GUARDS
+    physical.integration_all_walls_ready = True
+    physical.integration_ready_guard_handoff = True
     perception.handoff_complete = True
     perception.state = PerceptionState.PHYSICAL_DFS
     guard_counts = {
@@ -3262,6 +5407,8 @@ class DarkRenderer:
                     f"rows={geometry.layers} cols={geometry.columns} "
                     f"readyF={geometry.guard_ready_frame or '-'} "
                     f"wall={'READY' if status.get('ready', False) else 'SETTLING'} "
+                    f"sealed={status.get('structurally_sealed', False)} "
+                    f"dwell={status.get('wall_ready_dwell', 0.0):.2f} "
                     f"edgeGap={status.get('max_edge_gap', 0.0):.2f} "
                     f"intGap={status.get('max_internal_gap', 0.0):.2f}"
                 )
@@ -3298,6 +5445,7 @@ class DarkRenderer:
         )
         dfs_lines = [
             "TOPOLOGY / PHYSICAL DFS",
+            f"GuardStage={perception.guard_activation_stage}",
             f"LiDAR Persistent={persistent_count} | Outgoing={len(perception.outgoing)}",
             f"Parent={perception.parent.persistent_id if perception.parent else '-'} source={perception.parent_source or '-'}",
             f"Topology={perception.topology_ready_frame is not None} gating={getattr(physical, 'integration_guard_gating_enabled', False)} walls={getattr(physical, 'integration_all_walls_ready', False)}",
@@ -3584,6 +5732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     physical.integration_wall_max_step = 0.0
     physical.integration_frontier_max_step = 0.0
     physical.integration_shepherd_max_step = 0.0
+    physical.integration_final_return_requested = False
     install_local_forward_ingress(physical)
     install_thick_wall_readiness_audit(physical)
     install_continuous_guard_settling(physical)
