@@ -2002,6 +2002,12 @@ class Robot:
         # Local backtracking direction assigned only when this robot becomes
         # a Shepherd. This is a direction vector, not an absolute position.
         self.shepherd_return_direction: Optional[pygame.Vector2] = None
+
+        # Final all-branches-visited return state.  These are local motion
+        # commands, not absolute target coordinates.
+        self.final_return_direction_local: Optional[pygame.Vector2] = None
+        self.final_return_source_branch: Optional[str] = None
+
         # Lateral slot in the Branch's observed local frame. It is the only
         # frontier-line geometry a robot keeps while the line advances.
         self.frontier_local_lateral: Optional[float] = None
@@ -2337,7 +2343,7 @@ class Robot:
             color = TRUNK_RELAY_COLOR
         elif self.role == "RELAY":
             color = RELAY_COLOR
-        elif self.role in {"SHEPHERD", "PRE_SHEPHERD"}:
+        elif self.role in {"SHEPHERD", "PRE_SHEPHERD", "PRIMARY_RETURN_SHEPHERD"}:
             color = SHEPHERD_COLOR
         elif self.role == "JUNCTION_GUARD":
             color = JUNCTION_GUARD_COLOR
@@ -6869,8 +6875,8 @@ def observed_visited_branch_uids(robots) -> set[str]:
 
 
 def return_mobile_target_count(robots) -> int:
-    """All non-marker robots must return; persistent Pebbles stay in place."""
-    return len(robots) - len(get_pebbles(robots))
+    """Every physical robot must return to the original Base."""
+    return len(robots)
 
 
 def mirror_local_ingress_observation_to_uid(robot: "Robot", branch: str) -> None:
@@ -9235,7 +9241,7 @@ def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
     return True
 
 
-def begin_final_gather():
+def begin_final_gather(robots):
     global phase, relay_slots, relay_motion_scale, final_gather_timer
     global transfer_branch, final_base_transfer_active
     release_transient_roles_for_final_return(robots)
@@ -9246,7 +9252,10 @@ def begin_final_gather():
     final_base_transfer_active = False
     apply_consensus_branch_gates(None)
     phase = SimulationPhase.FINAL_JUNCTION_GATHER
-    print("[DFS] final gather")
+    print(
+        f"[DFS] final gather; ALL robots return "
+        f"target={len(robots)}/{len(robots)}"
+    )
 
 
 def begin_final_return(robots):
@@ -9269,7 +9278,10 @@ def begin_final_return(robots):
         for robot in robots
     )
     phase = SimulationPhase.RETURN_TO_BASE
-    print("[DFS] return to base")
+    print(
+        f"[DFS] return to original base; "
+        f"target_robots={return_mobile_target_count(robots)}"
+    )
 
 
 def recover_return_entry_stragglers(robots) -> int:
@@ -10614,6 +10626,8 @@ def reset_shepherd_roles(robots):
             robot.frontier_local_lateral = None
             robot.shepherd_branch = None
             robot.shepherd_return_direction = None
+            robot.final_return_direction_local = None
+            robot.final_return_source_branch = None
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_branch_uid = None
@@ -10630,6 +10644,7 @@ def release_transient_roles_for_final_return(robots):
 
     released_shepherds = 0
     released_relays = 0
+    released_pebbles = 0
     for robot in robots:
         robot.comm_bridge_target = None
         robot.comm_bridge_index = -1
@@ -10640,13 +10655,20 @@ def release_transient_roles_for_final_return(robots):
             "PRE_SHEPHERD",
             "JUNCTION_GUARD",
             "FRONTIER_SHEPHERD",
+            "PRIMARY_RETURN_SHEPHERD",
+            "PEBBLE",
         }:
+            was_pebble = robot.role == "PEBBLE"
             robot.role = "NORMAL"
+            if was_pebble:
+                released_pebbles += 1
             robot.shepherd_anchor = None
             robot.shepherd_origin = None
             robot.frontier_local_lateral = None
             robot.shepherd_branch = None
             robot.shepherd_return_direction = None
+            robot.final_return_direction_local = None
+            robot.final_return_source_branch = None
             robot.junction_guard_anchor = None
             robot.junction_guard_branch = None
             robot.junction_guard_branch_uid = None
@@ -10654,6 +10676,16 @@ def release_transient_roles_for_final_return(robots):
             robot.junction_guard_parent_id = None
             robot.junction_guard_layer = -1
             robot.is_branch_leader = False
+
+            # All DFS children are complete, so branch markers are no longer
+            # needed. Release every Pebble so every physical robot can return.
+            robot.pebble_anchor = None
+            robot.pebble_branch_uid = None
+            robot.pebble_branch_key = None
+            robot.pebble_state = None
+            robot.pebble_ingress_direction_local = None
+            robot.pebble_return_direction_local = None
+
             robot.transfer_target = None
             robot.velocity.update(0.0, 0.0)
             robot.acceleration.update(0.0, 0.0)
@@ -10674,11 +10706,12 @@ def release_transient_roles_for_final_return(robots):
     pre_shepherd_branch = None
     pre_shepherd_pack_dwell = 0.0
     pre_shepherd_pack_ready = False
-    if released_shepherds or released_relays:
+    if released_shepherds or released_relays or released_pebbles:
         print(
             "[Final Cleanup] "
             f"released_shepherds={released_shepherds}, "
-            f"released_branch_relays={released_relays}"
+            f"released_branch_relays={released_relays}, "
+            f"released_pebbles={released_pebbles}"
         )
 
 
@@ -11030,31 +11063,183 @@ def release_shepherds_into_flow(robots):
     )
 
 
-def release_shepherd_line_at_junction(robots) -> int:
-    """Turn the intact line back into NORMAL robots inside the Junction."""
+def shepherd_line_reached_junction(robots, branch: Optional[str] = None) -> bool:
+    """Return True once the real Shepherd line has reached the Junction mouth."""
+    target_branch = branch or active_branch
     if (
         phase != SimulationPhase.FLOW_BACKTRACK
-        or get_shepherd_line_depth(active_branch)
-        > SHEPHERD_JUNCTION_DEPTH_TOLERANCE
+        or target_branch not in BRANCHES
     ):
+        return False
+    live = [
+        robot for robot in robots
+        if robot.role == "SHEPHERD"
+        and robot.shepherd_branch == target_branch
+    ]
+    if not live:
+        return False
+    return (
+        get_shepherd_line_depth(target_branch)
+        <= SHEPHERD_JUNCTION_DEPTH_TOLERANCE
+    )
+
+
+def release_shepherd_line_at_junction(
+    robots,
+    *,
+    keep_as_guard: bool = False,
+) -> int:
+    """Handle the intact Shepherd line when it reaches the Junction.
+
+    Normal branch-to-branch DFS uses ``keep_as_guard=True``:
+        GUARD -> FRONTIER -> SHEPHERD -> GUARD
+
+    The returned Shepherd IDs are never re-elected.  At the instant the
+    Shepherd line reaches the Junction mouth, each SAME robot is restored to
+    the exact Guard anchor that was frozen when this Junction was first
+    guarded.  This intentionally performs a one-time pose snap back to the
+    original physical Guard formation. ``keep_as_guard=False`` retains the
+    legacy NORMAL-release path for compatibility with other callers.
+    """
+    if not shepherd_line_reached_junction(robots, active_branch):
         return 0
 
-    direction = get_backtrack_direction(active_branch)
-    stage_pebble_from_returned_shepherd_line(robots, active_branch)
+    branch = active_branch
+    branch_uid = branch_uid_for_fixture(branch)
+    direction = get_backtrack_direction(branch)
+    shepherds = [
+        robot for robot in robots
+        if robot.role == "SHEPHERD"
+        and robot.shepherd_branch == branch
+    ]
+    if not shepherds:
+        return 0
+
+    if keep_as_guard:
+        before = {
+            robot.robot_id: robot.position.copy()
+            for robot in shepherds
+        }
+
+        # Adaptive LiDAR freezes the first Guard pose for every physical ID
+        # before that Guard is ever promoted to Frontier.
+        lifecycle = globals().get("integration_wall_lifecycle", {}).get(
+            branch,
+            {},
+        )
+        original_anchor_by_id = lifecycle.get("guard_anchor_by_id", {})
+        retained_ids = []
+        restored_anchor_by_id = {}
+
+        for robot in shepherds:
+            retained_ids.append(robot.robot_id)
+
+            original_anchor = original_anchor_by_id.get(robot.robot_id)
+            if original_anchor is None:
+                # Standalone Environment fallback. Adaptive runs are expected
+                # to have guard_anchor_by_id for every returned Shepherd.
+                original_anchor = getattr(
+                    robot,
+                    "integration_guard_final_anchor",
+                    None,
+                )
+            if original_anchor is None:
+                raise RuntimeError(
+                    "missing original Guard anchor for returned Shepherd: "
+                    f"branch={branch} robot={robot.robot_id}"
+                )
+
+            original_anchor = original_anchor.copy()
+            restored_anchor_by_id[robot.robot_id] = original_anchor.copy()
+
+            # SAME physical robot ID, restored to the EXACT position it occupied
+            # as the first Junction Guard for this branch.
+            robot.position = original_anchor.copy()
+            robot.previous_position = original_anchor.copy()
+            robot.role = "JUNCTION_GUARD"
+            robot.junction_guard_anchor = original_anchor.copy()
+            robot.junction_guard_branch = branch
+            robot.junction_guard_branch_uid = branch_uid
+
+            if hasattr(robot, "integration_guard_final_anchor"):
+                robot.integration_guard_final_anchor = original_anchor.copy()
+            if hasattr(robot, "integration_guard_waypoints"):
+                robot.integration_guard_waypoints = [original_anchor.copy()]
+
+            # Preserve Guard layer / leader lineage. Clear only Shepherd motion.
+            robot.shepherd_anchor = None
+            robot.shepherd_origin = None
+            robot.frontier_local_lateral = None
+            robot.shepherd_branch = None
+            robot.shepherd_return_direction = None
+            robot.transfer_target = None
+
+            robot.velocity.update(0.0, 0.0)
+            robot.commanded_velocity.update(0.0, 0.0)
+            robot.observed_velocity.update(0.0, 0.0)
+            robot.acceleration.update(0.0, 0.0)
+            robot.filtered_acceleration.update(0.0, 0.0)
+
+        # The visited mouth is now closed at exactly its original Guard pose by
+        # exactly the same returned robot IDs. No WHO re-election occurs.
+        junction_guard_groups[branch] = sorted(retained_ids)
+
+        retained_set = set(retained_ids)
+        viscoelastic_rest_lengths_copy = {
+            pair: value
+            for pair, value in viscoelastic_rest_lengths.items()
+            if not retained_set.intersection(pair)
+        }
+        viscoelastic_last_seen_copy = {
+            pair: value
+            for pair, value in viscoelastic_last_seen.items()
+            if not retained_set.intersection(pair)
+        }
+        viscoelastic_rest_lengths.clear()
+        viscoelastic_rest_lengths.update(viscoelastic_rest_lengths_copy)
+        viscoelastic_last_seen.clear()
+        viscoelastic_last_seen.update(viscoelastic_last_seen_copy)
+
+        restore_jump = max(
+            (
+                robot.position.distance_to(before[robot.robot_id])
+                for robot in shepherds
+            ),
+            default=0.0,
+        )
+        original_anchor_error = max(
+            (
+                robot.position.distance_to(
+                    restored_anchor_by_id[robot.robot_id]
+                )
+                for robot in shepherds
+            ),
+            default=0.0,
+        )
+        print(
+            f"[ShepherdToOriginalGuard] branch={branch} "
+            f"guards={len(retained_ids)} same_ids=True "
+            f"restore_jump={restore_jump:.6f} "
+            f"original_anchor_error={original_anchor_error:.9f} "
+            "re_election=False restored_exact_original_pose=True"
+        )
+        return len(retained_ids)
+
+    # Legacy compatibility path: a caller may still explicitly dissolve the
+    # returned line into NORMAL flow.
+    stage_pebble_from_returned_shepherd_line(robots, branch)
     released = 0
-    for robot in robots:
+    for robot in list(shepherds):
         if robot.role != "SHEPHERD":
+            # One Shepherd may have become the topological Pebble marker.
             continue
         if robot.shepherd_anchor is not None:
             junction_slot = shepherd_slot_position_at_depth(
                 robot.shepherd_anchor,
-                active_branch,
+                branch,
                 0.0,
             )
-            target = (
-                junction_slot
-                + direction * SHEPHERD_JUNCTION_RELEASE_INSET
-            )
+            target = junction_slot + direction * SHEPHERD_JUNCTION_RELEASE_INSET
             if is_walkable(target, robot.radius):
                 robot.position = target
         robot.role = "NORMAL"
@@ -11063,9 +11248,7 @@ def release_shepherd_line_at_junction(robots) -> int:
         robot.frontier_local_lateral = None
         robot.shepherd_branch = None
         robot.shepherd_return_direction = None
-        robot.velocity = (
-            direction * SHEPHERD_JUNCTION_RELEASE_SPEED
-        )
+        robot.velocity = direction * SHEPHERD_JUNCTION_RELEASE_SPEED
         robot.acceleration.update(0.0, 0.0)
         robot.filtered_acceleration.update(0.0, 0.0)
         released += 1
@@ -13473,7 +13656,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 reference_density,
             )
             if selected is None:
-                begin_final_gather()
+                begin_final_gather(robots)
             else:
                 commit_junction_guard_roles(robots, selected)
                 pending_branch_start = selected
@@ -13849,7 +14032,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
                 f"[JunctionComplete] visited={len(visited_children)}/"
                 f"{len(discovered_children)}"
             )
-            begin_final_gather()
+            begin_final_gather(robots)
             return
         begin_junction_guard_formation(robots)
         phase = SimulationPhase.FORM_JUNCTION_GUARDS
@@ -13860,8 +14043,7 @@ def update_simulation_state(robots, dt, reference_density, spatial_grid):
 
     elif phase == SimulationPhase.FINAL_JUNCTION_GATHER:
         stragglers = sum(
-            robot.role != "PEBBLE"
-            and get_robot_region(robot.position) in BRANCHES
+            get_robot_region(robot.position) in BRANCHES
             for robot in robots
         )
         gather_ready = (
