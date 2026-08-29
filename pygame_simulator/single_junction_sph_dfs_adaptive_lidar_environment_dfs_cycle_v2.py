@@ -1072,9 +1072,14 @@ def compute_guard_lateral_interval(
     physical: types.ModuleType,
     descriptor: Any,
 ) -> tuple[float, float]:
-    usable_half = physical.local_physical_usable_half_width(descriptor)
-    edge_margin = physical.ROBOT_RADIUS * GUARD_EDGE_SEAL_MARGIN_RATIO
-    return (-usable_half + edge_margin, usable_half - edge_margin)
+    # LiDAR가 측정한 실제 branch 입구 전체 폭
+    mouth_half = 0.5 * float(descriptor.observed_physical_width)
+    center_half = max(
+        0.0,
+        mouth_half - physical.ROBOT_RADIUS,
+    )
+
+    return (-center_half, center_half)
 
 
 def compute_sealing_aware_column_count(
@@ -1085,9 +1090,11 @@ def compute_sealing_aware_column_count(
         physical, descriptor
     )
     span = max(0.0, lateral_max - lateral_min)
-    max_internal_gap = physical.FRONTIER_LINE_MAX_INTERNAL_GAP * GUARD_LATERAL_OVERLAP_RATIO
+    target_spacing = 2.5 * physical.ROBOT_RADIUS
     required_by_width = physical.required_junction_guard_count(descriptor)
-    required_by_gap = int(math.ceil(span / max(max_internal_gap, physical.EPSILON))) + 1
+    required_by_gap = int(
+        math.ceil(span / max(target_spacing, physical.EPSILON))
+    ) + 1
     columns = max(required_by_width, required_by_gap)
     spacing = span / max(columns - 1, 1)
     return columns, lateral_min, lateral_max, spacing

@@ -2257,13 +2257,18 @@ class Robot:
 
             if target is not None:
                 error = target - self.position
-                # A selected Shepherd claims its local slot, but the proposed
-                # step is still bounded by its current Base-side parent link.
-                if phase == SimulationPhase.FORM_SHEPHERD_BOUNDARY:
-                    motion_scale = 1.0
+
+                motion_scale = 1.0
+
+                if phase == SimulationPhase.PRESSURE_PUSH:
+                    shepherd_move_speed = SHEPHERD_PISTON_SPEED
+                elif phase == SimulationPhase.FLOW_BACKTRACK:
+                    shepherd_move_speed = SHEPHERD_LINE_BACKTRACK_SPEED
                 else:
-                    motion_scale = 1.0
-                step = SHEPHERD_FORM_SPEED * motion_scale * dt
+                    shepherd_move_speed = SHEPHERD_FORM_SPEED
+
+                step = shepherd_move_speed * motion_scale * dt
+                
                 next_position = (
                     target.copy()
                     if error.length() <= step
@@ -11047,7 +11052,28 @@ def normal_backtracking_metrics(robots, branch):
 def release_shepherds_into_flow(robots):
     """Start continuous line-preserving backtracking to the Junction."""
     global shepherd_flow_timer, shepherd_flow_start_depth
-    shepherd_flow_start_depth = get_shepherd_line_depth(active_branch)
+
+    live_shepherds = [
+        robot
+        for robot in robots
+        if robot.role == "SHEPHERD"
+        and robot.shepherd_branch == active_branch
+    ]
+
+    if live_shepherds:
+        shepherd_flow_start_depth = float(
+            sum(
+                branch_depth_from_junction(
+                    robot.position,
+                    active_branch,
+                )
+                for robot in live_shepherds
+            )
+            / len(live_shepherds)
+        )
+    else:
+        shepherd_flow_start_depth = get_shepherd_line_depth(active_branch)
+
     shepherd_flow_timer = 0.0
     retained = 0
     for robot in robots:
