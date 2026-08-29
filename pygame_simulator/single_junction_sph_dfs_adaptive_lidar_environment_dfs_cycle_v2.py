@@ -863,210 +863,997 @@ def _lidar_estimated_mouth_width(
         adaptive_cap,
     ))
 
-
 def build_provisional_guard_descriptors_from_lidar(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     frame: LidarFrame,
 ) -> list[ProvisionalGuardGeometry]:
-    """Build provisional mouth frames from LiDAR sectors, without localization."""
+    """Build general corridor-perpendicular Guard geometry from LiDAR.
+
+    Geometry policy:
+      1. Detect each opening.
+      2. Sample LiDAR points slightly INSIDE both opening boundaries.
+      3. Fit the two corridor side-wall directions.
+      4. Estimate one common corridor axis from those wall directions.
+      5. Build Guard/Frontier/Shepherd rows exactly perpendicular to that axis.
+
+    LEFT / RIGHT / UP identities are not used to calculate geometry.
+    """
+
     if perception.anchor_position is None:
-        raise RuntimeError("provisional Guard geometry requires a fixed Anchor")
+        raise RuntimeError(
+            "provisional Guard geometry requires a fixed Anchor"
+        )
+
+    # =========================================================
+    # Local helper 1:
+    # signed shortest angular difference
+    # =========================================================
+    def signed_angle_delta_deg(
+        from_angle: float,
+        to_angle: float,
+    ) -> float:
+        return (
+            (to_angle - from_angle + 180.0)
+            % 360.0
+            - 180.0
+        )
+
+    # =========================================================
+    # Local helper 2:
+    # collect LiDAR hits slightly INSIDE one opening boundary
+    #
+    # Important:
+    # do NOT sample outside the opening.
+    # Outside points may belong to the Junction lip/corner.
+    # =========================================================
+    def collect_corridor_side_points(
+        boundary_angle: float,
+        center_angle: float,
+        *,
+        min_fraction: float = 0.12,
+        max_fraction: float = 0.45,
+        sample_count: int = 12,
+    ) -> list[pygame.Vector2]:
+
+        delta = signed_angle_delta_deg(
+            boundary_angle,
+            center_angle,
+        )
+
+        if abs(delta) <= 1.0e-6:
+            return []
+
+        points: list[pygame.Vector2] = []
+        used_indices: set[int] = set()
+
+        fractions = np.linspace(
+            min_fraction,
+            max_fraction,
+            sample_count,
+        )
+
+        for fraction in fractions:
+
+            target_angle = (
+                boundary_angle
+                + delta * float(fraction)
+            )
+
+            # normalize to [-180, 180)
+            target_angle = (
+                (target_angle + 180.0)
+                % 360.0
+                - 180.0
+            )
+
+            index = min(
+                range(len(frame.angles)),
+                key=lambda i: circular_error(
+                    float(frame.angles[i]),
+                    target_angle,
+                ),
+            )
+
+            # same LiDAR ray duplicated by nearest-index lookup
+            if index in used_indices:
+                continue
+
+            used_indices.add(index)
+
+            distance = float(
+                frame.smoothed[index]
+            )
+
+            # Infinite / max-range rays do not describe a wall.
+            if (
+                not math.isfinite(distance)
+                or distance <= 0.0
+                or distance >= MAX_RANGE - 1.0e-6
+            ):
+                continue
+
+            angle = float(
+                frame.angles[index]
+            )
+
+            point_world = (
+                perception.anchor_position
+                + _body_local_unit(
+                    perception,
+                    angle,
+                )
+                * distance
+            )
+
+            points.append(
+                point_world
+            )
+
+        return points
+
+    # =========================================================
+    # Local helper 3:
+    # PCA line fitting for one corridor side wall
+    # =========================================================
+    def fit_corridor_wall_direction(
+        points: list[pygame.Vector2],
+    ) -> tuple[
+        pygame.Vector2 | None,
+        float,
+    ]:
+
+        if len(points) < 3:
+            return None, 0.0
+
+        xy = np.asarray(
+            [
+                [point.x, point.y]
+                for point in points
+            ],
+            dtype=float,
+        )
+
+        centroid = np.mean(
+            xy,
+            axis=0,
+        )
+
+        centered = (
+            xy
+            - centroid
+        )
+
+        covariance = (
+            centered.T
+            @ centered
+            / max(
+                len(points) - 1,
+                1,
+            )
+        )
+
+        eigenvalues, eigenvectors = (
+            np.linalg.eigh(
+                covariance
+            )
+        )
+
+        order = np.argsort(
+            eigenvalues
+        )
+
+        minor_value = float(
+            eigenvalues[order[0]]
+        )
+
+        major_value = float(
+            eigenvalues[order[-1]]
+        )
+
+        if major_value <= 1.0e-9:
+            return None, 0.0
+
+        linearity = (
+            major_value
+            / max(
+                minor_value,
+                1.0e-9,
+            )
+        )
+
+        # Not sufficiently line-like
+        if linearity < 3.0:
+            return None, linearity
+
+        principal = (
+            eigenvectors[
+                :,
+                order[-1],
+            ]
+        )
+
+        direction = pygame.Vector2(
+            float(principal[0]),
+            float(principal[1]),
+        )
+
+        if (
+            direction.length_squared()
+            <= physical.EPSILON
+        ):
+            return None, linearity
+
+        return (
+            direction.normalize(),
+            linearity,
+        )
+
+    # =========================================================
+    # Opening extraction
+    # =========================================================
     openings = sorted(
-        (dict(item) for item in frame.openings),
-        key=lambda item: float(item["center_angle"]),
+        (
+            dict(item)
+            for item in frame.openings
+        ),
+        key=lambda item: float(
+            item["center_angle"]
+        ),
     )
+
     if len(openings) < 3:
-        raise RuntimeError("Junction evidence lacks three provisional openings")
-    parent = min(openings, key=lambda item: circular_error(float(item["center_angle"]), 180.0))
-    outgoing = [item for item in openings if item is not parent]
+        raise RuntimeError(
+            "Junction evidence lacks three provisional openings"
+        )
+
+    # Incoming corridor
+    parent = min(
+        openings,
+        key=lambda item: circular_error(
+            float(item["center_angle"]),
+            180.0,
+        ),
+    )
+
+    outgoing = [
+        item
+        for item in openings
+        if item is not parent
+    ]
+
     if len(outgoing) < 3:
         parent = None
         outgoing = openings
-    outgoing = sorted(outgoing, key=lambda item: float(item["center_angle"]))
-    keys = []
-    for item in outgoing:
-        angle = float(item["center_angle"])
-        keys.append("UP" if abs(angle) < 30.0 else ("LEFT" if angle < 0.0 else "RIGHT"))
-    if len(set(keys)) != 3:
-        raise RuntimeError(f"duplicate LiDAR branch identities: {keys}")
-    print(f"[OpeningClassification] all={[round(float(x['center_angle']),1) for x in openings]} parent={round(float(parent['center_angle']),1) if parent else None} outgoing={[round(float(x['center_angle']),1) for x in outgoing]} keys={keys} unique=True")
-    openings = outgoing
-    forward = _body_local_unit(perception, 0.0)
-    lateral = pygame.Vector2(-forward.y, forward.x)
-    broad = max(openings, key=lambda item: float(item["width_deg"]))
-    width_reference = frame.adaptive_w * PROVISIONAL_MOUTH_WIDTH_W_RATIO
-    boundary_forward_depths = []
-    for key in ("start_angle", "end_angle"):
-        angle = float(broad[key])
-        projection = (
-            _body_local_unit(perception, angle).dot(forward)
-            * _range_at_local_angle(frame, angle)
-        )
-        if projection > 0.0:
-            boundary_forward_depths.append(projection)
-    raw_junction_depth = float(np.mean(boundary_forward_depths)) if boundary_forward_depths else width_reference
-    junction_depth = float(np.clip(
-        raw_junction_depth,
-        width_reference * PROVISIONAL_JUNCTION_DEPTH_MIN_WIDTH_RATIO,
-        width_reference * PROVISIONAL_JUNCTION_DEPTH_MAX_WIDTH_RATIO,
-    ))
-    junction_center = perception.anchor_position + forward * junction_depth
-    physical.integration_lidar_junction_estimate = junction_center.copy()
 
-    geometries: list[ProvisionalGuardGeometry] = []
-    for index, opening in enumerate(openings):
-        start = float(opening["start_angle"])
-        end = float(opening["end_angle"])
-        center = float(opening["center_angle"])
-        # The detector's opening start/end are threshold-support edges.
-        # They are NOT the physical mouth endpoints.  Use the immediately
-        # adjacent CLOSED wall rays so the Guard sits on the actual LiDAR
-        # opening mouth instead of deep inside the branch.
-        start_point, start_wall_angle, start_wall_range = _nearest_wall_side_endpoint(
-            frame, perception, start, search_direction=-1
+    outgoing = sorted(
+        outgoing,
+        key=lambda item: float(
+            item["center_angle"]
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # Current Physical DFS adapter identities only.
+    #
+    # IMPORTANT:
+    # these names are NOT used to calculate axis/normal.
+    # ---------------------------------------------------------
+    keys: list[str] = []
+
+    for item in outgoing:
+
+        angle = float(
+            item["center_angle"]
         )
-        end_point, end_wall_angle, end_wall_range = _nearest_wall_side_endpoint(
-            frame, perception, end, search_direction=+1
+
+        keys.append(
+            "UP"
+            if abs(angle) < 30.0
+            else (
+                "LEFT"
+                if angle < 0.0
+                else "RIGHT"
+            )
         )
+
+    if len(set(keys)) != 3:
+        raise RuntimeError(
+            f"duplicate LiDAR branch identities: {keys}"
+        )
+
+    print(
+        f"[OpeningClassification] "
+        f"all={[round(float(x['center_angle']), 1) for x in openings]} "
+        f"parent={round(float(parent['center_angle']), 1) if parent else None} "
+        f"outgoing={[round(float(x['center_angle']), 1) for x in outgoing]} "
+        f"keys={keys} unique=True"
+    )
+
+    openings = outgoing
+
+    # =========================================================
+    # Junction center estimate
+    # =========================================================
+    forward = _body_local_unit(
+        perception,
+        0.0,
+    ).normalize()
+
+    broad = max(
+        openings,
+        key=lambda item: float(
+            item["width_deg"]
+        ),
+    )
+
+    width_reference = (
+        frame.adaptive_w
+        * PROVISIONAL_MOUTH_WIDTH_W_RATIO
+    )
+
+    boundary_forward_depths: list[float] = []
+
+    for key in (
+        "start_angle",
+        "end_angle",
+    ):
+
+        angle = float(
+            broad[key]
+        )
+
+        projection = (
+            _body_local_unit(
+                perception,
+                angle,
+            ).dot(forward)
+            * _range_at_local_angle(
+                frame,
+                angle,
+            )
+        )
+
+        if projection > 0.0:
+            boundary_forward_depths.append(
+                projection
+            )
+
+    raw_junction_depth = (
+        float(
+            np.mean(
+                boundary_forward_depths
+            )
+        )
+        if boundary_forward_depths
+        else width_reference
+    )
+
+    junction_depth = float(
+        np.clip(
+            raw_junction_depth,
+            width_reference
+            * PROVISIONAL_JUNCTION_DEPTH_MIN_WIDTH_RATIO,
+            width_reference
+            * PROVISIONAL_JUNCTION_DEPTH_MAX_WIDTH_RATIO,
+        )
+    )
+
+    junction_center = (
+        perception.anchor_position
+        + forward * junction_depth
+    )
+
+    physical.integration_lidar_junction_estimate = (
+        junction_center.copy()
+    )
+
+    geometries: list[
+        ProvisionalGuardGeometry
+    ] = []
+
+    # =========================================================
+    # SAME algorithm for every outgoing branch
+    # =========================================================
+    for index, opening in enumerate(
+        openings
+    ):
+
+        start = float(
+            opening["start_angle"]
+        )
+
+        end = float(
+            opening["end_angle"]
+        )
+
+        center = float(
+            opening["center_angle"]
+        )
+
+        # -----------------------------------------------------
+        # Physical mouth-side evidence
+        # -----------------------------------------------------
+        (
+            start_point,
+            start_wall_angle,
+            start_wall_range,
+        ) = _nearest_wall_side_endpoint(
+            frame,
+            perception,
+            start,
+            search_direction=-1,
+        )
+
+        (
+            end_point,
+            end_wall_angle,
+            end_wall_range,
+        ) = _nearest_wall_side_endpoint(
+            frame,
+            perception,
+            end,
+            search_direction=+1,
+        )
+
         print(
-            f"[GuardWallEndpoint] center={center:+.1f} "
-            f"start_open={start:+.1f} start_wall={start_wall_angle:+.1f} r={start_wall_range:.2f} "
-            f"end_open={end:+.1f} end_wall={end_wall_angle:+.1f} r={end_wall_range:.2f}"
+            f"[GuardWallEndpoint] "
+            f"center={center:+.1f} "
+            f"start_open={start:+.1f} "
+            f"start_wall={start_wall_angle:+.1f} "
+            f"r={start_wall_range:.2f} "
+            f"end_open={end:+.1f} "
+            f"end_wall={end_wall_angle:+.1f} "
+            f"r={end_wall_range:.2f}"
         )
-        boundary_chord = end_point - start_point
-        radial = _body_local_unit(perception, center)
-        # A rear-side visibility lobe has a radial centre that points back into
-        # the traversed corridor. Its start/end chord nevertheless has a
-        # lateral dominant axis. Quantize only in the Anchor-local basis; no
-        # fixture direction or map mouth coordinate is consulted.
-        if abs(center) >= PROVISIONAL_SIDE_SECTOR_MIN_ABS_ANGLE:
-            sign = -1.0 if center < 0.0 else 1.0
-            axis = lateral * sign
-            axis_source = "BOUNDARY_CHORD_LATERAL_DOMINANT"
-        elif abs(radial.dot(lateral)) > abs(radial.dot(forward)):
-            sign = -1.0 if radial.dot(lateral) < 0.0 else 1.0
-            axis = lateral * sign
-            axis_source = "SECTOR_RADIAL_LATERAL_DOMINANT"
+
+        raw_chord = (
+            end_point
+            - start_point
+        )
+
+        wall_mid_world = (
+            perception.anchor_position
+            + 0.5
+            * (
+                start_point
+                + end_point
+            )
+        )
+
+        # -----------------------------------------------------
+        # Direction only:
+        # Junction -> this branch
+        #
+        # Used to resolve +/- ambiguity of PCA line.
+        # -----------------------------------------------------
+        opening_radial = (
+            _body_local_unit(
+                perception,
+                center,
+            ).normalize()
+        )
+
+        outward = (
+            wall_mid_world
+            - junction_center
+        )
+
+        if (
+            outward.length_squared()
+            <= physical.EPSILON
+        ):
+            outward = (
+                opening_radial.copy()
+            )
         else:
-            axis = forward.copy()
-            axis_source = "SECTOR_RADIAL_FORWARD_DOMINANT"
-        if boundary_chord.length_squared() > physical.EPSILON:
-            chord_axis_alignment = abs(boundary_chord.normalize().dot(axis))
+            outward = (
+                outward.normalize()
+            )
+
+        # -----------------------------------------------------
+        # Collect actual corridor-side wall points
+        # from BOTH sides, INSIDE the opening.
+        # -----------------------------------------------------
+        start_side_points = (
+            collect_corridor_side_points(
+                start,
+                center,
+            )
+        )
+
+        end_side_points = (
+            collect_corridor_side_points(
+                end,
+                center,
+            )
+        )
+
+        (
+            start_wall_direction,
+            start_quality,
+        ) = fit_corridor_wall_direction(
+            start_side_points
+        )
+
+        (
+            end_wall_direction,
+            end_quality,
+        ) = fit_corridor_wall_direction(
+            end_side_points
+        )
+
+        valid_directions: list[
+            tuple[
+                pygame.Vector2,
+                float,
+            ]
+        ] = []
+
+        for direction, quality in (
+            (
+                start_wall_direction,
+                start_quality,
+            ),
+            (
+                end_wall_direction,
+                end_quality,
+            ),
+        ):
+
+            if direction is None:
+                continue
+
+            direction = (
+                direction.normalize()
+            )
+
+            # -------------------------------------------------
+            # Reject a transverse Junction-lip fit.
+            #
+            # Corridor wall should be roughly aligned with
+            # the opening's outgoing direction.
+            # -------------------------------------------------
+            alignment = abs(
+                float(
+                    direction.dot(
+                        opening_radial
+                    )
+                )
+            )
+
+            if alignment < 0.55:
+                continue
+
+            # orient toward branch
+            if (
+                direction.dot(
+                    opening_radial
+                )
+                < 0.0
+            ):
+                direction = -direction
+
+            valid_directions.append(
+                (
+                    direction,
+                    quality,
+                )
+            )
+
+        # -----------------------------------------------------
+        # Combine the two corridor walls
+        # -----------------------------------------------------
+        if len(valid_directions) >= 2:
+
+            (
+                direction_a,
+                quality_a,
+            ) = valid_directions[0]
+
+            (
+                direction_b,
+                quality_b,
+            ) = valid_directions[1]
+
+            if (
+                direction_a.dot(
+                    direction_b
+                )
+                < 0.0
+            ):
+                direction_b = (
+                    -direction_b
+                )
+
+            parallel_score = float(
+                direction_a.dot(
+                    direction_b
+                )
+            )
+
+            # If the two fitted walls disagree strongly,
+            # trust the cleaner fit rather than averaging
+            # two unrelated lines.
+            if parallel_score < 0.85:
+
+                if quality_a >= quality_b:
+                    axis = direction_a
+                else:
+                    axis = direction_b
+
+                axis_source = (
+                    "LIDAR_BEST_SINGLE_CORRIDOR_WALL"
+                )
+
+            else:
+
+                combined = (
+                    direction_a
+                    * max(
+                        quality_a,
+                        1.0,
+                    )
+                    + direction_b
+                    * max(
+                        quality_b,
+                        1.0,
+                    )
+                )
+
+                if (
+                    combined.length_squared()
+                    > physical.EPSILON
+                ):
+                    axis = (
+                        combined.normalize()
+                    )
+
+                    axis_source = (
+                        "LIDAR_TWO_PARALLEL_CORRIDOR_WALLS"
+                    )
+
+                else:
+                    axis = direction_a
+
+                    axis_source = (
+                        "LIDAR_SINGLE_EFFECTIVE_CORRIDOR_WALL"
+                    )
+
+        elif len(valid_directions) == 1:
+
+            axis = (
+                valid_directions[
+                    0
+                ][0]
+            )
+
+            axis_source = (
+                "LIDAR_SINGLE_CORRIDOR_WALL"
+            )
+
         else:
-            chord_axis_alignment = 0.0
-        estimated_width = _lidar_estimated_mouth_width(
-            frame, opening, axis, perception
+            # -------------------------------------------------
+            # Last fallback only.
+            #
+            # Do NOT use raw mouth chord as corridor direction.
+            # -------------------------------------------------
+            axis = (
+                opening_radial.copy()
+            )
+
+            axis_source = (
+                "LIDAR_OPENING_RADIAL_FALLBACK"
+            )
+
+        # Ensure Junction -> branch sign
+        if (
+            axis.dot(
+                opening_radial
+            )
+            < 0.0
+        ):
+            axis = -axis
+
+        axis = (
+            axis.normalize()
         )
-        mouth = junction_center + axis * (0.5 * estimated_width)
-        normal = pygame.Vector2(-axis.y, axis.x)
-        uid = f"PROV_{index:02d}"
-        descriptor = physical.BranchDescriptor(
-            uid=uid,
-            junction_uid=physical.CURRENT_JUNCTION_ID,
-            fixture_key=None,
-            local_outgoing_direction=axis.copy(),
-            local_return_direction=-axis,
-            observed_mouth_position=mouth.copy(),
-            observed_width=estimated_width,
-            cohort_member_ids=set(),
-            direction_last_estimate=axis.copy(),
-            direction_stability_reference=axis.copy(),
-            direction_stable_dwell=1.0,
-            direction_sample_count=1,
-            direction_angular_spread=0.0,
-            direction_is_stable=True,
-            direction_mature_dwell=1.0,
-            direction_is_mature=True,
-            direction_downstream_travel=0.0,
-            motion_t=axis.copy(),
-            motion_n=normal,
-            motion_frame_locked=True,
-            motion_frame_source="LIDAR_PROVISIONAL_SECTOR",
-            motion_frame_sample_count=1,
-            motion_frame_angular_spread=0.0,
-            motion_observed_width=estimated_width,
-            observed_flow_width=estimated_width,
-            observed_physical_width=estimated_width,
-            physical_width_confident=True,
-            physical_width_source="LIDAR_OPENING_START_END_W",
-            physical_left_boundary_lateral=-0.5 * estimated_width,
-            physical_right_boundary_lateral=0.5 * estimated_width,
-            physical_boundary_sample_count=2,
-            discovered_at=physical.simulation_time,
-        )
-        branch_key = keys[index]
-        # The wall-side rays are useful evidence for width/diagnostics, but their
-        # connecting chord is perspective-skewed for LEFT/RIGHT openings.  Do
-        # not use that chord as the Guard row.  The branch axis above is already
-        # inferred from the Anchor-local LiDAR sector; construct the physical
-        # mouth as a cross-section perpendicular to that axis from the start.
-        mouth_normal = pygame.Vector2(-axis.y, axis.x).normalize()
-        raw_chord = end_point - start_point
+
+        # =====================================================
+        # Guard / Frontier / Shepherd direction
+        #
+        # ALWAYS 90 degrees to corridor axis
+        # =====================================================
+        mouth_normal = pygame.Vector2(
+            -axis.y,
+            axis.x,
+        ).normalize()
+
+        # Keep lateral sign consistent with the actual
+        # start -> end mouth evidence.
+        if (
+            raw_chord.length_squared()
+            > physical.EPSILON
+            and mouth_normal.dot(
+                raw_chord
+            )
+            < 0.0
+        ):
+            mouth_normal = (
+                -mouth_normal
+            )
+
+        # =====================================================
+        # Corridor width
+        #
+        # IMPORTANT:
+        # raw chord is used ONLY for width projection,
+        # never for corridor orientation.
+        # =====================================================
         projected_span = (
-            abs(float(raw_chord.dot(mouth_normal)))
-            if raw_chord.length_squared() > physical.EPSILON
+            abs(
+                float(
+                    raw_chord.dot(
+                        mouth_normal
+                    )
+                )
+            )
+            if (
+                raw_chord.length_squared()
+                > physical.EPSILON
+            )
             else 0.0
         )
 
-        # The adjacent CLOSED rays are the local wall-side evidence for the
-        # corridor cross-section.  In v13 their projected wall-to-wall span was
-        # incorrectly capped by the conservative W-derived width estimate.
-        # That made LEFT/RIGHT Guards only 9 columns wide even though the
-        # physical passage was wider.  Trust the projected wall endpoints when
-        # they form a valid cross-section; W is only a fallback, never an upper
-        # bound on Shepherd width.
-        minimum_physical_span = 4.0 * physical.ROBOT_RADIUS
-        if projected_span >= minimum_physical_span:
-            mouth_span = projected_span
-            width_source = "LIDAR_WALL_ENDPOINT_CROSS_SECTION"
+        estimated_width = (
+            _lidar_estimated_mouth_width(
+                frame,
+                opening,
+                axis,
+                perception,
+            )
+        )
+
+        minimum_physical_span = (
+            4.0
+            * physical.ROBOT_RADIUS
+        )
+
+        if (
+            projected_span
+            >= minimum_physical_span
+        ):
+
+            mouth_span = (
+                projected_span
+            )
+
+            width_source = (
+                "LIDAR_WALL_ENDPOINT_CROSS_SECTION"
+            )
+
         else:
-            mouth_span = max(estimated_width, minimum_physical_span)
-            width_source = "ADAPTIVE_W_FALLBACK"
 
-        # Re-center the straight cross-section laterally between the two
-        # observed wall-side points while preserving its axial mouth depth.
-        # This removes a second source of LEFT/RIGHT shortening: an off-centre
-        # nominal mouth would otherwise spend part of the available span on one
-        # wall and leave a gap on the other side.
-        wall_mid_world = perception.anchor_position + 0.5 * (start_point + end_point)
-        lateral_center_shift = float((wall_mid_world - mouth).dot(mouth_normal))
-        mouth = mouth + mouth_normal * lateral_center_shift
+            mouth_span = max(
+                estimated_width,
+                minimum_physical_span,
+            )
 
-        straight_start = mouth - mouth_normal * (0.5 * mouth_span)
-        straight_end = mouth + mouth_normal * (0.5 * mouth_span)
-        geometries.append(ProvisionalGuardGeometry(
-            provisional_uid=uid,
-            opening=opening,
-            descriptor=descriptor,
-            columns=0,
-            layers=0,
-            slots=[],
-            local_branch_key=branch_key,
-            opening_start_local=start_point.copy(),
-            opening_end_local=end_point.copy(),
-            mouth_start_world=straight_start.copy(),
-            mouth_end_world=straight_end.copy(),
-            mouth_center_world=mouth.copy(),
-            mouth_lateral_unit=mouth_normal.copy(),
-            branch_tangent_unit=axis.copy(),
-            mouth_span=float(mouth_span),
-        ))
-        print(
-            f"[GuardPerpendicularFrame] uid={uid} branch={branch_key} "
-            f"t=({axis.x:.3f},{axis.y:.3f}) "
-            f"n=({mouth_normal.x:.3f},{mouth_normal.y:.3f}) "
-            f"raw_chord={raw_chord.length():.3f} projected_span={projected_span:.3f} "
-            f"used_span={mouth_span:.3f} width_source={width_source} "
-            f"lateral_center_shift={lateral_center_shift:.3f} perpendicular=True"
+            width_source = (
+                "ADAPTIVE_W_FALLBACK"
+            )
+
+        # =====================================================
+        # Mouth position
+        #
+        # axial depth:
+        #   common Junction estimate
+        #
+        # lateral centering:
+        #   actual LiDAR mouth evidence
+        # =====================================================
+        mouth = (
+            junction_center
+            + axis
+            * (
+                0.5
+                * estimated_width
+            )
         )
-        print(
-            f"[GuardGeometryBasis] uid={uid} source={axis_source} "
-            f"chord_axis_alignment={chord_axis_alignment:.3f} "
-            f"junction_depth={junction_depth:.3f}"
+
+        lateral_center_shift = float(
+            (
+                wall_mid_world
+                - mouth
+            ).dot(
+                mouth_normal
+            )
         )
+
+        mouth = (
+            mouth
+            + mouth_normal
+            * lateral_center_shift
+        )
+
+        straight_start = (
+            mouth
+            - mouth_normal
+            * (
+                0.5
+                * mouth_span
+            )
+        )
+
+        straight_end = (
+            mouth
+            + mouth_normal
+            * (
+                0.5
+                * mouth_span
+            )
+        )
+
+        uid = (
+            f"PROV_{index:02d}"
+        )
+
+        descriptor = (
+            physical.BranchDescriptor(
+                uid=uid,
+                junction_uid=physical.CURRENT_JUNCTION_ID,
+                fixture_key=None,
+
+                local_outgoing_direction=(
+                    axis.copy()
+                ),
+
+                local_return_direction=(
+                    -axis
+                ),
+
+                observed_mouth_position=(
+                    mouth.copy()
+                ),
+
+                observed_width=mouth_span,
+
+                cohort_member_ids=set(),
+
+                direction_last_estimate=(
+                    axis.copy()
+                ),
+
+                direction_stability_reference=(
+                    axis.copy()
+                ),
+
+                direction_stable_dwell=1.0,
+                direction_sample_count=1,
+                direction_angular_spread=0.0,
+                direction_is_stable=True,
+
+                direction_mature_dwell=1.0,
+                direction_is_mature=True,
+
+                direction_downstream_travel=0.0,
+
+                motion_t=(
+                    axis.copy()
+                ),
+
+                motion_n=(
+                    mouth_normal.copy()
+                ),
+
+                motion_frame_locked=True,
+                motion_frame_source=axis_source,
+
+                motion_frame_sample_count=1,
+                motion_frame_angular_spread=0.0,
+
+                motion_observed_width=(
+                    mouth_span
+                ),
+
+                observed_flow_width=(
+                    mouth_span
+                ),
+
+                observed_physical_width=(
+                    mouth_span
+                ),
+
+                physical_width_confident=True,
+                physical_width_source=(
+                    width_source
+                ),
+
+                physical_left_boundary_lateral=(
+                    -0.5
+                    * mouth_span
+                ),
+
+                physical_right_boundary_lateral=(
+                    0.5
+                    * mouth_span
+                ),
+
+                physical_boundary_sample_count=2,
+
+                discovered_at=(
+                    physical.simulation_time
+                ),
+            )
+        )
+
+        # Adapter only
+        branch_key = keys[index]
+
+        geometries.append(
+            ProvisionalGuardGeometry(
+                provisional_uid=uid,
+                opening=opening,
+                descriptor=descriptor,
+
+                columns=0,
+                layers=0,
+                slots=[],
+
+                local_branch_key=(
+                    branch_key
+                ),
+
+                opening_start_local=(
+                    start_point.copy()
+                ),
+
+                opening_end_local=(
+                    end_point.copy()
+                ),
+
+                mouth_start_world=(
+                    straight_start.copy()
+                ),
+
+                mouth_end_world=(
+                    straight_end.copy()
+                ),
+
+                mouth_center_world=(
+                    mouth.copy()
+                ),
+
+                mouth_lateral_unit=(
+                    mouth_normal.copy()
+                ),
+
+                branch_tangent_unit=(
+                    axis.copy()
+                ),
+
+                mouth_span=float(
+                    mouth_span
+                ),
+            )
+        )
+
+        print(
+            f"[CorridorWallFrame] "
+            f"uid={uid} "
+            f"branch={branch_key} "
+            f"source={axis_source} "
+            f"axis=({axis.x:.3f},{axis.y:.3f}) "
+            f"normal=({mouth_normal.x:.3f},{mouth_normal.y:.3f}) "
+            f"start_pts={len(start_side_points)} "
+            f"end_pts={len(end_side_points)} "
+            f"start_q={start_quality:.2f} "
+            f"end_q={end_quality:.2f} "
+            f"span={mouth_span:.3f} "
+            f"lateral_shift={lateral_center_shift:.3f}"
+        )
+
     return geometries
-
 
 def compute_guard_lateral_interval(
     physical: types.ModuleType,
@@ -2842,49 +3629,96 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         lifecycle: dict[str, Any] | None = None,
         descriptor: Any | None = None,
     ) -> tuple[pygame.Vector2, pygame.Vector2, str]:
-        """Return a corridor-aligned transport frame for Frontier/Shepherd motion.
+        """Use the same LiDAR-frozen branch frame for Guard/Frontier/Shepherd.
 
-        The reference Physical DFS moves LEFT/RIGHT/UP Shepherds on the actual
-        corridor axis and preserves only the transverse slot during backtracking.
-        This integration keeps that behavior.  On the present cross-map the
-        legacy fixture direction is used strictly as the physics adapter already
-        acknowledged by BranchDescriptor; a future fixture-less branch falls
-        back to the LiDAR-frozen descriptor direction.
+        Do not re-align to legacy LEFT/RIGHT/UP fixture directions.
+        The frame frozen at initial Guard formation is reused through:
+        Guard -> Frontier -> Shepherd -> returned Guard.
         """
+
         descriptor = descriptor or descriptor_for(branch)
+
         lifecycle = lifecycle or getattr(
-            physical, "integration_wall_lifecycle", {}
+            physical,
+            "integration_wall_lifecycle",
+            {},
         ).get(branch, {})
 
-        fixture_axis = getattr(physical, "BRANCH_DIRECTIONS", {}).get(branch)
-        if fixture_axis is not None and fixture_axis.length_squared() > physical.EPSILON:
-            tangent = fixture_axis.normalize()
-            source = "LEGACY_FIXTURE_PHYSICS_ADAPTER"
-        else:
-            candidate = None
-            if lifecycle:
-                candidate = lifecycle.get("branch_tangent_unit")
-            if (
-                candidate is None
-                or candidate.length_squared() <= physical.EPSILON
-            ) and descriptor is not None:
-                candidate = getattr(descriptor, "motion_t", None)
-                if candidate is None:
-                    candidate = getattr(descriptor, "local_outgoing_direction", None)
-            if candidate is None or candidate.length_squared() <= physical.EPSILON:
-                raise RuntimeError(f"no transport tangent for branch {branch}")
-            tangent = candidate.normalize()
-            source = "LIDAR_FROZEN_FALLBACK"
+        # 1. 가장 우선:
+        # 처음 Guard 생성 시 LiDAR에서 frozen된 branch tangent
+        candidate = None
 
-        lateral = pygame.Vector2(-tangent.y, tangent.x)
-        old_lateral = lifecycle.get("mouth_lateral_unit") if lifecycle else None
+        if lifecycle:
+            candidate = lifecycle.get(
+                "branch_tangent_unit"
+            )
+
+        # 2. lifecycle에 없을 때만 descriptor의 LiDAR frame 사용
+        if (
+            candidate is None
+            or candidate.length_squared()
+            <= physical.EPSILON
+        ):
+            if descriptor is not None:
+                candidate = getattr(
+                    descriptor,
+                    "motion_t",
+                    None,
+                )
+
+        if (
+            candidate is None
+            or candidate.length_squared()
+            <= physical.EPSILON
+        ):
+            if descriptor is not None:
+                candidate = getattr(
+                    descriptor,
+                    "local_outgoing_direction",
+                    None,
+                )
+
+        if (
+            candidate is None
+            or candidate.length_squared()
+            <= physical.EPSILON
+        ):
+            raise RuntimeError(
+                f"no LiDAR-frozen transport tangent "
+                f"for branch {branch}"
+            )
+
+        tangent = candidate.normalize()
+
+        # tangent에 정확히 수직인 Guard/Shepherd row 방향
+        lateral = pygame.Vector2(
+            -tangent.y,
+            tangent.x,
+        ).normalize()
+
+        # 처음 Guard에서 사용했던 lateral 방향의 부호도 유지
+        old_lateral = (
+            lifecycle.get("mouth_lateral_unit")
+            if lifecycle
+            else None
+        )
+
         if (
             old_lateral is not None
-            and old_lateral.length_squared() > physical.EPSILON
+            and old_lateral.length_squared()
+            > physical.EPSILON
             and lateral.dot(old_lateral) < 0.0
         ):
             lateral = -lateral
-        return tangent, lateral.normalize(), source
+
+        source = "LIDAR_FROZEN_GUARD_FRAME"
+
+        return (
+            tangent,
+            lateral,
+            source,
+        )
+
 
     def lock_branch_transport_frame(
         branch: str,
