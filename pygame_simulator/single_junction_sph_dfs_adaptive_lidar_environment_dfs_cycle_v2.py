@@ -1749,173 +1749,214 @@ def activate_guard_cohort(
         "direct_position_overwrite_count=0"
     )
 
-
 def update_guard_readiness_and_activation(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     robots: Sequence[Any],
 ) -> None:
-    """Independently activate each branch when its natural shallow cohort fits."""
+    """Each branch independently recruits arriving NORMALs into Guard slots."""
+
     if not perception.provisional_guard_started:
         return
-    by_key = {g.local_branch_key: g for g in perception.provisional_guards}
-    pending: dict[str, tuple[list[Any], dict[str, Any], set[int]]] = {}
-    stage = perception.guard_activation_stage
-    if not perception.guard_activation_groups:
-        ordered = sorted(perception.provisional_guards, key=lambda g: -abs(float(g.opening.get("center_angle", 0.0))))
-        groups: list[list[ProvisionalGuardGeometry]] = []
-        for geometry in ordered:
-            priority = abs(float(geometry.opening.get("center_angle", 0.0)))
-            if not groups or abs(priority - abs(float(groups[-1][0].opening.get("center_angle", 0.0)))) > ASSOCIATION_TOLERANCE_DEG:
-                groups.append([geometry])
-            else:
-                groups[-1].append(geometry)
-        perception.guard_activation_groups = groups
-        print(f"[GuardActivationPlan] branch_count={len(ordered)} group_count={len(groups)}")
-        for index, group in enumerate(groups):
-            print(f"[GuardActivationPlan] group={index} members={[g.provisional_uid for g in group]} priorities={[abs(float(g.opening.get('center_angle', 0.0))) for g in group]}")
-    if not perception.guard_activation_groups:
-        return
-    groups = perception.guard_activation_groups
-    if stage == "SETTLING_ALL":
-        assert perception.guard_current_group_index >= len(groups)
-        ready_count = sum(bool(physical.integration_wall_status.get(g.provisional_uid, {}).get("ready", False)) for g in perception.provisional_guards)
-        print(f"[GuardSettlingAll] frame={getattr(physical, 'integration_frame', -1)} ready_count={ready_count} total_count={len(perception.provisional_guards)}")
-        cohorts_complete = all(
-            geometry.cohort_ready
-            and len(geometry.selected_ids) == len(geometry.slots)
-            for geometry in perception.provisional_guards
-        )
-        if ready_count == len(perception.provisional_guards) or cohorts_complete:
-            perception.guard_activation_stage = "COMPLETE"
-            print(
-                f"[GuardFormationComplete] frame={getattr(physical, 'integration_frame', -1)} "
-                f"cohorts_complete={cohorts_complete} walls_ready={ready_count}/"
-                f"{len(perception.provisional_guards)}"
-            )
-        return
-    if stage == "COMPLETE":
-        assert perception.guard_current_group_index >= len(groups)
-        return
-    assert stage == "WAIT_GROUP"
-    if perception.guard_current_group_index >= len(groups):
-        perception.guard_all_groups_activated = True
-        perception.guard_activation_stage = "SETTLING_ALL"
-        print(f"[AllGuardGroupsActivated] frame={getattr(physical, 'integration_frame', -1)} groups={len(groups)}")
-        return
-    current_group = perception.guard_activation_groups[perception.guard_current_group_index]
-    for future in perception.guard_activation_groups[perception.guard_current_group_index + 1:]:
-        assert all(not g.selected_ids for g in future)
+
+    frame = getattr(physical, "integration_frame", -1)
+
+    # 기존 group 순차 활성화는 사용하지 않는다.
+    # LEFT / RIGHT / UP가 각각 독립적으로 선착순 Guard를 만든다.
+    perception.guard_activation_groups = []
+
     for geometry in perception.provisional_guards:
+
         if geometry.cohort_ready:
             continue
-        if geometry not in current_group:
-            continue
-        physical.integration_guard_who_localization_enabled = True
-        candidates = collect_shallow_guard_candidates_with_localization(
-            physical, perception, robots, geometry
-        )
-        required = len(geometry.slots)
-        frame = getattr(physical, "integration_frame", -1)
-        candidate_just_sufficient = (
-            len(candidates) >= required
-            and geometry.candidate_sufficient_frame is None
-        )
-        if candidate_just_sufficient:
-            geometry.candidate_sufficient_frame = frame
-            print(
-                f"[Timeline] GUARD_CANDIDATE_SUFFICIENT "
-                f"uid={geometry.provisional_uid} frame={frame}"
-            )
-        critical_ids = (
-            communication_articulation_robot_ids(robots)
-            if len(candidates) >= required else set()
-        )
-        preferred = [
-            robot for robot in candidates
-            if robot.robot_id not in critical_ids
-        ]
-        assignment, diagnostics = compute_full_guard_slot_assignment(
-            physical, geometry, preferred
-        )
-        used_critical_fallback = False
-        if (
-            len(assignment) < required
-            and len(candidates) >= required
-        ):
-            assignment, diagnostics = compute_full_guard_slot_assignment(
-                physical, geometry, candidates
-            )
-            used_critical_fallback = True
-        diagnostics["communication_critical_fallback"] = (
-            used_critical_fallback
-        )
-        geometry.readiness_diagnostics = diagnostics
-        status = physical.integration_wall_status[geometry.provisional_uid]
-        status.update(diagnostics)
-        should_log = (
-            candidate_just_sufficient
-            or frame % GUARD_READINESS_LOG_PERIOD == 0
-            or branch_guard_cohort_ready(geometry, diagnostics)
-        )
-        geometry.last_candidate_count = diagnostics["candidate_count"]
-        geometry.last_assignment_count = diagnostics["assignment_count"]
-        if should_log:
-            print(
-                f"[GuardReadiness] uid={geometry.provisional_uid} "
-                f"frame={frame} required={required} "
-                f"candidate_count={diagnostics['candidate_count']} "
-                f"assignment_count={diagnostics['assignment_count']} "
-                f"coverage_ratio={diagnostics['coverage_ratio']:.3f} "
-                f"occupied_lateral_bins="
-                f"{diagnostics['occupied_lateral_bins']}/"
-                f"{GUARD_LATERAL_COVERAGE_BINS} "
-                f"axial_range=({diagnostics['axial_min']:.3f},"
-                f"{diagnostics['axial_max']:.3f}) "
-                f"max_assignment_distance="
-                f"{diagnostics['max_assignment_distance']:.3f} "
-                f"mean_assignment_distance="
-                f"{diagnostics['mean_assignment_distance']:.3f} "
-                f"ready={branch_guard_cohort_ready(geometry, diagnostics)}"
-            )
-        if frame % GUARD_READINESS_LOG_PERIOD == 0 or branch_guard_cohort_ready(geometry, diagnostics):
-            print(f"[GuardPreActivationGate] frame={frame} uid={geometry.provisional_uid} group_index={perception.guard_current_group_index} candidate_count={diagnostics['candidate_count']} required={required} full_assignment={diagnostics['full_slot_assignment_possible']} outer_edge_sealed={diagnostics['outer_edge_sealed']} left_edge_gap={diagnostics.get('left_edge_gap', 0.0):.3f} right_edge_gap={diagnostics.get('right_edge_gap', 0.0):.3f} activation_allowed={branch_guard_cohort_ready(geometry, diagnostics)}")
-        if branch_guard_cohort_ready(geometry, diagnostics):
-            pending[geometry.local_branch_key] = (assignment, diagnostics, critical_ids)
-            continue
-    if stage == "WAIT_GROUP" or stage == "WAIT_SIDE_PAIR":
-        if len(pending) == len(current_group):
-            for geometry in current_group:
-                assignment, diagnostics, critical_ids = pending[geometry.local_branch_key]
-                activate_guard_cohort(physical, perception, robots, geometry, assignment, critical_ids, diagnostics)
-            index = perception.guard_current_group_index
-            perception.guard_current_group_index += 1
-            if perception.guard_current_group_index >= len(perception.guard_activation_groups):
-                perception.guard_all_groups_activated = True
-                all_guard_cohorts_complete = all(
-                    geometry.cohort_ready
-                    and len(geometry.selected_ids) == len(geometry.slots)
-                    for geometry in perception.provisional_guards
-                )
-                perception.guard_activation_stage = (
-                    "COMPLETE" if all_guard_cohorts_complete else "SETTLING_ALL"
-                )
-                print(f"[AllGuardGroupsActivated] frame={getattr(physical, 'integration_frame', -1)}")
-                if all_guard_cohorts_complete:
-                    print(
-                        f"[GuardFormationComplete] frame={getattr(physical, 'integration_frame', -1)} "
-                        "cohorts_complete=True walls_diagnostic_only=True"
-                    )
-            else:
-                perception.guard_activation_stage = "WAIT_GROUP"
-                print(f"[GuardActivationAdvance] frame={getattr(physical, 'integration_frame', -1)} from_group={index} to_group={perception.guard_current_group_index}")
-            physical.integration_guard_who_localization_enabled = False
-            return
-        physical.integration_guard_who_localization_enabled = False
-        return
-    physical.integration_guard_who_localization_enabled = False
-    return
 
+        physical.integration_guard_who_localization_enabled = True
+
+        # 해당 branch 입구 근처까지 먼저 온 NORMAL들
+        candidates = collect_shallow_guard_candidates_with_localization(
+            physical,
+            perception,
+            robots,
+            geometry,
+        )
+
+        # 이미 Guard가 차지한 slot
+        occupied_slots = {
+            int(robot.integration_guard_slot_index)
+            for robot in robots
+            if robot.robot_id in geometry.selected_ids
+            and getattr(robot, "integration_guard_slot_index", None) is not None
+        }
+
+        # 가장자리부터 채우기
+        column_priority = build_edge_sealing_slot_order(
+            geometry.columns
+        )
+
+        slot_priority = [
+            layer * geometry.columns + column
+            for layer in range(geometry.layers)
+            for column in column_priority
+        ]
+
+        empty_slots = [
+            slot_index
+            for slot_index in slot_priority
+            if slot_index not in occupied_slots
+        ]
+
+        # 이미 다른 Guard로 뽑힌 로봇 제외
+        available = [
+            robot
+            for robot in candidates
+            if robot.robot_id not in geometry.selected_ids
+            and robot.role == "NORMAL"
+        ]
+
+        # 바깥쪽 slot부터 즉시 채운다.
+        for slot_index in empty_slots:
+
+            if not available:
+                break
+
+            slot = geometry.slots[slot_index]
+
+            # 해당 slot에 가장 가까운 선두 NORMAL을 사용
+            robot = min(
+                available,
+                key=lambda candidate: (
+                    candidate.position.distance_to(slot),
+                    -guard_mouth_coordinates(
+                        candidate.position,
+                        geometry,
+                    )[0],
+                    candidate.robot_id,
+                ),
+            )
+
+            available.remove(robot)
+
+            # 즉시 Guard로 전환
+            robot.role = "JUNCTION_GUARD"
+
+            robot.integration_guard_waypoints = [
+                slot.copy()
+            ]
+
+            robot.integration_guard_final_anchor = (
+                slot.copy()
+            )
+
+            robot.integration_guard_slot_index = (
+                slot_index
+            )
+
+            robot.junction_guard_anchor = slot.copy()
+
+            robot.junction_guard_branch = (
+                geometry.provisional_uid
+            )
+
+            robot.junction_guard_branch_uid = (
+                geometry.provisional_uid
+            )
+
+            robot.junction_guard_layer = (
+                slot_index // geometry.columns
+            )
+
+            # 첫 Guard를 branch leader로 사용
+            if not geometry.selected_ids:
+                geometry.descriptor.leader_id = (
+                    robot.robot_id
+                )
+                robot.junction_guard_parent_id = None
+                robot.is_branch_leader = True
+            else:
+                robot.junction_guard_parent_id = (
+                    geometry.descriptor.leader_id
+                )
+                robot.is_branch_leader = False
+
+            geometry.selected_ids.append(
+                robot.robot_id
+            )
+
+            print(
+                f"[IncrementalGuard] "
+                f"uid={geometry.provisional_uid} "
+                f"robot={robot.robot_id} "
+                f"slot={slot_index} "
+                f"filled={len(geometry.selected_ids)}/"
+                f"{len(geometry.slots)}"
+            )
+
+        # 부분적으로라도 Guard가 생긴 순간부터 물리적으로 사용
+        if geometry.selected_ids:
+
+            physical.integration_provisional_guard_groups[
+                geometry.provisional_uid
+            ] = list(geometry.selected_ids)
+
+            physical.integration_provisional_guard_active = True
+            physical.integration_guard_gating_enabled = True
+
+            if (
+                physical.integration_guard_formation_start_frame
+                is None
+            ):
+                physical.integration_guard_formation_start_frame = (
+                    frame
+                )
+
+            if geometry.role_assignment_frame is None:
+                geometry.role_assignment_frame = frame
+
+        # 3×N slot을 전부 채웠을 때만 완성 처리
+        if len(geometry.selected_ids) == len(
+            geometry.slots
+        ):
+            geometry.cohort_ready = True
+            geometry.guard_ready_frame = frame
+
+            status = physical.integration_wall_status[
+                geometry.provisional_uid
+            ]
+
+            status["assigned"] = len(
+                geometry.selected_ids
+            )
+
+            status["assignment_count"] = len(
+                geometry.selected_ids
+            )
+
+            print(
+                f"[IncrementalGuardComplete] "
+                f"uid={geometry.provisional_uid} "
+                f"robots={len(geometry.selected_ids)} "
+                f"frame={frame}"
+            )
+
+    # 모든 branch가 완성된 뒤에만 DFS로 넘어갈 수 있게 함
+    all_complete = all(
+        geometry.cohort_ready
+        and len(geometry.selected_ids)
+        == len(geometry.slots)
+        for geometry in perception.provisional_guards
+    )
+
+    if all_complete:
+        perception.guard_all_groups_activated = True
+        perception.guard_activation_stage = "COMPLETE"
+
+        print(
+            f"[GuardFormationComplete] "
+            f"frame={frame} "
+            f"incremental_first_arrival=True"
+        )
+
+    physical.integration_guard_who_localization_enabled = False
 
 def update_provisional_wall_settling_audit(
     physical: types.ModuleType,
