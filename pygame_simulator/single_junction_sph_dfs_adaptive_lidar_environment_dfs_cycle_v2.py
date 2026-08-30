@@ -1259,6 +1259,13 @@ def build_provisional_guard_descriptors_from_lidar(
         openings
     ):
 
+        # The three outgoing openings were already ordered in the Anchor's
+        # ingress frame.  Keep that local topology order available as a
+        # geometric sanity reference: left / forward / right.  This is not a
+        # fixture coordinate; it rotates with the robot's measured body yaw.
+        branch_key = keys[index]
+    
+
         start = float(
             opening["start_angle"]
         )
@@ -1559,6 +1566,12 @@ def build_provisional_guard_descriptors_from_lidar(
             axis.normalize()
         )
 
+        # Near a side mouth, one threshold opening can be an oblique view of
+        # the ingress corridor.  Its fitted wall then points back along the
+        # parent corridor and would place two of the three rows inside a wall.
+        # Reject that topologically impossible orientation using only the
+        # Anchor-local left/forward/right opening order.
+
         # =====================================================
         # Guard / Frontier / Shepherd direction
         #
@@ -1614,14 +1627,14 @@ def build_provisional_guard_descriptors_from_lidar(
             )
         )
 
-        minimum_physical_span = (
-            4.0
-            * physical.ROBOT_RADIUS
+        minimum_reliable_span = max(
+            4.0 * physical.ROBOT_RADIUS,
+            0.55 * frame.adaptive_w,
         )
 
         if (
             projected_span
-            >= minimum_physical_span
+            >= minimum_reliable_span
         ):
 
             mouth_span = (
@@ -1636,7 +1649,7 @@ def build_provisional_guard_descriptors_from_lidar(
 
             mouth_span = max(
                 estimated_width,
-                minimum_physical_span,
+                4.0 * physical.ROBOT_RADIUS,
             )
 
             width_source = (
@@ -1661,12 +1674,11 @@ def build_provisional_guard_descriptors_from_lidar(
             )
         )
 
-        lateral_center_shift = float(
-            (
-                wall_mid_world
-                - mouth
-            ).dot(
-                mouth_normal
+        lateral_center_shift = (
+            0.0
+            if axis_source == "LIDAR_TOPOLOGY_ORDER_FALLBACK"
+            else float(
+                (wall_mid_world - mouth).dot(mouth_normal)
             )
         )
 
@@ -1787,9 +1799,6 @@ def build_provisional_guard_descriptors_from_lidar(
             )
         )
 
-        # Adapter only
-        branch_key = keys[index]
-
         geometries.append(
             ProvisionalGuardGeometry(
                 provisional_uid=uid,
@@ -1853,6 +1862,52 @@ def build_provisional_guard_descriptors_from_lidar(
             f"lateral_shift={lateral_center_shift:.3f}"
         )
 
+    # Side openings are seen obliquely from the Anchor.  Their visible endpoint
+    # chord can be much shorter than the corridor cross-section even when the
+    # opening order and branch axis are correct.  Reuse the median directly
+    # measured full cross-section only for those low-confidence branches.
+    trusted_widths = [
+        float(geometry.mouth_span)
+        for geometry in geometries
+        if geometry.descriptor.physical_width_source
+        == "LIDAR_WALL_ENDPOINT_CROSS_SECTION"
+    ]
+    if trusted_widths:
+        fallback_width = float(np.median(trusted_widths))
+        for geometry in geometries:
+            descriptor = geometry.descriptor
+            if descriptor.physical_width_source != "ADAPTIVE_W_FALLBACK":
+                continue
+
+            tangent = geometry.branch_tangent_unit
+            normal = geometry.mouth_lateral_unit
+            if tangent is None or normal is None:
+                continue
+            center = (
+                junction_center
+                + tangent * (0.5 * fallback_width)
+            )
+
+            geometry.mouth_span = fallback_width
+            geometry.mouth_center_world = center.copy()
+            geometry.mouth_start_world = center - normal * (0.5 * fallback_width)
+            geometry.mouth_end_world = center + normal * (0.5 * fallback_width)
+            descriptor.observed_mouth_position = center.copy()
+            descriptor.observed_width = fallback_width
+            descriptor.motion_observed_width = fallback_width
+            descriptor.observed_flow_width = fallback_width
+            descriptor.observed_physical_width = fallback_width
+            descriptor.physical_left_boundary_lateral = -0.5 * fallback_width
+            descriptor.physical_right_boundary_lateral = 0.5 * fallback_width
+            descriptor.physical_width_source = (
+                "LIDAR_SHARED_FULL_CROSS_SECTION_FALLBACK"
+            )
+            print(
+                f"[GuardWidthFallback] uid={geometry.provisional_uid} "
+                f"width={fallback_width:.3f} "
+                "source=LIDAR_SHARED_FULL_CROSS_SECTION"
+            )
+
     return geometries
 
 def compute_guard_lateral_interval(
@@ -1861,9 +1916,12 @@ def compute_guard_lateral_interval(
 ) -> tuple[float, float]:
     # LiDAR가 측정한 실제 branch 입구 전체 폭
     mouth_half = 0.5 * float(descriptor.observed_physical_width)
+    wall_clearance = physical.ROBOT_RADIUS * (
+        1.0 + GUARD_EDGE_SEAL_MARGIN_RATIO
+    )
     center_half = max(
         0.0,
-        mouth_half - physical.ROBOT_RADIUS,
+        mouth_half - wall_clearance,
     )
 
     return (-center_half, center_half)
@@ -1962,6 +2020,158 @@ def build_sealing_aware_slots(
         lateral_min = lateral_max = 0.0
     spacing = (lateral_max - lateral_min) / max(columns - 1, 1)
     order = build_edge_sealing_slot_order(columns)
+
+    # LiDAR mouth-centre estimates can retain a small perspective bias.  Move
+    # only along the measured cross-section normal and choose the smallest
+    # correction that maximises collision-free 3xN slots.  No fixture label or
+    # branch coordinate is used; this is a physical feasibility correction.
+    search_step = max(0.25, 0.25 * physical.ROBOT_RADIUS)
+    search_limit = 0.20 * mouth_span
+    search_count = int(math.ceil(search_limit / search_step))
+    lateral_offsets = [0.0]
+    for step_index in range(1, search_count + 1):
+        offset = step_index * search_step
+        lateral_offsets.extend((-offset, offset))
+
+    def walkable_slot_count(lateral_offset: float) -> int:
+        shifted_center = mouth_center + normal * lateral_offset
+        return sum(
+            physical.is_walkable(
+                shifted_center
+                + tangent
+                * (
+                    physical.JUNCTION_GUARD_BRANCH_INSET
+                    + layer * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+                )
+                + normal * (lateral_min + spacing * column),
+                physical.ROBOT_RADIUS,
+            )
+            for layer in range(layers)
+            for column in range(columns)
+        )
+
+    best_lateral_offset = min(
+        lateral_offsets,
+        key=lambda offset: (-walkable_slot_count(offset), abs(offset)),
+    )
+    if abs(best_lateral_offset) > physical.EPSILON:
+        mouth_center += normal * best_lateral_offset
+        descriptor.observed_mouth_position = mouth_center.copy()
+        if geometry is not None:
+            geometry.mouth_center_world = mouth_center.copy()
+            geometry.mouth_start_world = mouth_center - normal * (0.5 * mouth_span)
+            geometry.mouth_end_world = mouth_center + normal * (0.5 * mouth_span)
+        print(
+            f"[GuardCenterCorrection] uid={descriptor.uid} "
+            f"lateral_offset={best_lateral_offset:.3f} "
+            f"walkable={walkable_slot_count(best_lateral_offset)}/"
+            f"{columns * layers}"
+        )
+        # ---------------------------------------------------------
+    # Every final Guard slot must be physically reachable.
+    #
+    # Center correction alone can still leave the outermost
+    # LEFT/RIGHT slots slightly inside a wall when the LiDAR
+    # corridor frame has a small angular error.
+    #
+    # Keep the same axis and 3xN structure.  Contract only the
+    # lateral span by the minimum amount required.
+    # ---------------------------------------------------------
+    total_required = columns * layers
+
+    def walkable_count_for_interval(
+        test_min: float,
+        test_max: float,
+    ) -> int:
+        test_spacing = (
+            test_max - test_min
+        ) / max(columns - 1, 1)
+
+        return sum(
+            physical.is_walkable(
+                mouth_center
+                + tangent
+                * (
+                    physical.JUNCTION_GUARD_BRANCH_INSET
+                    + layer
+                    * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+                )
+                + normal
+                * (
+                    test_min
+                    + test_spacing * column
+                ),
+                physical.ROBOT_RADIUS,
+            )
+            for layer in range(layers)
+            for column in range(columns)
+        )
+
+    current_walkable = walkable_count_for_interval(
+        lateral_min,
+        lateral_max,
+    )
+
+    if current_walkable < total_required:
+
+        max_extra_inset = min(
+            2.0 * physical.ROBOT_RADIUS,
+            0.10 * mouth_span,
+        )
+
+        corrected = False
+
+        for extra_inset in np.linspace(
+            0.0,
+            max_extra_inset,
+            41,
+        ):
+            test_min = lateral_min + float(extra_inset)
+            test_max = lateral_max - float(extra_inset)
+
+            if test_max <= test_min:
+                break
+
+            if (
+                walkable_count_for_interval(
+                    test_min,
+                    test_max,
+                )
+                == total_required
+            ):
+                lateral_min = test_min
+                lateral_max = test_max
+
+                spacing = (
+                    lateral_max - lateral_min
+                ) / max(columns - 1, 1)
+
+                corrected = True
+
+                print(
+                    f"[GuardSpanCorrection] "
+                    f"uid={descriptor.uid} "
+                    f"extra_inset={extra_inset:.3f} "
+                    f"walkable={total_required}/"
+                    f"{total_required}"
+                )
+                break
+
+        if not corrected:
+            raise RuntimeError(
+                f"Guard geometry has unreachable slots: "
+                f"uid={descriptor.uid} "
+                f"walkable={current_walkable}/"
+                f"{total_required}"
+            )
+
+    # Save the ACTUAL interval used to create the slots.
+    if geometry is not None:
+        geometry.sealing_lateral_min = lateral_min
+        geometry.sealing_lateral_max = lateral_max
+        geometry.slot_spacing = spacing
+
+
     slots: list[pygame.Vector2] = []
 
     for layer in range(layers):
@@ -2022,12 +2232,14 @@ def build_provisional_multilayer_slots(
         geometry.columns = columns
         geometry.layers = layers
         geometry.slots = [slot.copy() for slot in slots]
-        geometry.sealing_lateral_min = lateral_min
-        geometry.sealing_lateral_max = lateral_max
-        geometry.slot_spacing = slot_spacing
         walkable = sum(
             physical.is_walkable(slot, physical.ROBOT_RADIUS) for slot in slots
         )
+        unwalkable_slots = [
+            (index, slot)
+            for index, slot in enumerate(slots)
+            if not physical.is_walkable(slot, physical.ROBOT_RADIUS)
+        ]
         opening = geometry.opening
         print(f"[GuardGeometry] uid={geometry.provisional_uid}")
         print(f"[GuardGeometry] opening_start={float(opening['start_angle']):.3f}")
@@ -2050,6 +2262,11 @@ def build_provisional_multilayer_slots(
         print(f"[GuardGeometry] required={required}")
         print(f"[GuardGeometry] slot_spacing={slot_spacing:.3f}")
         print(f"[GuardGeometry] slots_walkable={walkable}/{len(slots)}")
+        if unwalkable_slots:
+            print(
+                f"[GuardGeometry] unwalkable_slots="
+                f"{[(index, round(slot.x, 3), round(slot.y, 3)) for index, slot in unwalkable_slots]}"
+            )
 
 
 def initialize_provisional_guard_geometry_after_detection(
@@ -2257,6 +2474,8 @@ def guard_mouth_coordinates(point: pygame.Vector2, geometry: ProvisionalGuardGeo
     return float(delta.dot(tangent)), float(delta.dot(lateral))
 
 
+
+
 def compute_full_guard_slot_assignment(
     physical: types.ModuleType,
     geometry: ProvisionalGuardGeometry,
@@ -2441,10 +2660,16 @@ def activate_guard_cohort(
     for robot, slot, slot_index in selected:
         before = robot.position.copy()
         robot.role = "JUNCTION_GUARD"
-        robot.integration_guard_waypoints = [slot.copy()]
+        robot.integration_guard_waypoints = build_guard_entry_waypoints(
+            physical,
+            geometry,
+            slot,
+        )
         robot.integration_guard_final_anchor = slot.copy()
         robot.integration_guard_slot_index = slot_index
-        robot.junction_guard_anchor = slot.copy()
+        robot.junction_guard_anchor = (
+            robot.integration_guard_waypoints[0].copy()
+        )
         robot.junction_guard_branch = geometry.provisional_uid
         robot.junction_guard_branch_uid = geometry.provisional_uid
         robot.junction_guard_hop = 0
@@ -2575,22 +2800,60 @@ def update_guard_readiness_and_activation(
             and getattr(robot, "integration_guard_slot_index", None) is not None
         }
 
-        # 가장자리부터 채우기
+        # 각 row 내부에서는 양 가장자리부터 채운다.
         column_priority = build_edge_sealing_slot_order(
             geometry.columns
         )
 
-        slot_priority = [
-            layer * geometry.columns + column
-            for layer in range(geometry.layers)
-            for column in column_priority
-        ]
+        # 물리적 통과 가능성을 고려해서
+        # branch 가장 안쪽 row -> 정션 쪽 row 순서로 형성한다.
+        active_layer = None
 
-        empty_slots = [
-            slot_index
-            for slot_index in slot_priority
-            if slot_index not in occupied_slots
-        ]
+        for layer in reversed(range(geometry.layers)):
+
+            layer_guards = [
+                robot
+                for robot in robots
+                if robot.robot_id in geometry.selected_ids
+                and getattr(robot, "junction_guard_layer", -1) == layer
+            ]
+
+            layer_fully_assigned = (
+                len(layer_guards) == geometry.columns
+            )
+
+            layer_settled = (
+                layer_fully_assigned
+                and all(
+                    robot.integration_guard_final_anchor is not None
+                    and robot.position.distance_to(
+                        robot.integration_guard_final_anchor
+                    )
+                    <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
+                    for robot in layer_guards
+                )
+            )
+
+            # 가장 깊은 아직 미완성 row 하나만 활성화
+            if not layer_settled:
+                active_layer = layer
+                break
+
+
+        if active_layer is None:
+            empty_slots = []
+
+        else:
+            slot_priority = [
+                active_layer * geometry.columns + column
+                for column in column_priority
+            ]
+
+            empty_slots = [
+                slot_index
+                for slot_index in slot_priority
+                if slot_index not in occupied_slots
+            ]
 
         # 이미 다른 Guard로 뽑힌 로봇 제외
         available = [
@@ -2626,9 +2889,11 @@ def update_guard_readiness_and_activation(
             # 즉시 Guard로 전환
             robot.role = "JUNCTION_GUARD"
 
-            robot.integration_guard_waypoints = [
-                slot.copy()
-            ]
+            robot.integration_guard_waypoints = build_guard_entry_waypoints(
+                physical,
+                geometry,
+                slot,
+            )
 
             robot.integration_guard_final_anchor = (
                 slot.copy()
@@ -2638,7 +2903,9 @@ def update_guard_readiness_and_activation(
                 slot_index
             )
 
-            robot.junction_guard_anchor = slot.copy()
+            robot.junction_guard_anchor = (
+                robot.integration_guard_waypoints[0].copy()
+            )
 
             robot.junction_guard_branch = (
                 geometry.provisional_uid

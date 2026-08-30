@@ -2123,15 +2123,22 @@ class Robot:
                 if error.length() <= step
                 else self.position + error.normalize() * step
             ) if error.length_squared() > EPSILON else self.position.copy()
-            # During the one-row full-Guard formation stage, the assigned
-            # K-hop group is the connectivity structure.  A transient global
-            # comm_parent can point behind the moving row and permanently
-            # clamp an otherwise walkable anchor.  Thick-wall motion keeps the
-            # existing communication clamp unchanged.
+            # During initial full-Guard formation, the assigned local group is
+            # the connectivity structure.  A transient global comm_parent can
+            # point behind a moving row and permanently clamp an otherwise
+            # walkable anchor.  Apply this consistently to every layer of a
+            # thick wall; rows are already released sequentially by the LiDAR
+            # adapter, deepest first.
             if not (
-                phase == SimulationPhase.FORM_JUNCTION_GUARDS
+                (
+                    phase == SimulationPhase.FORM_JUNCTION_GUARDS
+                    or globals().get(
+                        "integration_provisional_guard_active",
+                        False,
+                    )
+                )
                 and pending_branch_start is None
-                and self.junction_guard_layer == 0
+                and self.junction_guard_layer >= 0
             ):
                 next_position = limit_communication_proposed_position(
                     self,
