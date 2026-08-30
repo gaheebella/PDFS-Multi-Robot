@@ -3644,41 +3644,10 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     physical.integration_saturation_events = []
     physical.integration_backflow_events = []
 
-    # General final-return Guard sweep.
-    # No branch names are encoded in the ordering.
-    physical.FINAL_RETURN_PRIMARY_PUSH_SPEED = (
-        24.0 * physical.MOTION_SPEED_MULTIPLIER
-    )
-    physical.FINAL_RETURN_PRIMARY_RELEASE_SPEED = (
-        14.0 * physical.MOTION_SPEED_MULTIPLIER
-    )
-    physical.FINAL_RETURN_SECONDARY_RELEASE_SPEED = (
-        12.0 * physical.MOTION_SPEED_MULTIPLIER
-    )
-    physical.FINAL_RETURN_GUARD_RELEASE_DWELL = 0.18
-    physical.FINAL_RETURN_PUSH_MIN_DISTANCE = max(
-        physical.corridor_width * 0.80,
-        6.0 * physical.ROBOT_RADIUS,
-    )
-    physical.FINAL_RETURN_PUSH_CONTACT_RADIUS = (
-        2.75 * physical.ROBOT_RADIUS
-    )
-    physical.FINAL_RETURN_PUSH_CONTACT_GAIN = (
-        3.5 * physical.REPULSION_GAIN
-    )
-    physical.FINAL_RETURN_POST_PUSH_FLOW_SCALE = 0.70
-
     physical.integration_final_guard_sweep_active = False
-    physical.integration_final_guard_primary_branch = None
-    physical.integration_final_guard_primary_uid = None
-    physical.integration_final_guard_release_order = []
-    physical.integration_final_guard_release_index = 0
-    physical.integration_final_guard_release_timer = 0.0
-    physical.integration_final_guard_pusher_start_centroid = None
-    physical.integration_final_guard_pusher_target_distance = 0.0
-    physical.integration_final_guard_pusher_progress = 0.0
-    physical.integration_final_guard_primary_released = False
-    physical.integration_final_pusher_step = pygame.Vector2()
+    physical.integration_final_base_flow_dwell = 0.0
+    physical.integration_final_base_flow_established = False
+    physical.integration_final_all_guards_released = False
     physical.integration_frontier_lineage_events = []
     physical.integration_shepherd_anchor_offsets = {}
     # Backtracking is pack-coupled: the physical Shepherd piston may advance
@@ -6248,7 +6217,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         print(
             f"[FinalReturnPipeline] frame={getattr(physical, 'integration_frame', -1)} "
             "ALL_BRANCHES_VISITED -> FIXED_RETURNED_GUARDS -> "
-            "BASE_FLOW_DWELL -> SIMULTANEOUS_GUARD_RELEASE -> "
+            "BASE_FLOW_ESTABLISH -> SIMULTANEOUS_GUARD_RELEASE -> "
             "RETURN_TO_BASE -> ALL_ROBOTS_DONE"
         )
 
@@ -7141,24 +7110,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             and robot.junction_guard_branch == branch
         ]
 
-    def _guard_centroid(members: Sequence[Any]) -> pygame.Vector2:
-        if not members:
-            return pygame.Vector2()
-        return sum(
-            (robot.position for robot in members),
-            pygame.Vector2(),
-        ) / len(members)
-
-    def _signed_angle_from(
-        reference: pygame.Vector2,
-        target: pygame.Vector2,
-    ) -> float:
-        a = reference.normalize()
-        b = target.normalize()
-        cross = a.x * b.y - a.y * b.x
-        dot = physical.clamp(a.dot(b), -1.0, 1.0)
-        return math.atan2(cross, dot)
-
     def _visited_guard_branches(
         robots: Sequence[Any],
     ) -> list[str]:
@@ -7172,68 +7123,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 continue
             result.append(branch)
         return result
-
-    def _release_guard_group_to_normal(
-        robots: Sequence[Any],
-        branch: str,
-        *,
-        reason: str,
-        speed: float,
-    ) -> int:
-        members = _live_guard_members(robots, branch)
-        if not members:
-            return 0
-        base_direction = _final_base_return_direction()
-        released_ids = []
-        for robot in members:
-            released_ids.append(robot.robot_id)
-            robot.role = "NORMAL"
-            robot.junction_guard_anchor = None
-            robot.junction_guard_branch = None
-            robot.junction_guard_branch_uid = None
-            robot.junction_guard_hop = -1
-            robot.junction_guard_parent_id = None
-            robot.junction_guard_layer = -1
-            robot.is_branch_leader = False
-            robot.final_return_direction_local = base_direction.copy()
-            robot.final_return_source_branch = branch
-            robot.velocity = base_direction * speed
-            robot.acceleration.update(0.0, 0.0)
-            robot.filtered_acceleration.update(0.0, 0.0)
-
-        physical.junction_guard_groups[branch] = []
-        lifecycle = getattr(
-            physical,
-            "integration_wall_lifecycle",
-            {},
-        ).get(branch)
-        if lifecycle is not None:
-            lifecycle["state"] = "FINAL_RETURN_RELEASED"
-            lifecycle["final_return_release_frame"] = getattr(
-                physical, "integration_frame", -1
-            )
-            lifecycle["final_return_release_reason"] = reason
-
-        released_set = set(released_ids)
-        physical.viscoelastic_rest_lengths = {
-            pair: value
-            for pair, value in physical.viscoelastic_rest_lengths.items()
-            if not released_set.intersection(pair)
-        }
-        physical.viscoelastic_last_seen = {
-            pair: value
-            for pair, value in physical.viscoelastic_last_seen.items()
-            if not released_set.intersection(pair)
-        }
-
-        print(
-            f"[FinalGuardRelease] "
-            f"frame={getattr(physical, 'integration_frame', -1)} "
-            f"branch_uid={physical.branch_uid_for_fixture(branch)} "
-            f"robots={len(released_ids)} reason={reason} "
-            "role=GUARD->NORMAL"
-        )
-        return len(released_ids)
 
     def start_general_final_guard_sweep(
         robots: Sequence[Any],
@@ -7255,8 +7144,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 "ALL_BRANCHES_VISITED but no returned visited Guard walls exist"
             )
 
-        # 모든 visited Guard를 그대로 고정.
-        # 어떤 wall도 PRIMARY_RETURN_SHEPHERD로 만들지 않는다.
+        # Keep every visited Guard fixed at its original mouth anchor.
         for branch in branches:
             members = _live_guard_members(robots, branch)
 
@@ -7281,11 +7169,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
         physical.integration_final_guard_sweep_active = True
 
-        # PRIMARY pusher는 사용하지 않음.
-        physical.integration_final_guard_primary_branch = None
-        physical.integration_final_guard_primary_uid = None
-        physical.integration_final_pusher_step = pygame.Vector2()
-
         # Base flow detection state
         physical.integration_final_base_flow_dwell = 0.0
         physical.integration_final_base_flow_established = False
@@ -7305,7 +7188,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             f"frame={getattr(physical, 'integration_frame', -1)} "
             f"reason={reason} "
             f"guards={branches} "
-            "primary_pusher=False "
+            "moving_guard_pusher=False "
             "all_returned_guards_fixed=True"
         )
 
@@ -7346,7 +7229,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             communication_grid,
             dt,
         )
-        physical.integration_final_pusher_step = pygame.Vector2()
 
     def final_guard_robot_update(self: Any, dt: float) -> None:
         original_robot_update(self, dt)
@@ -7397,7 +7279,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         min_speed = float(physical.integration_final_base_flow_min_speed)
         corridor_half_width = 0.65 * physical.corridor_width
         moving_baseward = 0
-        entered_base_stream = 0
+        crossed_base_mouth = 0
         for robot in normals:
             delta = robot.position - base_mouth
             axial = float(delta.dot(base_direction))
@@ -7408,7 +7290,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             if base_speed >= min_speed:
                 moving_baseward += 1
             if axial >= 0.0 and base_speed > 0.0:
-                entered_base_stream += 1
+                crossed_base_mouth += 1
 
         minimum_flow_count = max(
             8,
@@ -7417,7 +7299,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         minimum_crossed_count = max(4, minimum_flow_count // 2)
         flow_now = (
             moving_baseward >= minimum_flow_count
-            and entered_base_stream >= minimum_crossed_count
+            and crossed_base_mouth >= minimum_crossed_count
         )
         if flow_now:
             physical.integration_final_base_flow_dwell += dt
@@ -7433,15 +7315,17 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             for branch in branches
             for robot in _live_guard_members(robots, branch)
         ]
-        overlap_tolerance = max(1.0e-6, 1.0e-3 * physical.ROBOT_RADIUS)
-        overlap_threshold = 2.0 * physical.ROBOT_RADIUS - overlap_tolerance
         overlapping_guard_pairs = 0
         min_guard_distance = float("inf")
         for index, left in enumerate(returned_guards):
             for right in returned_guards[index + 1:]:
                 distance = left.position.distance_to(right.position)
                 min_guard_distance = min(min_guard_distance, distance)
-                if distance < overlap_threshold:
+                overlap_tolerance = max(
+                    1.0e-6,
+                    1.0e-3 * min(left.radius, right.radius),
+                )
+                if distance < left.radius + right.radius - overlap_tolerance:
                     overlapping_guard_pairs += 1
 
         flow_established = (
@@ -7451,23 +7335,34 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         if frame % 10 == 0:
             print(
                 f"[FinalBaseFlow] frame={frame} "
-                f"guards_fixed={len(branches)} "
-                "primary_pusher=False "
-                f"moving={moving_baseward} entered={entered_base_stream} "
-                f"required={minimum_flow_count}/{minimum_crossed_count} "
+                f"normals={len(normals)} "
+                f"moving_baseward={moving_baseward} "
+                f"crossed_base_mouth={crossed_base_mouth} "
+                f"required_moving={minimum_flow_count} "
+                f"required_crossed={minimum_crossed_count} "
                 f"dwell={physical.integration_final_base_flow_dwell:.3f} "
+                f"required_dwell="
+                f"{physical.integration_final_base_flow_dwell_required:.2f} "
+                f"guards_fixed={len(branches)} "
                 f"flow_established={flow_established}"
             )
             print(
                 f"[FinalGuardOverlapAudit] frame={frame} "
-                "primary_pusher=False "
-                f"overlapping_guard_pairs={overlapping_guard_pairs} "
-                f"min_guard_distance="
+                f"guards={len(returned_guards)} "
+                f"overlapping_pairs={overlapping_guard_pairs} "
+                f"min_distance="
                 f"{min_guard_distance if math.isfinite(min_guard_distance) else -1.0:.3f}"
             )
 
         if not flow_established:
             return
+
+        physical.integration_final_base_flow_established = True
+        print(
+            f"[FinalBaseFlowEstablished] frame={frame} "
+            f"moving={moving_baseward} crossed={crossed_base_mouth} "
+            f"dwell={physical.integration_final_base_flow_dwell:.3f}"
+        )
 
         released_ids: list[int] = []
         for branch in branches:
@@ -7505,12 +7400,11 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         # Preserve all viscoelastic links so the released walls join the
         # already established connected SPH stream without a topology reset.
         physical.integration_final_all_guards_released = True
-        physical.integration_final_base_flow_established = True
         physical.integration_final_guard_sweep_active = False
-        physical.integration_final_pusher_step = pygame.Vector2()
         print(
             f"[FinalAllGuardsJoinFlow] frame={frame} "
-            f"released={len(released_ids)} simultaneous=True "
+            f"branches={branches} released_robots={len(released_ids)} "
+            "simultaneous=True teleport=False strong_launch=False "
             "viscoelastic_links_preserved=True"
         )
         physical.begin_final_return(robots)
@@ -8069,11 +7963,10 @@ class DarkRenderer:
             "NORMAL": COLORS["normal"], "JUNCTION_GUARD": COLORS["guard"],
             "FRONTIER_SHEPHERD": COLORS["frontier"], "SHEPHERD": COLORS["shepherd"],
             "PRE_SHEPHERD": COLORS["shepherd"],
-            "PRIMARY_RETURN_SHEPHERD": COLORS["shepherd"],
             "PEBBLE": COLORS["pebble"],
             "RELAY": COLORS["relay"], "TRUNK_RELAY": COLORS["trunk"],
         }
-        order = {"NORMAL": 0, "RELAY": 1, "TRUNK_RELAY": 1, "PEBBLE": 2, "JUNCTION_GUARD": 3, "FRONTIER_SHEPHERD": 4, "PRE_SHEPHERD": 5, "SHEPHERD": 5, "PRIMARY_RETURN_SHEPHERD": 6}
+        order = {"NORMAL": 0, "RELAY": 1, "TRUNK_RELAY": 1, "PEBBLE": 2, "JUNCTION_GUARD": 3, "FRONTIER_SHEPHERD": 4, "PRE_SHEPHERD": 5, "SHEPHERD": 5}
         for robot in sorted(robots, key=lambda item: order.get(item.role, 0)):
             color = role_colors.get(robot.role, COLORS["normal"])
             if density and robot.role == "NORMAL":
