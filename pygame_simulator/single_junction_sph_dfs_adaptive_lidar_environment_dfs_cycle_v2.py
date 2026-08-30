@@ -2474,6 +2474,104 @@ def guard_mouth_coordinates(point: pygame.Vector2, geometry: ProvisionalGuardGeo
     return float(delta.dot(tangent)), float(delta.dot(lateral))
 
 
+def build_guard_entry_waypoints(
+    physical: types.ModuleType,
+    geometry: ProvisionalGuardGeometry,
+    slot: pygame.Vector2,
+) -> list[pygame.Vector2]:
+    """Cross the branch mouth through a safe interior lane,
+    then spread to the final Guard slot.
+    """
+
+    center = (
+        geometry.mouth_center_world
+        or geometry.descriptor.observed_mouth_position
+    )
+
+    tangent = (
+        geometry.branch_tangent_unit
+        or geometry.descriptor.local_outgoing_direction
+    )
+
+    normal = (
+        geometry.mouth_lateral_unit
+        or geometry.descriptor.motion_n
+    )
+
+    if center is None or tangent is None or normal is None:
+        return [slot.copy()]
+
+    tangent = tangent.normalize()
+    normal = normal.normalize()
+
+    mouth_span = float(
+        geometry.mouth_span
+        or geometry.descriptor.observed_physical_width
+    )
+
+    final_lateral = float(
+        (slot - center).dot(normal)
+    )
+
+    # While crossing the mouth, stay slightly inside the
+    # mouth corners. After entering the branch, spread to
+    # the final 3xN Guard slot.
+    crossing_half_width = max(
+        0.0,
+        0.5 * mouth_span
+        - 3.0 * physical.ROBOT_RADIUS,
+    )
+
+    crossing_lateral = float(
+        np.clip(
+            final_lateral,
+            -crossing_half_width,
+            crossing_half_width,
+        )
+    )
+
+    # Junction-side waypoint immediately before the mouth.
+    approach = (
+        center
+        - tangent * (2.5 * physical.ROBOT_RADIUS)
+        + normal * crossing_lateral
+    )
+
+    # Branch-side waypoint immediately after crossing the mouth.
+    inside = (
+        center
+        + tangent * (2.5 * physical.ROBOT_RADIUS)
+        + normal * crossing_lateral
+    )
+
+    # A robot must never be assigned to an invalid final Guard slot.
+    if not physical.is_walkable(
+        slot,
+        physical.ROBOT_RADIUS,
+    ):
+        raise RuntimeError(
+            "attempted to assign Guard to an unwalkable final slot"
+        )
+
+    waypoints: list[pygame.Vector2] = []
+
+    if physical.is_walkable(
+        approach,
+        physical.ROBOT_RADIUS,
+    ):
+        waypoints.append(approach)
+
+    if physical.is_walkable(
+        inside,
+        physical.ROBOT_RADIUS,
+    ):
+        waypoints.append(inside)
+
+    waypoints.append(slot.copy())
+
+    return waypoints
+
+
 
 
 def compute_full_guard_slot_assignment(
@@ -3609,11 +3707,10 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     physical.integration_shepherd_fill_baseline_pressure = 0.0
     physical.integration_shepherd_fill_baseline_cross_fill = 0.0
     physical.integration_pending_shepherd_transition_event = None
-    physical.integration_shepherd_return_bias_scale = 1.00
     # One source of truth for the commanded piston speed and the actual
     # kinematic Shepherd step.  Previously command_depth moved at this rate,
     # but Robot.update still chased the target at SHEPHERD_FORM_SPEED.
-    physical.integration_herd_return_speed_scale = 0.65
+    physical.integration_herd_return_speed_scale = 1.00
     # Formation and return are different jobs. Formation must settle the full 3xN
     # wall before packing begins; return remains deliberately slow and contact-limited.
     physical.integration_herd_formation_speed_scale = 3.0
@@ -3632,6 +3729,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     physical.integration_shepherd_contact_damping_scale = 1.00
     physical.integration_shepherd_actual_motion_log_frame = -1
     physical.integration_real_contact_log_frame = -1
+    physical.integration_return_curtain_active = False
 
     def reference_start_shepherd_pressure_push(
         robots: Sequence[Any], branch: str
@@ -3654,6 +3752,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         physical.integration_backtrack_support_depth = None
         physical.integration_backtrack_support_count = 0
         physical.integration_backtrack_lateral_coverage = 0.0
+        physical.integration_return_curtain_active = False
 
         # Do NOT call the baseline start_shepherd_pressure_push() here. That
         # routine starts cross-branch transfer before the source branch has
@@ -4629,6 +4728,129 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             return None
         return float(np.median(estimates))
 
+    def original_guard_leading_depth(
+        branch: str,
+    ) -> float:
+        """처음 생성된 3xN Guard의 가장 branch 안쪽 row depth."""
+
+        lifecycle = getattr(
+            physical,
+            "integration_wall_lifecycle",
+            {},
+        ).get(branch)
+
+        if lifecycle is None:
+            raise RuntimeError(
+                f"missing lifecycle for original Guard depth: {branch}"
+            )
+
+        center = lifecycle.get("mouth_center_world")
+        tangent = lifecycle.get("branch_tangent_unit")
+        anchors = lifecycle.get("guard_anchor_by_id", {})
+
+        if (
+            center is None
+            or tangent is None
+            or not anchors
+        ):
+            raise RuntimeError(
+                f"missing frozen original Guard anchors: {branch}"
+            )
+
+        tangent = tangent.normalize()
+
+        return max(
+            float(
+                (anchor - center).dot(tangent)
+            )
+            for anchor in anchors.values()
+        )
+
+    def shepherd_return_depth(
+        branch: str,
+    ) -> float:
+        """Shepherd target depth. Never move past the original Guard wall."""
+
+        original_depth = original_guard_leading_depth(branch)
+
+        if physical.phase in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }:
+            command = getattr(
+                physical,
+                "integration_backtrack_command_depth",
+                None,
+            )
+
+            if command is not None:
+                return max(
+                    original_depth,
+                    float(command),
+                )
+
+        return max(
+            original_depth,
+            float(original_get_shepherd_line_depth(branch)),
+        )
+
+    def shepherd_returned_to_original_guard(
+        robots: Sequence[Any],
+        branch: str | None = None,
+    ) -> bool:
+        """SAME Shepherd IDs가 최초 Guard 위치에 실제로 돌아왔는지 확인."""
+
+        target_branch = branch or physical.active_branch
+
+        if physical.phase != physical.SimulationPhase.FLOW_BACKTRACK:
+            return False
+
+        lifecycle = getattr(
+            physical,
+            "integration_wall_lifecycle",
+            {},
+        ).get(target_branch)
+
+        if lifecycle is None:
+            return False
+
+        expected_ids = set(
+            lifecycle.get("robot_ids", [])
+        )
+
+        original_anchors = lifecycle.get(
+            "guard_anchor_by_id",
+            {},
+        )
+
+        if (
+            not expected_ids
+            or set(original_anchors) != expected_ids
+        ):
+            return False
+
+        shepherds = {
+            robot.robot_id: robot
+            for robot in physical.get_shepherds(robots)
+            if (
+                robot.shepherd_branch == target_branch
+                and robot.robot_id in expected_ids
+            )
+        }
+
+        if set(shepherds) != expected_ids:
+            return False
+
+        tolerance = physical.JUNCTION_GUARD_POSITION_TOLERANCE
+
+        return all(
+            shepherds[robot_id].position.distance_to(
+                original_anchors[robot_id]
+            )
+            <= tolerance
+            for robot_id in expected_ids
+        )
+
     def backtrack_pack_support(
         robots: Sequence[Any], branch: str
     ) -> tuple[float | None, float | None, int, float]:
@@ -4860,10 +5082,16 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         }:
             return
 
+        physical.integration_return_curtain_active = False
+
         descriptor = descriptor_for(branch)
         lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
         if descriptor is None or lifecycle is None:
             return
+
+        # Final return floor is the original physical Guard wall,
+        # not branch depth zero / Junction mouth.
+        return_floor = original_guard_leading_depth(branch)
 
         # command depth is the dead-end-side leading-row scalar.
         current_line = shepherd_line_leading_depth(robots, branch, descriptor)
@@ -4964,7 +5192,10 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         # that motion itself and physically compress the NORMAL rear; waiting for
         # the rear to move first turns the Shepherd into a passive follower and
         # deadlocks at the dead-end.
-        proposed_command = max(0.0, previous_command - max_forward_step)
+        proposed_command = max(
+            return_floor,
+            previous_command - max_forward_step,
+        )
         active_min_center_gap = max(
             1.05 * physical.ROBOT_RADIUS,
             float(physical.ROBOT_RADIUS)
@@ -4979,7 +5210,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             # minimum centre gap.  Unlike the old 2.05R support clamp, this allows
             # controlled compression, so the Shepherd actually pushes the body.
             hard_contact_floor = max(
-                0.0,
+                return_floor,
                 float(rear_depth)
                 + active_min_center_gap
                 - minimum_axial_offset,
@@ -5005,9 +5236,12 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             # It uses the same hard non-tunnelling floor, only at a reduced speed.
             partial_speed_scale = 0.35
             partial_step = max_forward_step * partial_speed_scale
-            proposed_partial = max(0.0, previous_command - partial_step)
+            proposed_partial = max(
+                return_floor,
+                previous_command - partial_step,
+            )
             hard_contact_floor = max(
-                0.0,
+                return_floor,
                 float(rear_depth)
                 + active_min_center_gap
                 - minimum_axial_offset,
@@ -5021,16 +5255,41 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
 
         elif active_branch_normals > 0:
-            # No trustworthy local rear sample at all: hold to prevent a solo run.
-            command = previous_command
-            mode = "HOLD_NO_REAR_SAMPLE"
+            # NORMAL robots still exist in the active branch, but the local
+            # rear-support window has temporarily lost them.
+            #
+            # Holding forever here creates a deadlock:
+            # NORMALs keep moving toward the Junction while the Shepherd stays
+            # behind, so rear support can never be reacquired.
+            #
+            # Therefore let the intact 3xN Shepherd slowly catch up until
+            # physical rear support is observed again.
+            seek_speed_scale = 1.00
+
+            seek_step = (
+                max_forward_step
+                * seek_speed_scale
+            )
+
+            command = max(
+                return_floor,
+                previous_command - seek_step,
+            )
+
+            mode = "SEEK_PACK_NO_REAR_SAMPLE"
 
         else:
             # Only a genuinely empty active branch allows an unaccompanied finish.
-            command = max(0.0, previous_command - max_forward_step)
-            mode = "BRANCH_CLEAR_FINISH"
+            command = max(
+                return_floor,
+                previous_command - max_forward_step,
+            )
+            mode = "RETURN_TO_ORIGINAL_GUARD"
 
-        command = max(0.0, float(command))
+        command = max(
+            return_floor,
+            float(command),
+        )
 
         # V28: the complete Shepherd wall is one rigid body.  The old baseline
         # clamps every Shepherd independently to its current communication parent;
@@ -5131,23 +5390,23 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
 
         if not rigid_geometry_safe:
+         # 3xN 벽 자체가 벽/장애물에 들어가는 경우만 실제로 정지.
             command = previous_command
             mode = "HOLD_RIGID_3XN_GEOMETRY"
+
+        elif not rigid_internal_connected:
+            # Shepherd 3xN 내부 communication mesh가 깨지는 경우도 정지.
+            command = previous_command
+            mode = "HOLD_RIGID_3XN_INTERNAL_COMM"
+
         elif not rigid_comm_safe:
-            # The communication graph is rebuilt after motion.  Do not permanently
-            # pin a currently Base-connected rigid wall merely because the *next*
-            # tiny common step has no tether under the stale graph.  Grant one-step
-            # re-parenting grace; if connectivity is actually lost on the following
-            # frame, the wall then holds.  Shape is still preserved as one 3xN body.
-            currently_connected = bool(branch_shepherds) and all(
-                getattr(shepherd, "connected_to_base", False)
-                for shepherd in branch_shepherds
-            )
-            if currently_connected:
-                mode = f"{mode}_COMM_REPARENT_GRACE"
-            else:
-                command = previous_command
-                mode = "HOLD_RIGID_3XN_TETHER"
+            # 외부 Base-connected tether가 순간적으로 없어졌다는 이유만으로
+            # Shepherd 전체 piston을 영구 정지시키지 않는다.
+            #
+            # 3xN 내부 mesh와 physical geometry가 유지된다면
+            # 이미 계산된 command를 그대로 실행하고,
+            # 다음 communication update에서 재연결을 허용한다.
+            mode = f"{mode}_EXTERNAL_TETHER_REPARENT"
 
         physical.integration_backtrack_command_depth = command
         physical.integration_backtrack_pack_rear_depth = rear_depth
@@ -5163,6 +5422,15 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         frame = getattr(physical, "integration_frame", -1)
         if frame % 10 == 0:
+            print(
+                f"[OriginalGuardReturn] "
+                f"frame={frame} "
+                f"branch={branch} "
+                f"command_depth={command:.3f} "
+                f"return_floor={return_floor:.3f} "
+                f"current_leading_depth={float(current_line):.3f} "
+                f"error_to_floor={float(current_line) - return_floor:.3f}"
+            )
             print(
                 f"[ReturnPistonContact] frame={frame} phase={physical.phase.name} "
                 f"branch={branch} current_line={float(current_line):.3f} "
@@ -5182,51 +5450,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
 
 
-
-
-    def pack_coupled_route_force(robot: Any) -> pygame.Vector2:
-        """Keep active-branch NORMALs moving to the Junction during return.
-
-        The legacy transfer controller may start steering toward the next child
-        while the old branch is still draining.  During PRESSURE_PUSH and
-        FLOW_BACKTRACK we instead keep robots physically in the active branch
-        moving along the observed return axis.  Once they reach the Junction,
-        the original controller resumes.
-        """
-        if (
-            physical.phase in {
-                physical.SimulationPhase.PRESSURE_PUSH,
-                physical.SimulationPhase.FLOW_BACKTRACK,
-            }
-            and robot.role == "NORMAL"
-            and not robot.base_reserve
-        ):
-            branch = physical.active_branch
-            descriptor = descriptor_for(branch)
-            if descriptor is not None:
-                axial, lateral = physical.branch_local_coordinates(
-                    robot.position, descriptor
-                )
-                usable_half = physical.local_physical_usable_half_width(descriptor)
-                if (
-                    axial > 0.0
-                    and abs(lateral)
-                    <= usable_half + 2.5 * physical.ROBOT_RADIUS
-                ):
-                    # Match the working reference Physical DFS: NORMAL robots in
-                    # the source branch receive the full return-body drive while
-                    # the real Shepherd robots supply the finite-radius piston
-                    # pressure.  The previous 0.10 scaling made the kinematic
-                    # Shepherd target much faster than the SPH body and is the
-                    # direct reason the Shepherd appeared to sprint home alone.
-                    gain = (
-                        physical.PRESSURE_BACKTRACK_BODY_FORCE
-                        if physical.phase == physical.SimulationPhase.PRESSURE_PUSH
-                        else physical.FLOW_BACKTRACK_FORCE
-                    ) * physical.integration_shepherd_return_bias_scale
-                    return descriptor.local_return_direction.normalize() * gain
-        return original_compute_route_force(robot)
-
     def real_shepherd_contact_force(robot: Any) -> pygame.Vector2:
         """Finite-radius contact force from the actual Shepherd robots only.
 
@@ -5245,18 +5468,21 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             or robot.base_reserve
         ):
             setattr(robot, "last_real_shepherd_contact_force", 0.0)
+            setattr(robot, "last_real_shepherd_contact_count", 0)
             return pygame.Vector2()
 
         branch = physical.active_branch
         descriptor = descriptor_for(branch)
         if descriptor is None:
             setattr(robot, "last_real_shepherd_contact_force", 0.0)
+            setattr(robot, "last_real_shepherd_contact_count", 0)
             return pygame.Vector2()
 
         axial, lateral = physical.branch_local_coordinates(robot.position, descriptor)
         usable_half = physical.local_physical_usable_half_width(descriptor)
         if axial <= 0.0 or abs(lateral) > usable_half + 2.5 * physical.ROBOT_RADIUS:
             setattr(robot, "last_real_shepherd_contact_force", 0.0)
+            setattr(robot, "last_real_shepherd_contact_count", 0)
             return pygame.Vector2()
 
         shepherds = [
@@ -5273,6 +5499,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             ]
         if not shepherds:
             setattr(robot, "last_real_shepherd_contact_force", 0.0)
+            setattr(robot, "last_real_shepherd_contact_count", 0)
             return pygame.Vector2()
 
         radius = float(physical.ROBOT_RADIUS)
@@ -5355,6 +5582,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         physical.limit_vector(total, contact_force_limit)
         setattr(robot, "last_real_shepherd_contact_force", total.length())
+        setattr(robot, "last_real_shepherd_contact_count", contacts)
 
         frame = getattr(physical, "integration_frame", -1)
         if (
@@ -5379,7 +5607,11 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         Junction attraction.  Preserve only the component perpendicular to the
         return axis so corridor/lane centering can still operate.
         """
+        if getattr(physical, "integration_final_guard_sweep_active", False):
+            return final_guard_sweep_route_force(robot)
+
         force = original_compute_route_force(robot)
+        setattr(robot, "last_physical_only_route_axial", 0.0)
         if (
             physical.phase in {
                 physical.SimulationPhase.PRESSURE_PUSH,
@@ -5398,10 +5630,98 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                     return_axis = descriptor.local_return_direction.normalize()
                     axial_component = force.dot(return_axis)
                     force = force - return_axis * axial_component
+                    setattr(
+                        robot,
+                        "last_physical_only_route_axial",
+                        abs(force.dot(return_axis)),
+                    )
                     # Add only real pairwise Shepherd contact.  No global return-axis
                     # drive is added to NORMAL robots.
                     force += real_shepherd_contact_force(robot)
         return force
+
+    def physical_only_compute_sph_forces(
+        robots: Sequence[Any],
+        grid: Any,
+        communication_grid: Any,
+        dt: float = 1.0 / 60.0,
+    ) -> None:
+        """Keep SPH physics while disabling the invisible return pressure field."""
+        return_phase = physical.phase in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }
+        physical.integration_current_robots = robots
+        physical.integration_return_curtain_active = False
+
+        virtual_pressure_force = getattr(physical, "VIRTUAL_PRESSURE_FORCE", None)
+        if return_phase and virtual_pressure_force is not None:
+            physical.VIRTUAL_PRESSURE_FORCE = 0.0
+        try:
+            original_compute_sph_forces(robots, grid, communication_grid, dt)
+        finally:
+            if return_phase and virtual_pressure_force is not None:
+                physical.VIRTUAL_PRESSURE_FORCE = virtual_pressure_force
+
+        frame = getattr(physical, "integration_frame", -1)
+        if not return_phase or frame % 10 != 0:
+            return
+
+        branch = physical.active_branch
+        descriptor = descriptor_for(branch)
+        active_normals = []
+        if descriptor is not None:
+            usable_half = physical.local_physical_usable_half_width(descriptor)
+            for robot in robots:
+                if robot.role != "NORMAL" or robot.base_reserve:
+                    continue
+                axial, lateral = physical.branch_local_coordinates(
+                    robot.position, descriptor
+                )
+                if (
+                    axial > 0.0
+                    and abs(lateral)
+                    <= usable_half + 2.5 * physical.ROBOT_RADIUS
+                ):
+                    active_normals.append(robot)
+
+        normal_axial_route_max = max(
+            (
+                float(getattr(robot, "last_physical_only_route_axial", 0.0))
+                for robot in active_normals
+            ),
+            default=0.0,
+        )
+        real_shepherd_contacts = sum(
+            int(getattr(robot, "last_real_shepherd_contact_count", 0))
+            for robot in active_normals
+        )
+        max_real_contact_force = max(
+            (
+                float(getattr(robot, "last_real_shepherd_contact_force", 0.0))
+                for robot in active_normals
+            ),
+            default=0.0,
+        )
+        command_depth = getattr(
+            physical, "integration_backtrack_command_depth", None
+        )
+        return_floor = (
+            original_guard_leading_depth(branch)
+            if descriptor is not None
+            else float("nan")
+        )
+        print(
+            f"[PhysicalOnlyReturn] frame={frame} phase={physical.phase.name} "
+            f"branch={branch} "
+            f"normal_axial_route_max={normal_axial_route_max:.9f} "
+            f"real_shepherd_contacts={real_shepherd_contacts} "
+            f"max_real_contact_force={max_real_contact_force:.3f} "
+            f"command_depth="
+            f"{float(command_depth) if command_depth is not None else -1.0:.3f} "
+            f"return_floor={return_floor:.3f} "
+            f"curtain_active={physical.integration_return_curtain_active}"
+        )
 
     def local_slot_at_depth(
         anchor: pygame.Vector2, branch: str, depth: float
@@ -5721,17 +6041,65 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         return len(remaining_shepherds)
 
-    def remaining_dfs_branch_uids(robots: Sequence[Any]) -> tuple[set[str], set[str], list[str]]:
+    def remaining_dfs_branch_uids(
+        robots: Sequence[Any],
+    ) -> tuple[set[str], set[str], list[str]]:
         """Return discovered, visited and still-unvisited branch UIDs."""
-        discovered = set(getattr(physical, "integration_detected_branch_order", []))
+
+        discovered = set(
+            getattr(
+                physical,
+                "integration_detected_branch_order",
+                [],
+            )
+        )
+
         if not discovered:
-            discovered = set(physical.discovered_branch_uids())
-        visited = set(physical.observed_visited_branch_uids(robots))
-        order = getattr(physical, "integration_detected_branch_order", [])
-        remaining = [uid for uid in order if uid not in visited]
+            discovered = set(
+                physical.discovered_branch_uids()
+            )
+
+        # Legacy Pebble-based evidence, if any.
+        visited = set(
+            physical.observed_visited_branch_uids(robots)
+        )
+
+        # Physical DFS integration:
+        # an intact SAME-ID wall that completed
+        # Guard -> Frontier -> Shepherd -> Guard
+        # is also valid persistent VISITED evidence.
+        for branch, lifecycle in getattr(
+            physical,
+            "integration_wall_lifecycle",
+            {},
+        ).items():
+            if lifecycle.get("state") != "VISITED_GUARD":
+                continue
+
+            uid = physical.branch_uid_for_fixture(branch)
+
+            if uid is not None:
+                visited.add(uid)
+
+        order = getattr(
+            physical,
+            "integration_detected_branch_order",
+            [],
+        )
+
+        remaining = [
+            uid
+            for uid in order
+            if uid not in visited
+        ]
+
         if not order:
-            remaining = sorted(discovered - visited)
+            remaining = sorted(
+                discovered - visited
+            )
+
         return discovered, visited, remaining
+
 
     def arm_cross_branch_carry(
         robots: Sequence[Any],
@@ -6026,22 +6394,43 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             arrival_frame = getattr(physical, "integration_frame", -1)
             completed_branch = branch
 
-            # First record the branch visit while the returned physical line is
-            # still intact. create_branch_pebble() must use a NORMAL candidate;
-            # the Shepherd lineage itself is reserved for the Guard cycle.
-            if not physical.complete_active_branch(
-                completed_branch,
-                robots,
-                True,
-            ):
-                # Keep the Shepherd wall intact at the Junction and retry next
-                # frame rather than destroying its lineage.
-                print(
-                    f"[ShepherdArrivalVisitWait] frame={arrival_frame} "
-                    f"branch={completed_branch} "
-                    "reason=VISIT_MARKER_NOT_READY"
+            completed_uid = (
+                physical.active_branch_uid
+                or physical.branch_uid_for_fixture(completed_branch)
+            )
+
+            if completed_uid is None:
+                raise RuntimeError(
+                    f"missing branch UID at Shepherd return: {completed_branch}"
                 )
-                return
+
+            original_anchors = (lifecycle or {}).get(
+                "guard_anchor_by_id",
+                {},
+            )
+            same_ids_at_return = (
+                bool(shepherd_ids_before)
+                and set(original_anchors) == shepherd_ids_before
+            )
+            max_original_guard_error_before_release = max(
+                (
+                    robot.position.distance_to(
+                        original_anchors[robot.robot_id]
+                    )
+                    for robot in shepherds_before
+                    if robot.robot_id in original_anchors
+                ),
+                default=float("inf"),
+            )
+            print(
+                f"[OriginalGuardReturnComplete] "
+                f"branch={completed_branch} "
+                f"same_ids={same_ids_at_return} "
+                f"max_anchor_error="
+                f"{max_original_guard_error_before_release:.6f} "
+                f"tolerance="
+                f"{physical.JUNCTION_GUARD_POSITION_TOLERANCE:.6f}"
+            )
 
             # Exact lifecycle requested:
             # SAME Guard IDs -> Frontier -> Shepherd -> SAME Guard IDs.
@@ -6113,6 +6502,35 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                     f"expected={sorted(expected_ids)} "
                     f"returned={sorted(returned_guard_ids)}"
                 )
+
+            # Returned SAME-ID Guard wall is the completion evidence.
+            # Do not require a Pebble before starting the next DFS branch.
+            physical.set_branch_descriptor_state(
+                completed_uid,
+                "VISITED",
+            )
+
+            physical.previous_branch_direction = (
+                physical.get_backtrack_direction(completed_branch)
+            )
+
+            physical.distributed_consensus_branch = None
+            physical.active_branch_uid = None
+
+            for robot in robots:
+                robot.branch_vote = None
+                robot.branch_vote_confidence = 0.0
+                robot.distributed_branch_decision = None
+
+            physical.record_distributed_consensus(
+                clear_selection=True
+            )
+
+            if hasattr(physical, "metrics"):
+                physical.metrics.branch_events.append({
+                    "branch": completed_branch,
+                    "completed_at": physical.simulation_time,
+                })
 
             if lifecycle is not None:
                 lifecycle["state"] = "VISITED_GUARD"
@@ -6662,10 +7080,13 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
     # Restore the exact Environment fill/transport logic.
     physical.update_transfer_continuity_control = original_transfer_control
 
-    # Restore exact Environment Shepherd/backtracking mechanics.
-    physical.get_shepherd_line_depth = original_get_shepherd_line_depth
-    physical.compute_route_force = original_compute_route_force
-    physical.compute_sph_forces = original_compute_sph_forces
+    # Shepherd/backtracking mechanics.
+    physical.get_shepherd_line_depth = shepherd_return_depth
+    physical.shepherd_line_reached_junction = (
+        shepherd_returned_to_original_guard
+    )
+    physical.compute_route_force = shepherd_physical_only_route_force
+    physical.compute_sph_forces = physical_only_compute_sph_forces
     physical.start_shepherd_pressure_push = (
         original_start_shepherd_pressure_push
     )
@@ -6992,7 +7413,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             "integration_final_guard_sweep_active",
             False,
         ):
-            return original_compute_route_force(robot)
+            return shepherd_physical_only_route_force(robot)
 
         if robot.role in {
             "JUNCTION_GUARD",
@@ -7027,7 +7448,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         dt: float = 1.0 / 60.0,
     ) -> None:
         # Compute ordinary SPH/repulsion first.
-        original_compute_sph_forces(
+        physical_only_compute_sph_forces(
             robots,
             grid,
             communication_grid,
@@ -7142,7 +7563,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
     # Install final-sweep mechanics after the reference Environment hooks
     # have been restored.
-    physical.compute_route_force = final_guard_sweep_route_force
+    physical.compute_route_force = shepherd_physical_only_route_force
     physical.compute_sph_forces = final_guard_compute_sph_forces
     physical.Robot.update = final_guard_robot_update
 
@@ -7344,7 +7765,10 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             physical.phase == physical.SimulationPhase.EXPLORE_BRANCH
         )
         lidar_shepherd_return = (
-            physical.phase == physical.SimulationPhase.FLOW_BACKTRACK
+            physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
         )
 
         if (
@@ -8309,6 +8733,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[Init] reference_density={reference_density:.6f}")
     print("[Init] artificial_initial_compression=False")
     print("[Init] SPH_from_first_frame=True local_forward_from_first_frame=True")
+    print(
+        "[Init] physical_shepherd_only=True "
+        "invisible_return_curtain=False"
+    )
     perception = AdaptivePerception(physical, robots)
     initial_lidar_frame = perception.update(physical.simulation_time)
     print(f"[LiDAR] initial_opening_count={len(initial_lidar_frame.openings)}")
