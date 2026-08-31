@@ -475,6 +475,160 @@ def configure_extended_approach(physical: types.ModuleType) -> tuple[float, floa
     )
     return base_length_before, base_length_after
 
+def configure_multi_test_geometry(
+    physical: types.ModuleType,
+) -> None:
+    """Install one physical Child Junction for Multi-DFS testing.
+
+    IMPORTANT:
+    J1 geometry exists only as simulator environment geometry.
+    Runtime Junction detection must never use its center/rect directly.
+    """
+
+    x0 = float(physical.center_x)
+    y0 = float(physical.center_y)
+    h = float(physical.half_width)
+    length = float(physical.normal_length)
+
+    # RIGHT corridor의 실제 끝에 J1 중심을 둔다.
+    x1 = x0 + h + float(physical.right_length)
+
+    j1_rect = pygame.Rect(
+        round(x1 - h),
+        round(y0 - h),
+        round(physical.corridor_width),
+        round(physical.corridor_width),
+    )
+
+    j1_up_rect = pygame.Rect(
+        round(x1 - h),
+        round(y0 - h - length),
+        round(physical.corridor_width),
+        round(length),
+    )
+
+    j1_down_rect = pygame.Rect(
+        round(x1 - h),
+        round(y0 + h),
+        round(physical.corridor_width),
+        round(length),
+    )
+
+    # J0 + RIGHT corridor + J1 + J1 UP/DOWN을 하나의
+    # 실제 free-space polygon으로 만든다.
+    physical.cross_points = [
+        # J0 UP
+        (x0 - h, y0 - h - length),
+        (x0 + h, y0 - h - length),
+
+        # J0 UP -> RIGHT corridor upper wall
+        (x0 + h, y0 - h),
+        (x1 - h, y0 - h),
+
+        # J1 UP
+        (x1 - h, y0 - h - length),
+        (x1 + h, y0 - h - length),
+
+        # J1 오른쪽 전체 벽
+        (x1 + h, y0 + h + length),
+
+        # J1 DOWN
+        (x1 - h, y0 + h + length),
+        (x1 - h, y0 + h),
+
+        # RIGHT corridor lower wall -> J0
+        (x0 + h, y0 + h),
+
+        # BASE corridor
+        (x0 + h, y0 + h + physical.base_length),
+        (x0 - h, y0 + h + physical.base_length),
+        (x0 - h, y0 + h),
+
+        # J0 LEFT
+        (x0 - h - length, y0 + h),
+        (x0 - h - length, y0 - h),
+
+        # close polygon
+        (x0 - h, y0 - h),
+    ]
+
+    # 실제 collision/LiDAR용 mask 재생성
+    physical.floor_surface = pygame.Surface(
+        (physical.SCREEN_WIDTH, physical.SCREEN_HEIGHT),
+        pygame.SRCALPHA,
+    )
+    physical.floor_surface.fill((0, 0, 0, 0))
+
+    pygame.draw.polygon(
+        physical.floor_surface,
+        (255, 255, 255, 255),
+        physical.cross_points,
+    )
+
+    physical.walkable_mask = pygame.mask.from_surface(
+        physical.floor_surface
+    )
+
+    # -----------------------------------------------------
+    # Region recognition 확장
+    # -----------------------------------------------------
+    original_get_robot_region = physical.get_robot_region
+
+    def multi_get_robot_region(
+        position: pygame.Vector2,
+    ) -> str:
+        point = (
+            int(position.x),
+            int(position.y),
+        )
+
+        if j1_rect.collidepoint(point):
+            return "J1_JUNCTION"
+
+        if j1_up_rect.collidepoint(point):
+            return "J1_UP"
+
+        if j1_down_rect.collidepoint(point):
+            return "J1_DOWN"
+
+        return original_get_robot_region(position)
+
+    physical.get_robot_region = multi_get_robot_region
+
+    def multi_is_region_allowed(
+        position: pygame.Vector2,
+    ) -> bool:
+        return physical.get_robot_region(position) in {
+            "BOTTOM",
+            "JUNCTION",
+            "UP",
+            "LEFT",
+            "RIGHT",
+            "J1_JUNCTION",
+            "J1_UP",
+            "J1_DOWN",
+        }
+
+    physical.is_region_allowed = multi_is_region_allowed
+
+    # RIGHT는 이제 물리적인 dead-end가 아니다.
+    # J1 존재 여부는 이후 LiDAR가 판단해야 한다.
+    off_map = pygame.Rect(
+        -10000,
+        -10000,
+        1,
+        1,
+    )
+
+    physical.dead_end_regions["RIGHT"] = off_map.copy()
+    physical.early_capture_regions["RIGHT"] = off_map.copy()
+
+    print(
+        "[MultiMap] physical_test_geometry_ready "
+        "J0_RIGHT_is_nonterminal=True "
+        "J1_shape=T_JUNCTION "
+        "runtime_detection_authority=LIDAR_ONLY"
+    )
 
 def install_local_forward_ingress(physical: types.ModuleType) -> None:
     """Disable artificial MOVE compression and install body-local propulsion."""
@@ -8561,6 +8715,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     physical = _load_physical_definitions()
     configure_extended_approach(physical)
+    configure_multi_test_geometry(physical)
     physical.integration_guard_hold_active = False
     physical.integration_guard_gating_enabled = False
     physical.integration_placement_localization_enabled = False
