@@ -322,6 +322,70 @@ class MultiJunctionManager:
 
 multi_dfs = MultiJunctionManager()
 
+def sync_multi_dfs_from_physical(
+    physical: types.ModuleType,
+) -> None:
+    """Mirror the current Physical-DFS branch states into Multi DFS.
+
+    Read-only synchronization:
+    this function must never change Physical DFS behavior.
+    """
+
+    frame = multi_dfs.current
+
+    if frame is None:
+        return
+
+    if not frame.branch_order:
+        return
+
+    changed = False
+
+    for uid in frame.branch_order:
+        descriptor = physical.branch_descriptors_by_uid.get(uid)
+
+        if descriptor is None:
+            continue
+
+        physical_state = str(descriptor.visit_state)
+        previous_state = frame.branch_states.get(uid)
+
+        if previous_state != physical_state:
+            frame.branch_states[uid] = physical_state
+            changed = True
+
+            print(
+                "[MultiDFS] BRANCH_SYNC "
+                f"junction={frame.junction_uid} "
+                f"branch={uid} "
+                f"{previous_state}->{physical_state}"
+            )
+
+    active_uid = getattr(
+        physical,
+        "active_branch_uid",
+        None,
+    )
+
+    if frame.active_branch_uid != active_uid:
+        previous_active = frame.active_branch_uid
+        frame.active_branch_uid = active_uid
+
+        print(
+            "[MultiDFS] ACTIVE_SYNC "
+            f"junction={frame.junction_uid} "
+            f"{previous_active}->{active_uid}"
+        )
+
+    if changed:
+        print(
+            "[MultiDFS] STATE "
+            f"junction={frame.junction_uid} "
+            f"depth={multi_dfs.depth} "
+            f"states={frame.branch_states}"
+        )
+
+
 def _load_physical_definitions() -> types.ModuleType:
     """Load definitions before the original top-level main loop starts."""
     source = PHYSICAL_SOURCE.read_text(encoding="utf-8")
@@ -8676,6 +8740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 phase_before_update = physical.phase
                 active_branch_before_update = physical.active_branch_uid
                 physical.update_simulation_state(robots, dt, reference_density, spatial_grid)
+                sync_multi_dfs_from_physical(physical)
                 if phase_before_update != physical.phase or active_branch_before_update != physical.active_branch_uid:
                     jumps = []
                     velocity_changes = []
