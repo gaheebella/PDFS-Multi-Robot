@@ -120,6 +120,31 @@ JUNCTION_ARRIVAL_RATIO_THRESHOLD = 0.45
 ANCHOR_ENTRANCE_STOP_TOLERANCE = 80.0
 ENTRANCE_STABILITY_FRAMES = 1
 
+# ---------------------------------------------------------
+# Multi-Junction Child LiDAR probe
+# ---------------------------------------------------------
+
+# A fixed Parent LiDAR should remain in place while it can still
+# observe the active exploration front.  Once the Frontier moves
+# close to the LiDAR maximum sensing depth, the same LiDAR robot
+# is released as a Child-observation probe.
+#
+# This is NOT Child-Junction evidence.
+CHILD_PROBE_TRIGGER_RANGE_RATIO = 0.95
+CHILD_PROBE_TRIGGER_DISTANCE = (
+    MAX_RANGE * CHILD_PROBE_TRIGGER_RANGE_RATIO
+)
+# Moving Child-Junction structural evidence.
+CHILD_CANDIDATE_MIN_STRUCTURAL_STREAK = 12
+CHILD_CANDIDATE_NON_AXIAL_MAX_DOT = 0.75
+CHILD_CANDIDATE_MIN_MOUTH_WIDTH_RATIO = 0.35
+CHILD_PARENT_CLEARANCE_W_RATIO = 0.50
+CHILD_APPROACH_STOP_W_RATIO = 0.10
+CHILD_APPROACH_SLOWDOWN_W_RATIO = 0.35
+# Child stationary Junction verification
+CHILD_STATIONARY_PERSISTENCE_RATIO = 0.60
+CHILD_STATIONARY_MIN_OUTGOING = 2
+
 
 class PerceptionState(Enum):
     MOVING = auto()
@@ -234,6 +259,54 @@ class ProvisionalGuardGeometry:
 # =========================================================
 
 @dataclass
+class ChildObservationSession:
+    """Fresh LiDAR observation session for one possible Child Junction."""
+
+    parent_junction_uid: str
+    parent_branch_uid: str
+
+    lidar_id: int
+    start_frame: int
+    start_position: pygame.Vector2
+
+    # Frozen local ingress frame from the Parent branch.
+    ingress_t: pygame.Vector2
+    ingress_n: pygame.Vector2
+
+    samples: int = 0
+    valid_samples: int = 0
+    consecutive_valid: int = 0
+
+    last_valid_w: float | None = None
+    last_selected_threshold: float | None = None
+
+    # Moving structural-candidate state.
+    structural_streak: int = 0
+
+    candidate_frame: int | None = None
+    candidate_position: pygame.Vector2 | None = None
+    candidate_depth_local: float | None = None
+    candidate_selected_threshold: float | None = None
+    candidate_lidar_frame: LidarFrame | None = None
+
+    candidate_last_position: pygame.Vector2 | None = None
+    candidate_traveled_axial: float = 0.0
+    candidate_remaining_depth: float | None = None
+
+    anchor_stopped: bool = False
+    anchor_stop_frame: int | None = None
+    # Fresh stationary verification state.
+    stationary_samples: int = 0
+    stationary_tracks: list[PersistentOpening] = field(
+        default_factory=list
+    )
+    stationary_outgoing: list[PersistentOpening] = field(
+        default_factory=list
+    )
+    stationary_confirmed: bool = False
+    stationary_confirmation_frame: int | None = None
+
+@dataclass
 class MultiJunctionFrame:
     """Logical DFS state for one confirmed Junction."""
 
@@ -277,6 +350,14 @@ class MultiJunctionManager:
         # Child detection state will be implemented later.
         self.child_candidate_active: bool = False
         self.child_confirmed: bool = False
+
+        # Same LiDAR robot used for deep-branch Child observation.
+        self.child_probe_active: bool = False
+        self.child_probe_branch_uid: str | None = None
+        self.child_probe_start_frame: int | None = None
+        self.child_probe_lidar_id: int | None = None
+        self.child_probe_start_position: pygame.Vector2 | None = None
+        self.child_session: ChildObservationSession | None = None
 
     @property
     def current(self) -> MultiJunctionFrame | None:
@@ -385,6 +466,1308 @@ def sync_multi_dfs_from_physical(
             f"states={frame.branch_states}"
         )
 
+def update_child_lidar_probe(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Release the same LiDAR robot only for deep-branch observation.
+
+    IMPORTANT:
+    - This does not confirm a Child Junction.
+    - This does not release the Parent Junction.
+    - This does not create Markers.
+    - This does not perform DFS PUSH.
+    """
+
+    frame = multi_dfs.current
+
+    if frame is None:
+        return
+
+    active_uid = getattr(
+        physical,
+        "active_branch_uid",
+        None,
+    )
+
+          # -----------------------------------------------------
+    # Probe already moving:
+    # keep the SAME LiDAR robot near the frozen branch
+    # centerline while allowing physical forward motion.
+    # -----------------------------------------------------
+    if multi_dfs.child_probe_active:
+        if active_uid != multi_dfs.child_probe_branch_uid:
+            return
+
+        descriptor = physical.branch_descriptors_by_uid.get(
+            active_uid
+        )
+
+        if descriptor is None:
+            return
+
+        lidar_robot = perception.leader
+
+        try:
+            axial, lateral = physical.branch_local_coordinates(
+                lidar_robot.position,
+                descriptor,
+            )
+
+            tangent, normal = physical.descriptor_local_basis(
+                descriptor
+            )
+
+        except (ValueError, AttributeError):
+            return
+
+        tangent = tangent.normalize()
+        normal = normal.normalize()
+
+        # -------------------------------------------------
+        # Local branch-frame guidance only.
+        #
+        # No J1 global coordinate.
+        # No direct position overwrite.
+        # No teleport.
+        # -------------------------------------------------
+
+        session = multi_dfs.child_session
+
+        # Once the Child Anchor has stopped, do not apply
+        # any more probe/approach drive.
+        if (
+            session is not None
+            and session.anchor_stopped
+        ):
+            return
+
+        lateral_velocity = (
+            lidar_robot.velocity.dot(normal)
+        )
+
+        # -------------------------------------------------
+        # Lateral centerline restoration.
+        # -------------------------------------------------
+        lateral_command = (
+            -3.0 * lateral
+            -2.2 * lateral_velocity
+        )
+
+        lateral_command = max(
+            -55.0,
+            min(55.0, lateral_command),
+        )
+
+        # Default before a Child Candidate exists.
+        forward_command = 18.0
+
+        # -------------------------------------------------
+        # Child Candidate approach
+        #
+        # Candidate position/depth were frozen when the
+        # moving structural Candidate was latched.
+        #
+        # remaining_depth
+        #   = saved_candidate_depth
+        #     - signed local odometry
+        # -------------------------------------------------
+        if (
+            multi_dfs.child_candidate_active
+            and session is not None
+            and session.candidate_depth_local is not None
+            and session.candidate_last_position is not None
+        ):
+
+            # ---------------------------------------------
+            # Candidate-start-relative local odometry.
+            #
+            # Measure displacement directly from the frozen
+            # Candidate position instead of accumulating
+            # frame-to-frame steps.
+            # ---------------------------------------------
+            if session.candidate_position is None:
+                return
+
+            displacement_from_candidate = (
+                lidar_robot.position
+                - session.candidate_position
+            )
+
+            session.candidate_traveled_axial = max(
+                0.0,
+                float(
+                    displacement_from_candidate.dot(
+                        session.ingress_t
+                    )
+                ),
+            )
+
+            session.candidate_remaining_depth = max(
+                0.0,
+                session.candidate_depth_local
+                - session.candidate_traveled_axial,
+            )
+
+            # Use the W measured at Candidate time as the
+            # scale reference. Later unstable scans must not
+            # move the stopping criterion.
+            if (
+                session.candidate_lidar_frame
+                is not None
+            ):
+                candidate_width = float(
+                    session.candidate_lidar_frame.adaptive_w
+                )
+            elif session.last_valid_w is not None:
+                candidate_width = float(
+                    session.last_valid_w
+                )
+            else:
+                candidate_width = float(
+                    lidar_frame.adaptive_w
+                )
+
+            stop_tolerance = (
+                CHILD_APPROACH_STOP_W_RATIO
+                * candidate_width
+            )
+
+            slowdown_distance = max(
+                stop_tolerance
+                + physical.ROBOT_RADIUS,
+                CHILD_APPROACH_SLOWDOWN_W_RATIO
+                * candidate_width,
+            )
+
+            remaining_depth = (
+                session.candidate_remaining_depth
+            )
+
+            # ---------------------------------------------
+            # Candidate approach complete -> Anchor STOP
+            # at the LiDAR robot's CURRENT physical pose.
+            #
+            # No coordinate target.
+            # No position overwrite.
+            # No teleport.
+            # ---------------------------------------------
+            if remaining_depth <= stop_tolerance:
+                session.anchor_stopped = True
+                session.anchor_stop_frame = (
+                    physical.integration_frame
+                )
+                # Start a completely fresh stationary
+                # Child-Junction verification session.
+                session.stationary_samples = 0
+                session.stationary_tracks.clear()
+                session.stationary_outgoing.clear()
+                session.stationary_confirmed = False
+                session.stationary_confirmation_frame = None
+
+                perception.anchor_position = (
+                    lidar_robot.position.copy()
+                )
+                perception.anchor_fixed = True
+
+                lidar_robot.is_fixed_anchor = True
+                lidar_robot.base_reserve = True
+
+                lidar_robot.velocity.update(
+                    0.0,
+                    0.0,
+                )
+                lidar_robot.acceleration.update(
+                    0.0,
+                    0.0,
+                )
+                lidar_robot.filtered_acceleration.update(
+                    0.0,
+                    0.0,
+                )
+
+                # Parent Physical DFS is NOT released here.
+                physical.integration_guard_hold_active = False
+
+                print(
+                    "[ChildAnchorStop] "
+                    f"parent={session.parent_junction_uid} "
+                    f"branch={session.parent_branch_uid} "
+                    f"lidar_id={session.lidar_id} "
+                    f"frame={session.anchor_stop_frame} "
+                    f"candidate_depth="
+                    f"{session.candidate_depth_local:.2f} "
+                    f"traveled="
+                    f"{session.candidate_traveled_axial:.2f} "
+                    f"remaining={remaining_depth:.2f} "
+                    f"stop_tol={stop_tolerance:.2f} "
+                    "position_snap=False "
+                    "confirmed=False "
+                    "parent_release=False "
+                    "marker=False "
+                    "dfs_push=False"
+                )
+
+                return
+
+            # ---------------------------------------------
+            # Slow down continuously as remaining depth
+            # approaches the stop tolerance.
+            # ---------------------------------------------
+            slowdown_span = max(
+                slowdown_distance
+                - stop_tolerance,
+                physical.EPSILON,
+            )
+
+            drive_ratio = float(
+                np.clip(
+                    (
+                        remaining_depth
+                        - stop_tolerance
+                    )
+                    / slowdown_span,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            # ---------------------------------------------
+            # Axial velocity tracking.
+            #
+            # A constant +18 acceleration was too weak
+            # against SPH / repulsion / damping and allowed
+            # the LiDAR robot to oscillate in place.
+            #
+            # Here we command a LOCAL forward velocity
+            # along the frozen ingress axis.
+            # ---------------------------------------------
+            axial_velocity = float(
+                lidar_robot.velocity.dot(
+                    session.ingress_t
+                )
+            )
+
+            # Far from the Candidate target:
+            #   target ≈ 14 px/s
+            #
+            # Near the stop point:
+            #   target smoothly falls to ≈ 3 px/s.
+            target_axial_speed = (
+                3.0
+                + 11.0 * drive_ratio
+            )
+
+            speed_error = (
+                target_axial_speed
+                - axial_velocity
+            )
+
+            # ---------------------------------------------
+            # Child approach owns ONLY the frozen ingress
+            # axial direction.
+            #
+            # SPH / robot interaction may still act in the
+            # lateral direction, but its axial acceleration
+            # must not fight the Child approach controller.
+            # ---------------------------------------------
+            existing_axial_acc = float(
+                lidar_robot.acceleration.dot(
+                    session.ingress_t
+                )
+            )
+
+            lidar_robot.acceleration -= (
+                session.ingress_t
+                * existing_axial_acc
+            )
+
+            forward_command = (
+                10.0 * speed_error
+            )
+
+            forward_limit = (
+                0.25
+                * physical.MAX_ACCELERATION
+            )
+
+            # Symmetric control:
+            # positive -> accelerate toward Child
+            # negative -> brake when moving too fast
+            forward_command = float(
+                np.clip(
+                    forward_command,
+                    -forward_limit,
+                    forward_limit,
+                )
+            )
+
+            if (
+                physical.integration_frame
+                % 10
+                == 0
+            ):
+                print(
+                    "[ChildCandidateApproach] "
+                    f"parent={session.parent_junction_uid} "
+                    f"branch={session.parent_branch_uid} "
+                    f"lidar_id={session.lidar_id} "
+                    f"traveled="
+                    f"{session.candidate_traveled_axial:.2f} "
+                    f"remaining="
+                    f"{remaining_depth:.2f} "
+                    f"stop_tol="
+                    f"{stop_tolerance:.2f} "
+                    f"sph_axial_removed="
+                    f"{existing_axial_acc:.2f} "
+                    f"axial_v="
+                    f"{axial_velocity:.2f} "
+                    f"target_v="
+                    f"{target_axial_speed:.2f} "
+                    f"forward_cmd="
+                    f"{forward_command:.2f}"
+                )
+
+        # -------------------------------------------------
+        # Physical acceleration only.
+        #
+        # Never write lidar_robot.position here.
+        # -------------------------------------------------
+        lidar_robot.acceleration += (
+            tangent * forward_command
+            + normal * lateral_command
+        )
+
+        if physical.integration_frame % 20 == 0:
+            print(
+                "[ChildProbeProgress] "
+                f"junction={frame.junction_uid} "
+                f"branch={active_uid} "
+                f"lidar_id={lidar_robot.robot_id} "
+                f"axial={axial:.2f} "
+                f"lateral={lateral:.2f} "
+                f"lateral_v={lateral_velocity:.2f} "
+                f"center_cmd={lateral_command:.2f}"
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # Probe may start only during ordinary Branch exploration.
+    # -----------------------------------------------------
+    if (
+        physical.phase
+        != physical.SimulationPhase.EXPLORE_BRANCH
+        or active_uid is None
+    ):
+        return
+
+    descriptor = physical.branch_descriptors_by_uid.get(
+        active_uid
+    )
+
+    if descriptor is None:
+        return
+
+    active_fixture = getattr(
+        physical,
+        "active_branch",
+        None,
+    )
+
+    if active_fixture is None:
+        return
+
+    frontiers = physical.get_frontier_shepherds(
+        robots,
+        active_fixture,
+    )
+
+    if not frontiers:
+        return
+
+    # Measure Frontier depth only in the frozen local Branch frame.
+    frontier_depths: list[float] = []
+
+    for robot in frontiers:
+        try:
+            axial, _ = physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        except (ValueError, AttributeError):
+            continue
+
+        frontier_depths.append(float(axial))
+
+    if not frontier_depths:
+        return
+
+    frontier_centroid_depth = (
+        sum(frontier_depths)
+        / len(frontier_depths)
+    )
+
+    # LiDAR still has enough forward observation support.
+    if (
+        frontier_centroid_depth
+        < CHILD_PROBE_TRIGGER_DISTANCE
+    ):
+        return
+
+    lidar_robot = perception.leader
+
+    # Same LiDAR ID must be retained.
+    multi_dfs.child_probe_active = True
+    multi_dfs.child_probe_branch_uid = active_uid
+    multi_dfs.child_probe_start_frame = (
+        physical.integration_frame
+    )
+    multi_dfs.child_probe_lidar_id = (
+        lidar_robot.robot_id
+    )
+    multi_dfs.child_probe_start_position = (
+        lidar_robot.position.copy()
+    )
+
+    # Freeze LiDAR orientation to the active Branch's
+    # already-observed local tangent.
+    tangent, normal = physical.descriptor_local_basis(
+        descriptor
+    )
+    tangent = tangent.normalize()
+    normal = normal.normalize()
+
+    perception.yaw_deg = math.degrees(
+        math.atan2(
+            tangent.y,
+            tangent.x,
+        )
+    )
+
+
+
+    # -----------------------------------------------------
+    # Start a completely fresh Child-observation session.
+    #
+    # Do not reuse J0 persistent-opening history here.
+    # -----------------------------------------------------
+    multi_dfs.child_session = ChildObservationSession(
+        parent_junction_uid=frame.junction_uid,
+        parent_branch_uid=active_uid,
+        lidar_id=lidar_robot.robot_id,
+        start_frame=physical.integration_frame,
+        start_position=lidar_robot.position.copy(),
+        ingress_t=tangent.copy(),
+        ingress_n=normal.copy(),
+    )
+
+    print(
+        "[ChildSessionStart] "
+        f"parent={frame.junction_uid} "
+        f"branch={active_uid} "
+        f"lidar_id={lidar_robot.robot_id} "
+        f"frame={physical.integration_frame}"
+    )
+
+
+    # -----------------------------------------------------
+    # Release ONLY the LiDAR robot.
+    #
+    # Do NOT release the Parent Junction.
+    # -----------------------------------------------------
+    perception.anchor_fixed = False
+    lidar_robot.is_fixed_anchor = False
+    lidar_robot.base_reserve = False
+
+    print(
+        "[ChildProbeStart] "
+        f"junction={frame.junction_uid} "
+        f"branch={active_uid} "
+        f"lidar_id={lidar_robot.robot_id} "
+        f"frontier_depth={frontier_centroid_depth:.2f} "
+        f"trigger_depth={CHILD_PROBE_TRIGGER_DISTANCE:.2f} "
+        f"yaw={perception.yaw_deg:.2f} "
+        "parent_release=False "
+        "marker=False "
+        "dfs_push=False"
+    )
+
+def update_child_observation_session(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+) -> None:
+    """Accumulate only fresh Child-observation LiDAR samples."""
+
+    session = multi_dfs.child_session
+
+    if not multi_dfs.child_probe_active:
+        return
+
+    if session is None:
+        return
+
+    # The LiDAR robot ID must never change.
+    if perception.leader.robot_id != session.lidar_id:
+        raise RuntimeError(
+            "Child observation LiDAR ID changed: "
+            f"{session.lidar_id} -> "
+            f"{perception.leader.robot_id}"
+        )
+
+    session.samples += 1
+
+    valid = (
+        lidar_frame.interval_valid
+        and lidar_frame.selected is not None
+    )
+
+    if valid:
+        session.valid_samples += 1
+        session.consecutive_valid += 1
+
+        session.last_valid_w = float(
+            lidar_frame.adaptive_w
+        )
+
+        session.last_selected_threshold = float(
+            lidar_frame.selected
+        )
+
+    else:
+        session.consecutive_valid = 0
+
+    if physical.integration_frame % 20 == 0:
+        print(
+            "[ChildSession] "
+            f"parent={session.parent_junction_uid} "
+            f"branch={session.parent_branch_uid} "
+            f"lidar_id={session.lidar_id} "
+            f"samples={session.samples} "
+            f"valid={session.valid_samples} "
+            f"consecutive_valid={session.consecutive_valid} "
+            f"openings={len(lidar_frame.openings)} "
+            f"interval_valid={lidar_frame.interval_valid} "
+            f"selected={lidar_frame.selected}"
+        )   
+
+def _build_child_stationary_frozen_frame(
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+    session: ChildObservationSession,
+) -> LidarFrame | None:
+    """Re-evaluate a stationary raw scan with the valid Candidate threshold.
+
+    The current adaptive W may become invalid inside a Junction.
+    Therefore the threshold that was valid when the moving Candidate
+    was detected is frozen and reused here.
+
+    Raw FAR/Rmax rays are still not accepted as physical mouths.
+    Finite wall-side verification is performed separately.
+    """
+
+    if (
+        session.candidate_selected_threshold is None
+        or session.candidate_lidar_frame is None
+    ):
+        return None
+
+    frozen_threshold = float(
+        session.candidate_selected_threshold
+    )
+
+    candidate_frame = session.candidate_lidar_frame
+
+    openings, diagnostics = (
+        adaptive._detect_openings_w_tau_with_diagnostics(
+            lidar_frame.angles,
+            lidar_frame.raw,
+            selected_threshold=frozen_threshold,
+            threshold_interval_valid=True,
+            smoothing_window_size=SMOOTHING_WINDOW,
+        )
+    )
+
+    return LidarFrame(
+        frame=lidar_frame.frame,
+        angles=lidar_frame.angles.copy(),
+        raw=lidar_frame.raw.copy(),
+        smoothed=np.asarray(
+            diagnostics["smoothed_ranges"]
+        ),
+        support=np.asarray(
+            diagnostics["open_support_mask"],
+            dtype=bool,
+        ),
+        openings=tuple(
+            dict(item)
+            for item in openings
+        ),
+        left=lidar_frame.left,
+        right=lidar_frame.right,
+
+        # Keep the geometry scale that was valid when the
+        # moving Child Candidate was created.
+        adaptive_w=float(
+            candidate_frame.adaptive_w
+        ),
+        lower=float(candidate_frame.lower),
+        upper=float(candidate_frame.upper),
+        selected=frozen_threshold,
+        interval_valid=True,
+        current_evidence=False,
+    )
+
+def update_child_stationary_verification(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+) -> None:
+    """Confirm a Child Junction from persistent stationary physical mouths.
+
+    This function may confirm the Child Junction only.
+
+    It does NOT:
+    - release the Parent Junction,
+    - create Markers,
+    - change ACTIVE -> ACTIVE_CHILD,
+    - perform DFS PUSH.
+    """
+
+    session = multi_dfs.child_session
+
+    if (
+        session is None
+        or not multi_dfs.child_candidate_active
+        or not session.anchor_stopped
+        or multi_dfs.child_confirmed
+    ):
+        return
+
+    frozen_frame = _build_child_stationary_frozen_frame(
+        perception,
+        lidar_frame,
+        session,
+    )
+
+    if frozen_frame is None:
+        return
+
+    session.stationary_samples += 1
+
+    verified_outgoing: list[
+        dict[str, float]
+    ] = []
+
+    candidate_width = float(
+        session.candidate_lidar_frame.adaptive_w
+    )
+
+    minimum_mouth_width = (
+        CHILD_CANDIDATE_MIN_MOUTH_WIDTH_RATIO
+        * candidate_width
+    )
+
+    # -----------------------------------------------------
+    # Verify physical mouths.
+    #
+    # An OPEN sector alone is insufficient.
+    # Both wall-side finite endpoints must exist.
+    # -----------------------------------------------------
+    for opening in frozen_frame.openings:
+        start_angle = float(
+            opening["start_angle"]
+        )
+        end_angle = float(
+            opening["end_angle"]
+        )
+        center_angle = float(
+            opening["center_angle"]
+        )
+
+        try:
+            start_point, _, _ = (
+                _nearest_wall_side_endpoint(
+                    frozen_frame,
+                    perception,
+                    start_angle,
+                    search_direction=-1,
+                )
+            )
+
+            end_point, _, _ = (
+                _nearest_wall_side_endpoint(
+                    frozen_frame,
+                    perception,
+                    end_angle,
+                    search_direction=+1,
+                )
+            )
+        except RuntimeError:
+            # A FAR/Rmax opening without finite wall sides
+            # is not a verified physical branch mouth.
+            continue
+
+        mouth_chord = (
+            end_point - start_point
+        )
+
+        if (
+            mouth_chord.length()
+            < minimum_mouth_width
+        ):
+            continue
+
+        radial = _body_local_unit(
+            perception,
+            center_angle,
+        )
+
+        if (
+            radial.length_squared()
+            <= physical.EPSILON
+        ):
+            continue
+
+        radial = radial.normalize()
+
+        ingress_alignment = float(
+            radial.dot(session.ingress_t)
+        )
+
+        # The corridor actually traversed from the Parent is
+        # represented by stored ingress history.
+        #
+        # Do not require a rear LiDAR opening and do not count
+        # a strong rear-facing opening as a Child outgoing edge.
+        if ingress_alignment <= -0.50:
+            continue
+
+        verified_outgoing.append(
+            opening
+        )
+
+    # -----------------------------------------------------
+    # Associate only VERIFIED stationary mouths.
+    # Moving-session persistence is never reused.
+    # -----------------------------------------------------
+    available = set(
+        range(len(session.stationary_tracks))
+    )
+
+    for opening in verified_outgoing:
+        center = float(
+            opening["center_angle"]
+        )
+
+        candidates = [
+            (
+                circular_error(
+                    center,
+                    session.stationary_tracks[
+                        index
+                    ].center_angle,
+                ),
+                index,
+            )
+            for index in available
+        ]
+
+        error, index = min(
+            candidates,
+            default=(float("inf"), -1),
+        )
+
+        if (
+            index >= 0
+            and error
+            <= ASSOCIATION_TOLERANCE_DEG
+        ):
+            track = (
+                session.stationary_tracks[index]
+            )
+            available.remove(index)
+
+        else:
+            track = PersistentOpening(
+                "CHILD_OPEN_"
+                f"{len(session.stationary_tracks):02d}"
+            )
+            session.stationary_tracks.append(
+                track
+            )
+
+        track.update(
+            opening,
+            physical.integration_frame,
+        )
+
+    persistent_outgoing = [
+        track
+        for track in session.stationary_tracks
+        if (
+            len(track.observations)
+            >= MIN_PERSISTENT_OBSERVATIONS
+            and track.persistence_ratio(
+                session.stationary_samples
+            )
+            >= CHILD_STATIONARY_PERSISTENCE_RATIO
+        )
+    ]
+
+    # Re-check that the stationary result still contains
+    # non-axial structure relative to the frozen ingress axis.
+    persistent_non_axial = []
+
+    for track in persistent_outgoing:
+        radial = _body_local_unit(
+            perception,
+            track.center_angle,
+        )
+
+        if (
+            radial.length_squared()
+            <= physical.EPSILON
+        ):
+            continue
+
+        radial = radial.normalize()
+
+        alignment = abs(
+            float(
+                radial.dot(session.ingress_t)
+            )
+        )
+
+        if (
+            alignment
+            <= CHILD_CANDIDATE_NON_AXIAL_MAX_DOT
+        ):
+            persistent_non_axial.append(
+                track
+            )
+
+    if (
+        physical.integration_frame
+        % 10
+        == 0
+    ):
+        print(
+            "[ChildStationaryVerification] "
+            f"parent={session.parent_junction_uid} "
+            f"branch={session.parent_branch_uid} "
+            f"lidar_id={session.lidar_id} "
+            f"samples={session.stationary_samples} "
+            f"frozen_threshold="
+            f"{session.candidate_selected_threshold:.2f} "
+            f"raw_openings="
+            f"{len(frozen_frame.openings)} "
+            f"verified_outgoing="
+            f"{len(verified_outgoing)} "
+            f"persistent_outgoing="
+            f"{len(persistent_outgoing)} "
+            f"persistent_non_axial="
+            f"{len(persistent_non_axial)}"
+        )
+
+    confirmed = (
+        len(persistent_outgoing)
+        >= CHILD_STATIONARY_MIN_OUTGOING
+        and len(persistent_non_axial)
+        >= 1
+    )
+
+    if not confirmed:
+        return
+
+    # -----------------------------------------------------
+    # Child Junction CONFIRMED.
+    #
+    # Stop here. Parent release / Marker / DFS PUSH belong
+    # to the NEXT implementation stage.
+    # -----------------------------------------------------
+    persistent_outgoing.sort(
+        key=lambda track: track.center_angle
+    )
+
+    session.stationary_outgoing = list(
+        persistent_outgoing
+    )
+
+    session.stationary_confirmed = True
+
+    session.stationary_confirmation_frame = (
+        physical.integration_frame
+    )
+
+    multi_dfs.child_confirmed = True
+
+    print(
+        "[ChildJunctionConfirmed] "
+        f"parent={session.parent_junction_uid} "
+        f"branch={session.parent_branch_uid} "
+        f"lidar_id={session.lidar_id} "
+        f"frame="
+        f"{session.stationary_confirmation_frame} "
+        f"stationary_samples="
+        f"{session.stationary_samples} "
+        f"outgoing_count="
+        f"{len(session.stationary_outgoing)} "
+        f"frozen_threshold="
+        f"{session.candidate_selected_threshold:.2f} "
+        "parent_source=INGRESS_HISTORY "
+        "parent_release=False "
+        "marker=False "
+        "active_child=False "
+        "dfs_push=False"
+    )
+
+
+
+def update_child_moving_candidate(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+) -> None:
+    """Detect a moving Child-Junction candidate from fresh local LiDAR evidence.
+
+    This only latches a candidate.
+
+    It does NOT:
+    - confirm a Child Junction,
+    - release the Parent Junction,
+    - create Markers,
+    - perform DFS PUSH.
+    """
+
+    session = multi_dfs.child_session
+
+    if (
+        not multi_dfs.child_probe_active
+        or session is None
+        or multi_dfs.child_candidate_active
+    ):
+        return
+
+    # -----------------------------------------------------
+    # Parent-Junction clearance gate
+    #
+    # Prevent the already-known Parent Junction J0
+    # from being detected again as a Child Junction.
+    # -----------------------------------------------------
+    descriptor = physical.branch_descriptors_by_uid.get(
+        session.parent_branch_uid
+    )
+
+    if descriptor is None:
+        return
+
+    try:
+        current_axial, current_lateral = (
+            physical.branch_local_coordinates(
+                perception.leader.position,
+                descriptor,
+            )
+        )
+    except (ValueError, AttributeError):
+        return
+
+    width_reference = session.last_valid_w
+
+    if width_reference is None:
+        width_reference = float(
+            lidar_frame.adaptive_w
+        )
+
+    parent_clearance_depth = (
+        CHILD_PARENT_CLEARANCE_W_RATIO
+        * width_reference
+    )
+
+    if current_axial < parent_clearance_depth:
+        session.structural_streak = 0
+
+        if physical.integration_frame % 20 == 0:
+            print(
+                "[ChildParentClearance] "
+                f"parent={session.parent_junction_uid} "
+                f"branch={session.parent_branch_uid} "
+                f"lidar_id={session.lidar_id} "
+                f"axial={current_axial:.2f} "
+                f"lateral={current_lateral:.2f} "
+                f"required={parent_clearance_depth:.2f} "
+                "cleared=False"
+            )
+
+        return
+
+    # Invalid adaptive-threshold frames cannot provide
+    # new structural evidence.
+    if (
+        not lidar_frame.interval_valid
+        or lidar_frame.selected is None
+    ):
+        session.structural_streak = 0
+        return
+
+    verified_outgoing: list[
+        tuple[
+            dict[str, float],
+            pygame.Vector2,
+            pygame.Vector2,
+            float,
+        ]
+    ] = []
+
+    non_axial_verified: list[
+        tuple[
+            dict[str, float],
+            pygame.Vector2,
+            pygame.Vector2,
+            float,
+        ]
+    ] = []
+
+    for opening in lidar_frame.openings:
+        start_angle = float(
+            opening["start_angle"]
+        )
+        end_angle = float(
+            opening["end_angle"]
+        )
+        center_angle = float(
+            opening["center_angle"]
+        )
+
+        # -------------------------------------------------
+        # A physical mouth must have finite wall-side
+        # endpoints on BOTH sides of the OPEN sector.
+        # -------------------------------------------------
+        try:
+            (
+                start_point,
+                _,
+                _,
+            ) = _nearest_wall_side_endpoint(
+                lidar_frame,
+                perception,
+                start_angle,
+                search_direction=-1,
+            )
+
+            (
+                end_point,
+                _,
+                _,
+            ) = _nearest_wall_side_endpoint(
+                lidar_frame,
+                perception,
+                end_angle,
+                search_direction=+1,
+            )
+
+        except RuntimeError:
+            continue
+
+        mouth_chord = (
+            end_point
+            - start_point
+        )
+
+        minimum_mouth_width = (
+            CHILD_CANDIDATE_MIN_MOUTH_WIDTH_RATIO
+            * lidar_frame.adaptive_w
+        )
+
+        if (
+            mouth_chord.length()
+            < minimum_mouth_width
+        ):
+            continue
+
+        radial = _body_local_unit(
+            perception,
+            center_angle,
+        )
+
+        if radial.length_squared() <= physical.EPSILON:
+            continue
+
+        radial = radial.normalize()
+
+        signed_ingress_alignment = float(
+            radial.dot(
+                session.ingress_t
+            )
+        )
+
+        # A strong rear-facing sector corresponds to the
+        # corridor already traversed from the Parent.
+        # It is not a new outgoing Child branch.
+        if signed_ingress_alignment <= -0.50:
+            continue
+
+        evidence = (
+            opening,
+            start_point,
+            end_point,
+            signed_ingress_alignment,
+        )
+
+        verified_outgoing.append(
+            evidence
+        )
+
+        # At least one branch direction must break away
+        # from the incoming corridor axis.
+        if (
+            abs(signed_ingress_alignment)
+            <= CHILD_CANDIDATE_NON_AXIAL_MAX_DOT
+        ):
+            non_axial_verified.append(
+                evidence
+            )
+
+    # -----------------------------------------------------
+    # Structural Junction evidence
+    #
+    # Not simply "opening count >= 3".
+    #
+    # Require:
+    # 1. at least two finite physical outgoing mouths
+    # 2. at least one non-axial outgoing mouth
+    # -----------------------------------------------------
+    structural_evidence = (
+        len(verified_outgoing) >= 2
+        and len(non_axial_verified) >= 1
+    )
+
+    if structural_evidence:
+        session.structural_streak += 1
+    else:
+        session.structural_streak = 0
+
+    if physical.integration_frame % 10 == 0:
+        print(
+            "[ChildStructuralEvidence] "
+            f"parent={session.parent_junction_uid} "
+            f"branch={session.parent_branch_uid} "
+            f"lidar_id={session.lidar_id} "
+            f"verified_outgoing={len(verified_outgoing)} "
+            f"non_axial={len(non_axial_verified)} "
+            f"streak={session.structural_streak}/"
+            f"{CHILD_CANDIDATE_MIN_STRUCTURAL_STREAK}"
+        )
+
+    if (
+        session.structural_streak
+        < CHILD_CANDIDATE_MIN_STRUCTURAL_STREAK
+    ):
+        return
+
+    # -----------------------------------------------------
+    # Estimate local Junction depth from the non-axial
+    # mouth wall breaks.
+    #
+    # This is relative to the CURRENT LiDAR pose and the
+    # frozen ingress axis. No global J1 coordinate is used.
+    # -----------------------------------------------------
+    depth_samples: list[float] = []
+
+    for (
+        _,
+        start_point,
+        end_point,
+        _,
+    ) in non_axial_verified:
+
+        mouth_midpoint_local = (
+            0.5
+            * (
+                start_point
+                + end_point
+            )
+        )
+
+        depth = float(
+            mouth_midpoint_local.dot(
+                session.ingress_t
+            )
+        )
+
+        if depth > 0.0:
+            depth_samples.append(
+                depth
+            )
+
+    if not depth_samples:
+        return
+
+    candidate_depth = float(
+        np.median(
+            depth_samples
+        )
+    )
+
+    multi_dfs.child_candidate_active = True
+
+    session.candidate_frame = (
+        physical.integration_frame
+    )
+
+    session.candidate_position = (
+        perception.leader.position.copy()
+    )
+
+    session.candidate_depth_local = (
+        candidate_depth
+    )
+
+    session.candidate_selected_threshold = float(
+        lidar_frame.selected
+    )
+
+    session.candidate_lidar_frame = (
+        lidar_frame
+    )
+
+    # -----------------------------------------------------
+    # Freeze the Candidate approach reference.
+    #
+    # From this point on, approach depth is reduced only
+    # by local odometry along the stored ingress axis.
+    # Do not recompute the Child position from later scans.
+    # -----------------------------------------------------
+    session.candidate_last_position = (
+        perception.leader.position.copy()
+    )
+
+    session.candidate_traveled_axial = 0.0
+
+    session.candidate_remaining_depth = (
+        candidate_depth
+    )
+
+    session.anchor_stopped = False
+    session.anchor_stop_frame = None
+
+    print(
+        "[ChildMovingCandidate] "
+        f"parent={session.parent_junction_uid} "
+        f"branch={session.parent_branch_uid} "
+        f"lidar_id={session.lidar_id} "
+        f"frame={session.candidate_frame} "
+        f"verified_outgoing={len(verified_outgoing)} "
+        f"non_axial={len(non_axial_verified)} "
+        f"depth_local={candidate_depth:.2f} "
+        f"threshold={session.candidate_selected_threshold:.2f} "
+        "confirmed=False "
+        "parent_release=False "
+        "marker=False "
+        "dfs_push=False"
+    )
 
 def _load_physical_definitions() -> types.ModuleType:
     """Load definitions before the original top-level main loop starts."""
@@ -8835,6 +10218,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 physical, robots, reference_density, frame_count
             )
             physical.compute_sph_forces(robots, physics_grid, spatial_grid, dt)
+
+            update_child_lidar_probe(
+                physical,
+                perception,
+                robots,
+            )
+
             if perception.state == PerceptionState.JUNCTION_APPROACH:
                 perception.leader.acceleration *= 0.35
             for robot in robots:
@@ -8862,7 +10252,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             perception.enforce_anchor()
             spatial_grid = physical.build_spatial_grid(robots)
             physical.update_communication_system(robots, spatial_grid)
+
             lidar_frame = perception.update(physical.simulation_time)
+            update_child_observation_session(
+                physical,
+                perception,
+                lidar_frame,
+            )
+            update_child_moving_candidate(
+                physical,
+                perception,
+                lidar_frame,
+            )
+
+            update_child_stationary_verification(
+                physical,
+                perception,
+                lidar_frame,
+            )
+
+
             if (
                 perception.anchor_fixed
                 and perception.state in {
