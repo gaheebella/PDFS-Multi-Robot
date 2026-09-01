@@ -716,16 +716,20 @@ def retain_parent_completion_markers(
     parent: MultiJunctionFrame,
     robots: Sequence[Any],
 ) -> None:
-    """Reuse existing Single-DFS VISITED Pebbles.
+    """Retain or materialize one physical Completion Marker per VISITED branch.
 
-    ACTIVE_CHILD branch never receives a Completion Marker here.
+    Existing VISITED Pebbles are reused.
+
+    If legacy/same-ID Physical DFS completed the branch by restoring the
+    original Guard wall instead of creating a Pebble, promote exactly one
+    robot from that branch's existing JUNCTION_GUARD lineage in place.
+
+    ACTIVE_CHILD never receives a Completion Marker here.
     """
 
     existing_by_uid = {
         pebble.pebble_branch_uid: pebble
-        for pebble in physical.get_pebbles(
-            robots
-        )
+        for pebble in physical.get_pebbles(robots)
         if (
             getattr(
                 pebble,
@@ -742,34 +746,280 @@ def retain_parent_completion_markers(
         )
     }
 
+    visited_uids: list[str] = []
+
     for branch_uid, state in (
         parent.branch_states.items()
     ):
         if state != "VISITED":
             continue
 
+        visited_uids.append(branch_uid)
+
         marker = existing_by_uid.get(
             branch_uid
         )
 
+        # -------------------------------------------------
+        # Legacy/same-ID Guard-cycle compatibility:
+        #
+        # GUARD -> FRONTIER -> SHEPHERD -> GUARD completed
+        # the branch without materialising a Pebble.
+        #
+        # Use one robot from THAT SAME branch Guard lineage.
+        # No NORMAL re-election and no teleport.
+        # -------------------------------------------------
+        if marker is None:
+
+            candidates = [
+                robot
+                for robot in robots
+                if (
+                    getattr(
+                        robot,
+                        "role",
+                        None,
+                    )
+                    == "JUNCTION_GUARD"
+                    and getattr(
+                        robot,
+                        "junction_guard_branch_uid",
+                        None,
+                    )
+                    == branch_uid
+                )
+            ]
+
+            descriptor = getattr(
+                physical,
+                "branch_descriptors_by_uid",
+                {},
+            ).get(branch_uid)
+
+            mouth = (
+                getattr(
+                    descriptor,
+                    "observed_mouth_position",
+                    None,
+                )
+                if descriptor is not None
+                else None
+            )
+
+            if candidates:
+                if mouth is not None:
+                    marker = min(
+                        candidates,
+                        key=lambda robot: (
+                            robot.position.distance_squared_to(
+                                mouth
+                            ),
+                            robot.robot_id,
+                        ),
+                    )
+                else:
+                    # Deterministic fallback inside the SAME
+                    # original Guard lineage only.
+                    marker = min(
+                        candidates,
+                        key=lambda robot:
+                            robot.robot_id,
+                    )
+
         if marker is None:
             raise RuntimeError(
-                "VISITED Parent branch has no "
-                "physical Completion Pebble: "
+                "VISITED Parent branch has neither "
+                "a physical Completion Pebble nor "
+                "an original Guard candidate: "
                 f"junction={parent.junction_uid} "
                 f"branch={branch_uid}"
             )
+
+        # Existing Pebble: nothing else to materialise.
+        if (
+            getattr(marker, "role", None)
+            == "PEBBLE"
+            and getattr(
+                marker,
+                "pebble_state",
+                None,
+            )
+            == "VISITED"
+        ):
+            parent.completion_marker_ids[
+                branch_uid
+            ] = marker.robot_id
+
+            print(
+                "[CompletionMarkerRetained] "
+                f"junction={parent.junction_uid} "
+                f"branch={branch_uid} "
+                f"robot={marker.robot_id}"
+            )
+            continue
+
+        branch_key = getattr(
+            marker,
+            "junction_guard_branch",
+            None,
+        )
+
+        ingress = None
+
+        if descriptor is not None:
+            candidate_ingress = getattr(
+                descriptor,
+                "local_outgoing_direction",
+                None,
+            )
+            if (
+                candidate_ingress is not None
+                and candidate_ingress.length_squared()
+                > physical.EPSILON
+            ):
+                ingress = (
+                    candidate_ingress.normalize()
+                )
+
+        if ingress is None:
+            local_by_uid = getattr(
+                marker,
+                "local_ingress_tangents_by_uid",
+                {},
+            )
+            candidate_ingress = (
+                local_by_uid.get(branch_uid)
+            )
+
+            if (
+                candidate_ingress is not None
+                and candidate_ingress.length_squared()
+                > physical.EPSILON
+            ):
+                ingress = (
+                    candidate_ingress.normalize()
+                )
+
+        if (
+            ingress is None
+            and branch_key is not None
+        ):
+            local_by_fixture = getattr(
+                marker,
+                "local_ingress_tangents",
+                {},
+            )
+            candidate_ingress = (
+                local_by_fixture.get(branch_key)
+            )
+
+            if (
+                candidate_ingress is not None
+                and candidate_ingress.length_squared()
+                > physical.EPSILON
+            ):
+                ingress = (
+                    candidate_ingress.normalize()
+                )
+
+        if ingress is None:
+            raise RuntimeError(
+                "Original Guard selected for Completion "
+                "Marker has no valid branch-local ingress: "
+                f"junction={parent.junction_uid} "
+                f"branch={branch_uid} "
+                f"robot={marker.robot_id}"
+            )
+
+        # Preserve the physical pose exactly.
+        marker.role = "PEBBLE"
+        marker.pebble_anchor = (
+            marker.position.copy()
+        )
+        marker.pebble_branch_uid = (
+            branch_uid
+        )
+        marker.pebble_branch_key = (
+            branch_key
+        )
+        marker.pebble_state = "VISITED"
+        marker.pebble_ingress_direction_local = (
+            ingress.copy()
+        )
+        marker.pebble_return_direction_local = (
+            -ingress
+        )
+
+        if hasattr(
+            physical,
+            "branch_completion_epoch",
+        ):
+            physical.branch_completion_epoch += 1
+            marker.pebble_completion_epoch = (
+                physical.branch_completion_epoch
+            )
+        else:
+            marker.pebble_completion_epoch = 0
+
+        if hasattr(
+            marker,
+            "known_visited_branch_uids",
+        ):
+            marker.known_visited_branch_uids.add(
+                branch_uid
+            )
+
+        if (
+            branch_key is not None
+            and hasattr(
+                marker,
+                "known_visited_branches",
+            )
+        ):
+            marker.known_visited_branches.add(
+                branch_key
+            )
+
+        # Marker becomes force-free in its current pose.
+        marker.velocity.update(0.0, 0.0)
+        marker.commanded_velocity.update(
+            0.0,
+            0.0,
+        )
+        marker.observed_velocity.update(
+            0.0,
+            0.0,
+        )
+        marker.acceleration.update(0.0, 0.0)
+        marker.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
 
         parent.completion_marker_ids[
             branch_uid
         ] = marker.robot_id
 
+        existing_by_uid[
+            branch_uid
+        ] = marker
+
         print(
-            "[CompletionMarkerRetained] "
+            "[CompletionMarkerBackfilled] "
             f"junction={parent.junction_uid} "
             f"branch={branch_uid} "
-            f"robot={marker.robot_id}"
+            f"robot={marker.robot_id} "
+            "source=ORIGINAL_GUARD "
+            "position_jump=0"
         )
+
+    print(
+        "[ParentCompletionMarkersReady] "
+        f"junction={parent.junction_uid} "
+        f"visited={visited_uids} "
+        f"markers="
+        f"{parent.completion_marker_ids}"
+    )
 
 def create_parent_return_marker(
     physical: types.ModuleType,
@@ -11669,9 +11919,34 @@ class DarkRenderer:
         order = {"NORMAL": 0, "RELAY": 1, "TRUNK_RELAY": 1, "PEBBLE": 2, "JUNCTION_GUARD": 3, "FRONTIER_SHEPHERD": 4, "PRE_SHEPHERD": 5, "SHEPHERD": 5}
         for robot in sorted(robots, key=lambda item: order.get(item.role, 0)):
             color = role_colors.get(robot.role, COLORS["normal"])
+
             if density and robot.role == "NORMAL":
-                color = physical.density_to_color(robot.density, max(robot.density, 1.0))
-            pygame.draw.circle(self.screen, color, robot.position, max(2, round(robot.radius + 1)))
+                color = physical.density_to_color(
+                    robot.density,
+                    max(robot.density, 1.0),
+                )
+
+            draw_radius = max(
+                2,
+                round(robot.radius + 1),
+            )
+
+            pygame.draw.circle(
+                self.screen,
+                color,
+                robot.position,
+                draw_radius,
+            )
+
+            # Make physical DFS Pebbles clearly visible.
+            if robot.role == "PEBBLE":
+                pygame.draw.circle(
+                    self.screen,
+                    (255, 255, 255),
+                    robot.position,
+                    draw_radius + 4,
+                    2,
+                )
         pygame.draw.circle(self.screen, COLORS["anchor"], perception.leader.position, 7)
         pygame.draw.circle(self.screen, COLORS["background"], perception.leader.position, 7, 2)
         self.screen.blit(self.small.render(f"LiDAR {perception.leader.robot_id}", True, COLORS["anchor"]), perception.leader.position + pygame.Vector2(9, -18))
