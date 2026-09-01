@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Sequence
+import copy
 
 from multi_junction_sph_dfs_adaptive_lidar_anchor_v2_child_session_ok import CHILD_PROBE_TRIGGER_DISTANCE
 import numpy as np
@@ -340,6 +341,15 @@ class MultiJunctionFrame:
     return_marker_id: int | None = None
     completion_marker_ids: dict[str, int] = field(default_factory=dict)
 
+    # Parent Junction을 Child 탐색 동안 복원할 수 있도록
+    # Physical DFS의 논리/geometry context를 보존한다.
+    #
+    # Robot world position은 저장하지 않는다.
+    # 나중 복귀는 Return Marker + local information으로 수행한다.
+    saved_physical_context: dict[str, Any] = field(
+        default_factory=dict
+    )
+
     # True only when every branch/subtree below this Junction is done.
     subtree_complete: bool = False
 
@@ -637,6 +647,518 @@ def sync_multi_dfs_from_physical(
             f"depth={multi_dfs.depth} "
             f"states={frame.branch_states}"
         )
+
+def save_parent_physical_context(
+    physical: types.ModuleType,
+    parent: MultiJunctionFrame,
+) -> None:
+    """Freeze Parent DFS control context before physical release.
+
+    No robot position is stored as a return target.
+    """
+
+    if parent.saved_physical_context:
+        return
+
+    parent.saved_physical_context = copy.deepcopy(
+        {
+            "branch_descriptors_by_uid":
+                physical.branch_descriptors_by_uid,
+
+            "fixture_key_to_branch_uid":
+                physical.fixture_key_to_branch_uid,
+
+            "branch_uid_to_fixture_key":
+                physical.branch_uid_to_fixture_key,
+
+            "detected_branch_candidates":
+                physical.detected_branch_candidates,
+
+            "junction_guard_groups":
+                physical.junction_guard_groups,
+
+            "integration_wall_lifecycle":
+                physical.integration_wall_lifecycle,
+
+            "integration_ready_guard_ids_by_uid":
+                physical.integration_ready_guard_ids_by_uid,
+
+            "integration_wall_status":
+                physical.integration_wall_status,
+
+            "branch_order_plan":
+                physical.branch_order_plan,
+
+            "branch_fixture_order_plan":
+                physical.branch_fixture_order_plan,
+
+            "active_branch":
+                physical.active_branch,
+
+            "active_branch_uid":
+                physical.active_branch_uid,
+
+            "phase":
+                physical.phase,
+        }
+    )
+
+    print(
+        "[ParentStateSaved] "
+        f"junction={parent.junction_uid} "
+        f"branches={parent.branch_order} "
+        f"states={parent.branch_states} "
+        f"active_child={parent.active_branch_uid}"
+    )
+
+def retain_parent_completion_markers(
+    physical: types.ModuleType,
+    parent: MultiJunctionFrame,
+    robots: Sequence[Any],
+) -> None:
+    """Reuse existing Single-DFS VISITED Pebbles.
+
+    ACTIVE_CHILD branch never receives a Completion Marker here.
+    """
+
+    existing_by_uid = {
+        pebble.pebble_branch_uid: pebble
+        for pebble in physical.get_pebbles(
+            robots
+        )
+        if (
+            getattr(
+                pebble,
+                "pebble_state",
+                None,
+            )
+            == "VISITED"
+            and getattr(
+                pebble,
+                "pebble_branch_uid",
+                None,
+            )
+            is not None
+        )
+    }
+
+    for branch_uid, state in (
+        parent.branch_states.items()
+    ):
+        if state != "VISITED":
+            continue
+
+        marker = existing_by_uid.get(
+            branch_uid
+        )
+
+        if marker is None:
+            raise RuntimeError(
+                "VISITED Parent branch has no "
+                "physical Completion Pebble: "
+                f"junction={parent.junction_uid} "
+                f"branch={branch_uid}"
+            )
+
+        parent.completion_marker_ids[
+            branch_uid
+        ] = marker.robot_id
+
+        print(
+            "[CompletionMarkerRetained] "
+            f"junction={parent.junction_uid} "
+            f"branch={branch_uid} "
+            f"robot={marker.robot_id}"
+        )
+
+def create_parent_return_marker(
+    physical: types.ModuleType,
+    parent: MultiJunctionFrame,
+    robots: Sequence[Any],
+    perception: AdaptivePerception,
+) -> int:
+    """Convert one existing Parent wall robot in place.
+
+    No teleport.
+    No global Junction coordinate.
+    LiDAR robot is never used.
+    """
+
+    parent_branch_uids = set(
+        parent.branch_order
+    )
+
+    candidates: list[
+        tuple[float, int, Any]
+    ] = []
+
+    for robot in robots:
+
+        if robot is perception.leader:
+            continue
+
+        if robot.role != "JUNCTION_GUARD":
+            continue
+
+        branch_uid = getattr(
+            robot,
+            "junction_guard_branch_uid",
+            None,
+        )
+
+        branch_key = getattr(
+            robot,
+            "junction_guard_branch",
+            None,
+        )
+
+        if (
+            branch_uid
+            not in parent_branch_uids
+        ):
+            try:
+                branch_uid = (
+                    physical.branch_uid_for_fixture(
+                        branch_key
+                    )
+                )
+            except (
+                KeyError,
+                TypeError,
+                AttributeError,
+            ):
+                branch_uid = None
+
+        if branch_uid not in parent_branch_uids:
+            continue
+
+        descriptor = (
+            physical.branch_descriptors_by_uid.get(
+                branch_uid
+            )
+        )
+
+        if descriptor is None:
+            continue
+
+        try:
+            axial, _ = (
+                physical.branch_local_coordinates(
+                    robot.position,
+                    descriptor,
+                )
+            )
+        except (
+            ValueError,
+            AttributeError,
+        ):
+            continue
+
+        # mouth 근처 Guard를 우선 선택한다.
+        candidates.append(
+            (
+                abs(float(axial)),
+                robot.robot_id,
+                robot,
+            )
+        )
+
+    if not candidates:
+        raise RuntimeError(
+            "no physical Parent Guard available "
+            "for Junction Return Marker"
+        )
+
+    _, _, marker = min(
+        candidates
+    )
+
+    # -------------------------------------------------
+    # Same-position role transition only.
+    # -------------------------------------------------
+    marker.role = "PEBBLE"
+
+    marker.pebble_anchor = (
+        marker.position.copy()
+    )
+
+    # Return Marker는 branch completion fact가 아니다.
+    marker.pebble_branch_uid = None
+    marker.pebble_branch_key = None
+
+    marker.pebble_state = (
+        "JUNCTION_RETURN"
+    )
+
+    marker.pebble_ingress_direction_local = None
+
+    marker.pebble_return_direction_local = (
+        parent.return_direction_local.copy()
+        if parent.return_direction_local
+        is not None
+        else None
+    )
+
+    # Multi-Junction-specific local metadata.
+    marker.marker_type = (
+        "JUNCTION_RETURN"
+    )
+
+    marker.marker_junction_uid = (
+        parent.junction_uid
+    )
+
+    marker.junction_guard_anchor = None
+    marker.junction_guard_branch = None
+    marker.junction_guard_branch_uid = None
+    marker.junction_guard_parent_id = None
+    marker.junction_guard_layer = -1
+    marker.is_branch_leader = False
+
+    marker.shepherd_anchor = None
+    marker.shepherd_origin = None
+    marker.shepherd_branch = None
+    marker.frontier_local_lateral = None
+
+    marker.velocity.update(
+        0.0,
+        0.0,
+    )
+
+    marker.acceleration.update(
+        0.0,
+        0.0,
+    )
+
+    marker.filtered_acceleration.update(
+        0.0,
+        0.0,
+    )
+
+    parent.return_marker_id = (
+        marker.robot_id
+    )
+
+    print(
+        "[ReturnMarkerCreated] "
+        f"junction={parent.junction_uid} "
+        f"robot={marker.robot_id} "
+        "position_snap=False "
+        "branch_uid=None "
+        "state=JUNCTION_RETURN"
+    )
+
+    return marker.robot_id
+
+def release_parent_physical_roles(
+    physical: types.ModuleType,
+    parent: MultiJunctionFrame,
+    robots: Sequence[Any],
+) -> dict[str, int]:
+    """Release only Parent wall roles.
+
+    Completion Pebbles and Return Marker remain fixed.
+    Breadcrumb/Relay robots are intentionally preserved.
+    """
+
+    parent_branch_uids = set(
+        parent.branch_order
+    )
+
+    released = {
+        "guard": 0,
+        "frontier": 0,
+        "shepherd": 0,
+    }
+
+    for robot in robots:
+
+        if robot.role == "PEBBLE":
+            continue
+
+        branch_uid = None
+
+        if robot.role == "JUNCTION_GUARD":
+
+            branch_uid = getattr(
+                robot,
+                "junction_guard_branch_uid",
+                None,
+            )
+
+            branch_key = getattr(
+                robot,
+                "junction_guard_branch",
+                None,
+            )
+
+            if (
+                branch_uid
+                not in parent_branch_uids
+            ):
+                try:
+                    branch_uid = (
+                        physical.branch_uid_for_fixture(
+                            branch_key
+                        )
+                    )
+                except (
+                    KeyError,
+                    TypeError,
+                    AttributeError,
+                ):
+                    branch_uid = None
+
+        elif robot.role in {
+            "FRONTIER_SHEPHERD",
+            "SHEPHERD",
+            "PRE_SHEPHERD",
+        }:
+
+            branch_key = getattr(
+                robot,
+                "shepherd_branch",
+                None,
+            )
+
+            try:
+                branch_uid = (
+                    physical.branch_uid_for_fixture(
+                        branch_key
+                    )
+                )
+            except (
+                KeyError,
+                TypeError,
+                AttributeError,
+            ):
+                branch_uid = None
+
+        else:
+            continue
+
+        if branch_uid not in parent_branch_uids:
+            continue
+
+        previous_role = robot.role
+
+        robot.role = "NORMAL"
+
+        robot.junction_guard_anchor = None
+        robot.junction_guard_branch = None
+        robot.junction_guard_branch_uid = None
+        robot.junction_guard_hop = -1
+        robot.junction_guard_parent_id = None
+        robot.junction_guard_layer = -1
+        robot.is_branch_leader = False
+
+        if hasattr(
+            robot,
+            "integration_guard_waypoints",
+        ):
+            robot.integration_guard_waypoints = []
+
+        if hasattr(
+            robot,
+            "integration_guard_final_anchor",
+        ):
+            robot.integration_guard_final_anchor = None
+
+        robot.shepherd_anchor = None
+        robot.shepherd_origin = None
+        robot.shepherd_branch = None
+        robot.shepherd_return_direction = None
+        robot.frontier_local_lateral = None
+
+        robot.base_reserve = False
+
+        if previous_role == "JUNCTION_GUARD":
+            released["guard"] += 1
+
+        elif previous_role == "FRONTIER_SHEPHERD":
+            released["frontier"] += 1
+
+        else:
+            released["shepherd"] += 1
+
+    print(
+        "[ParentRolesReleased] "
+        f"junction={parent.junction_uid} "
+        f"guards={released['guard']} "
+        f"frontiers={released['frontier']} "
+        f"shepherds={released['shepherd']} "
+        "relays_preserved=True"
+    )
+
+    return released
+
+def release_confirmed_parent_junction(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Compress confirmed Parent Junction into local markers."""
+
+    if not multi_dfs.parent_release_pending:
+        return
+
+    if len(multi_dfs.stack) < 2:
+        raise RuntimeError(
+            "Parent release requires "
+            "stack=[Parent, Child]"
+        )
+
+    child = multi_dfs.stack[-1]
+    parent = multi_dfs.stack[-2]
+
+    print(
+        "[JunctionReleaseStart] "
+        f"parent={parent.junction_uid} "
+        f"child={child.junction_uid} "
+        f"active_child="
+        f"{parent.active_branch_uid}"
+    )
+
+    # 1. logical / physical Parent context 보존
+    save_parent_physical_context(
+        physical,
+        parent,
+    )
+
+    # 2. 완료 Branch의 기존 Pebble 유지
+    retain_parent_completion_markers(
+        physical,
+        parent,
+        robots,
+    )
+
+    # 3. Junction Return Marker 한 대 남김
+    create_parent_return_marker(
+        physical,
+        parent,
+        robots,
+        perception,
+    )
+
+    # 4. 나머지 Parent wall 역할 해제
+    release_parent_physical_roles(
+        physical,
+        parent,
+        robots,
+    )
+
+    multi_dfs.parent_release_pending = False
+
+    print(
+        "[ParentReleaseComplete] "
+        f"parent={parent.junction_uid} "
+        f"child={child.junction_uid} "
+        f"completion_markers="
+        f"{parent.completion_marker_ids} "
+        f"return_marker="
+        f"{parent.return_marker_id} "
+        "parent_release_pending=False"
+    )
 
 def update_child_lidar_probe(
     physical: types.ModuleType,
@@ -10959,6 +11481,17 @@ def handoff_to_physical_dfs(
 
         root.active_branch_uid = None
 
+                # Preserve J0's actual traversed ingress frame.
+        #
+        # This is local history, not a global Junction target.
+        root.ingress_direction_local = (
+            physical.integration_incoming_direction_local.copy()
+        )
+
+        root.return_direction_local = (
+            physical.integration_base_return_direction_local.copy()
+        )
+
         print(
             "[MultiDFS] ROOT_REGISTERED "
             f"junction={root.junction_uid} "
@@ -11700,6 +12233,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lidar_frame,
             )
 
+            release_confirmed_parent_junction(
+                physical,
+                perception,
+                robots,
+            )
+
 
             if (
                 perception.anchor_fixed
@@ -11725,7 +12264,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_wall_ready_blockers(physical, perception, robots)
             if perception.state == PerceptionState.BRANCHES_READY:
                 handoff_to_physical_dfs(physical, perception, robots)
-            if perception.handoff_complete:
+
+            child_topology_pending = (
+                multi_dfs.current is not None
+                and multi_dfs.current.parent_junction_uid
+                is not None
+                and not multi_dfs.current.branch_order
+            )
+            if (
+                perception.handoff_complete
+                and not child_topology_pending
+            ):
                 normal_snapshot = {
                     robot.robot_id: (robot.position.copy(), robot.velocity.copy())
                     for robot in robots if robot.role == "NORMAL"
@@ -11746,12 +12295,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                         max_jump, jump_id = max(jumps)
                         max_dv = max(velocity_changes)
                         print(f"[BranchOpenAudit] frame={frame_count} branch={physical.active_branch_uid} tracked_normals={len(jumps)} max_normal_state_transition_jump={max_jump:.6f} max_normal_velocity_change={max_dv:.6f}")
-            else:
+            elif not perception.handoff_complete:
                 # Preserve pre-handoff communication/relay physics without
                 # invoking the legacy Junction inference transition.
                 physical.update_local_ingress_tangents(robots)
                 physical.update_initial_release_flow_event(robots, dt)
                 physical.update_relay_deployment(robots, dt)
+            else:
+                # -------------------------------------------------
+                # Child is confirmed and pushed, but its own
+                # Physical DFS context has not been initialized yet.
+                #
+                # Do NOT allow the old Parent Physical DFS state
+                # machine to continue running.
+                # -------------------------------------------------
+                if frame_count % 10 == 0:
+                    print(
+                        "[PhysicalDFSSuspended] "
+                        f"current="
+                        f"{multi_dfs.current.junction_uid} "
+                        "reason="
+                        "CHILD_TOPOLOGY_NOT_INITIALIZED "
+                        f"stack="
+                        f"{[
+                            frame.junction_uid
+                            for frame in multi_dfs.stack
+                        ]}"
+                    )
             physical.update_metrics_per_frame(robots, dt)
             if (
                 (
