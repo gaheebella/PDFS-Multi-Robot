@@ -1853,161 +1853,43 @@ def update_child_moving_candidate(
 
         return
 
-    # Invalid adaptive-threshold frames cannot provide
-    # new structural evidence.
-    if (
-        not lidar_frame.interval_valid
-        or lidar_frame.selected is None
-    ):
+        # -----------------------------------------------------
+    # General finite-mouth Junction detector.
+    #
+    # J1 / J2 / ... use the same structural rule.
+    # Parent information comes from the frozen ingress
+    # history, never from a global Junction coordinate.
+    # -----------------------------------------------------
+    observation = evaluate_general_junction_structure(
+        perception,
+        lidar_frame,
+        session.ingress_t,
+    )
+
+    if not observation.valid:
         session.structural_streak = 0
         return
 
-    verified_outgoing: list[
-        tuple[
-            dict[str, float],
-            pygame.Vector2,
-            pygame.Vector2,
-            float,
-        ]
-    ] = []
+    session.structural_streak += 1
 
-    non_axial_verified: list[
-        tuple[
-            dict[str, float],
-            pygame.Vector2,
-            pygame.Vector2,
-            float,
-        ]
-    ] = []
-
-    for opening in lidar_frame.openings:
-        start_angle = float(
-            opening["start_angle"]
-        )
-        end_angle = float(
-            opening["end_angle"]
-        )
-        center_angle = float(
-            opening["center_angle"]
-        )
-
-        # -------------------------------------------------
-        # A physical mouth must have finite wall-side
-        # endpoints on BOTH sides of the OPEN sector.
-        # -------------------------------------------------
-        try:
-            (
-                start_point,
-                _,
-                _,
-            ) = _nearest_wall_side_endpoint(
-                lidar_frame,
-                perception,
-                start_angle,
-                search_direction=-1,
-            )
-
-            (
-                end_point,
-                _,
-                _,
-            ) = _nearest_wall_side_endpoint(
-                lidar_frame,
-                perception,
-                end_angle,
-                search_direction=+1,
-            )
-
-        except RuntimeError:
-            continue
-
-        mouth_chord = (
-            end_point
-            - start_point
-        )
-
-        minimum_mouth_width = (
-            CHILD_CANDIDATE_MIN_MOUTH_WIDTH_RATIO
-            * lidar_frame.adaptive_w
-        )
-
-        if (
-            mouth_chord.length()
-            < minimum_mouth_width
-        ):
-            continue
-
-        radial = _body_local_unit(
-            perception,
-            center_angle,
-        )
-
-        if radial.length_squared() <= physical.EPSILON:
-            continue
-
-        radial = radial.normalize()
-
-        signed_ingress_alignment = float(
-            radial.dot(
-                session.ingress_t
-            )
-        )
-
-        # A strong rear-facing sector corresponds to the
-        # corridor already traversed from the Parent.
-        # It is not a new outgoing Child branch.
-        if signed_ingress_alignment <= -0.50:
-            continue
-
-        evidence = (
-            opening,
-            start_point,
-            end_point,
-            signed_ingress_alignment,
-        )
-
-        verified_outgoing.append(
-            evidence
-        )
-
-        # At least one branch direction must break away
-        # from the incoming corridor axis.
-        if (
-            abs(signed_ingress_alignment)
-            <= CHILD_CANDIDATE_NON_AXIAL_MAX_DOT
-        ):
-            non_axial_verified.append(
-                evidence
-            )
-
-    # -----------------------------------------------------
-    # Structural Junction evidence
-    #
-    # Not simply "opening count >= 3".
-    #
-    # Require:
-    # 1. at least two finite physical outgoing mouths
-    # 2. at least one non-axial outgoing mouth
-    # -----------------------------------------------------
-    structural_evidence = (
-        len(verified_outgoing) >= 2
-        and len(non_axial_verified) >= 1
-    )
-
-    if structural_evidence:
-        session.structural_streak += 1
-    else:
-        session.structural_streak = 0
-
-    if physical.integration_frame % 10 == 0:
+    if (
+        physical.integration_frame
+        % 10
+        == 0
+    ):
         print(
-            "[ChildStructuralEvidence] "
+            "[GeneralJunctionEvidence] "
+            f"scope=CHILD "
             f"parent={session.parent_junction_uid} "
             f"branch={session.parent_branch_uid} "
-            f"lidar_id={session.lidar_id} "
-            f"verified_outgoing={len(verified_outgoing)} "
-            f"non_axial={len(non_axial_verified)} "
-            f"streak={session.structural_streak}/"
+            f"verified_outgoing="
+            f"{len(observation.verified_outgoing)} "
+            f"non_axial="
+            f"{len(observation.non_axial_outgoing)} "
+            f"entrance_depth="
+            f"{observation.entrance_depth:.2f} "
+            f"streak="
+            f"{session.structural_streak}/"
             f"{CHILD_CANDIDATE_MIN_STRUCTURAL_STREAK}"
         )
 
@@ -2017,47 +1899,8 @@ def update_child_moving_candidate(
     ):
         return
 
-    # -----------------------------------------------------
-    # Estimate Child entrance depth only from already
-    # VERIFIED finite non-axial mouths.
-    #
-    # Do not use the raw broadest LiDAR opening here.
-    # -----------------------------------------------------
-    depth_samples: list[float] = []
-
-    for (
-        _,
-        start_point,
-        end_point,
-        _,
-    ) in non_axial_verified:
-
-        mouth_midpoint_local = (
-            0.5
-            * (
-                start_point
-                + end_point
-            )
-        )
-
-        depth = float(
-            mouth_midpoint_local.dot(
-                session.ingress_t
-            )
-        )
-
-        if depth > 0.0:
-            depth_samples.append(
-                depth
-            )
-
-    if not depth_samples:
-        return
-
     candidate_depth = float(
-        np.median(
-            depth_samples
-        )
+        observation.entrance_depth
     )
 
     multi_dfs.child_candidate_active = True
@@ -2108,8 +1951,10 @@ def update_child_moving_candidate(
         f"branch={session.parent_branch_uid} "
         f"lidar_id={session.lidar_id} "
         f"frame={session.candidate_frame} "
-        f"verified_outgoing={len(verified_outgoing)} "
-        f"non_axial={len(non_axial_verified)} "
+        f"verified_outgoing="
+        f"{len(observation.verified_outgoing)} "
+        f"non_axial="
+        f"{len(observation.non_axial_outgoing)} "
         f"depth_local={candidate_depth:.2f} "
         f"threshold={session.candidate_selected_threshold:.2f} "
         "confirmed=False "
@@ -3060,6 +2905,209 @@ def _nearest_wall_side_endpoint(
         f"no finite wall-side LiDAR hit near opening boundary {boundary_angle:+.1f}deg"
     )
 
+@dataclass(frozen=True)
+class GeneralVerifiedMouth:
+    opening: dict[str, float]
+    start_point: pygame.Vector2
+    end_point: pygame.Vector2
+    midpoint: pygame.Vector2
+    width: float
+    ingress_alignment: float
+    is_non_axial: bool
+
+
+@dataclass(frozen=True)
+class GeneralJunctionObservation:
+    valid: bool
+    verified_outgoing: tuple[GeneralVerifiedMouth, ...]
+    non_axial_outgoing: tuple[GeneralVerifiedMouth, ...]
+    entrance_depth: float | None
+
+
+def evaluate_general_junction_structure(
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+    ingress_t: pygame.Vector2,
+) -> GeneralJunctionObservation:
+    """Finite-mouth Junction structure for Child J1/J2/...
+
+    Parent edge comes from the actually traversed ingress history.
+    No global Junction coordinate or fixture position is used.
+    """
+
+    if (
+        not lidar_frame.interval_valid
+        or lidar_frame.selected is None
+    ):
+        return GeneralJunctionObservation(
+            valid=False,
+            verified_outgoing=(),
+            non_axial_outgoing=(),
+            entrance_depth=None,
+        )
+
+    if ingress_t.length_squared() <= 1.0e-12:
+        return GeneralJunctionObservation(
+            valid=False,
+            verified_outgoing=(),
+            non_axial_outgoing=(),
+            entrance_depth=None,
+        )
+
+    ingress = ingress_t.normalize()
+
+    minimum_mouth_width = (
+        CHILD_CANDIDATE_MIN_MOUTH_WIDTH_RATIO
+        * lidar_frame.adaptive_w
+    )
+
+    verified_outgoing: list[
+        GeneralVerifiedMouth
+    ] = []
+
+    non_axial_outgoing: list[
+        GeneralVerifiedMouth
+    ] = []
+
+    for opening in lidar_frame.openings:
+
+        start_angle = float(
+            opening["start_angle"]
+        )
+
+        end_angle = float(
+            opening["end_angle"]
+        )
+
+        center_angle = float(
+            opening["center_angle"]
+        )
+
+        try:
+            start_point, _, _ = (
+                _nearest_wall_side_endpoint(
+                    lidar_frame,
+                    perception,
+                    start_angle,
+                    search_direction=-1,
+                )
+            )
+
+            end_point, _, _ = (
+                _nearest_wall_side_endpoint(
+                    lidar_frame,
+                    perception,
+                    end_angle,
+                    search_direction=+1,
+                )
+            )
+
+        except RuntimeError:
+            # FAR/Rmax only is not a physical branch mouth.
+            continue
+
+        width = float(
+            start_point.distance_to(
+                end_point
+            )
+        )
+
+        if width < minimum_mouth_width:
+            continue
+
+        radial = _body_local_unit(
+            perception,
+            center_angle,
+        )
+
+        if radial.length_squared() <= 1.0e-12:
+            continue
+
+        radial = radial.normalize()
+
+        ingress_alignment = float(
+            radial.dot(
+                ingress
+            )
+        )
+
+        # Strong rear direction = already traversed Parent.
+        if ingress_alignment <= -0.50:
+            continue
+
+        midpoint = (
+            0.5
+            * (
+                start_point
+                + end_point
+            )
+        )
+
+        is_non_axial = (
+            abs(ingress_alignment)
+            <= CHILD_CANDIDATE_NON_AXIAL_MAX_DOT
+        )
+
+        mouth = GeneralVerifiedMouth(
+            opening=dict(opening),
+            start_point=start_point,
+            end_point=end_point,
+            midpoint=midpoint,
+            width=width,
+            ingress_alignment=ingress_alignment,
+            is_non_axial=is_non_axial,
+        )
+
+        verified_outgoing.append(
+            mouth
+        )
+
+        if is_non_axial:
+            non_axial_outgoing.append(
+                mouth
+            )
+
+    entrance_depth_samples = [
+        float(
+            mouth.midpoint.dot(
+                ingress
+            )
+        )
+        for mouth in non_axial_outgoing
+        if float(
+            mouth.midpoint.dot(
+                ingress
+            )
+        ) > 0.0
+    ]
+
+    entrance_depth = (
+        float(
+            np.median(
+                entrance_depth_samples
+            )
+        )
+        if entrance_depth_samples
+        else None
+    )
+
+    valid = (
+        len(verified_outgoing)
+        >= CHILD_STATIONARY_MIN_OUTGOING
+        and len(non_axial_outgoing) >= 1
+        and entrance_depth is not None
+    )
+
+    return GeneralJunctionObservation(
+        valid=valid,
+        verified_outgoing=tuple(
+            verified_outgoing
+        ),
+        non_axial_outgoing=tuple(
+            non_axial_outgoing
+        ),
+        entrance_depth=entrance_depth,
+    )
 
 def _lidar_estimated_mouth_width(
     frame: LidarFrame,
