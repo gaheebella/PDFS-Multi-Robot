@@ -359,6 +359,10 @@ class MultiJunctionManager:
         # Child detection state will be implemented later.
         self.child_candidate_active: bool = False
         self.child_confirmed: bool = False
+        # Confirmed Child has been logically pushed,
+        # but Parent physical release is still pending.
+        self.child_push_complete: bool = False
+        self.parent_release_pending: bool = False
 
         # Same LiDAR robot used for deep-branch Child observation.
         self.child_probe_active: bool = False
@@ -408,7 +412,166 @@ class MultiJunctionManager:
         uid = f"J{self.next_junction_index}"
         self.next_junction_index += 1
         return uid
+    def push_confirmed_child(
+        self,
+        session: ChildObservationSession,
+    ) -> MultiJunctionFrame:
+        """Push one stationary-confirmed Child Junction.
 
+        Logical DFS bookkeeping only.
+
+        This does NOT:
+        - release Parent Guard/Shepherd roles,
+        - create Completion/Return Markers,
+        - start Child Physical DFS.
+        """
+
+        if self.child_push_complete:
+            raise RuntimeError(
+                "confirmed Child Junction was pushed twice"
+            )
+
+        parent = self.current
+
+        if parent is None:
+            raise RuntimeError(
+                "cannot push Child without Parent Junction"
+            )
+
+        if (
+            parent.junction_uid
+            != session.parent_junction_uid
+        ):
+            raise RuntimeError(
+                "Child session Parent does not match "
+                "current DFS Junction: "
+                f"current={parent.junction_uid} "
+                f"session_parent="
+                f"{session.parent_junction_uid}"
+            )
+
+        parent_branch_uid = (
+            session.parent_branch_uid
+        )
+
+        if (
+            parent_branch_uid
+            not in parent.branch_states
+        ):
+            raise RuntimeError(
+                "Child Parent branch missing from "
+                "Parent DFS frame: "
+                f"{parent_branch_uid}"
+            )
+
+        previous_state = (
+            parent.branch_states[
+                parent_branch_uid
+            ]
+        )
+
+        if previous_state != "ACTIVE":
+            raise RuntimeError(
+                "confirmed Child must come from "
+                "an ACTIVE Parent branch: "
+                f"branch={parent_branch_uid} "
+                f"state={previous_state}"
+            )
+
+        # -------------------------------------------------
+        # Parent branch is NOT complete.
+        #
+        # Its subtree is now being explored, therefore:
+        #
+        # ACTIVE -> ACTIVE_CHILD
+        #
+        # Never mark it VISITED here.
+        # -------------------------------------------------
+        parent.branch_states[
+            parent_branch_uid
+        ] = "ACTIVE_CHILD"
+
+        parent.active_branch_uid = (
+            parent_branch_uid
+        )
+
+        child_uid = (
+            self.allocate_child_uid()
+        )
+
+        ingress = (
+            session.ingress_t.copy()
+        )
+
+        if (
+            ingress.length_squared()
+            <= 1.0e-12
+        ):
+            raise RuntimeError(
+                "confirmed Child has invalid ingress direction"
+            )
+
+        ingress = ingress.normalize()
+
+        child = MultiJunctionFrame(
+            junction_uid=child_uid,
+            parent_junction_uid=(
+                parent.junction_uid
+            ),
+            incoming_branch_uid=(
+                parent_branch_uid
+            ),
+
+            # Direction actually traversed from Parent
+            # toward this Child.
+            ingress_direction_local=(
+                ingress.copy()
+            ),
+
+            # Physical return direction later points
+            # back toward the Parent.
+            return_direction_local=(
+                -ingress
+            ),
+        )
+
+        # Child branch_order / branch_states intentionally
+        # remain empty here.
+        #
+        # They are populated NEXT from the stationary
+        # verified outgoing mouths.
+        self.stack.append(
+            child
+        )
+
+        self.child_push_complete = True
+        self.parent_release_pending = True
+
+        print(
+            "[ParentBranchActiveChild] "
+            f"junction={parent.junction_uid} "
+            f"branch={parent_branch_uid} "
+            f"{previous_state}->ACTIVE_CHILD"
+        )
+
+        print(
+            "[DFSStackPush] "
+            f"parent={parent.junction_uid} "
+            f"child={child.junction_uid} "
+            f"incoming_branch="
+            f"{child.incoming_branch_uid} "
+            f"depth={self.depth}"
+        )
+
+        print(
+            "[MultiDFS] STACK "
+            f"junctions="
+            f"{[frame.junction_uid for frame in self.stack]} "
+            f"current={self.current.junction_uid} "
+            "parent_release_pending=True"
+        )
+
+        return child
 
 multi_dfs = MultiJunctionManager()
 
@@ -1477,13 +1640,18 @@ def update_child_stationary_verification(
 ) -> None:
     """Confirm a Child Junction from persistent stationary physical mouths.
 
-    This function may confirm the Child Junction only.
+    After stationary confirmation this function performs
+    logical Multi-DFS handoff only:
 
-    It does NOT:
-    - release the Parent Junction,
-    - create Markers,
-    - change ACTIVE -> ACTIVE_CHILD,
-    - perform DFS PUSH.
+    - Parent ACTIVE -> ACTIVE_CHILD
+    - create Child MultiJunctionFrame
+    - DFS PUSH
+
+    It still does NOT:
+    - release Parent Guard/Shepherd roles,
+    - create Completion/Return Markers,
+    - initialize Child branch descriptors,
+    - start Child Physical DFS.
     """
 
     session = multi_dfs.child_session
@@ -1754,6 +1922,12 @@ def update_child_stationary_verification(
 
     multi_dfs.child_confirmed = True
 
+    child_frame = (
+        multi_dfs.push_confirmed_child(
+            session
+        )
+    )
+
     print(
         "[ChildJunctionConfirmed] "
         f"parent={session.parent_junction_uid} "
@@ -1770,8 +1944,10 @@ def update_child_stationary_verification(
         "parent_source=INGRESS_HISTORY "
         "parent_release=False "
         "marker=False "
-        "active_child=False "
-        "dfs_push=False"
+        "active_child=True "
+        "dfs_push=True "
+        f"child={child_frame.junction_uid} "
+        f"dfs_depth={multi_dfs.depth}"
     )
 
 
