@@ -313,6 +313,12 @@ class ChildObservationSession:
     stationary_outgoing: list[PersistentOpening] = field(
         default_factory=list
     )
+    stationary_verified_openings: list[
+    dict[str, float]
+    ] = field(default_factory=list)
+
+    stationary_confirmed_lidar_frame: LidarFrame | None = None
+
     stationary_confirmed: bool = False
     stationary_confirmation_frame: int | None = None
 
@@ -1410,6 +1416,286 @@ def release_confirmed_parent_junction(
         "parent_release_pending=False"
     )
 
+def initialize_confirmed_child_guard_context(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Initialize physical Guard formation for confirmed Child Junction."""
+
+    child = multi_dfs.current
+    session = multi_dfs.child_session
+
+    # 현재 Junction 자체가 없으면 아무 것도 하지 않음.
+    if child is None:
+        return
+
+    # Root J0에는 이 함수 사용하지 않음.
+    if child.parent_junction_uid is None:
+        return
+
+    # 아직 J0 Parent release가 끝나지 않았다면 기다림.
+    if multi_dfs.parent_release_pending:
+        return
+
+    # Child observation 정보가 없으면 기다림.
+    if session is None:
+        return
+
+    # J1 stationary confirmation 전에는 실행하지 않음.
+    if not session.stationary_confirmed:
+        return
+
+    # 이미 J1 Branch가 등록됐다면 중복 초기화하지 않음.
+    if child.branch_order:
+        return
+
+    print(
+        "[ChildGuardInitializationStart] "
+        f"junction={child.junction_uid} "
+        f"parent={child.parent_junction_uid} "
+        f"incoming_branch={child.incoming_branch_uid}"
+    )
+
+    # 1. 기존 J0 Physical DFS handoff를 잠시 끊음.
+    reset_guard_frontend_for_child(
+    perception
+    )
+
+    reset_physical_guard_context_for_child(
+        physical
+    )
+
+    branch_uids = (
+        register_current_child_branches()
+    )
+
+    child_frame = (
+    session.stationary_confirmed_lidar_frame
+)
+
+    if child_frame is None:
+        raise RuntimeError(
+            "Child Guard initialization "
+            "missing stationary LiDAR frame"
+        )
+
+    geometries = (
+        build_provisional_guard_descriptors_from_lidar(
+            physical,
+            perception,
+            child_frame,
+            outgoing_override=(
+                session.stationary_verified_openings
+            ),
+            branch_uids_override=(
+                branch_uids
+            ),
+            junction_uid_override=(
+                child.junction_uid
+            ),
+        )
+    )
+
+    geometry_frame = (
+        session.stationary_confirmation_frame
+        if session.stationary_confirmation_frame
+        is not None
+        else child_frame.frame
+    )
+
+    install_provisional_guard_geometries(
+        physical,
+        perception,
+        robots,
+        geometries,
+        geometry_frame,
+    )
+
+    print(
+        "[ChildTopologyInitialized] "
+        f"junction={child.junction_uid} "
+        f"branches={branch_uids}"
+    )
+
+
+def reset_guard_frontend_for_child(
+    perception: AdaptivePerception,
+) -> None:
+    """Reset Guard-formation frontend before building Child Junction guards."""
+
+    # J0 Physical DFS handoff를 끊는다.
+    perception.handoff_complete = False
+
+    # J0에서 사용했던 Guard geometry 정보를 비운다.
+    perception.provisional_guards = []
+    perception.provisional_guard_started = False
+
+    # Guard 검증/진단 상태 초기화.
+    perception.guard_leakage.clear()
+    perception.guard_communication_audits.clear()
+
+    perception.guard_geometry_frame = None
+    perception.guard_who_frame = None
+    perception.guard_motion_start_frame = None
+
+    perception.guard_all_groups_activated = False
+    perception.guard_current_group_index = 0
+
+    perception.integration_detected_branch_order = []
+
+    print(
+        "[ChildGuardFrontendReset] "
+        "handoff_complete=False "
+        "provisional_guard_started=False"
+    )
+
+def reset_physical_guard_context_for_child(
+    physical: types.ModuleType,
+) -> None:
+    """Clear current-Junction Guard/DFS registries before installing Child."""
+
+    # J0의 값은 이미 parent.saved_physical_context에 deepcopy돼 있으므로
+    # 현재 singleton registry는 J1용으로 새로 시작한다.
+    physical.branch_descriptors_by_uid = {}
+
+    physical.fixture_key_to_branch_uid = {}
+    physical.branch_uid_to_fixture_key = {}
+
+    physical.detected_branch_candidates = set()
+
+    physical.junction_guard_groups = {}
+
+    physical.integration_wall_lifecycle = {}
+    physical.integration_ready_guard_ids_by_uid = {}
+    physical.integration_wall_status = {}
+    physical.integration_wall_stats = {}
+
+    physical.integration_provisional_guard_groups = {}
+
+    physical.integration_provisional_guard_active = False
+    physical.integration_guard_gating_enabled = False
+
+    # J0에서 이미 True였으므로 반드시 초기화.
+    physical.integration_all_walls_ready = False
+    physical.integration_ready_guard_handoff = False
+
+    physical.integration_guard_formation_start_frame = None
+
+    physical.branch_order_plan = []
+    physical.branch_fixture_order_plan = []
+
+    physical.active_branch = None
+    physical.active_branch_uid = None
+
+    # -------------------------------------------------
+    # J0 -> Child Junction transition.
+    #
+    # J0의 EXPLORE_BRANCH phase를 그대로 남겨두면
+    # single-junction transfer/relay controllers가
+    # active_branch=None인 상태에서 계속 실행된다.
+    #
+    # Child Guard가 완성될 때까지 명시적으로
+    # Guard formation phase로 전환한다.
+    # -------------------------------------------------
+    previous_phase = physical.phase
+
+    physical.phase = (
+        physical.SimulationPhase.FORM_JUNCTION_GUARDS
+    )
+
+    physical.integration_child_guard_forming = True
+
+    print(
+        "[ChildPhysicalPhaseReset] "
+        f"{previous_phase.name}->FORM_JUNCTION_GUARDS "
+        "active_branch=None"
+    )
+
+    print(
+        "[ChildPhysicalGuardContextReset] "
+        "old_parent_context_cleared=True "
+        "all_walls_ready=False "
+        "ready_handoff=False"
+    )
+
+
+
+def register_current_child_branches() -> list[str]:
+    """Create outgoing DFS branch identities for the confirmed Child."""
+
+    child = multi_dfs.current
+    session = multi_dfs.child_session
+
+    if child is None:
+        raise RuntimeError(
+            "Child branch registration requires current Junction"
+        )
+
+    if child.parent_junction_uid is None:
+        raise RuntimeError(
+            "Root J0 must not use Child branch registration"
+        )
+
+    if session is None:
+        raise RuntimeError(
+            "Child branch registration requires observation session"
+        )
+
+    if not session.stationary_confirmed:
+        raise RuntimeError(
+            "Child branch registration requires stationary confirmation"
+        )
+
+    if child.branch_order:
+        return list(child.branch_order)
+
+    openings = sorted(
+        session.stationary_verified_openings,
+        key=lambda opening:
+            float(opening["center_angle"]),
+    )
+
+    if not openings:
+        raise RuntimeError(
+            "Confirmed Child has no stationary verified outgoing openings"
+        )
+
+    child.branch_order = [
+        f"{child.junction_uid}-B{index}"
+        for index in range(len(openings))
+    ]
+
+    child.branch_states = {
+        branch_uid: "UNVISITED"
+        for branch_uid in child.branch_order
+    }
+
+    child.active_branch_uid = None
+
+    for branch_uid, opening in zip(
+        child.branch_order,
+        openings,
+    ):
+        print(
+            "[ChildBranchRegistered] "
+            f"junction={child.junction_uid} "
+            f"branch={branch_uid} "
+            f"center_angle="
+            f"{float(opening['center_angle']):.2f}"
+        )
+
+    print(
+        "[ChildPhysicalContextActivated] "
+        f"junction={child.junction_uid} "
+        f"parent={child.parent_junction_uid} "
+        f"incoming_branch={child.incoming_branch_uid} "
+        f"outgoing={child.branch_order}"
+    )
+
+    return list(child.branch_order)
+
+
 def update_child_lidar_probe(
     physical: types.ModuleType,
     perception: AdaptivePerception,
@@ -1786,6 +2072,10 @@ def update_child_lidar_probe(
                 session.stationary_samples = 0
                 session.stationary_tracks.clear()
                 session.stationary_outgoing.clear()
+
+                session.stationary_verified_openings.clear()
+                session.stationary_confirmed_lidar_frame = None
+
                 session.stationary_confirmed = False
                 session.stationary_confirmation_frame = None
 
@@ -1793,6 +2083,10 @@ def update_child_lidar_probe(
                     lidar_robot.position.copy()
                 )
                 perception.anchor_fixed = True
+
+                physical.integration_anchor_position = (
+                    perception.anchor_position.copy()
+                )
 
                 lidar_robot.is_fixed_anchor = True
                 lidar_robot.base_reserve = True
@@ -2405,6 +2699,66 @@ def _build_child_stationary_frozen_frame(
         current_evidence=False,
     )
 
+
+def match_stationary_tracks_to_verified_openings(
+    tracks: Sequence[PersistentOpening],
+    openings: Sequence[dict[str, float]],
+) -> list[dict[str, float]]:
+    """Match persistent Child openings to the current verified physical mouths."""
+
+    remaining = [
+        dict(opening)
+        for opening in openings
+    ]
+
+    matched: list[dict[str, float]] = []
+
+    for track in sorted(
+        tracks,
+        key=lambda item: item.center_angle,
+    ):
+        if not remaining:
+            break
+
+        opening = min(
+            remaining,
+            key=lambda item: circular_error(
+                float(item["center_angle"]),
+                float(track.center_angle),
+            ),
+        )
+
+        error = circular_error(
+            float(opening["center_angle"]),
+            float(track.center_angle),
+        )
+
+        if error > ASSOCIATION_TOLERANCE_DEG:
+            raise RuntimeError(
+                "Persistent Child opening could not "
+                "be matched to verified physical mouth: "
+                f"track={track.center_angle:.2f} "
+                f"error={error:.2f}"
+            )
+
+        matched.append(
+            dict(opening)
+        )
+        remaining.remove(
+            opening
+        )
+
+    if len(matched) != len(tracks):
+        raise RuntimeError(
+            "Child stationary opening match incomplete: "
+            f"tracks={len(tracks)} "
+            f"matched={len(matched)}"
+        )
+
+    return matched
+
+
+
 def update_child_stationary_verification(
     physical: types.ModuleType,
     perception: AdaptivePerception,
@@ -2684,6 +3038,17 @@ def update_child_stationary_verification(
 
     session.stationary_outgoing = list(
         persistent_outgoing
+    )
+
+    session.stationary_verified_openings = (
+        match_stationary_tracks_to_verified_openings(
+            persistent_outgoing,
+            verified_outgoing,
+        )
+    )
+
+    session.stationary_confirmed_lidar_frame = (
+        frozen_frame
     )
 
     session.stationary_confirmed = True
@@ -4085,6 +4450,12 @@ def build_provisional_guard_descriptors_from_lidar(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     frame: LidarFrame,
+    *,
+    outgoing_override: Sequence[
+        dict[str, float]
+    ] | None = None,
+    branch_uids_override: Sequence[str] | None = None,
+    junction_uid_override: str | None = None,
 ) -> list[ProvisionalGuardGeometry]:
     """Build general corridor-perpendicular Guard geometry from LiDAR.
 
@@ -4307,89 +4678,185 @@ def build_provisional_guard_descriptors_from_lidar(
             linearity,
         )
 
+            # =========================================================
+    # Opening extraction / topology identity
     # =========================================================
-    # Opening extraction
-    # =========================================================
-    openings = sorted(
-        (
-            dict(item)
-            for item in frame.openings
-        ),
-        key=lambda item: float(
-            item["center_angle"]
-        ),
-    )
 
-    if len(openings) < 3:
-        raise RuntimeError(
-            "Junction evidence lacks three provisional openings"
+    if outgoing_override is None:
+
+        # -------------------------------------------------
+        # Root J0
+        #
+        # J0의 기존 LiDAR topology adapter만 여기서 사용.
+        # Geometry 계산 자체는 아래 공통 코드가 담당한다.
+        # -------------------------------------------------
+        all_openings = sorted(
+            (
+                dict(item)
+                for item in frame.openings
+            ),
+            key=lambda item: float(
+                item["center_angle"]
+            ),
         )
 
-    # Incoming corridor
-    parent = min(
-        openings,
-        key=lambda item: circular_error(
-            float(item["center_angle"]),
-            180.0,
-        ),
-    )
-
-    outgoing = [
-        item
-        for item in openings
-        if item is not parent
-    ]
-
-    if len(outgoing) < 3:
-        parent = None
-        outgoing = openings
-
-    outgoing = sorted(
-        outgoing,
-        key=lambda item: float(
-            item["center_angle"]
-        ),
-    )
-
-    # ---------------------------------------------------------
-    # Current Physical DFS adapter identities only.
-    #
-    # IMPORTANT:
-    # these names are NOT used to calculate axis/normal.
-    # ---------------------------------------------------------
-    keys: list[str] = []
-
-    for item in outgoing:
-
-        angle = float(
-            item["center_angle"]
-        )
-
-        keys.append(
-            "UP"
-            if abs(angle) < 30.0
-            else (
-                "LEFT"
-                if angle < 0.0
-                else "RIGHT"
+        if len(all_openings) < 3:
+            raise RuntimeError(
+                "Junction evidence lacks "
+                "three provisional openings"
             )
+
+        parent = min(
+            all_openings,
+            key=lambda item: circular_error(
+                float(
+                    item["center_angle"]
+                ),
+                180.0,
+            ),
         )
 
-    if len(set(keys)) != 3:
-        raise RuntimeError(
-            f"duplicate LiDAR branch identities: {keys}"
+        outgoing = [
+            item
+            for item in all_openings
+            if item is not parent
+        ]
+
+        # 기존 J0 rear-opening 예외 유지.
+        if len(outgoing) < 3:
+            parent = None
+            outgoing = list(
+                all_openings
+            )
+
+        openings = sorted(
+            outgoing,
+            key=lambda item: float(
+                item["center_angle"]
+            ),
         )
 
-    print(
-        f"[OpeningClassification] "
-        f"all={[round(float(x['center_angle']), 1) for x in openings]} "
-        f"parent={round(float(parent['center_angle']), 1) if parent else None} "
-        f"outgoing={[round(float(x['center_angle']), 1) for x in outgoing]} "
-        f"keys={keys} unique=True"
-    )
+        # -------------------------------------------------
+        # J0 Physical DFS fixture adapter.
+        #
+        # 이 label은 geometry 계산에는 사용하지 않고
+        # 기존 single-junction Physical DFS 연결에만 사용.
+        # -------------------------------------------------
+        keys: list[str | None] = []
 
-    openings = outgoing
+        for item in openings:
 
+            angle = float(
+                item["center_angle"]
+            )
+
+            key = (
+                "UP"
+                if abs(angle) < 30.0
+                else (
+                    "LEFT"
+                    if angle < 0.0
+                    else "RIGHT"
+                )
+            )
+
+            keys.append(
+                key
+            )
+
+        if len(set(keys)) != 3:
+            raise RuntimeError(
+                "duplicate LiDAR branch "
+                f"identities: {keys}"
+            )
+
+        branch_uids = [
+            f"PROV_{index:02d}"
+            for index
+            in range(len(openings))
+        ]
+
+        junction_uid = (
+            physical.CURRENT_JUNCTION_ID
+        )
+
+        print(
+            "[OpeningClassification] "
+            f"all="
+            f"{[round(float(x['center_angle']), 1) for x in all_openings]} "
+            f"parent="
+            f"{round(float(parent['center_angle']), 1) if parent else None} "
+            f"outgoing="
+            f"{[round(float(x['center_angle']), 1) for x in openings]} "
+            f"keys={keys} "
+            "scope=ROOT"
+        )
+
+    else:
+
+        # -------------------------------------------------
+        # Child J1/J2/...
+        #
+        # incoming Parent edge는 stationary verification에서
+        # 이미 제거됨.
+        #
+        # 따라서 여기서는 verified outgoing만 사용한다.
+        # -------------------------------------------------
+        openings = sorted(
+            (
+                dict(item)
+                for item in outgoing_override
+            ),
+            key=lambda item: float(
+                item["center_angle"]
+            ),
+        )
+
+        if branch_uids_override is None:
+            raise RuntimeError(
+                "Child Guard geometry requires "
+                "branch_uids_override"
+            )
+
+        branch_uids = list(
+            branch_uids_override
+        )
+
+        if (
+            len(branch_uids)
+            != len(openings)
+        ):
+            raise RuntimeError(
+                "Child branch/opening count mismatch: "
+                f"branches={len(branch_uids)} "
+                f"openings={len(openings)}"
+            )
+
+        if junction_uid_override is None:
+            raise RuntimeError(
+                "Child Guard geometry requires "
+                "junction_uid_override"
+            )
+
+        junction_uid = (
+            junction_uid_override
+        )
+
+        # Child에서는 UP/LEFT/RIGHT fixture label 사용 X.
+        keys = [
+            None
+            for _ in openings
+        ]
+
+        print(
+            "[ChildOpeningSet] "
+            f"junction={junction_uid} "
+            f"branches={branch_uids} "
+            f"angles="
+            f"{[round(float(x['center_angle']), 1) for x in openings]} "
+            "fixture_labels_used=False"
+        )
+   
     # =========================================================
     # Junction center estimate
     # =========================================================
@@ -4907,14 +5374,14 @@ def build_provisional_guard_descriptors_from_lidar(
             )
         )
 
-        uid = (
-            f"PROV_{index:02d}"
-        )
+        uid = branch_uids[
+            index
+        ]
 
         descriptor = (
             physical.BranchDescriptor(
                 uid=uid,
-                junction_uid=physical.CURRENT_JUNCTION_ID,
+                junction_uid=junction_uid,
                 fixture_key=None,
 
                 local_outgoing_direction=(
@@ -5477,25 +5944,33 @@ def build_provisional_multilayer_slots(
                 f"{[(index, round(slot.x, 3), round(slot.y, 3)) for index, slot in unwalkable_slots]}"
             )
 
-
-def initialize_provisional_guard_geometry_after_detection(
+def install_provisional_guard_geometries(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     robots: Sequence[Any],
-    frame: LidarFrame,
+    geometries: Sequence[
+        ProvisionalGuardGeometry
+    ],
+    geometry_frame: int,
 ) -> None:
-    """Freeze LiDAR WHERE now; leave every robot NORMAL until mouth-local READY."""
-    if perception.provisional_guard_started:
-        return
-    geometries = build_provisional_guard_descriptors_from_lidar(
-        physical, perception, frame
+    """Install one Junction's Guard geometries into the common Guard pipeline."""
+
+    build_provisional_multilayer_slots(
+        physical,
+        robots,
+        geometries,
+        perception,
     )
-    build_provisional_multilayer_slots(physical, robots, geometries, perception)
+
     for geometry in geometries:
+
         physical.branch_descriptors_by_uid[
             geometry.provisional_uid
         ] = geometry.descriptor
-        physical.integration_wall_status[geometry.provisional_uid] = {
+
+        physical.integration_wall_status[
+            geometry.provisional_uid
+        ] = {
             "capture": 0,
             "candidate_count": 0,
             "assignment_count": 0,
@@ -5504,26 +5979,61 @@ def initialize_provisional_guard_geometry_after_detection(
             "rows": geometry.layers,
             "slots_per_row": geometry.columns,
             "slots_walkable": sum(
-                physical.is_walkable(slot, physical.ROBOT_RADIUS)
+                physical.is_walkable(
+                    slot,
+                    physical.ROBOT_RADIUS,
+                )
                 for slot in geometry.slots
             ),
-            "slots_total": len(geometry.slots),
+            "slots_total": len(
+                geometry.slots
+            ),
             "ready": False,
             "ready_frame": None,
         }
-    perception.provisional_guards = list(geometries)
-    print("[GuardBranchMap] " + " ".join(f"{g.provisional_uid}={g.local_branch_key}" for g in geometries))
+
+    perception.provisional_guards = list(
+        geometries
+    )
+
+    print(
+        "[GuardBranchMap] "
+        + " ".join(
+            f"{geometry.provisional_uid}="
+            f"{geometry.local_branch_key}"
+            for geometry in geometries
+        )
+    )
+
     perception.provisional_guard_started = True
-    perception.guard_geometry_frame = perception.confirmation_frame
+
+    perception.guard_geometry_frame = (
+        geometry_frame
+    )
+
     physical.integration_provisional_guard_groups = {}
+
     physical.integration_provisional_guard_active = False
+
     physical.integration_guard_gating_enabled = False
+
     print(
         "[Timeline] GUARD_GEOMETRY_READY "
-        f"frame={perception.guard_geometry_frame} roles_assigned=0"
+        f"frame={geometry_frame} "
+        "roles_assigned=0"
     )
+
+    # -----------------------------------------------------
+    # Leakage diagnostics.
+    # -----------------------------------------------------
+    perception.guard_leakage.clear()
+
     for geometry in geometries:
-        descriptor = geometry.descriptor
+
+        descriptor = (
+            geometry.descriptor
+        )
+
         state = {
             "robots_beyond_mouth_at_detection": 0,
             "robots_beyond_mouth": 0,
@@ -5537,31 +6047,103 @@ def initialize_provisional_guard_geometry_after_detection(
             "leakage_blocked_after_edge_seal": False,
             "previous_axial": {},
         }
-        usable_half = physical.local_physical_usable_half_width(descriptor)
-        for robot in robots:
-            axial, lateral = physical.branch_local_coordinates(
-                robot.position, descriptor
+
+        usable_half = (
+            physical.local_physical_usable_half_width(
+                descriptor
             )
-            state["previous_axial"][robot.robot_id] = axial
+        )
+
+        for robot in robots:
+
+            axial, lateral = (
+                physical.branch_local_coordinates(
+                    robot.position,
+                    descriptor,
+                )
+            )
+
+            state[
+                "previous_axial"
+            ][robot.robot_id] = axial
+
             if (
                 robot.role == "NORMAL"
                 and axial > 0.0
-                and abs(lateral) <= usable_half
+                and abs(lateral)
+                <= usable_half
             ):
-                state["robots_beyond_mouth_at_detection"] += 1
-                state["maximum_normal_depth_before_wall_ready"] = max(
-                    state["maximum_normal_depth_before_wall_ready"], axial
+                state[
+                    "robots_beyond_mouth_at_detection"
+                ] += 1
+
+                state[
+                    "maximum_normal_depth_before_wall_ready"
+                ] = max(
+                    state[
+                        "maximum_normal_depth_before_wall_ready"
+                    ],
+                    axial,
                 )
-                state["deepest_leaked_robot_depth"] = max(
-                    state["deepest_leaked_robot_depth"], axial
+
+                state[
+                    "deepest_leaked_robot_depth"
+                ] = max(
+                    state[
+                        "deepest_leaked_robot_depth"
+                    ],
+                    axial,
                 )
-        perception.guard_leakage[geometry.provisional_uid] = state
+
+        perception.guard_leakage[
+            geometry.provisional_uid
+        ] = state
+
         print(
-            f"[Leakage] uid={geometry.provisional_uid} "
-            f"robots_beyond_mouth_at_detection="
+            "[Leakage] "
+            f"uid={geometry.provisional_uid} "
+            "robots_beyond_mouth_at_detection="
             f"{state['robots_beyond_mouth_at_detection']}"
         )
-    physical.integration_guard_leakage = perception.guard_leakage
+
+    physical.integration_guard_leakage = (
+        perception.guard_leakage
+    )
+
+
+def initialize_provisional_guard_geometry_after_detection(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+    frame: LidarFrame,
+) -> None:
+    """Initialize Root J0 Guard geometry."""
+
+    if perception.provisional_guard_started:
+        return
+
+    geometries = (
+        build_provisional_guard_descriptors_from_lidar(
+            physical,
+            perception,
+            frame,
+        )
+    )
+
+    geometry_frame = (
+        perception.confirmation_frame
+        if perception.confirmation_frame is not None
+        else frame.frame
+    )
+
+    install_provisional_guard_geometries(
+        physical,
+        perception,
+        robots,
+        geometries,
+        geometry_frame,
+    )
+
 
 
 def communication_articulation_robot_ids(
@@ -6853,6 +7435,30 @@ def install_lidar_relay_protection(
             physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
             physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
         }:
+            return
+
+
+        current_junction = (
+                    multi_dfs.current
+                )
+        
+        child_guard_forming = (
+            current_junction is not None
+            and current_junction.parent_junction_uid
+            is not None
+            and not perception.handoff_complete
+        )
+
+        if child_guard_forming:
+            return
+
+        active_branch = getattr(
+            physical,
+            "active_branch",
+            None,
+        )
+            
+        if active_branch is None:
             return
 
         if (
@@ -12514,9 +13120,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 robots,
             )
 
+            initialize_confirmed_child_guard_context(
+                physical,
+                perception,
+                robots,
+            )
+
+            current_junction = (
+                multi_dfs.current
+            )
+
+            is_child_junction = (
+                current_junction is not None
+                and current_junction.parent_junction_uid
+                is not None
+            )
 
             if (
-                perception.anchor_fixed
+                not is_child_junction
+                and perception.anchor_fixed
                 and perception.state in {
                     PerceptionState.FIXED_ACCUMULATING,
                     PerceptionState.BRANCHES_READY,
@@ -12525,8 +13147,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and not perception.provisional_guard_started
             ):
                 initialize_provisional_guard_geometry_after_detection(
-                    physical, perception, robots, lidar_frame
+                    physical,
+                    perception,
+                    robots,
+                    lidar_frame,
                 )
+            
             update_provisional_guard_leakage(
                 physical, perception, robots
             )
@@ -12537,8 +13163,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 physical, perception, robots
             )
             log_wall_ready_blockers(physical, perception, robots)
-            if perception.state == PerceptionState.BRANCHES_READY:
-                handoff_to_physical_dfs(physical, perception, robots)
+            if (
+                perception.state
+                == PerceptionState.BRANCHES_READY
+                and not is_child_junction
+            ):
+                handoff_to_physical_dfs(
+                    physical,
+                    perception,
+                    robots,
+                )
 
             child_topology_pending = (
                 multi_dfs.current is not None
