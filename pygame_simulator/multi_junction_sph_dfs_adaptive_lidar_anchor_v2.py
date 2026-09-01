@@ -28,6 +28,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Sequence
 
+from multi_junction_sph_dfs_adaptive_lidar_anchor_v2_child_session_ok import CHILD_PROBE_TRIGGER_DISTANCE
 import numpy as np
 import pygame
 
@@ -130,8 +131,16 @@ ENTRANCE_STABILITY_FRAMES = 1
 # is released as a Child-observation probe.
 #
 # This is NOT Child-Junction evidence.
+# Child probe starts after the active Frontier has moved
+# sufficiently deep relative to its locally observed mouth width.
+#
+# The LiDAR range still acts as an upper cap.
 CHILD_PROBE_TRIGGER_RANGE_RATIO = 0.95
-CHILD_PROBE_TRIGGER_DISTANCE = (
+CHILD_PROBE_TRIGGER_WIDTH_RATIO = 1.50
+
+CHILD_PROBE_RELAY_TRIGGER_RATIO = 0.82
+
+CHILD_PROBE_TRIGGER_MAX_DISTANCE = (
     MAX_RANGE * CHILD_PROBE_TRIGGER_RANGE_RATIO
 )
 # Moving Child-Junction structural evidence.
@@ -561,7 +570,176 @@ def update_child_lidar_probe(
         )
 
         # Default before a Child Candidate exists.
-        forward_command = 18.0
+                # -------------------------------------------------
+        # Smooth Child-probe cruise BEFORE Candidate latch.
+        #
+        # From the moment the LiDAR probe is released,
+        # the Child controller owns the frozen ingress
+        # axial direction.
+        #
+        # SPH remains active laterally, but must not
+        # alternately push the LiDAR forward/backward.
+        # -------------------------------------------------
+        candidate_control_active = (
+            multi_dfs.child_candidate_active
+            and session is not None
+            and session.candidate_depth_local is not None
+            and session.candidate_last_position is not None
+        )
+
+        forward_command = 0.0
+
+        if not candidate_control_active:
+
+            axial_direction = (
+                session.ingress_t
+                if session is not None
+                else tangent
+            )
+
+            axial_velocity = float(
+                lidar_robot.velocity.dot(
+                    axial_direction
+                )
+            )
+
+            # Remove only SPH acceleration along the
+            # branch-forward axis.
+            #
+            # Lateral SPH interaction remains untouched.
+            existing_axial_acc = float(
+                lidar_robot.acceleration.dot(
+                    axial_direction
+                )
+            )
+
+            lidar_robot.acceleration -= (
+                axial_direction
+                * existing_axial_acc
+            )
+
+            # Smooth cruise rather than a constant
+            # acceleration command.
+                        # -------------------------------------------------
+            # Communication-aware smooth cruise.
+            #
+            # Cruise freely while the current Base-rooted
+            # communication link has enough margin.
+            #
+            # As the LiDAR approaches the communication
+            # hard limit, smoothly reduce the desired
+            # forward speed to zero instead of repeatedly
+            # pushing against the hard communication clamp.
+            #
+            # Once a new Breadcrumb becomes the parent,
+            # comm_parent_distance drops again and the
+            # LiDAR naturally accelerates forward.
+            # -------------------------------------------------
+            probe_cruise_speed = 10.0
+
+            comm_parent = getattr(
+                lidar_robot,
+                "comm_parent",
+                None,
+            )
+
+            if (
+                comm_parent is None
+                or not lidar_robot.connected_to_base
+            ):
+                comm_parent_distance = float("inf")
+                comm_speed_scale = 0.0
+
+            else:
+                comm_parent_distance = (
+                    lidar_robot.position.distance_to(
+                        comm_parent.position
+                    )
+                )
+
+                comm_guard_start = float(
+                    physical.COMM_GUARD_START
+                )
+
+                comm_hard_limit = float(
+                    physical.COMM_GUARD_HARD_LIMIT
+                )
+
+                if (
+                    comm_parent_distance
+                    <= comm_guard_start
+                ):
+                    comm_speed_scale = 1.0
+
+                elif (
+                    comm_parent_distance
+                    >= comm_hard_limit
+                ):
+                    comm_speed_scale = 0.0
+
+                else:
+                    comm_speed_scale = (
+                        comm_hard_limit
+                        - comm_parent_distance
+                    ) / max(
+                        physical.EPSILON,
+                        comm_hard_limit
+                        - comm_guard_start,
+                    )
+
+                    comm_speed_scale = float(
+                        np.clip(
+                            comm_speed_scale,
+                            0.0,
+                            1.0,
+                        )
+                    )
+
+            probe_target_axial_speed = (
+                probe_cruise_speed
+                * comm_speed_scale
+            )
+
+            probe_speed_error = (
+                probe_target_axial_speed
+                - axial_velocity
+            )
+
+            probe_forward_limit = (
+                0.15
+                * physical.MAX_ACCELERATION
+            )
+
+            forward_command = float(
+                np.clip(
+                    6.0 * probe_speed_error,
+                    -probe_forward_limit,
+                    probe_forward_limit,
+                )
+            )
+
+            if (
+                physical.integration_frame
+                % 20
+                == 0
+            ):
+                print(
+                    "[ChildProbeCruise] "
+                    f"junction={frame.junction_uid} "
+                    f"branch={active_uid} "
+                    f"lidar_id={lidar_robot.robot_id} "
+                    f"axial_v={axial_velocity:.2f} "
+                    f"target_v="
+                    f"{probe_target_axial_speed:.2f} "
+                    f"comm_scale="
+                    f"{comm_speed_scale:.2f} "
+                    f"comm_dist="
+                    f"{comm_parent_distance:.2f} "
+                    f"sph_axial_removed="
+                    f"{existing_axial_acc:.2f} "
+                    f"forward_cmd="
+                    f"{forward_command:.2f}"
+                )
 
         # -------------------------------------------------
         # Child Candidate approach
@@ -628,17 +806,25 @@ def update_child_lidar_probe(
                 candidate_width = float(
                     lidar_frame.adaptive_w
                 )
-
-            stop_tolerance = (
-                CHILD_APPROACH_STOP_W_RATIO
-                * candidate_width
+            # Use the SAME entrance-stop tolerance as J0.
+            #
+            # J0:
+            #   entrance_depth <= ANCHOR_ENTRANCE_STOP_TOLERANCE
+            #
+            # Child Junctions must use the same geometric
+            # stopping rule instead of driving almost to
+            # zero remaining depth.
+            # SAME entrance-stop rule as J0.
+            stop_tolerance = float(
+                ANCHOR_ENTRANCE_STOP_TOLERANCE
             )
 
-            slowdown_distance = max(
+            # Start slowing before the common entrance
+            # stopping boundary so approach remains smooth.
+            slowdown_distance = (
                 stop_tolerance
-                + physical.ROBOT_RADIUS,
-                CHILD_APPROACH_SLOWDOWN_W_RATIO
-                * candidate_width,
+                + CHILD_APPROACH_SLOWDOWN_W_RATIO
+                * candidate_width
             )
 
             remaining_depth = (
@@ -653,7 +839,9 @@ def update_child_lidar_probe(
             # No position overwrite.
             # No teleport.
             # ---------------------------------------------
-            if remaining_depth <= stop_tolerance:
+            if anchor_entrance_stop_reached(
+                remaining_depth
+            ):
                 session.anchor_stopped = True
                 session.anchor_stop_frame = (
                     physical.integration_frame
@@ -840,15 +1028,60 @@ def update_child_lidar_probe(
         )
 
         if physical.integration_frame % 20 == 0:
+            comm_parent = getattr(
+                lidar_robot,
+                "comm_parent",
+                None,
+            )
+
+            comm_parent_id = getattr(
+                comm_parent,
+                "robot_id",
+                None,
+            )
+
+            comm_parent_distance = (
+                lidar_robot.position.distance_to(
+                    comm_parent.position
+                )
+                if comm_parent is not None
+                else float("nan")
+            )
+
+            probe_acc = lidar_robot.acceleration.length()
+
+            forward_test_position = (
+                lidar_robot.position
+                + tangent * physical.ROBOT_RADIUS
+            )
+
+            forward_walkable = physical.is_walkable(
+                forward_test_position,
+                lidar_robot.radius,
+            )
+
             print(
                 "[ChildProbeProgress] "
                 f"junction={frame.junction_uid} "
                 f"branch={active_uid} "
                 f"lidar_id={lidar_robot.robot_id} "
+                f"role={lidar_robot.role} "
                 f"axial={axial:.2f} "
                 f"lateral={lateral:.2f} "
                 f"lateral_v={lateral_velocity:.2f} "
-                f"center_cmd={lateral_command:.2f}"
+                f"center_cmd={lateral_command:.2f} "
+                f"acc={probe_acc:.2f} "
+                f"anchor_fixed={perception.anchor_fixed} "
+                f"is_fixed_anchor="
+                f"{lidar_robot.is_fixed_anchor} "
+                f"base_reserve={lidar_robot.base_reserve} "
+                f"connected="
+                f"{lidar_robot.connected_to_base} "
+                f"comm_parent={comm_parent_id} "
+                f"comm_dist={comm_parent_distance:.2f} "
+                f"comm_hard="
+                f"{physical.COMM_GUARD_HARD_LIMIT:.2f} "
+                f"forward_walkable={forward_walkable}"
             )
 
         return
@@ -909,14 +1142,128 @@ def update_child_lidar_probe(
         / len(frontier_depths)
     )
 
-    # LiDAR still has enough forward observation support.
+        # -----------------------------------------------------
+    # Branch-local adaptive Child-probe trigger.
+    #
+    # Use the physical mouth width measured for THIS branch,
+    # rather than one fixed world-distance threshold.
+    #
+    # The LiDAR max-range threshold remains only an upper cap.
+    # -----------------------------------------------------
+    observed_width = float(
+        getattr(
+            descriptor,
+            "observed_physical_width",
+            0.0,
+        )
+        or getattr(
+            descriptor,
+            "observed_width",
+            0.0,
+        )
+        or 0.0
+    )
+
+    if observed_width > physical.EPSILON:
+        child_probe_trigger_depth = min(
+            CHILD_PROBE_TRIGGER_MAX_DISTANCE,
+            CHILD_PROBE_TRIGGER_WIDTH_RATIO
+            * observed_width,
+        )
+    else:
+        # Safe fallback if physical mouth width is unavailable.
+        child_probe_trigger_depth = (
+            CHILD_PROBE_TRIGGER_MAX_DISTANCE
+        )
+
+    if physical.integration_frame % 20 == 0:
+        observed_width = float(
+            getattr(
+                descriptor,
+                "observed_physical_width",
+                0.0,
+            )
+            or getattr(
+                descriptor,
+                "observed_width",
+                0.0,
+            )
+            or 0.0
+        )
+
+        print(
+            "[ChildProbeGate] "
+            f"junction={frame.junction_uid} "
+            f"branch={active_uid} "
+            f"frontier_depth="
+            f"{frontier_centroid_depth:.2f} "
+            f"trigger_depth="
+            f"{child_probe_trigger_depth:.2f} "
+            f"mouth_width="
+            f"{observed_width:.2f} "
+            f"depth_over_width="
+            f"{frontier_centroid_depth / max(observed_width, physical.EPSILON):.2f} "
+            f"frontiers="
+            f"{len(frontier_depths)} "
+            "probe_active=False"
+        )
+
     if (
         frontier_centroid_depth
-        < CHILD_PROBE_TRIGGER_DISTANCE
+        < child_probe_trigger_depth
     ):
         return
 
     lidar_robot = perception.leader
+
+    # The persistent LiDAR robot must never have been consumed
+    # by a Relay/Breadcrumb role.
+    if lidar_robot.role in {
+        "RELAY",
+        "TRUNK_RELAY",
+    }:
+        previous_role = lidar_robot.role
+        previous_relay_index = getattr(
+            lidar_robot,
+            "relay_index",
+            -1,
+        )
+
+        lidar_robot.role = "NORMAL"
+        lidar_robot.relay_anchor = None
+        lidar_robot.relay_index = -1
+
+        if hasattr(
+            lidar_robot,
+            "relay_scope",
+        ):
+            lidar_robot.relay_scope = None
+
+        if hasattr(
+            lidar_robot,
+            "relay_owner_edge_id",
+        ):
+            lidar_robot.relay_owner_edge_id = None
+
+        lidar_robot.velocity.update(
+            0.0,
+            0.0,
+        )
+        lidar_robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+        lidar_robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        print(
+            "[LiDARIllegalRelayRelease] "
+            f"lidar_id={lidar_robot.robot_id} "
+            f"previous_role={previous_role} "
+            f"relay_index={previous_relay_index}"
+        )
 
     # Same LiDAR ID must be retained.
     multi_dfs.child_probe_active = True
@@ -987,7 +1334,10 @@ def update_child_lidar_probe(
         f"branch={active_uid} "
         f"lidar_id={lidar_robot.robot_id} "
         f"frontier_depth={frontier_centroid_depth:.2f} "
-        f"trigger_depth={CHILD_PROBE_TRIGGER_DISTANCE:.2f} "
+        f"trigger_depth={child_probe_trigger_depth:.2f} "
+        f"mouth_width={observed_width:.2f} "
+        f"depth_over_width="
+        f"{frontier_centroid_depth / max(observed_width, physical.EPSILON):.2f} "
         f"yaw={perception.yaw_deg:.2f} "
         "parent_release=False "
         "marker=False "
@@ -1668,11 +2018,10 @@ def update_child_moving_candidate(
         return
 
     # -----------------------------------------------------
-    # Estimate local Junction depth from the non-axial
-    # mouth wall breaks.
+    # Estimate Child entrance depth only from already
+    # VERIFIED finite non-axial mouths.
     #
-    # This is relative to the CURRENT LiDAR pose and the
-    # frozen ingress axis. No global J1 coordinate is used.
+    # Do not use the raw broadest LiDAR opening here.
     # -----------------------------------------------------
     depth_samples: list[float] = []
 
@@ -2372,28 +2721,87 @@ class AdaptivePerception:
             print(f"[LiDAR] junction evidence openings={len(openings)}")
             print("[LiDAR] parent_opening_in_evidence=True")
             print(f"[JunctionCandidate] frame={self.frame} anchor_fixed=False state={self.state.name}")
+
         if self.state == PerceptionState.JUNCTION_APPROACH and not self.anchor_fixed:
-            broad = max(openings, key=lambda item: float(item["width_deg"])) if openings else None
-            if broad is not None:
-                left_ep = _body_local_unit(self, float(broad["start_angle"])) * _range_at_local_angle(result, float(broad["start_angle"]))
-                right_ep = _body_local_unit(self, float(broad["end_angle"])) * _range_at_local_angle(result, float(broad["end_angle"]))
-                center_ep = 0.5 * (left_ep + right_ep)
-                width_ep = float(left_ep.distance_to(right_ep))
-                depth_ep = float(center_ep.dot(_body_local_unit(self, 0.0)))
-                self.entrance_detected = depth_ep > 0.0 and width_ep >= 0.5 * adaptive_w
-                self.entrance_detection_frame = self.frame
-                self.entrance_left_endpoint_local = left_ep
-                self.entrance_right_endpoint_local = right_ep
-                self.entrance_center_local = center_ep
-                self.entrance_depth = depth_ep
-                self.entrance_confidence = min(1.0, width_ep / max(adaptive_w, 1.0))
-                self.entrance_history.append((depth_ep, width_ep))
-                self.entrance_history = self.entrance_history[-8:]
-                print(f"[EntranceEstimate] frame={self.frame} left=({left_ep.x:.2f},{left_ep.y:.2f}) right=({right_ep.x:.2f},{right_ep.y:.2f}) depth={depth_ep:.2f} width={width_ep:.2f} valid={self.entrance_detected}")
+            entrance = estimate_junction_entrance(
+                self,
+                result,
+            )
+
+            if entrance is not None:
+                self.entrance_detected = (
+                    entrance.valid
+                )
+
+                self.entrance_detection_frame = (
+                    self.frame
+                )
+
+                self.entrance_left_endpoint_local = (
+                    entrance.left_endpoint
+                )
+
+                self.entrance_right_endpoint_local = (
+                    entrance.right_endpoint
+                )
+
+                self.entrance_center_local = (
+                    entrance.center
+                )
+
+                self.entrance_depth = (
+                    entrance.depth
+                )
+
+                self.entrance_confidence = min(
+                    1.0,
+                    entrance.width
+                    / max(
+                        result.adaptive_w,
+                        1.0,
+                    ),
+                )
+
+                self.entrance_history.append(
+                    (
+                        entrance.depth,
+                        entrance.width,
+                    )
+                )
+
+                self.entrance_history = (
+                    self.entrance_history[-8:]
+                )
+
+                print(
+                    "[EntranceEstimate] "
+                    f"frame={self.frame} "
+                    f"left="
+                    f"({entrance.left_endpoint.x:.2f},"
+                    f"{entrance.left_endpoint.y:.2f}) "
+                    f"right="
+                    f"({entrance.right_endpoint.x:.2f},"
+                    f"{entrance.right_endpoint.y:.2f}) "
+                    f"depth={entrance.depth:.2f} "
+                    f"width={entrance.width:.2f} "
+                    f"valid={entrance.valid}"
+                )
             drive_scale = 0.35 if self.entrance_detected else 1.0
+
             print(f"[AnchorApproach] frame={self.frame} entrance_depth={self.entrance_depth if self.entrance_depth is not None else float('nan'):.2f} drive_scale={drive_scale:.2f}")
             stable = self.entrance_detected and len(self.entrance_history) >= ENTRANCE_STABILITY_FRAMES
-            if stable and self.entrance_depth is not None and self.entrance_depth <= ANCHOR_ENTRANCE_STOP_TOLERANCE and self.frame > int(self.junction_candidate_frame or -1):
+            if (
+                stable
+                and self.entrance_depth is not None
+                and anchor_entrance_stop_reached(
+                    self.entrance_depth
+                )
+                and self.frame
+                > int(
+                    self.junction_candidate_frame
+                    or -1
+                )
+            ):
                 self.junction_confirmed = True
                 self.confirmation_frame = self.frame
                 self.confirmation_time = simulation_time
@@ -2486,6 +2894,128 @@ def _range_at_local_angle(frame: LidarFrame, angle_deg: float) -> float:
     )
     return float(frame.smoothed[index])
 
+@dataclass(frozen=True)
+class JunctionEntranceEstimate:
+    left_endpoint: pygame.Vector2
+    right_endpoint: pygame.Vector2
+    center: pygame.Vector2
+    width: float
+    depth: float
+    valid: bool
+
+
+def estimate_junction_entrance(
+    perception: AdaptivePerception,
+    lidar_frame: LidarFrame,
+    *,
+    forward_axis: pygame.Vector2 | None = None,
+) -> JunctionEntranceEstimate | None:
+    """Common J0/J1/J2 entrance estimator.
+
+    This intentionally reproduces the current J0 entrance
+    geometry first.
+
+    No global Junction position is used.
+    """
+
+    if not lidar_frame.openings:
+        return None
+
+    if forward_axis is None:
+        forward = _body_local_unit(
+            perception,
+            0.0,
+        )
+    else:
+        forward = forward_axis.copy()
+
+    if forward.length_squared() <= 1.0e-12:
+        return None
+
+    forward = forward.normalize()
+
+    broad = max(
+        lidar_frame.openings,
+        key=lambda item: float(
+            item["width_deg"]
+        ),
+    )
+
+    start_angle = float(
+        broad["start_angle"]
+    )
+
+    end_angle = float(
+        broad["end_angle"]
+    )
+
+    left_endpoint = (
+        _body_local_unit(
+            perception,
+            start_angle,
+        )
+        * _range_at_local_angle(
+            lidar_frame,
+            start_angle,
+        )
+    )
+
+    right_endpoint = (
+        _body_local_unit(
+            perception,
+            end_angle,
+        )
+        * _range_at_local_angle(
+            lidar_frame,
+            end_angle,
+        )
+    )
+
+    center = (
+        0.5
+        * (
+            left_endpoint
+            + right_endpoint
+        )
+    )
+
+    width = float(
+        left_endpoint.distance_to(
+            right_endpoint
+        )
+    )
+
+    depth = float(
+        center.dot(
+            forward
+        )
+    )
+
+    valid = (
+        depth > 0.0
+        and width
+        >= 0.5 * lidar_frame.adaptive_w
+    )
+
+    return JunctionEntranceEstimate(
+        left_endpoint=left_endpoint,
+        right_endpoint=right_endpoint,
+        center=center,
+        width=width,
+        depth=depth,
+        valid=valid,
+    )
+
+
+def anchor_entrance_stop_reached(
+    remaining_entrance_depth: float,
+) -> bool:
+    """Common J0/J1/J2 Anchor entrance-stop rule."""
+
+    return (
+        remaining_entrance_depth
+        <= ANCHOR_ENTRANCE_STOP_TOLERANCE
+    )
 
 def _nearest_wall_side_endpoint(
     frame: LidarFrame,
@@ -3349,36 +3879,19 @@ def build_provisional_guard_descriptors_from_lidar(
             )
 
         # =====================================================
-        # Mouth position
+        # Unified physical mouth geometry
         #
-        # axial depth:
-        #   common Junction estimate
+        # Every outgoing branch uses the SAME rule:
         #
-        # lateral centering:
-        #   actual LiDAR mouth evidence
+        # finite wall endpoint A + finite wall endpoint B
+        #                     ↓
+        #            physical mouth midpoint
+        #
+        # No UP / LEFT / RIGHT special case.
+        # No Junction-center-derived axial mouth relocation.
         # =====================================================
-        mouth = (
-            junction_center
-            + axis
-            * (
-                0.5
-                * estimated_width
-            )
-        )
 
-        lateral_center_shift = (
-            0.0
-            if axis_source == "LIDAR_TOPOLOGY_ORDER_FALLBACK"
-            else float(
-                (wall_mid_world - mouth).dot(mouth_normal)
-            )
-        )
-
-        mouth = (
-            mouth
-            + mouth_normal
-            * lateral_center_shift
-        )
+        mouth = wall_mid_world.copy()
 
         straight_start = (
             mouth
@@ -3551,7 +4064,8 @@ def build_provisional_guard_descriptors_from_lidar(
             f"start_q={start_quality:.2f} "
             f"end_q={end_quality:.2f} "
             f"span={mouth_span:.3f} "
-            f"lateral_shift={lateral_center_shift:.3f}"
+            f"mouth=({mouth.x:.3f},{mouth.y:.3f}) "
+            f"geometry=FINITE_ENDPOINT_MIDPOINT"
         )
 
     # Side openings are seen obliquely from the Anchor.  Their visible endpoint
@@ -3575,10 +4089,17 @@ def build_provisional_guard_descriptors_from_lidar(
             normal = geometry.mouth_lateral_unit
             if tangent is None or normal is None:
                 continue
-            center = (
-                junction_center
-                + tangent * (0.5 * fallback_width)
-            )
+            # Preserve the physical mouth position measured
+            # from the finite wall endpoints.
+            #
+            # Fallback may replace WIDTH only.
+            # It must never relocate the mouth center.
+            center = geometry.mouth_center_world
+
+            if center is None:
+                continue
+
+            center = center.copy()
 
             geometry.mouth_span = fallback_width
             geometry.mouth_center_world = center.copy()
@@ -4222,6 +4743,11 @@ def build_guard_entry_waypoints(
         )
     )
 
+    staging = (
+        center
+        - tangent * (4.5 * physical.ROBOT_RADIUS)
+    )
+
     # Junction-side waypoint immediately before the mouth.
     approach = (
         center
@@ -4247,18 +4773,29 @@ def build_guard_entry_waypoints(
 
     waypoints: list[pygame.Vector2] = []
 
+    # First gather onto the branch-local centerline on the
+    # Junction side. This prevents diagonal corner clipping.
+    if physical.is_walkable(
+        staging,
+        physical.ROBOT_RADIUS,
+    ):
+        waypoints.append(staging)
+
+    # Then spread laterally while still on the Junction side.
     if physical.is_walkable(
         approach,
         physical.ROBOT_RADIUS,
     ):
         waypoints.append(approach)
 
+    # Cross the mouth at the already-safe lateral coordinate.
     if physical.is_walkable(
         inside,
         physical.ROBOT_RADIUS,
     ):
         waypoints.append(inside)
 
+    # Finally move to the frozen 3xN physical Guard slot.
     waypoints.append(slot.copy())
 
     return waypoints
@@ -4590,60 +5127,36 @@ def update_guard_readiness_and_activation(
             and getattr(robot, "integration_guard_slot_index", None) is not None
         }
 
-        # 각 row 내부에서는 양 가장자리부터 채운다.
+        # -------------------------------------------------
+        # Unified multi-layer Guard recruitment
+        #
+        # Every branch uses exactly the same rule:
+        #
+        #   create full 3xN geometry first
+        #   recruit into ALL unoccupied layers
+        #   let every row settle concurrently
+        #
+        # Deeper rows retain priority, but a row does NOT
+        # have to finish settling before another row starts.
+        # -------------------------------------------------
+
         column_priority = build_edge_sealing_slot_order(
             geometry.columns
         )
 
-        # 물리적 통과 가능성을 고려해서
-        # branch 가장 안쪽 row -> 정션 쪽 row 순서로 형성한다.
-        active_layer = None
-
-        for layer in reversed(range(geometry.layers)):
-
-            layer_guards = [
-                robot
-                for robot in robots
-                if robot.robot_id in geometry.selected_ids
-                and getattr(robot, "junction_guard_layer", -1) == layer
-            ]
-
-            layer_fully_assigned = (
-                len(layer_guards) == geometry.columns
+        slot_priority = [
+            layer * geometry.columns + column
+            for layer in reversed(
+                range(geometry.layers)
             )
+            for column in column_priority
+        ]
 
-            layer_settled = (
-                layer_fully_assigned
-                and all(
-                    robot.integration_guard_final_anchor is not None
-                    and robot.position.distance_to(
-                        robot.integration_guard_final_anchor
-                    )
-                    <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
-                    for robot in layer_guards
-                )
-            )
-
-            # 가장 깊은 아직 미완성 row 하나만 활성화
-            if not layer_settled:
-                active_layer = layer
-                break
-
-
-        if active_layer is None:
-            empty_slots = []
-
-        else:
-            slot_priority = [
-                active_layer * geometry.columns + column
-                for column in column_priority
-            ]
-
-            empty_slots = [
-                slot_index
-                for slot_index in slot_priority
-                if slot_index not in occupied_slots
-            ]
+        empty_slots = [
+            slot_index
+            for slot_index in slot_priority
+            if slot_index not in occupied_slots
+        ]
 
         # 이미 다른 Guard로 뽑힌 로봇 제외
         available = [
@@ -4735,6 +5248,22 @@ def update_guard_readiness_and_activation(
                 f"{len(geometry.slots)}"
             )
 
+        status = physical.integration_wall_status[
+            geometry.provisional_uid
+        ]
+
+        status["candidate_count"] = len(
+            candidates
+        )
+
+        status["assignment_count"] = len(
+            geometry.selected_ids
+        )
+
+        status["assigned"] = len(
+            geometry.selected_ids
+        )
+
         # 부분적으로라도 Guard가 생긴 순간부터 물리적으로 사용
         if geometry.selected_ids:
 
@@ -4825,6 +5354,106 @@ def update_provisional_wall_settling_audit(
             ) <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
             for robot in guards
         )
+
+        # -------------------------------------------------
+        # Diagnose Guards that never reach their FINAL slot.
+        #
+        # Do not relax the readiness threshold before we
+        # know why these physical robots remain unsettled.
+        # -------------------------------------------------
+        unsettled_guards = []
+
+        for robot in guards:
+            final_anchor = getattr(
+                robot,
+                "integration_guard_final_anchor",
+                None,
+            )
+
+            if final_anchor is None:
+                final_error = float("inf")
+            else:
+                final_error = robot.position.distance_to(
+                    final_anchor
+                )
+
+            if (
+                final_error
+                <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
+            ):
+                continue
+
+            current_anchor = getattr(
+                robot,
+                "junction_guard_anchor",
+                None,
+            )
+
+            current_target_error = (
+                robot.position.distance_to(
+                    current_anchor
+                )
+                if current_anchor is not None
+                else float("inf")
+            )
+
+            waypoints = getattr(
+                robot,
+                "integration_guard_waypoints",
+                [],
+            )
+
+            unsettled_guards.append(
+                (
+                    robot,
+                    final_error,
+                    current_target_error,
+                    len(waypoints),
+                )
+            )
+
+        if (
+            unsettled_guards
+            and getattr(
+                physical,
+                "integration_frame",
+                0,
+            ) % 20
+            == 0
+        ):
+            print(
+                f"[GuardSettlingDetail] "
+                f"uid={geometry.provisional_uid} "
+                f"settled={settled}/{len(guards)} "
+                f"unsettled={len(unsettled_guards)} "
+                f"tol="
+                f"{physical.JUNCTION_GUARD_POSITION_TOLERANCE:.3f}"
+            )
+
+            for (
+                robot,
+                final_error,
+                current_target_error,
+                waypoint_count,
+            ) in sorted(
+                unsettled_guards,
+                key=lambda item: -item[1],
+            ):
+                print(
+                    f"[GuardSettlingRobot] "
+                    f"uid={geometry.provisional_uid} "
+                    f"id={robot.robot_id} "
+                    f"layer="
+                    f"{getattr(robot, 'junction_guard_layer', -1)} "
+                    f"slot="
+                    f"{getattr(robot, 'integration_guard_slot_index', -1)} "
+                    f"final_error={final_error:.3f} "
+                    f"current_target_error="
+                    f"{current_target_error:.3f} "
+                    f"waypoints={waypoint_count} "
+                    f"speed={robot.velocity.length():.3f}"
+                )
+
         complete_rows = 0
         minimum_span_ratio = 1.0
         maximum_edge_gap = 0.0
@@ -5193,6 +5822,537 @@ def install_thick_wall_readiness_audit(physical: types.ModuleType) -> None:
         return audited_ready(robots)
 
     physical.junction_guards_formed = ready_or_handoff_bypass
+
+
+def install_lidar_relay_protection(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+) -> None:
+    """Keep the persistent LiDAR visible to relay-front tracking,
+    but never allow it to become the Breadcrumb itself.
+
+    LiDAR 675:
+      - remains NORMAL,
+      - contributes to front_progress,
+      - is excluded only from tail_band Relay election.
+    """
+
+    lidar_robot = perception.leader
+
+    def protected_update_relay_deployment(
+        robots: Sequence[Any],
+        dt: float,
+    ) -> None:
+
+        physical.relay_deploy_cooldown = max(
+            0.0,
+            physical.relay_deploy_cooldown - dt,
+        )
+
+        physical.relay_motion_scale = 1.0
+
+        if physical.phase not in {
+            physical.SimulationPhase.MOVE_TO_JUNCTION,
+            physical.SimulationPhase.EXPLORE_BRANCH,
+            physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+            physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
+        }:
+            return
+
+        if (
+            physical.phase
+            == physical.SimulationPhase.MOVE_TO_JUNCTION
+            and physical.simulation_time
+            < physical.BASE_COMPRESSION_DURATION
+        ):
+            return
+
+        if (
+            physical.relay_deploy_cooldown > 0.0
+            or physical.base_station is None
+        ):
+            return
+
+        breadcrumbs = (
+            physical.get_active_branch_relays(
+                robots
+            )
+        )
+
+        last_node = (
+            breadcrumbs[-1]
+            if breadcrumbs
+            else physical.base_station
+        )
+
+        last_progress = (
+            physical.relay_path_progress(
+                last_node.relay_anchor,
+                physical.active_branch,
+            )
+            if (
+                breadcrumbs
+                and last_node.relay_anchor is not None
+            )
+            else 0.0
+        )
+
+        # -------------------------------------------------
+        # IMPORTANT:
+        #
+        # LiDAR 675 stays NORMAL here.
+        # Therefore it contributes to front_progress.
+        # -------------------------------------------------
+        mobile = [
+            robot
+            for robot in robots
+            if robot.role == "NORMAL"
+            and not robot.base_reserve
+            and robot.connected_to_base
+            and physical.get_robot_region(
+                robot.position
+            )
+            in {
+                "BOTTOM",
+                "JUNCTION",
+                physical.active_branch,
+            }
+        ]
+
+        ahead = [
+            (
+                physical.relay_path_progress(
+                    robot.position,
+                    physical.active_branch,
+                ),
+                robot,
+            )
+            for robot in mobile
+            if physical.relay_path_progress(
+                robot.position,
+                physical.active_branch,
+            )
+            > last_progress + physical.EPSILON
+        ]
+
+        if not ahead:
+            return
+
+        ahead.sort(
+            key=lambda item: (
+                item[0],
+                item[1].robot_id,
+            )
+        )
+
+        front_progress = ahead[-1][0]
+
+        # -------------------------------------------------
+        # Reactive Breadcrumb trigger based on the actual
+        # explored FRONT, not on the slowest NORMAL tail.
+        #
+        # A few NORMAL robots may remain close to the last
+        # breadcrumb while the LiDAR/front has already
+        # stretched the communication chain.
+        #
+        # Waiting for the absolute rear-most NORMAL to move
+        # BREADCRUMB_SPACING creates a deadlock:
+        #
+        # front stops for communication
+        #     -> rear-most NORMAL does not clear
+        #     -> no breadcrumb
+        #     -> front can never resume
+        # -------------------------------------------------
+        required_front_progress = (
+            last_progress
+            + physical.BREADCRUMB_SPACING
+            + physical.BREADCRUMB_FRONT_CLEARANCE
+        )
+
+        if front_progress < required_front_progress:
+            return
+
+        target_progress = (
+            last_progress
+            + physical.BREADCRUMB_SPACING
+        )
+
+        # Select an already-existing physical NORMAL robot
+        # near the desired local spacing.
+        #
+        # No robot is teleported. The selected robot stops
+        # exactly where it already is.
+        tail_band = [
+            (progress, robot)
+            for progress, robot in ahead
+            if robot is not lidar_robot
+            and progress
+            <= (
+                front_progress
+                - physical.BREADCRUMB_FRONT_CLEARANCE
+            )
+            and physical.BREADCRUMB_DEPLOY_DISTANCE
+            <= robot.position.distance_to(
+                last_node.position
+            )
+            <= physical.COMM_RANGE * 0.88
+        ]
+
+        if not tail_band:
+            return
+
+        tail_progress, tail_robot = min(
+            tail_band,
+            key=lambda item: (
+                abs(
+                    item[0]
+                    - target_progress
+                ),
+                abs(
+                    item[1].position.distance_to(
+                        last_node.position
+                    )
+                    - physical.BREADCRUMB_SPACING
+                ),
+                item[1].robot_id,
+            ),
+        )
+
+
+        if (
+            tail_robot.total_distance
+            < physical.BREADCRUMB_MIN_TRAVEL
+        ):
+            return
+
+        tail_robot.role = "RELAY"
+
+        tail_robot.relay_anchor = (
+            tail_robot.position.copy()
+        )
+
+        tail_robot.relay_index = (
+            breadcrumbs[-1].relay_index + 1
+            if breadcrumbs
+            else 0
+        )
+
+        tail_robot.velocity.update(
+            0.0,
+            0.0,
+        )
+
+        tail_robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        tail_robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        physical.relay_slots.append(
+            {
+                "index": tail_robot.relay_index,
+                "position": (
+                    tail_robot.relay_anchor.copy()
+                ),
+                "path_distance": tail_progress,
+            }
+        )
+
+        guards = (
+            physical.assign_breadcrumb_front_guards(
+                robots,
+                tail_robot,
+                tail_progress,
+            )
+        )
+
+        physical.relay_deploy_cooldown = (
+            physical.BREADCRUMB_DEPLOY_COOLDOWN
+        )
+
+        print(
+            "[Breadcrumb] "
+            f"tail robot={tail_robot.robot_id}, "
+            f"index={tail_robot.relay_index}, "
+            f"progress={tail_progress:.1f}, "
+            f"static_guards={len(guards)} "
+            f"lidar_front_visible=True "
+            f"lidar_selected=False"
+        )
+
+    physical.update_relay_deployment = (
+        protected_update_relay_deployment
+    )
+
+    print(
+        "[LiDARRoleProtection] "
+        f"lidar_id={lidar_robot.robot_id} "
+        "visible_to_front_progress=True "
+        "breadcrumb_candidate=False"
+    )
+
+def update_child_probe_relay_support(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Freeze a local NORMAL neighbor only when the moving LiDAR
+    is about to exhaust its current Base-side communication link.
+
+    This is Child-probe communication support only.
+
+    It does NOT:
+    - confirm a Child Junction,
+    - release the Parent Junction,
+    - create a Return Marker,
+    - perform DFS PUSH,
+    - move any robot by position overwrite.
+    """
+
+    if not multi_dfs.child_probe_active:
+        return
+
+    lidar_robot = perception.leader
+
+    if lidar_robot.role != "NORMAL":
+        return
+
+    if not lidar_robot.connected_to_base:
+        return
+
+    parent = lidar_robot.comm_parent
+
+    if parent is None:
+        return
+
+    parent_distance = lidar_robot.position.distance_to(
+        parent.position
+    )
+
+    hard_limit = float(
+        physical.COMM_GUARD_HARD_LIMIT
+    )
+
+    trigger_distance = (
+        CHILD_PROBE_RELAY_TRIGGER_RATIO
+        * hard_limit
+    )
+
+    # Current link still has sufficient room.
+    if parent_distance < trigger_distance:
+        return
+
+    current_margin = float(
+        getattr(
+            lidar_robot,
+            "comm_path_margin",
+            float("-inf"),
+        )
+    )
+
+    candidates: list[
+        tuple[float, float, int, Any]
+    ] = []
+
+    # -------------------------------------------------
+    # Use only LOCAL communication neighbors.
+    #
+    # A support candidate must already:
+    #   1. be a physical NORMAL robot,
+    #   2. have a Base path,
+    #   3. be a direct LiDAR communication neighbor.
+    #
+    # No Child global position or J1 fixture coordinate
+    # is used here.
+    # -------------------------------------------------
+    for candidate in getattr(
+        lidar_robot,
+        "comm_neighbors",
+        [],
+    ):
+        if candidate is lidar_robot:
+            continue
+
+        if candidate is parent:
+            continue
+
+        if getattr(
+            candidate,
+            "role",
+            None,
+        ) != "NORMAL":
+            continue
+
+        if getattr(
+            candidate,
+            "base_reserve",
+            False,
+        ):
+            continue
+
+        if not getattr(
+            candidate,
+            "connected_to_base",
+            False,
+        ):
+            continue
+
+        candidate_distance = (
+            lidar_robot.position.distance_to(
+                candidate.position
+            )
+        )
+
+        if (
+            candidate_distance
+            >= physical.COMM_GUARD_HARD_LIMIT
+        ):
+            continue
+
+        candidate_path_margin = float(
+            getattr(
+                candidate,
+                "comm_path_margin",
+                float("-inf"),
+            )
+        )
+
+        if not math.isfinite(
+            candidate_path_margin
+        ):
+            continue
+
+        local_edge_margin = (
+            physical.COMM_RANGE
+            - candidate_distance
+        )
+
+        bridge_margin = min(
+            candidate_path_margin,
+            local_edge_margin,
+        )
+
+        # Prefer a support node that actually improves
+        # the LiDAR's widest Base-rooted path.
+        if (
+            bridge_margin
+            <= current_margin
+            + physical.EPSILON
+        ):
+            continue
+
+        candidates.append(
+            (
+                -bridge_margin,
+                candidate_distance,
+                candidate.robot_id,
+                candidate,
+            )
+        )
+
+    if not candidates:
+        if (
+            physical.integration_frame
+            % 20
+            == 0
+        ):
+            print(
+                "[ChildProbeRelayWait] "
+                f"lidar_id={lidar_robot.robot_id} "
+                f"parent="
+                f"{getattr(parent, 'robot_id', None)} "
+                f"parent_dist={parent_distance:.2f} "
+                f"trigger={trigger_distance:.2f} "
+                f"hard={hard_limit:.2f} "
+                f"current_margin="
+                f"{current_margin:.2f} "
+                "candidate=NONE"
+            )
+
+        return
+
+    _, _, _, relay_robot = min(
+        candidates
+    )
+
+    previous_relays = (
+        physical.get_active_branch_relays(
+            robots
+        )
+    )
+
+    relay_index = (
+        max(
+            (
+                relay.relay_index
+                for relay in previous_relays
+            ),
+            default=-1,
+        )
+        + 1
+    )
+
+    relay_robot.role = "RELAY"
+    relay_robot.relay_anchor = (
+        relay_robot.position.copy()
+    )
+    relay_robot.relay_index = relay_index
+
+    if hasattr(
+        relay_robot,
+        "relay_scope",
+    ):
+        relay_robot.relay_scope = "BRANCH"
+
+    if hasattr(
+        relay_robot,
+        "relay_owner_edge_id",
+    ):
+        relay_robot.relay_owner_edge_id = (
+            multi_dfs.child_probe_branch_uid
+        )
+
+    if hasattr(
+        relay_robot,
+        "relay_branch",
+    ):
+        relay_robot.relay_branch = getattr(
+            physical,
+            "active_branch",
+            None,
+        )
+
+    relay_robot.velocity.update(
+        0.0,
+        0.0,
+    )
+
+    relay_robot.acceleration.update(
+        0.0,
+        0.0,
+    )
+
+    relay_robot.filtered_acceleration.update(
+        0.0,
+        0.0,
+    )
+
+    print(
+        "[ChildProbeRelay] "
+        f"lidar_id={lidar_robot.robot_id} "
+        f"relay_id={relay_robot.robot_id} "
+        f"relay_index={relay_index} "
+        f"old_parent="
+        f"{getattr(parent, 'robot_id', None)} "
+        f"old_parent_dist={parent_distance:.2f} "
+        f"relay_dist="
+        f"{lidar_robot.position.distance_to(relay_robot.position):.2f} "
+        "position_snap=False"
+    )
 
 
 def install_continuous_guard_settling(physical: types.ModuleType) -> None:
@@ -9362,29 +10522,70 @@ def handoff_to_physical_dfs(
     local_count = sum(r.position.distance_to(junction_center) <= 2.0 * scale for r in eligible)
     arrival_ratio = local_count / max(len(eligible), 1)
     junction_arrived = arrival_ratio >= JUNCTION_ARRIVAL_RATIO_THRESHOLD
+    
     all_guard_cohorts_complete = all(
         geometry.cohort_ready
         and len(geometry.selected_ids) == len(geometry.slots)
         for geometry in perception.provisional_guards
     )
+
+    # Every 3xN Guard must be physically settled and structurally
+    # sealed before Physical DFS may start.
+    #
+    # Assignment completion alone is NOT sufficient.
+    all_provisional_walls_ready = all(
+        bool(
+            physical.integration_wall_status
+            .get(geometry.provisional_uid, {})
+            .get("ready", False)
+        )
+        for geometry in perception.provisional_guards
+    )
+
     gate_checks = {
-        "topology_ready": perception.topology_ready_frame is not None,
-        "all_groups_activated": perception.guard_all_groups_activated,
+        "topology_ready": (
+            perception.topology_ready_frame is not None
+        ),
+        "all_groups_activated": (
+            perception.guard_all_groups_activated
+        ),
+        "all_guard_cohorts_complete": (
+            all_guard_cohorts_complete
+        ),
+        "all_provisional_walls_ready": (
+            all_provisional_walls_ready
+        ),
         "guard_complete": (
             perception.guard_all_groups_activated
             and all_guard_cohorts_complete
+            and all_provisional_walls_ready
         ),
-        "all_guard_cohorts_complete": all_guard_cohorts_complete,
         "junction_arrived": junction_arrived,
     }
+
     if perception.handoff_complete or perception.anchor_position is None or not perception.provisional_guard_started or not perception.provisional_guards:
         gate_checks["handoff_inputs"] = False
     allowed = all(gate_checks.values())
-    print(f"[DFSStartGate] frame={getattr(physical, 'integration_frame', -1)} topology_ready={gate_checks['topology_ready']} all_groups_activated={gate_checks['all_groups_activated']} all_guard_cohorts_complete={gate_checks['all_guard_cohorts_complete']} guard_complete={gate_checks['guard_complete']} junction_local_count={local_count} eligible_count={len(eligible)} junction_arrival_ratio={arrival_ratio:.3f} junction_arrived={junction_arrived} blocking_reasons={[name for name, ok in gate_checks.items() if not ok]} allowed={allowed}")
+    print(
+        f"[DFSStartGate] "
+        f"frame={getattr(physical, 'integration_frame', -1)} "
+        f"topology_ready={gate_checks['topology_ready']} "
+        f"all_groups_activated={gate_checks['all_groups_activated']} "
+        f"all_guard_cohorts_complete="
+        f"{gate_checks['all_guard_cohorts_complete']} "
+        f"all_provisional_walls_ready="
+        f"{gate_checks['all_provisional_walls_ready']} "
+        f"guard_complete={gate_checks['guard_complete']} "
+        f"junction_local_count={local_count} "
+        f"eligible_count={len(eligible)} "
+        f"junction_arrival_ratio={arrival_ratio:.3f} "
+        f"junction_arrived={junction_arrived} "
+        f"blocking_reasons="
+        f"{[name for name, ok in gate_checks.items() if not ok]} "
+        f"allowed={allowed}"
+    )
     if not allowed:
         return
-    for geometry in perception.provisional_guards:
-        physical.integration_wall_status.setdefault(geometry.provisional_uid, {})["ready"] = True
     refine_guard_geometry_from_persistent_lidar(
         physical, perception, robots
     )
@@ -10154,6 +11355,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "invisible_return_curtain=False"
     )
     perception = AdaptivePerception(physical, robots)
+    install_lidar_relay_protection(
+        physical,
+        perception,
+    )
     initial_lidar_frame = perception.update(physical.simulation_time)
     print(f"[LiDAR] initial_opening_count={len(initial_lidar_frame.openings)}")
     print(
