@@ -1570,6 +1570,11 @@ def reset_physical_guard_context_for_child(
     physical.integration_ready_guard_ids_by_uid = {}
     physical.integration_wall_status = {}
     physical.integration_wall_stats = {}
+    # -------------------------------------------------
+    # Child Guard lifecycle는 dict의 비어있음 여부로 판단하지 않는다.
+    # J1/J2/...마다 명시적인 초기화 flag를 사용한다.
+    # -------------------------------------------------
+    physical.integration_child_guard_lifecycle_initialized = False
 
     physical.integration_provisional_guard_groups = {}
 
@@ -1694,6 +1699,443 @@ def register_current_child_branches() -> list[str]:
     )
 
     return list(child.branch_order)
+
+
+def child_all_guard_walls_ready(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+) -> bool:
+    """Return True only when every current Child Guard wall is physically READY."""
+
+    child = multi_dfs.current
+
+    if child is None:
+        return False
+
+    if child.parent_junction_uid is None:
+        return False
+
+    if not child.branch_order:
+        return False
+
+    if not perception.provisional_guards:
+        return False
+
+    geometry_by_uid = {
+        geometry.provisional_uid: geometry
+        for geometry in perception.provisional_guards
+    }
+
+    for branch_uid in child.branch_order:
+
+        geometry = geometry_by_uid.get(
+            branch_uid
+        )
+
+        if geometry is None:
+            return False
+
+        if not geometry.cohort_ready:
+            return False
+
+        if (
+            len(geometry.selected_ids)
+            != len(geometry.slots)
+        ):
+            return False
+
+        status = (
+            physical.integration_wall_status.get(
+                branch_uid,
+                {},
+            )
+        )
+
+        if not bool(
+            status.get("ready", False)
+        ):
+            return False
+
+    return True
+
+
+def initialize_child_guard_lifecycle(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Freeze Child Guard IDs and branch-local offsets for later reuse."""
+
+    child = multi_dfs.current
+
+    if child is None:
+        raise RuntimeError(
+            "Child Guard lifecycle requires current Junction"
+        )
+
+    by_id = {
+        robot.robot_id: robot
+        for robot in robots
+    }
+
+    geometry_by_uid = {
+        geometry.provisional_uid: geometry
+        for geometry in perception.provisional_guards
+    }
+
+    physical.integration_wall_lifecycle = {}
+    physical.integration_ready_guard_ids_by_uid = {}
+
+    for branch_uid in child.branch_order:
+
+        geometry = geometry_by_uid.get(
+            branch_uid
+        )
+
+        if geometry is None:
+            raise RuntimeError(
+                "Missing Child Guard geometry: "
+                f"{branch_uid}"
+            )
+
+        descriptor = (
+            physical.branch_descriptors_by_uid[
+                branch_uid
+            ]
+        )
+
+        robot_ids = sorted(
+            geometry.selected_ids
+        )
+
+        members = [
+            by_id[robot_id]
+            for robot_id in robot_ids
+            if robot_id in by_id
+        ]
+
+        if len(members) != len(robot_ids):
+            raise RuntimeError(
+                "Child Guard robot ID lookup incomplete: "
+                f"branch={branch_uid}"
+            )
+
+        coordinates = [
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+            for robot in members
+        ]
+
+        centroid_axial = float(
+            np.mean([
+                axial
+                for axial, _ in coordinates
+            ])
+        )
+
+        centroid_lateral = float(
+            np.mean([
+                lateral
+                for _, lateral in coordinates
+            ])
+        )
+
+        physical.integration_ready_guard_ids_by_uid[
+            branch_uid
+        ] = list(
+            robot_ids
+        )
+
+        physical.integration_wall_lifecycle[
+            branch_uid
+        ] = {
+            "uid": branch_uid,
+            "state": "GUARD",
+
+            "rows": geometry.layers,
+            "cols": geometry.columns,
+
+            # SAME-ID lineage
+            "robot_ids": list(robot_ids),
+
+            # -------------------------------------------------
+            # 최초 READY Guard의 centroid.
+            # Frontier/Shepherd가 끝난 뒤 정확히 이 depth로 돌아온다.
+            # -------------------------------------------------
+            "centroid_axial": centroid_axial,
+            "centroid_lateral": centroid_lateral,
+
+            "original_guard_centroid_axial": centroid_axial,
+            "original_guard_centroid_lateral": centroid_lateral,
+
+            # -------------------------------------------------
+            # 최초 Guard의 실제 world pose 보존.
+            # 나중에 SAME IDs → 원래 Guard 위치 복귀 검증에 사용.
+            # -------------------------------------------------
+            "guard_anchor_by_id": {
+                robot.robot_id: robot.position.copy()
+                for robot in members
+            },
+
+            # 원래 Guard 메타데이터도 같이 보존.
+            "guard_layer_by_id": {
+                robot.robot_id: int(
+                    getattr(
+                        robot,
+                        "junction_guard_layer",
+                        -1,
+                    )
+                )
+                for robot in members
+            },
+
+            "guard_hop_by_id": {
+                robot.robot_id: int(
+                    getattr(
+                        robot,
+                        "junction_guard_hop",
+                        -1,
+                    )
+                )
+                for robot in members
+            },
+
+            "guard_parent_id_by_id": {
+                robot.robot_id: getattr(
+                    robot,
+                    "junction_guard_parent_id",
+                    None,
+                )
+                for robot in members
+            },
+
+            "guard_branch_key_by_id": {
+                robot.robot_id: getattr(
+                    robot,
+                    "junction_guard_branch",
+                    None,
+                )
+                for robot in members
+            },
+
+            "guard_is_leader_by_id": {
+                robot.robot_id: bool(
+                    getattr(
+                        robot,
+                        "is_branch_leader",
+                        False,
+                    )
+                )
+                for robot in members
+            },
+
+            # -------------------------------------------------
+            # 최초 3×N 상대 구조.
+            # Guard → Frontier → Shepherd 동안 계속 유지.
+            # -------------------------------------------------
+            "relative_offsets": {
+                robot.robot_id: (
+                    float(axial - centroid_axial),
+                    float(lateral - centroid_lateral),
+                )
+                for robot, (
+                    axial,
+                    lateral,
+                ) in zip(
+                    members,
+                    coordinates,
+                )
+            },
+        }
+
+        print(
+            "[ChildGuardLifecycleSaved] "
+            f"junction={child.junction_uid} "
+            f"branch={branch_uid} "
+            f"robots={len(robot_ids)} "
+            f"rows={geometry.layers} "
+            f"cols={geometry.columns}"
+        )
+
+    physical.integration_child_guard_lifecycle_initialized = True
+
+    print(
+        "[ChildGuardLifecycleReady] "
+        f"junction={child.junction_uid} "
+        f"branches={child.branch_order} "
+        "initialized=True"
+    )
+
+
+def select_next_child_branch_uid(
+    child: MultiJunctionFrame,
+) -> str | None:
+    """Select the next Child branch only when no sibling is still active."""
+
+    active_states = {
+        "ACTIVE",
+        "ACTIVE_CHILD",
+    }
+
+    active_branches = [
+        branch_uid
+        for branch_uid in child.branch_order
+        if child.branch_states.get(branch_uid)
+        in active_states
+    ]
+
+    # -------------------------------------------------
+    # Strict DFS:
+    # 이전 Child branch가 아직 ACTIVE라면
+    # 다음 sibling branch를 절대 시작하지 않는다.
+    # -------------------------------------------------
+    if active_branches:
+        if len(active_branches) > 1:
+            raise RuntimeError(
+                "Multiple Child branches are ACTIVE: "
+                f"junction={child.junction_uid} "
+                f"active={active_branches}"
+            )
+
+        return None
+
+    if child.active_branch_uid is not None:
+        return None
+
+    # -------------------------------------------------
+    # 앞 branch들은 VISITED여야 하고,
+    # 처음 만나는 UNVISITED branch만 선택한다.
+    # -------------------------------------------------
+    for branch_uid in child.branch_order:
+
+        state = child.branch_states.get(
+            branch_uid
+        )
+
+        if state == "UNVISITED":
+            return branch_uid
+
+        if state != "VISITED":
+            raise RuntimeError(
+                "Invalid Child branch state before "
+                "sibling selection: "
+                f"junction={child.junction_uid} "
+                f"branch={branch_uid} "
+                f"state={state}"
+            )
+
+    return None
+
+def prepare_child_frontier_handoff(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Prepare exactly one Child Guard wall for Frontier transport."""
+
+    child = multi_dfs.current
+
+    if child is None:
+        return
+
+    # Root J0는 기존 Physical DFS가 담당한다.
+    if child.parent_junction_uid is None:
+        return
+
+    # -------------------------------------------------
+    # 1. 현재 Child의 모든 outgoing Guard wall이
+    # 실제로 READY여야 한다.
+    # -------------------------------------------------
+    if not child_all_guard_walls_ready(
+        physical,
+        perception,
+    ):
+        return
+
+    # -------------------------------------------------
+    # 2. Guard lifecycle은 Child Junction당 딱 한 번 저장.
+    #
+    # integration_wall_lifecycle가 비어 있는지를
+    # 초기화 여부로 사용하면 안 된다.
+    # 이 dict는 이후에도 B0/B1 lifecycle을 계속 보존한다.
+    # -------------------------------------------------
+    if not getattr(
+        physical,
+        "integration_child_guard_lifecycle_initialized",
+        False,
+    ):
+        initialize_child_guard_lifecycle(
+            physical,
+            perception,
+            robots,
+        )
+
+    # -------------------------------------------------
+    # 3. 이미 어떤 Child Frontier가 물리적으로 활성 상태면
+    # sibling handoff 금지.
+    # -------------------------------------------------
+    active_frontier_uid = getattr(
+        physical,
+        "integration_child_frontier_active_uid",
+        None,
+    )
+
+    if active_frontier_uid is not None:
+        return
+
+    # -------------------------------------------------
+    # 4. 논리 DFS에서도 기존 branch가 아직 ACTIVE면
+    # sibling 선택 금지.
+    # -------------------------------------------------
+    active_branches = [
+        branch_uid
+        for branch_uid in child.branch_order
+        if child.branch_states.get(branch_uid)
+        in {
+            "ACTIVE",
+            "ACTIVE_CHILD",
+        }
+    ]
+
+    if active_branches:
+        return
+
+    if child.active_branch_uid is not None:
+        return
+
+    # -------------------------------------------------
+    # IMPORTANT:
+    #
+    # 여기서 integration_child_dfs_phase == "IDLE"
+    # 같은 별도 gate를 사용하지 않는다.
+    #
+    # 실제 DFS ownership은
+    # child.branch_states / child.active_branch_uid /
+    # integration_child_frontier_active_uid 로 판정한다.
+    # -------------------------------------------------
+
+    branch_uid = select_next_child_branch_uid(
+        child
+    )
+
+    if branch_uid is None:
+        return
+
+    print(
+        "[ChildAllGuardsReady] "
+        f"junction={child.junction_uid} "
+        f"branches={child.branch_order}"
+    )
+
+    print(
+        "[ChildFrontierPending] "
+        f"junction={child.junction_uid} "
+        f"selected_branch={branch_uid} "
+        "guards_remain_fixed=True "
+        "frontier_transport_ready=True"
+    )
 
 
 def update_child_lidar_probe(
@@ -4856,78 +5298,403 @@ def build_provisional_guard_descriptors_from_lidar(
             f"{[round(float(x['center_angle']), 1) for x in openings]} "
             "fixture_labels_used=False"
         )
-   
+    # =========================================================
+        # Child T-Junction physical mouth frame
+        #
+        # A confirmed Child T-junction has:
+        #
+        #     Parent ingress + two outgoing physical mouths
+        #
+        # For the two outgoing branches, the vector connecting
+        # their finite-mouth midpoints gives the common branch axis.
+        #
+        # No J1 coordinate.
+        # No UP/DOWN fixture.
+        # No global map information.
+        # =========================================================
+
+        child_two_mouth_centers: list[
+            pygame.Vector2
+        ] = []
+
+        child_two_mouth_center: (
+            pygame.Vector2 | None
+        ) = None
+
+        if (
+            branch_uids_override is not None
+            and len(openings) == 2
+        ):
+
+            for child_opening in openings:
+
+                child_start = float(
+                    child_opening[
+                        "start_angle"
+                    ]
+                )
+
+                child_end = float(
+                    child_opening[
+                        "end_angle"
+                    ]
+                )
+
+                (
+                    child_start_point,
+                    _,
+                    _,
+                ) = _nearest_wall_side_endpoint(
+                    frame,
+                    perception,
+                    child_start,
+                    search_direction=-1,
+                )
+
+                (
+                    child_end_point,
+                    _,
+                    _,
+                ) = _nearest_wall_side_endpoint(
+                    frame,
+                    perception,
+                    child_end,
+                    search_direction=+1,
+                )
+
+                child_mouth_world = (
+                    perception.anchor_position
+                    + 0.5
+                    * (
+                        child_start_point
+                        + child_end_point
+                    )
+                )
+
+                child_two_mouth_centers.append(
+                    child_mouth_world
+                )
+
+            if (
+                len(child_two_mouth_centers)
+                == 2
+            ):
+
+                child_two_mouth_center = (
+                    0.5
+                    * (
+                        child_two_mouth_centers[0]
+                        + child_two_mouth_centers[1]
+                    )
+                )
+
+                child_pair_vector = (
+                    child_two_mouth_centers[1]
+                    - child_two_mouth_centers[0]
+                )
+
+                print(
+                    "[ChildTwoMouthFrame] "
+                    f"junction={junction_uid} "
+                    f"mouth0="
+                    f"({child_two_mouth_centers[0].x:.3f},"
+                    f"{child_two_mouth_centers[0].y:.3f}) "
+                    f"mouth1="
+                    f"({child_two_mouth_centers[1].x:.3f},"
+                    f"{child_two_mouth_centers[1].y:.3f}) "
+                    f"center="
+                    f"({child_two_mouth_center.x:.3f},"
+                    f"{child_two_mouth_center.y:.3f}) "
+                    f"pair_vector="
+                    f"({child_pair_vector.x:.3f},"
+                    f"{child_pair_vector.y:.3f})"
+                )
+
+
+
     # =========================================================
     # Junction center estimate
+    #
+    # Root J0:
+    #   기존 검증된 entrance-depth 규칙 그대로 사용.
+    #
+    # Child J1/J2/...:
+    #   Parent에서 실제로 traversed한 ingress axis를 고정하고,
+    #   stationary finite outgoing mouths의 midpoint가 놓이는
+    #   ingress-depth plane으로 Junction center를 추정한다.
+    #
+    # No global Junction coordinate.
     # =========================================================
-    forward = _body_local_unit(
+
+    body_forward = _body_local_unit(
         perception,
         0.0,
     ).normalize()
 
-    broad = max(
-        openings,
-        key=lambda item: float(
-            item["width_deg"]
-        ),
-    )
+    if branch_uids_override is None:
 
-    width_reference = (
-        frame.adaptive_w
-        * PROVISIONAL_MOUTH_WIDTH_W_RATIO
-    )
-
-    boundary_forward_depths: list[float] = []
-
-    for key in (
-        "start_angle",
-        "end_angle",
-    ):
-
-        angle = float(
-            broad[key]
+        # -----------------------------------------------------
+        # ROOT J0 -- 기존 코드 그대로
+        # -----------------------------------------------------
+        forward = (
+            body_forward.copy()
         )
 
-        projection = (
-            _body_local_unit(
-                perception,
-                angle,
-            ).dot(forward)
-            * _range_at_local_angle(
-                frame,
-                angle,
+        broad = max(
+            openings,
+            key=lambda item: float(
+                item["width_deg"]
+            ),
+        )
+
+        width_reference = (
+            frame.adaptive_w
+            * PROVISIONAL_MOUTH_WIDTH_W_RATIO
+        )
+
+        boundary_forward_depths: list[float] = []
+
+        for key in (
+            "start_angle",
+            "end_angle",
+        ):
+
+            angle = float(
+                broad[key]
+            )
+
+            projection = (
+                _body_local_unit(
+                    perception,
+                    angle,
+                ).dot(forward)
+                * _range_at_local_angle(
+                    frame,
+                    angle,
+                )
+            )
+
+            if projection > 0.0:
+                boundary_forward_depths.append(
+                    projection
+                )
+
+        raw_junction_depth = (
+            float(
+                np.mean(
+                    boundary_forward_depths
+                )
+            )
+            if boundary_forward_depths
+            else width_reference
+        )
+
+        junction_depth = float(
+            np.clip(
+                raw_junction_depth,
+                width_reference
+                * PROVISIONAL_JUNCTION_DEPTH_MIN_WIDTH_RATIO,
+                width_reference
+                * PROVISIONAL_JUNCTION_DEPTH_MAX_WIDTH_RATIO,
             )
         )
 
-        if projection > 0.0:
-            boundary_forward_depths.append(
-                projection
+        junction_center = (
+            perception.anchor_position
+            + forward * junction_depth
+        )
+
+    else:
+
+        # -----------------------------------------------------
+        # CHILD J1 / J2 / ...
+        #
+        # Parent -> Child로 실제 이동했던 local ingress axis를
+        # 그대로 사용한다.
+        # -----------------------------------------------------
+        session = (
+            multi_dfs.child_session
+        )
+
+        if (
+            session is not None
+            and session.ingress_t.length_squared()
+            > physical.EPSILON
+        ):
+            forward = (
+                session.ingress_t.normalize()
+            )
+        else:
+            forward = (
+                body_forward.copy()
             )
 
-    raw_junction_depth = (
-        float(
-            np.mean(
-                boundary_forward_depths
+        # 모든 finite mouth midpoint의 ingress depth.
+        all_mouth_depths: list[float] = []
+
+        # 특히 Junction 횡방향으로 열린 mouth들이
+        # Junction crossing plane을 가장 잘 알려준다.
+        non_axial_mouth_depths: list[float] = []
+
+        for center_opening in openings:
+
+            center_start = float(
+                center_opening["start_angle"]
             )
-        )
-        if boundary_forward_depths
-        else width_reference
-    )
 
-    junction_depth = float(
-        np.clip(
-            raw_junction_depth,
-            width_reference
-            * PROVISIONAL_JUNCTION_DEPTH_MIN_WIDTH_RATIO,
-            width_reference
-            * PROVISIONAL_JUNCTION_DEPTH_MAX_WIDTH_RATIO,
-        )
-    )
+            center_end = float(
+                center_opening["end_angle"]
+            )
 
-    junction_center = (
-        perception.anchor_position
-        + forward * junction_depth
-    )
+            center_angle = float(
+                center_opening["center_angle"]
+            )
+
+            try:
+                (
+                    center_start_point,
+                    _,
+                    _,
+                ) = _nearest_wall_side_endpoint(
+                    frame,
+                    perception,
+                    center_start,
+                    search_direction=-1,
+                )
+
+                (
+                    center_end_point,
+                    _,
+                    _,
+                ) = _nearest_wall_side_endpoint(
+                    frame,
+                    perception,
+                    center_end,
+                    search_direction=+1,
+                )
+
+            except RuntimeError:
+                continue
+
+            # _nearest_wall_side_endpoint()의 point는
+            # Anchor 기준 world-oriented relative vector.
+            mouth_mid_local = (
+                0.5
+                * (
+                    center_start_point
+                    + center_end_point
+                )
+            )
+
+            mouth_depth = float(
+                mouth_mid_local.dot(
+                    forward
+                )
+            )
+
+            if mouth_depth <= 0.0:
+                continue
+
+            all_mouth_depths.append(
+                mouth_depth
+            )
+
+            radial = (
+                _body_local_unit(
+                    perception,
+                    center_angle,
+                )
+            )
+
+            if (
+                radial.length_squared()
+                <= physical.EPSILON
+            ):
+                continue
+
+            radial = (
+                radial.normalize()
+            )
+
+            ingress_alignment = abs(
+                float(
+                    radial.dot(
+                        forward
+                    )
+                )
+            )
+
+            # Parent ingress에 거의 직교하는 outgoing mouths가
+            # Junction의 forward crossing plane을 가장 안정적으로
+            # 나타낸다.
+            if (
+                ingress_alignment
+                <= CHILD_CANDIDATE_NON_AXIAL_MAX_DOT
+            ):
+                non_axial_mouth_depths.append(
+                    mouth_depth
+                )
+
+        if non_axial_mouth_depths:
+
+            junction_depth = float(
+                np.median(
+                    non_axial_mouth_depths
+                )
+            )
+
+            center_source = (
+                "CHILD_FINITE_NON_AXIAL_MOUTH_MEDIAN"
+            )
+
+        elif all_mouth_depths:
+
+            junction_depth = float(
+                np.median(
+                    all_mouth_depths
+                )
+            )
+
+            center_source = (
+                "CHILD_FINITE_MOUTH_MEDIAN"
+            )
+
+        else:
+
+            # 실제 finite mouth를 얻지 못했을 때만 fallback.
+            junction_depth = float(
+                frame.adaptive_w
+                * PROVISIONAL_MOUTH_WIDTH_W_RATIO
+            )
+
+            center_source = (
+                "CHILD_ADAPTIVE_W_FALLBACK"
+            )
+
+        # 중요:
+        # Child에서는 J0의
+        # 0.95W <= depth <= 1.25W clip을 적용하지 않는다.
+        #
+        # Anchor가 이미 Junction 가까이에 정지했기 때문에
+        # finite mouth에서 직접 관측된 local depth를 사용한다.
+        junction_center = (
+            perception.anchor_position
+            + forward * junction_depth
+        )
+
+        print(
+            "[ChildJunctionCenterEstimate] "
+            f"junction={junction_uid} "
+            f"depth={junction_depth:.3f} "
+            f"center="
+            f"({junction_center.x:.3f},"
+            f"{junction_center.y:.3f}) "
+            f"non_axial_samples="
+            f"{[round(value, 3) for value in non_axial_mouth_depths]} "
+            f"all_samples="
+            f"{[round(value, 3) for value in all_mouth_depths]} "
+            f"source={center_source}"
+        )
 
     physical.integration_lidar_junction_estimate = (
         junction_center.copy()
@@ -5251,17 +6018,128 @@ def build_provisional_guard_descriptors_from_lidar(
             axis.normalize()
         )
 
-        # Near a side mouth, one threshold opening can be an oblique view of
-        # the ingress corridor.  Its fitted wall then points back along the
-        # parent corridor and would place two of the three rows inside a wall.
-        # Reject that topologically impossible orientation using only the
-        # Anchor-local left/forward/right opening order.
-
-        # =====================================================
-        # Guard / Frontier / Shepherd direction
+        # =========================================================
+        # Child Junction only
         #
-        # ALWAYS 90 degrees to corridor axis
-        # =====================================================
+        # Child stationary LiDAR에서 얻은 두 finite wall endpoints는
+        # 실제 branch mouth의 양쪽 경계를 나타낸다.
+        #
+        # raw_chord:
+        #     wall endpoint A -> wall endpoint B
+        #     = corridor CROSS direction
+        #
+        # 따라서 Child corridor axis는 raw_chord에 정확히 수직으로
+        # 정의한다.
+        #
+        # J0 Root는 기존 wall-fit axis를 그대로 유지한다.
+        # =========================================================
+
+        # =========================================================
+        # Child T-Junction axis correction
+        #
+        # DO NOT use the individual mouth chord as corridor axis
+        # evidence. The chord is perspective-skewed from the Anchor.
+        #
+        # Instead:
+        #
+        # physical mouth 0
+        #        │
+        #        │
+        #        │   common axis
+        #        │
+        # physical mouth 1
+        #
+        # The common midpoint gives the local Junction center and
+        # each branch direction is center -> its own mouth.
+        # =========================================================
+        if (
+            branch_uids_override is not None
+            and child_two_mouth_center
+            is not None
+            and len(
+                child_two_mouth_centers
+            )
+            == len(openings)
+        ):
+
+            wall_fit_axis = (
+                axis.copy()
+            )
+
+            child_axis = (
+                child_two_mouth_centers[index]
+                - child_two_mouth_center
+            )
+
+            if (
+                child_axis.length_squared()
+                <= physical.EPSILON
+            ):
+                raise RuntimeError(
+                    "Child two-mouth axis is degenerate: "
+                    f"uid={branch_uids[index]}"
+                )
+
+            child_axis = (
+                child_axis.normalize()
+            )
+
+            # Safety only:
+            # ensure the axis points toward the observed opening.
+            if (
+                child_axis.dot(
+                    opening_radial
+                )
+                < 0.0
+            ):
+                child_axis = (
+                    -child_axis
+                )
+
+            dot_value = float(
+                np.clip(
+                    wall_fit_axis.dot(
+                        child_axis
+                    ),
+                    -1.0,
+                    1.0,
+                )
+            )
+
+            correction_deg = math.degrees(
+                math.acos(
+                    dot_value
+                )
+            )
+
+            previous_source = (
+                axis_source
+            )
+
+            axis = (
+                child_axis.copy()
+            )
+
+            axis_source = (
+                "CHILD_TWO_MOUTH_CENTER_AXIS"
+            )
+
+            print(
+                "[ChildCorridorAxisCorrection] "
+                f"uid={branch_uids[index]} "
+                f"wall_fit="
+                f"({wall_fit_axis.x:.3f},"
+                f"{wall_fit_axis.y:.3f}) "
+                f"two_mouth_axis="
+                f"({axis.x:.3f},"
+                f"{axis.y:.3f}) "
+                f"correction_deg="
+                f"{correction_deg:.2f} "
+                f"previous_source="
+                f"{previous_source}"
+            )
+
+
         mouth_normal = pygame.Vector2(
             -axis.y,
             axis.x,
@@ -5791,8 +6669,8 @@ def build_sealing_aware_slots(
     if current_walkable < total_required:
 
         max_extra_inset = min(
-            2.0 * physical.ROBOT_RADIUS,
-            0.10 * mouth_span,
+            4.0 * physical.ROBOT_RADIUS,
+            0.15 * mouth_span,
         )
 
         corrected = False
@@ -5834,6 +6712,102 @@ def build_sealing_aware_slots(
                 break
 
         if not corrected:
+
+            # ---------------------------------------------------------
+            # Diagnostic only.
+            #
+            # Do NOT relax the Guard feasibility condition.
+            # Identify exactly which layer/column is outside
+            # the physical walkable region.
+            # ---------------------------------------------------------
+            diagnostic_spacing = (
+                lateral_max - lateral_min
+            ) / max(
+                columns - 1,
+                1,
+            )
+
+            unwalkable_diagnostics = []
+
+            for layer in range(layers):
+
+                axial = (
+                    physical.JUNCTION_GUARD_BRANCH_INSET
+                    + layer
+                    * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+                )
+
+                for column in range(columns):
+
+                    lateral = (
+                        lateral_min
+                        + diagnostic_spacing
+                        * column
+                    )
+
+                    slot = (
+                        mouth_center
+                        + tangent * axial
+                        + normal * lateral
+                    )
+
+                    if physical.is_walkable(
+                        slot,
+                        physical.ROBOT_RADIUS,
+                    ):
+                        continue
+
+                    unwalkable_diagnostics.append(
+                        (
+                            layer,
+                            column,
+                            axial,
+                            lateral,
+                            slot.x,
+                            slot.y,
+                        )
+                    )
+
+            print(
+                "[GuardUnwalkableSummary] "
+                f"uid={descriptor.uid} "
+                f"rows={layers} "
+                f"cols={columns} "
+                f"unwalkable="
+                f"{len(unwalkable_diagnostics)}/"
+                f"{total_required} "
+                f"t=({tangent.x:.3f},"
+                f"{tangent.y:.3f}) "
+                f"n=({normal.x:.3f},"
+                f"{normal.y:.3f}) "
+                f"mouth="
+                f"({mouth_center.x:.3f},"
+                f"{mouth_center.y:.3f}) "
+                f"span="
+                f"{lateral_max - lateral_min:.3f}"
+            )
+
+            for (
+                layer,
+                column,
+                axial,
+                lateral,
+                world_x,
+                world_y,
+            ) in unwalkable_diagnostics:
+
+                print(
+                    "[GuardUnwalkableSlot] "
+                    f"uid={descriptor.uid} "
+                    f"layer={layer} "
+                    f"column={column} "
+                    f"axial={axial:.3f} "
+                    f"lateral={lateral:.3f} "
+                    f"world="
+                    f"({world_x:.3f},"
+                    f"{world_y:.3f})"
+                )
+
             raise RuntimeError(
                 f"Guard geometry has unreachable slots: "
                 f"uid={descriptor.uid} "
@@ -6685,6 +7659,21 @@ def update_guard_readiness_and_activation(
     for geometry in perception.provisional_guards:
 
         if geometry.cohort_ready:
+            continue
+        lifecycle = (
+            physical.integration_wall_lifecycle.get(
+                geometry.provisional_uid
+            )
+        )
+
+        if (
+            lifecycle is not None
+            and lifecycle.get(
+                "state",
+                "GUARD",
+            )
+            != "GUARD"
+        ):
             continue
 
         physical.integration_guard_who_localization_enabled = True
@@ -9105,7 +10094,18 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         usable_half = physical.local_physical_usable_half_width(descriptor)
         cohort = []
         for robot in robots:
-            if robot.role != "NORMAL":
+
+            if (
+                robot.role != "NORMAL"
+                or robot.base_reserve
+                or bool(
+                    getattr(
+                        robot,
+                        "is_fixed_anchor",
+                        False,
+                    )
+                )
+            ):
                 continue
             axial, lateral = physical.branch_local_coordinates(
                 robot.position, descriptor
@@ -12894,6 +13894,3766 @@ def advance_guard_settling_waypoints(
             waypoints.pop(0)
             robot.junction_guard_anchor = waypoints[0].copy()
 
+def child_rigid_wall_target(
+    physical: types.ModuleType,
+    descriptor: Any,
+    lifecycle: dict[str, Any],
+    robot_id: int,
+    centroid_depth: float,
+) -> pygame.Vector2:
+    """Translate the exact original Child Guard wall without deformation."""
+
+    tangent, _ = (
+        physical.descriptor_local_basis(
+            descriptor
+        )
+    )
+
+    anchor_by_id = lifecycle.get(
+        "guard_anchor_by_id",
+        {},
+    )
+
+    original_anchor = anchor_by_id.get(
+        robot_id
+    )
+
+    if original_anchor is None:
+        raise RuntimeError(
+            "Child rigid wall missing original Guard anchor: "
+            f"uid={descriptor.uid} "
+            f"robot={robot_id}"
+        )
+
+    original_depth = float(
+        lifecycle[
+            "original_guard_centroid_axial"
+        ]
+    )
+
+    translation = (
+        tangent
+        * (
+            float(centroid_depth)
+            - original_depth
+        )
+    )
+
+    return (
+        original_anchor.copy()
+        + translation
+    )
+
+
+def install_child_frontier_transport_runtime(
+    physical: types.ModuleType,
+) -> None:
+    """Descriptor-local Child Frontier/Shepherd physical boundary runtime."""
+
+    # saturation bridge가 설치한 최종 Robot.update를 보존.
+    original_robot_update = physical.Robot.update
+
+    # =================================================
+    # Child dynamic wall runtime
+    # =================================================
+    physical.integration_child_frontier_active_uid = None
+    physical.integration_child_frontier_ids = set()
+    physical.integration_child_frontier_offsets = {}
+
+    physical.integration_child_frontier_centroid_lateral = 0.0
+
+    physical.integration_child_frontier_depth = 0.0
+    physical.integration_child_frontier_target_depth = 0.0
+
+    physical.integration_child_frontier_bootstrap_complete = False
+    physical.integration_child_frontier_ready_logged = False
+
+    # -------------------------------------------------
+    # Child Physical DFS state.
+    #
+    # IMPORTANT:
+    # physical.phase를 J1 때문에 EXPLORE_BRANCH로 바꾸지 않는다.
+    # dynamic J1-B0/J1-B1은 fixture가 아니기 때문이다.
+    # -------------------------------------------------
+    physical.integration_child_dfs_phase = "IDLE"
+
+        # =================================================
+    # Child Physical DFS piston tuning
+    #
+    # PRESSURE_PUSH:
+    # 짧고 강한 압축을 만들어 SPH pressure를 올린다.
+    #
+    # FLOW_BACKTRACK:
+    # 압축 후 만들어진 후퇴 흐름을 계속 유지한다.
+    # =================================================
+        # =================================================
+    # Child J1 wall motion policy
+    #
+    # 탐색은 군집보다 먼저 질주하면 안 된다.
+    # Backtracking은 반대로 빠른 piston이어야 한다.
+    #
+    # 여기 값은 MOTION_SPEED_MULTIPLIER와 독립적인
+    # 실제 world-space px/s 값이다.
+    # =================================================
+
+    physical.integration_child_frontier_cruise_speed = 10.0
+
+    physical.integration_child_pressure_push_speed = 42.0
+
+    physical.integration_child_flow_backtrack_speed = 36.0
+
+    # Frontier는 NORMAL 극단값 98%가 아니라
+    # 실제 주 군집 front를 따라간다.
+    physical.integration_child_frontier_support_quantile = 0.90
+
+    # Shepherd만 NORMAL을 실제로 압축할 수 있음.
+    physical.integration_child_active_min_center_gap_ratio = 1.50
+
+
+    physical.integration_child_fill_dwell = 0.0
+    physical.integration_child_flow_dwell = 0.0
+
+    physical.integration_child_fill_baseline_density = None
+    physical.integration_child_fill_baseline_pressure = None
+
+    # =================================================
+    # Swept robot-vs-robot collision limiter
+    # =================================================
+    def child_boundary_robot_swept_limit(
+        robot: Any,
+        old_position: pygame.Vector2,
+        proposed_position: pygame.Vector2,
+    ) -> pygame.Vector2:
+        """Prevent Child Frontier/Shepherd from tunnelling through robots."""
+
+        movement = (
+            proposed_position
+            - old_position
+        )
+
+        movement_sq = movement.length_squared()
+
+        if movement_sq <= physical.EPSILON:
+            return proposed_position.copy()
+
+        boundary_ids = set(
+            getattr(
+                physical,
+                "integration_child_frontier_ids",
+                set(),
+            )
+        )
+
+        max_alpha = 1.0
+
+        current_robots = getattr(
+            physical,
+            "integration_current_robots",
+            (),
+        )
+
+        for other in current_robots:
+
+            if other is robot:
+                continue
+
+            # 같은 3×N rigid wall 내부 로봇끼리는
+            # 저장된 relative offset controller가 구조를 유지한다.
+            if other.robot_id in boundary_ids:
+                continue
+
+            other_radius = float(
+                getattr(
+                    other,
+                    "radius",
+                    physical.ROBOT_RADIUS,
+                )
+            )
+
+            child_phase = getattr(
+                physical,
+                "integration_child_dfs_phase",
+                "IDLE",
+            )
+
+            # =================================================
+            # Frontier:
+            # 다른 로봇을 절대로 관통하지 않음.
+            #
+            # Shepherd PRESSURE_PUSH / FLOW_BACKTRACK:
+            # soft-body piston이므로 NORMAL과 약간의
+            # compliant overlap을 허용한다.
+            #
+            # center crossing은 여전히 절대 허용하지 않는다.
+            # =================================================
+            if (
+                robot.role == "SHEPHERD"
+                and other.role == "NORMAL"
+                and child_phase in {
+                    "PRESSURE_PUSH",
+                    "FLOW_BACKTRACK",
+                }
+            ):
+
+                minimum_distance = (
+                    float(
+                        getattr(
+                            physical,
+                            "integration_child_active_min_center_gap_ratio",
+                            1.50,
+                        )
+                    )
+                    * float(
+                        physical.ROBOT_RADIUS
+                    )
+                )
+
+            else:
+
+                minimum_distance = (
+                    float(robot.radius)
+                    + other_radius
+                )
+
+            relative = (
+                old_position
+                - other.position
+            )
+
+            c = (
+                relative.length_squared()
+                - minimum_distance**2
+            )
+
+            # 이미 아주 조금 겹쳐 있는 상태라면
+            # 더 안쪽으로 파고드는 이동만 금지한다.
+            if c <= 0.0:
+
+                if relative.dot(movement) < 0.0:
+                    max_alpha = 0.0
+
+                continue
+
+            a = movement_sq
+
+            b = (
+                2.0
+                * relative.dot(movement)
+            )
+
+            discriminant = (
+                b * b
+                - 4.0 * a * c
+            )
+
+            if discriminant < 0.0:
+                continue
+
+            sqrt_discriminant = math.sqrt(
+                discriminant
+            )
+
+            hit_alpha = (
+                -b
+                - sqrt_discriminant
+            ) / (
+                2.0 * a
+            )
+
+            if (
+                0.0
+                <= hit_alpha
+                <= 1.0
+            ):
+                max_alpha = min(
+                    max_alpha,
+                    max(
+                        0.0,
+                        hit_alpha - 1.0e-3,
+                    ),
+                )
+
+        return (
+            old_position
+            + movement * max_alpha
+        )
+
+    # =================================================
+    # Dynamic Child wall Robot.update
+    # =================================================
+    def child_frontier_robot_update(
+        self: Any,
+        dt: float,
+    ) -> None:
+        """Move one Child Frontier/Shepherd as part of one rigid 3xN wall."""
+
+        uid = getattr(
+            physical,
+            "integration_child_frontier_active_uid",
+            None,
+        )
+
+        boundary_ids = set(
+            getattr(
+                physical,
+                "integration_child_frontier_ids",
+                set(),
+            )
+        )
+
+        is_child_boundary = (
+            uid is not None
+            and self.robot_id in boundary_ids
+            and self.shepherd_branch == uid
+            and self.role in {
+                "FRONTIER_SHEPHERD",
+                "SHEPHERD",
+            }
+        )
+
+        # -------------------------------------------------
+        # Root / NORMAL / Guard / Pebble / Relay 등은
+        # 기존 Robot.update 그대로.
+        # -------------------------------------------------
+        if not is_child_boundary:
+            return original_robot_update(
+                self,
+                dt,
+            )
+
+        descriptor = (
+            physical.branch_descriptors_by_uid.get(
+                uid
+            )
+        )
+
+        if descriptor is None:
+            raise RuntimeError(
+                "Child rigid wall descriptor missing: "
+                f"uid={uid}"
+            )
+
+        lifecycle = (
+            physical.integration_wall_lifecycle.get(
+                uid
+            )
+        )
+
+        if lifecycle is None:
+            raise RuntimeError(
+                "Child rigid wall lifecycle missing: "
+                f"uid={uid}"
+            )
+
+        anchor_by_id = lifecycle.get(
+            "guard_anchor_by_id",
+            {},
+        )
+
+        if self.robot_id not in anchor_by_id:
+            raise RuntimeError(
+                "Child rigid wall original Guard anchor missing: "
+                f"uid={uid} "
+                f"robot={self.robot_id}"
+            )
+
+        current_robots = tuple(
+            getattr(
+                physical,
+                "integration_current_robots",
+                (),
+            )
+        )
+
+        boundary_members = [
+            robot
+            for robot in current_robots
+            if (
+                robot.robot_id in boundary_ids
+                and robot.shepherd_branch == uid
+                and robot.role in {
+                    "FRONTIER_SHEPHERD",
+                    "SHEPHERD",
+                }
+            )
+        ]
+
+        if (
+            len(boundary_members)
+            != len(boundary_ids)
+        ):
+            raise RuntimeError(
+                "Child rigid wall member count mismatch: "
+                f"uid={uid} "
+                f"expected={len(boundary_ids)} "
+                f"actual={len(boundary_members)}"
+            )
+
+        frame = int(
+            getattr(
+                physical,
+                "integration_frame",
+                -1,
+            )
+        )
+
+        child_phase = getattr(
+            physical,
+            "integration_child_dfs_phase",
+            "IDLE",
+        )
+
+        # =================================================
+        # 한 frame에서 wall motion plan은 단 한 번만 계산.
+        #
+        # 이후 96대 모두 같은 plan을 사용한다.
+        # =================================================
+
+        cached_frame = getattr(
+            physical,
+            "integration_child_rigid_wall_plan_frame",
+            None,
+        )
+
+        cached_uid = getattr(
+            physical,
+            "integration_child_rigid_wall_plan_uid",
+            None,
+        )
+
+        need_new_plan = (
+            cached_frame != frame
+            or cached_uid != uid
+        )
+
+        if need_new_plan:
+
+            requested_depth = float(
+                physical.integration_child_frontier_depth
+            )
+
+            # -------------------------------------------------
+            # 실제 wall이 마지막으로 적용한 공통 depth.
+            # 처음에는 현재 requested depth에서 시작.
+            # -------------------------------------------------
+            applied_uid = getattr(
+                physical,
+                "integration_child_rigid_applied_uid",
+                None,
+            )
+
+            if applied_uid != uid:
+
+                applied_depth = requested_depth
+
+                physical.integration_child_rigid_applied_uid = (
+                    uid
+                )
+
+            else:
+
+                applied_depth = float(
+                    getattr(
+                        physical,
+                        "integration_child_rigid_applied_depth",
+                        requested_depth,
+                    )
+                )
+
+            # -------------------------------------------------
+            # FILL에서는 Shepherd 완전 정지.
+            #
+            # 설령 다른 controller가 depth를 실수로 바꿔도
+            # 여기서 실제 wall은 움직이지 않는다.
+            # -------------------------------------------------
+            if (
+                self.role == "SHEPHERD"
+                and child_phase == "FILL"
+            ):
+                requested_depth = (
+                    applied_depth
+                )
+
+            candidate_positions: dict[
+                int,
+                pygame.Vector2,
+            ] = {}
+
+            for member in boundary_members:
+
+                candidate_positions[
+                    member.robot_id
+                ] = child_rigid_wall_target(
+                    physical,
+                    descriptor,
+                    lifecycle,
+                    member.robot_id,
+                    requested_depth,
+                )
+
+            wall_allowed = True
+            blocking_reason = "NONE"
+
+            # =================================================
+            # 1. Static wall collision
+            #
+            # 한 robot이라도 불가능하면
+            # 96대 전체가 이번 frame HOLD.
+            # =================================================
+            for member in boundary_members:
+
+                candidate = (
+                    candidate_positions[
+                        member.robot_id
+                    ]
+                )
+
+                if not physical.is_walkable(
+                    candidate,
+                    member.radius,
+                ):
+                    wall_allowed = False
+                    blocking_reason = (
+                        "STATIC_WALL"
+                    )
+                    break
+
+            # =================================================
+            # 2. Communication constraint
+            #
+            # 같은 3×N wall 내부 parent는 같이 움직이므로
+            # 내부 link는 검사하지 않는다.
+            #
+            # wall 외부 parent와의 연결만 검사한다.
+            #
+            # 하나라도 끊기면 wall 전체 HOLD.
+            # =================================================
+            if wall_allowed:
+
+                hard_limit = float(
+                    physical.COMM_GUARD_HARD_LIMIT
+                )
+
+                for member in boundary_members:
+
+                    if not bool(
+                        getattr(
+                            member,
+                            "connected_to_base",
+                            False,
+                        )
+                    ):
+                        continue
+
+                    parent = getattr(
+                        member,
+                        "comm_parent",
+                        None,
+                    )
+
+                    if parent is None:
+                        continue
+
+                    parent_id = getattr(
+                        parent,
+                        "robot_id",
+                        None,
+                    )
+
+                    # 같은 rigid wall의 parent라면
+                    # 상대거리가 변하지 않으므로 skip.
+                    if parent_id in boundary_ids:
+                        continue
+
+                    candidate = (
+                        candidate_positions[
+                            member.robot_id
+                        ]
+                    )
+
+                    parent_position = getattr(
+                        parent,
+                        "position",
+                        None,
+                    )
+
+                    if parent_position is None:
+                        continue
+
+                    proposed_distance = (
+                        candidate.distance_to(
+                            parent_position
+                        )
+                    )
+
+                    if (
+                        proposed_distance
+                        > hard_limit
+                    ):
+                        wall_allowed = False
+                        blocking_reason = (
+                            "COMM_EXTERNAL_PARENT"
+                        )
+                        break
+
+            # =================================================
+            # 3. Robot collision
+            #
+            # 개별 robot의 위치를 따로 제한하지 않는다.
+            #
+            # 대신 모든 boundary member에 대해
+            # proposed rigid position이 가능한지만 검사하고,
+            # 하나라도 막히면 3×N 전체가 HOLD.
+            #
+            # PRESSURE_PUSH/FLOW_BACKTRACK에서는
+            # child_boundary_robot_swept_limit() 내부의
+            # 1.50R soft compression rule이 사용된다.
+            # =================================================
+                        # =================================================
+            # 3. Robot contact
+            #
+            # 중요:
+            # NORMAL과 접촉했다고 wall 전체를 HOLD하지 않는다.
+            #
+            # 각 Shepherd가 이번 frame에 갈 수 있는 비율을 계산하고
+            # 가장 작은 비율을 3xN 전체에 공통 적용한다.
+            #
+            # 따라서:
+            #
+            # - Guard 원래 형상 유지
+            # - NORMAL 관통 없음
+            # - NORMAL과 실제 접촉 가능
+            # - 접촉한 만큼 계속 piston advance 가능
+            # =================================================
+
+            contact_limited = False
+            common_progress = 1.0
+
+            if wall_allowed:
+
+                for member in boundary_members:
+
+                    old_member_position = (
+                        member.position.copy()
+                    )
+
+                    candidate = (
+                        candidate_positions[
+                            member.robot_id
+                        ]
+                    )
+
+                    requested_motion = (
+                        candidate
+                        - old_member_position
+                    )
+
+                    requested_length_sq = (
+                        requested_motion.length_squared()
+                    )
+
+                    if (
+                        requested_length_sq
+                        <= physical.EPSILON
+                    ):
+                        continue
+
+                    limited_candidate = (
+                        child_boundary_robot_swept_limit(
+                            member,
+                            old_member_position,
+                            candidate,
+                        )
+                    )
+
+                    limited_motion = (
+                        limited_candidate
+                        - old_member_position
+                    )
+
+                    member_progress = (
+                        limited_motion.dot(
+                            requested_motion
+                        )
+                        / requested_length_sq
+                    )
+
+                    member_progress = max(
+                        0.0,
+                        min(
+                            1.0,
+                            member_progress,
+                        ),
+                    )
+
+                    common_progress = min(
+                        common_progress,
+                        member_progress,
+                    )
+
+            if (
+                wall_allowed
+                and common_progress
+                < 1.0 - 1.0e-6
+            ):
+
+                contact_limited = True
+
+                requested_depth = (
+                    applied_depth
+                    + (
+                        requested_depth
+                        - applied_depth
+                    )
+                    * common_progress
+                )
+
+            # =================================================
+            # 4. 공통 wall depth commit
+            # =================================================
+            if wall_allowed:
+
+                committed_depth = (
+                    requested_depth
+                )
+
+            else:
+
+                committed_depth = (
+                    applied_depth
+                )
+            # Controller상의 depth와 실제 rigid wall 위치를
+            # 항상 동일하게 유지한다.
+            physical.integration_child_frontier_depth = (
+                committed_depth
+            )
+            # -------------------------------------------------
+            # 최종 위치를 다시 ORIGINAL Guard anchors에서
+            # 공통 translation으로 생성.
+            #
+            # 그러므로 상대 위치는 항상:
+            #
+            #   Pi - Pj
+            #     =
+            #   GuardPi - GuardPj
+            #
+            # 가 된다.
+            # -------------------------------------------------
+            committed_positions: dict[
+                int,
+                pygame.Vector2,
+            ] = {}
+
+            for member in boundary_members:
+
+                committed_positions[
+                    member.robot_id
+                ] = child_rigid_wall_target(
+                    physical,
+                    descriptor,
+                    lifecycle,
+                    member.robot_id,
+                    committed_depth,
+                )
+
+            physical.integration_child_rigid_wall_plan_frame = (
+                frame
+            )
+
+            physical.integration_child_rigid_wall_plan_uid = (
+                uid
+            )
+
+            physical.integration_child_rigid_wall_plan_positions = (
+                committed_positions
+            )
+
+            physical.integration_child_rigid_applied_depth = (
+                committed_depth
+            )
+
+            physical.integration_child_rigid_wall_blocked = (
+                not wall_allowed
+            )
+
+            physical.integration_child_rigid_wall_block_reason = (
+                blocking_reason
+            )
+
+            if (
+                not wall_allowed
+                and frame % 20 == 0
+            ):
+                print(
+                    "[ChildRigidWallHold] "
+                    f"uid={uid} "
+                    f"phase={child_phase} "
+                    f"reason={blocking_reason} "
+                    f"requested_depth="
+                    f"{requested_depth:.3f} "
+                    f"applied_depth="
+                    f"{applied_depth:.3f}"
+                )
+            if (
+                contact_limited
+                and frame % 20 == 0
+            ):
+                print(
+                    "[ChildRigidWallContactLimit] "
+                    f"uid={uid} "
+                    f"phase={child_phase} "
+                    f"progress={common_progress:.3f} "
+                    f"requested_depth="
+                    f"{requested_depth:.3f} "
+                    f"applied_depth="
+                    f"{applied_depth:.3f}"
+                )
+        # =================================================
+        # 여기부터는 96대 각각이 같은 cached plan을
+        # 실행만 한다.
+        #
+        # 속도 계산 X
+        # 개별 communication clamp X
+        # 개별 collision clamp X
+        # =================================================
+
+        plan_positions = getattr(
+            physical,
+            "integration_child_rigid_wall_plan_positions",
+            {},
+        )
+
+        target = plan_positions.get(
+            self.robot_id
+        )
+
+        if target is None:
+            raise RuntimeError(
+                "Child rigid wall planned position missing: "
+                f"uid={uid} "
+                f"robot={self.robot_id}"
+            )
+
+        old_position = (
+            self.position.copy()
+        )
+
+        # -------------------------------------------------
+        # 실제 이동.
+        #
+        # target 자체가 이미:
+        #   - common depth
+        #   - communication test
+        #   - robot collision test
+        #   - static-wall test
+        #
+        # 를 통과한 rigid-wall 위치다.
+        # -------------------------------------------------
+        self.position = (
+            target.copy()
+        )
+
+        self.observed_velocity = (
+            self.position
+            - old_position
+        ) / max(
+            dt,
+            physical.EPSILON,
+        )
+
+        self.velocity = (
+            self.observed_velocity.copy()
+        )
+
+        self.commanded_velocity = (
+            self.observed_velocity.copy()
+        )
+
+        # 이 wall은 target-controlled rigid boundary.
+        self.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        self.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        if hasattr(
+            physical,
+            "update_indirect_contact_state",
+        ):
+            physical.update_indirect_contact_state(
+                self,
+                dt,
+            )
+
+        self.previous_position = (
+            old_position
+        )
+
+        self._record_motion()
+
+    physical.Robot.update = (
+        child_frontier_robot_update
+    )
+
+
+def install_child_branch_physical_drive(
+    physical: types.ModuleType,
+) -> None:
+    """Drive the movable NORMAL swarm into the selected dynamic Child branch."""
+
+    # IMPORTANT:
+    # install_local_physical_saturation_bridge()가 설치한
+    # 최종 route-force wrapper를 다시 감싼다.
+    original_route_force = (
+        physical.compute_route_force
+    )
+
+    def child_real_shepherd_contact_force(
+        robot: Any,
+        descriptor: Any,
+        branch_uid: str,
+    ) -> pygame.Vector2:
+        """Real spring-damper contact from visible Child Shepherd robots."""
+
+        child_phase = getattr(
+            physical,
+            "integration_child_dfs_phase",
+            "IDLE",
+        )
+
+        if child_phase not in {
+            "PRESSURE_PUSH",
+            "FLOW_BACKTRACK",
+        }:
+            return pygame.Vector2()
+
+        current_robots = getattr(
+            physical,
+            "integration_current_robots",
+            (),
+        )
+
+        shepherd_ids = set(
+            getattr(
+                physical,
+                "integration_child_frontier_ids",
+                set(),
+            )
+        )
+
+        shepherds = [
+            other
+            for other in current_robots
+            if (
+                other.robot_id
+                in shepherd_ids
+                and other.role == "SHEPHERD"
+                and other.shepherd_branch
+                == branch_uid
+            )
+        ]
+
+        if not shepherds:
+            return pygame.Vector2()
+
+        radius = float(
+            physical.ROBOT_RADIUS
+        )
+
+        shell_ratio = float(
+            getattr(
+                physical,
+                "integration_shepherd_contact_shell_ratio",
+                2.35,
+            )
+        )
+
+        spring_scale = float(
+            getattr(
+                physical,
+                "integration_shepherd_contact_spring_scale",
+                2.50,
+            )
+        )
+
+        damping_scale = float(
+            getattr(
+                physical,
+                "integration_shepherd_contact_damping_scale",
+                1.00,
+            )
+        )
+
+        spring_gain = (
+            float(physical.REPULSION_GAIN)
+            * spring_scale
+        )
+
+        damping_gain = (
+            float(
+                getattr(
+                    physical,
+                    "VISCOELASTIC_DASHPOT_GAIN",
+                    physical.DAMPING,
+                )
+            )
+            * damping_scale
+        )
+
+        total_force = (
+            pygame.Vector2()
+        )
+
+        contact_count = 0
+
+        for shepherd in shepherds:
+
+            delta = (
+                robot.position
+                - shepherd.position
+            )
+
+            distance_sq = (
+                delta.length_squared()
+            )
+
+            if distance_sq <= physical.EPSILON:
+
+                contact_normal = (
+                    descriptor.local_return_direction.normalize()
+                )
+
+                distance = 0.0
+
+            else:
+
+                distance = math.sqrt(
+                    distance_sq
+                )
+
+                contact_radius = max(
+                    float(robot.radius)
+                    + float(shepherd.radius)
+                    + 0.05 * radius,
+
+                    shell_ratio * radius,
+                )
+
+                if distance >= contact_radius:
+                    continue
+
+                contact_normal = (
+                    delta / distance
+                )
+
+            compression = max(
+                0.0,
+                contact_radius
+                - distance,
+            )
+
+            relative_normal_speed = (
+                robot.velocity
+                - shepherd.velocity
+            ).dot(
+                contact_normal
+            )
+
+            magnitude = max(
+                0.0,
+                spring_gain * compression
+                - damping_gain
+                * relative_normal_speed,
+            )
+
+            total_force += (
+                contact_normal
+                * magnitude
+            )
+
+            contact_count += 1
+
+        # 비정상적으로 큰 순간 contact force 방지.
+        force_limit = float(
+            getattr(
+                physical,
+                "PHYSICAL_GUARD_FORCE_LIMIT",
+                getattr(
+                    physical,
+                    "MAX_ACCELERATION",
+                    300.0,
+                ),
+            )
+        )
+
+        if (
+            total_force.length_squared()
+            > force_limit**2
+        ):
+            total_force.scale_to_length(
+                force_limit
+            )
+
+        setattr(
+            robot,
+            "last_child_shepherd_contact_count",
+            contact_count,
+        )
+
+        setattr(
+            robot,
+            "last_child_shepherd_contact_force",
+            total_force.length(),
+        )
+
+        return total_force
+
+
+
+    def child_branch_route_force(
+        robot: Any,
+    ) -> pygame.Vector2:
+
+        child = multi_dfs.current
+
+        # Root에서는 기존 Physical DFS 그대로.
+        if (
+            child is None
+            or child.parent_junction_uid
+            is None
+        ):
+            return original_route_force(
+                robot
+            )
+
+        branch_uid = getattr(
+            physical,
+            "integration_child_frontier_active_uid",
+            None,
+        )
+
+        if branch_uid is None:
+            return original_route_force(
+                robot
+            )
+
+        # Guard / Frontier / Shepherd / Pebble / Relay는
+        # 이 swarm drive를 받지 않는다.
+        if (
+            robot.role != "NORMAL"
+            or robot.base_reserve
+            or bool(
+                getattr(
+                    robot,
+                    "is_fixed_anchor",
+                    False,
+                )
+            )
+        ):
+            return original_route_force(
+                robot
+            )
+
+        descriptor = (
+            physical.branch_descriptors_by_uid.get(
+                branch_uid
+            )
+        )
+
+        if descriptor is None:
+            return original_route_force(
+                robot
+            )
+
+        child_phase = getattr(
+            physical,
+            "integration_child_dfs_phase",
+            "IDLE",
+        )
+
+        tangent, normal = (
+            physical.descriptor_local_basis(
+                descriptor
+            )
+        )
+
+        tangent = tangent.normalize()
+        normal = normal.normalize()
+
+        axial, lateral = (
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        )
+
+        usable_half = (
+            physical.local_physical_usable_half_width(
+                descriptor
+            )
+        )
+
+        observed_width = max(
+            float(
+                getattr(
+                    descriptor,
+                    "observed_physical_width",
+                    0.0,
+                )
+                or getattr(
+                    descriptor,
+                    "observed_width",
+                    0.0,
+                )
+            ),
+            4.0 * physical.ROBOT_RADIUS,
+        )
+
+        drive_force = float(
+            getattr(
+                physical,
+                "ROUTE_FORCE",
+                adaptive.LOCAL_FORWARD_DRIVE_FORCE,
+            )
+        )
+
+        centering_gain = float(
+            getattr(
+                physical,
+                "CENTERING_GAIN",
+                1.0,
+            )
+        )
+
+        # =================================================
+        # EXPLORE / FILL
+        #
+        # 모든 movable NORMAL이 선택 Child branch로 들어감.
+        # =================================================
+        if child_phase in {
+            "EXPLORE",
+            "FILL",
+        }:
+
+            # Mouth 앞의 Junction 공간으로 먼저 모은 후
+            # branch 방향으로 넣는다.
+            #
+            # 따라서 J1-B0이 UP이라고 하드코딩하지 않는다.
+            staging_distance = max(
+                0.35 * observed_width,
+                4.0 * physical.ROBOT_RADIUS,
+            )
+
+            staging_point = (
+                descriptor.observed_mouth_position
+                - tangent
+                * staging_distance
+            )
+
+            # 아직 mouth보다 충분히 뒤이거나
+            # branch centerline에서 너무 멀면
+            # 먼저 staging point로 이동.
+            if (
+                axial
+                < -0.20 * observed_width
+                or abs(lateral)
+                > usable_half * 1.10
+            ):
+
+                delta = (
+                    staging_point
+                    - robot.position
+                )
+
+                if (
+                    delta.length_squared()
+                    <= physical.EPSILON
+                ):
+                    return pygame.Vector2()
+
+                return (
+                    delta.normalize()
+                    * drive_force
+                )
+
+            # mouth 근처부터는 branch tangent 방향으로
+            # SPH 군집 전체가 같이 전진.
+            lateral_force = (
+                -centering_gain
+                * lateral
+            )
+
+            max_lateral_force = (
+                0.45 * drive_force
+            )
+
+            lateral_force = max(
+                -max_lateral_force,
+                min(
+                    max_lateral_force,
+                    lateral_force,
+                ),
+            )
+
+            return (
+                tangent * drive_force
+                + normal * lateral_force
+            )
+
+        # =================================================
+        # PRESSURE_PUSH / FLOW_BACKTRACK
+        #
+        # Branch 내부 NORMAL에는 Junction 방향
+        # artificial suction을 주지 않는다.
+        #
+        # 실제 Shepherd contact + SPH로만 뒤로 밀린다.
+        # =================================================
+        if child_phase in {
+            "PRESSURE_PUSH",
+            "FLOW_BACKTRACK",
+        }:
+
+            lateral_force = (
+                -centering_gain
+                * lateral
+            )
+
+            lateral_limit = (
+                0.35 * drive_force
+            )
+
+            lateral_force = max(
+                -lateral_limit,
+                min(
+                    lateral_limit,
+                    lateral_force,
+                ),
+            )
+
+            force = (
+                normal * lateral_force
+            )
+
+            # 아직 branch 내부에 있으면
+            # axial return force를 직접 주지 않는다.
+            if axial > 0.0:
+
+                force += (
+                    child_real_shepherd_contact_force(
+                        robot,
+                        descriptor,
+                        branch_uid,
+                    )
+                )
+
+                return force
+
+            # 이미 mouth를 넘어 J1 Junction 쪽으로 나온 로봇만
+            # Shepherd 앞 공간을 비우도록 local return 방향으로 이동.
+            outlet_force = float(
+                getattr(
+                    physical,
+                    "OUTLET_FORCE",
+                    drive_force,
+                )
+            )
+
+            return (
+                descriptor.local_return_direction.normalize()
+                * outlet_force
+                + force
+            )
+
+        return original_route_force(
+            robot
+        )
+
+    physical.compute_route_force = (
+        child_branch_route_force
+    )
+
+def compute_child_frontier_walkable_target_depth(
+    physical: types.ModuleType,
+    descriptor: Any,
+    relative_offsets: dict[int, tuple[float, float]],
+    centroid_lateral: float,
+    start_depth: float,
+    requested_target_depth: float,
+) -> float:
+    """Return the deepest common centroid depth where the whole 3xN wall is walkable."""
+
+    tangent, normal = (
+        physical.descriptor_local_basis(
+            descriptor
+        )
+    )
+
+    mouth = (
+        descriptor.observed_mouth_position
+    )
+
+    if mouth is None:
+        raise RuntimeError(
+            "Child Frontier walkability check requires mouth: "
+            f"uid={descriptor.uid}"
+        )
+
+    def whole_wall_walkable(
+        centroid_depth: float,
+    ) -> bool:
+
+        for (
+            axial_offset,
+            lateral_offset,
+        ) in relative_offsets.values():
+
+            target = (
+                mouth
+                + tangent
+                * (
+                    float(centroid_depth)
+                    + float(axial_offset)
+                )
+                + normal
+                * (
+                    float(centroid_lateral)
+                    + float(lateral_offset)
+                )
+            )
+
+            if not physical.is_walkable(
+                target,
+                physical.ROBOT_RADIUS,
+            ):
+                return False
+
+        return True
+
+    if requested_target_depth <= start_depth:
+        return float(start_depth)
+
+    # 현재 Guard 위치는 이미 READY였으므로 반드시 walkable이어야 한다.
+    if not whole_wall_walkable(
+        start_depth
+    ):
+        raise RuntimeError(
+            "Current Child Guard wall is not walkable before Frontier start: "
+            f"uid={descriptor.uid} "
+            f"depth={start_depth:.3f}"
+        )
+
+    # 요청한 최종 위치까지 3xN 전체가 들어가면 그대로 사용.
+    if whole_wall_walkable(
+        requested_target_depth
+    ):
+        return float(
+            requested_target_depth
+        )
+
+    # -------------------------------------------------
+    # start -> requested target 구간에서
+    # 3xN 전체가 함께 들어갈 수 있는 최대 깊이를 찾는다.
+    #
+    # 개별 robot target을 clamp하지 않는다.
+    # wall 전체의 centroid depth만 줄인다.
+    # -------------------------------------------------
+    low = float(start_depth)
+    high = float(requested_target_depth)
+
+    for _ in range(32):
+
+        mid = 0.5 * (
+            low + high
+        )
+
+        if whole_wall_walkable(
+            mid
+        ):
+            low = mid
+        else:
+            high = mid
+
+    # 수치 경계 바로 위에 걸리지 않도록 아주 작은 여유를 둔다.
+    safety_margin = max(
+        0.10,
+        0.10 * physical.ROBOT_RADIUS,
+    )
+
+    safe_depth = max(
+        float(start_depth),
+        float(low)
+        - safety_margin,
+    )
+
+    print(
+        "[ChildFrontierTargetClamped] "
+        f"uid={descriptor.uid} "
+        f"requested={requested_target_depth:.3f} "
+        f"safe={safe_depth:.3f} "
+        f"reduction="
+        f"{requested_target_depth - safe_depth:.3f}"
+    )
+
+    return safe_depth
+
+
+def activate_child_frontier_transport(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Promote the selected Child Guard wall to same-ID Frontier."""
+
+    child = multi_dfs.current
+
+    # Root에서는 절대 실행하지 않는다.
+    if (
+        child is None
+        or child.parent_junction_uid
+        is None
+    ):
+        return
+
+    # 이미 Child Frontier를 시작했다.
+    if (
+        getattr(
+            physical,
+            "integration_child_frontier_active_uid",
+            None,
+        )
+        is not None
+    ):
+        return
+
+    if not child.branch_order:
+        return
+
+    # -------------------------------------------------
+    # prepare_child_frontier_handoff()가
+    # 모든 Child Guard lifecycle을 저장했는지 확인.
+    # -------------------------------------------------
+    for uid in child.branch_order:
+
+        lifecycle = (
+            physical.integration_wall_lifecycle.get(
+                uid
+            )
+        )
+
+        if lifecycle is None:
+            return
+
+        if "robot_ids" not in lifecycle:
+            return
+
+        if "relative_offsets" not in lifecycle:
+            return
+
+    # -------------------------------------------------
+    # 아직 모든 Child Guard가 실제 위치에 settle되지 않았다면
+    # Frontier로 절대 승격하지 않는다.
+    # -------------------------------------------------
+    geometry_by_uid = {
+        geometry.provisional_uid:
+            geometry
+        for geometry
+        in perception.provisional_guards
+    }
+
+    for uid in child.branch_order:
+
+        geometry = geometry_by_uid.get(
+            uid
+        )
+
+        if geometry is None:
+            return
+
+        expected_ids = set(
+            physical.integration_wall_lifecycle[
+                uid
+            ]["robot_ids"]
+        )
+
+        guards = [
+            robot
+            for robot in robots
+            if (
+                robot.robot_id
+                in expected_ids
+                and robot.role
+                == "JUNCTION_GUARD"
+                and getattr(
+                    robot,
+                    "junction_guard_branch_uid",
+                    None,
+                )
+                == uid
+            )
+        ]
+
+        live_ids = {
+            robot.robot_id
+            for robot in guards
+        }
+
+        if live_ids != expected_ids:
+            return
+
+        for robot in guards:
+
+            final_anchor = getattr(
+                robot,
+                "integration_guard_final_anchor",
+                None,
+            )
+
+            if final_anchor is None:
+                return
+
+            if (
+                robot.position.distance_to(
+                    final_anchor
+                )
+                > physical.JUNCTION_GUARD_POSITION_TOLERANCE
+            ):
+                return
+
+    # -------------------------------------------------
+    # DFS child branch 선택.
+    #
+    # 현재 실행에서는 J1-B0가 나와야 하지만
+    # 문자열을 하드코딩하지 않는다.
+    # -------------------------------------------------
+    branch_uid = (
+        select_next_child_branch_uid(
+            child
+        )
+    )
+
+    if branch_uid is None:
+        return
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(
+            branch_uid
+        )
+    )
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            branch_uid
+        )
+    )
+
+    if (
+        lifecycle is None
+        or descriptor is None
+    ):
+        raise RuntimeError(
+            "Selected Child Frontier has no context: "
+            f"branch={branch_uid}"
+        )
+
+    expected_ids = set(
+        lifecycle["robot_ids"]
+    )
+
+    frontier_members = [
+        robot
+        for robot in robots
+        if (
+            robot.robot_id
+            in expected_ids
+            and robot.role
+            == "JUNCTION_GUARD"
+            and getattr(
+                robot,
+                "junction_guard_branch_uid",
+                None,
+            )
+            == branch_uid
+        )
+    ]
+
+    live_ids = {
+        robot.robot_id
+        for robot in frontier_members
+    }
+
+    # 정확히 same IDs인지 강제.
+    if live_ids != expected_ids:
+        raise RuntimeError(
+            "Child Frontier Guard lineage mismatch: "
+            f"branch={branch_uid} "
+            f"expected={len(expected_ids)} "
+            f"live={len(live_ids)}"
+        )
+
+    if not frontier_members:
+        raise RuntimeError(
+            "Child Frontier has zero Guard members: "
+            f"branch={branch_uid}"
+        )
+
+    # -------------------------------------------------
+    # 역할 전환 직전의 실제 settle 위치를 다시 측정.
+    #
+    # 이론 slot이 아니라 실제 3×N wall 자세를 동결한다.
+    # -------------------------------------------------
+    local_coordinates = {
+        robot.robot_id:
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        for robot in frontier_members
+    }
+
+    centroid_axial = float(
+        np.mean([
+            axial
+            for axial, _
+            in local_coordinates.values()
+        ])
+    )
+
+    centroid_lateral = float(
+        np.mean([
+            lateral
+            for _, lateral
+            in local_coordinates.values()
+        ])
+    )
+
+    relative_offsets = {
+        robot_id: (
+            float(
+                axial
+                - centroid_axial
+            ),
+            float(
+                lateral
+                - centroid_lateral
+            ),
+        )
+        for robot_id, (
+            axial,
+            lateral,
+        )
+        in local_coordinates.items()
+    }
+
+    # 기존 lifecycle에도 최신 actual pose를 저장.
+    lifecycle["centroid_axial"] = (
+        centroid_axial
+    )
+
+    lifecycle["centroid_lateral"] = (
+        centroid_lateral
+    )
+
+    lifecycle["relative_offsets"] = (
+        relative_offsets
+    )
+
+    # -------------------------------------------------
+    # 같은 3×N Guard wall에서 각 robot이
+    # 원래 몇 번째 layer(row)에 있었는지 저장.
+    #
+    # 이후 Child Frontier가 dead-end에 접근할 때
+    # 가장 앞쪽 row만 골라 contact를 검사하기 위해 사용.
+    # -------------------------------------------------
+    lifecycle["guard_layer_by_id"] = {
+        robot.robot_id: int(
+            getattr(
+                robot,
+                "junction_guard_layer",
+                -1,
+            )
+        )
+        for robot in frontier_members
+    }
+
+    lifecycle["state"] = (
+        "FRONTIER"
+    )
+
+    # -------------------------------------------------
+    # 3×N wall 전체가 mouth를 빠져나갈 만큼의
+    # 초기 bootstrap 이동거리 계산.
+    # -------------------------------------------------
+    axial_offsets = [
+        float(value[0])
+        for value
+        in relative_offsets.values()
+    ]
+
+    if axial_offsets:
+        wall_axial_span = (
+            max(axial_offsets)
+            - min(axial_offsets)
+        )
+    else:
+        wall_axial_span = 0.0
+
+    bootstrap_distance = max(
+        float(
+            physical.FRONTIER_LINE_LEAD_GAP
+        ),
+        wall_axial_span
+        + 2.0
+        * float(
+            physical.ROBOT_RADIUS
+        ),
+    )
+
+    requested_target_depth = (
+        centroid_axial
+        + bootstrap_distance
+    )
+
+    target_depth = (
+        compute_child_frontier_walkable_target_depth(
+            physical,
+            descriptor,
+            relative_offsets,
+            centroid_lateral,
+            centroid_axial,
+            requested_target_depth,
+        )
+    )
+
+    # -------------------------------------------------
+    # 반드시 Controller state를 먼저 만든다.
+    # 그 다음에 role을 FRONTIER로 바꾼다.
+    # -------------------------------------------------
+    physical.integration_child_frontier_active_uid = (
+        branch_uid
+    )
+
+    physical.integration_child_frontier_ids = (
+        set(expected_ids)
+    )
+
+    physical.integration_child_frontier_offsets = (
+        dict(relative_offsets)
+    )
+
+    physical.integration_child_frontier_centroid_lateral = (
+        centroid_lateral
+    )
+
+    physical.integration_child_frontier_depth = (
+        centroid_axial
+    )
+
+    physical.integration_child_frontier_target_depth = (
+        target_depth
+    )
+
+    physical.integration_child_frontier_bootstrap_complete = (
+        False
+    )
+
+    physical.integration_child_frontier_ready_logged = (
+        False
+    )
+
+    # -------------------------------------------------
+    # Child Physical DFS cycle 시작.
+    # -------------------------------------------------
+    physical.integration_child_dfs_phase = (
+        "EXPLORE"
+    )
+
+    physical.integration_child_fill_dwell = (
+        0.0
+    )
+
+    physical.integration_child_flow_dwell = (
+        0.0
+    )
+
+    physical.integration_child_fill_baseline_density = (
+        None
+    )
+
+    physical.integration_child_fill_baseline_pressure = (
+        None
+    )
+
+    # -------------------------------------------------
+    # Controller 준비 완료 후 role 전환.
+    # 같은 Guard IDs 전부 사용.
+    # -------------------------------------------------
+    for robot in frontier_members:
+
+        robot.role = (
+            "FRONTIER_SHEPHERD"
+        )
+
+        robot.shepherd_anchor = (
+            robot.position.copy()
+        )
+
+        robot.shepherd_origin = (
+            robot.position.copy()
+        )
+
+        # J1-B0 같은 dynamic UID를 그대로 저장.
+        robot.shepherd_branch = (
+            branch_uid
+        )
+
+        robot.frontier_local_lateral = (
+            float(
+                relative_offsets[
+                    robot.robot_id
+                ][1]
+            )
+        )
+
+        # Guard 고정 anchor 해제.
+        robot.junction_guard_anchor = (
+            None
+        )
+
+        # Guard waypoint도 더 이상 사용하지 않는다.
+        if hasattr(
+            robot,
+            "integration_guard_waypoints",
+        ):
+            robot.integration_guard_waypoints = (
+                []
+            )
+
+        robot.velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.commanded_velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.observed_velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+    # -------------------------------------------------
+    # Child DFS 논리 상태만 ACTIVE.
+    #
+    # physical.active_branch는 건드리지 않는다.
+    # physical.phase도 EXPLORE_BRANCH로 바꾸지 않는다.
+    # -------------------------------------------------
+    descriptor.visit_state = (
+        "ACTIVE"
+    )
+
+    child.branch_states[
+        branch_uid
+    ] = "ACTIVE"
+
+    child.active_branch_uid = (
+        branch_uid
+    )
+
+    physical.active_branch_uid = (
+        branch_uid
+    )
+
+    print(
+        "[ChildFrontierTransportStart] "
+        f"junction={child.junction_uid} "
+        f"branch={branch_uid} "
+        f"robots={len(frontier_members)} "
+        "same_ids=True "
+        "position_jump=0 "
+        f"start_depth={centroid_axial:.3f} "
+        f"target_depth={target_depth:.3f}"
+    )
+
+def child_branch_pack_metrics(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    branch_uid: str,
+) -> dict[str, float | int]:
+    """Measure the real NORMAL pack immediately behind the Child Shepherd."""
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            branch_uid
+        )
+    )
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(
+            branch_uid
+        )
+    )
+
+    if descriptor is None or lifecycle is None:
+        return {
+            "count": 0,
+            "coverage": 0.0,
+            "mean_density": 0.0,
+            "mean_pressure": 0.0,
+            "low_speed_ratio": 0.0,
+        }
+
+    shepherd_depth = float(
+        physical.integration_child_frontier_depth
+    )
+
+    usable_half = (
+        physical.local_physical_usable_half_width(
+            descriptor
+        )
+    )
+
+    observed_width = max(
+        float(
+            getattr(
+                descriptor,
+                "observed_physical_width",
+                0.0,
+            )
+            or getattr(
+                descriptor,
+                "observed_width",
+                0.0,
+            )
+        ),
+        4.0 * physical.ROBOT_RADIUS,
+    )
+
+    pack_depth = max(
+        0.55 * observed_width,
+        3.0 * physical.ROBOT_RADIUS,
+    )
+
+    pack_normals = []
+
+    for robot in robots:
+
+        if (
+            robot.role != "NORMAL"
+            or robot.base_reserve
+            or bool(
+                getattr(
+                    robot,
+                    "is_fixed_anchor",
+                    False,
+                )
+            )
+        ):
+            continue
+
+        axial, lateral = (
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        )
+
+        if (
+            shepherd_depth - pack_depth
+            <= axial
+            <= shepherd_depth
+            + physical.ROBOT_RADIUS
+            and abs(lateral)
+            <= usable_half
+        ):
+            pack_normals.append(
+                (
+                    robot,
+                    float(lateral),
+                )
+            )
+
+    if not pack_normals:
+        return {
+            "count": 0,
+            "coverage": 0.0,
+            "mean_density": 0.0,
+            "mean_pressure": 0.0,
+            "low_speed_ratio": 0.0,
+        }
+
+    # ---------------------------------------------
+    # Cross-section coverage
+    # ---------------------------------------------
+    bin_count = max(
+        3,
+        GUARD_LATERAL_COVERAGE_BINS,
+    )
+
+    occupied_bins = set()
+
+    if usable_half > physical.EPSILON:
+
+        for _, lateral in pack_normals:
+
+            normalized = (
+                lateral + usable_half
+            ) / (
+                2.0 * usable_half
+            )
+
+            index = int(
+                normalized
+                * bin_count
+            )
+
+            index = max(
+                0,
+                min(
+                    bin_count - 1,
+                    index,
+                ),
+            )
+
+            occupied_bins.add(
+                index
+            )
+
+    coverage = (
+        len(occupied_bins)
+        / bin_count
+    )
+
+    densities = [
+        float(robot.density)
+        for robot, _
+        in pack_normals
+    ]
+
+    pressures = [
+        max(
+            0.0,
+            float(robot.pressure),
+        )
+        for robot, _
+        in pack_normals
+    ]
+
+    low_speed_threshold = float(
+        getattr(
+            physical,
+            "DEAD_END_FORWARD_SPEED_THRESHOLD",
+            8.0,
+        )
+    )
+
+    low_speed_ratio = (
+        sum(
+            robot.velocity.length()
+            <= low_speed_threshold
+            for robot, _
+            in pack_normals
+        )
+        / len(pack_normals)
+    )
+
+    return {
+        "count": len(pack_normals),
+
+        "coverage": float(
+            coverage
+        ),
+
+        "mean_density": float(
+            np.mean(densities)
+        ),
+
+        "mean_pressure": float(
+            np.mean(pressures)
+        ),
+
+        "low_speed_ratio": float(
+            low_speed_ratio
+        ),
+    }
+
+
+def promote_child_frontier_to_shepherd(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    branch_uid: str,
+) -> None:
+    """Same Child Frontier IDs become Shepherds in-place."""
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(
+            branch_uid
+        )
+    )
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            branch_uid
+        )
+    )
+
+    if lifecycle is None or descriptor is None:
+        raise RuntimeError(
+            "Child Shepherd promotion missing context: "
+            f"branch={branch_uid}"
+        )
+
+    expected_ids = set(
+        physical.integration_child_frontier_ids
+    )
+
+    frontiers = [
+        robot
+        for robot in robots
+        if (
+            robot.robot_id in expected_ids
+            and robot.role
+            == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch
+            == branch_uid
+        )
+    ]
+
+    live_ids = {
+        robot.robot_id
+        for robot in frontiers
+    }
+
+    if live_ids != expected_ids:
+        raise RuntimeError(
+            "Child Frontier->Shepherd lineage mismatch: "
+            f"branch={branch_uid} "
+            f"expected={len(expected_ids)} "
+            f"live={len(live_ids)}"
+        )
+
+    transition_positions = {
+        robot.robot_id:
+            robot.position.copy()
+        for robot in frontiers
+    }
+
+    for robot in frontiers:
+
+        # SAME position, SAME IDs.
+        robot.role = (
+            "SHEPHERD"
+        )
+
+        robot.shepherd_anchor = (
+            robot.position.copy()
+        )
+
+        robot.shepherd_origin = (
+            robot.position.copy()
+        )
+
+        robot.shepherd_branch = (
+            branch_uid
+        )
+
+        robot.shepherd_return_direction = (
+            descriptor.local_return_direction.copy()
+        )
+
+        robot.velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.commanded_velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+    max_jump = max(
+        (
+            robot.position.distance_to(
+                transition_positions[
+                    robot.robot_id
+                ]
+            )
+            for robot in frontiers
+        ),
+        default=0.0,
+    )
+
+    lifecycle["state"] = (
+        "FILL"
+    )
+
+    lifecycle[
+        "frontier_contact_centroid_depth"
+    ] = float(
+        physical.integration_child_frontier_depth
+    )
+
+    physical.integration_child_dfs_phase = (
+        "FILL"
+    )
+
+    physical.integration_child_fill_dwell = (
+        0.0
+    )
+
+    physical.integration_child_flow_dwell = (
+        0.0
+    )
+
+    metrics = child_branch_pack_metrics(
+        physical,
+        robots,
+        branch_uid,
+    )
+
+    physical.integration_child_fill_baseline_density = max(
+        float(metrics["mean_density"]),
+        physical.EPSILON,
+    )
+
+    physical.integration_child_fill_baseline_pressure = max(
+        float(metrics["mean_pressure"]),
+        physical.EPSILON,
+    )
+
+    print(
+        "[ChildFrontierToShepherd] "
+        f"branch={branch_uid} "
+        f"robots={len(frontiers)} "
+        "same_ids=True "
+        f"max_position_jump={max_jump:.6f} "
+        "phase=FILL"
+    )
+
+
+def finish_child_branch_return(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    branch_uid: str,
+) -> None:
+    """Restore the exact same Child Shepherd IDs to the original Guard wall."""
+
+    child = multi_dfs.current
+
+    if child is None:
+        raise RuntimeError(
+            "Child Guard return without current Junction"
+        )
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(
+            branch_uid
+        )
+    )
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            branch_uid
+        )
+    )
+
+    if lifecycle is None or descriptor is None:
+        raise RuntimeError(
+            "Child Guard return missing context: "
+            f"branch={branch_uid}"
+        )
+
+    expected_ids = set(
+        lifecycle.get(
+            "robot_ids",
+            [],
+        )
+    )
+
+    original_anchors = (
+        lifecycle.get(
+            "guard_anchor_by_id",
+            {},
+        )
+    )
+
+    if (
+        not expected_ids
+        or set(original_anchors)
+        != expected_ids
+    ):
+        raise RuntimeError(
+            "Original Child Guard anchors missing: "
+            f"branch={branch_uid}"
+        )
+
+    shepherds = {
+        robot.robot_id:
+            robot
+        for robot in robots
+        if (
+            robot.robot_id
+            in expected_ids
+            and robot.role
+            == "SHEPHERD"
+            and robot.shepherd_branch
+            == branch_uid
+        )
+    }
+
+    if set(shepherds) != expected_ids:
+        raise RuntimeError(
+            "Child Shepherd lineage lost before Guard return: "
+            f"branch={branch_uid}"
+        )
+
+    layer_by_id = (
+        lifecycle.get(
+            "guard_layer_by_id",
+            {},
+        )
+    )
+
+    hop_by_id = (
+        lifecycle.get(
+            "guard_hop_by_id",
+            {},
+        )
+    )
+
+    parent_by_id = (
+        lifecycle.get(
+            "guard_parent_id_by_id",
+            {},
+        )
+    )
+
+    branch_key_by_id = (
+        lifecycle.get(
+            "guard_branch_key_by_id",
+            {},
+        )
+    )
+
+    leader_by_id = (
+        lifecycle.get(
+            "guard_is_leader_by_id",
+            {},
+        )
+    )
+
+    max_error = 0.0
+
+    for robot_id, robot in shepherds.items():
+
+        original_anchor = (
+            original_anchors[
+                robot_id
+            ]
+        )
+
+        max_error = max(
+            max_error,
+            robot.position.distance_to(
+                original_anchor
+            ),
+        )
+
+        robot.role = (
+            "JUNCTION_GUARD"
+        )
+
+        robot.junction_guard_anchor = (
+            original_anchor.copy()
+        )
+
+        robot.junction_guard_branch_uid = (
+            branch_uid
+        )
+
+        robot.junction_guard_branch = (
+            branch_key_by_id.get(
+                robot_id
+            )
+        )
+
+        robot.junction_guard_layer = int(
+            layer_by_id.get(
+                robot_id,
+                -1,
+            )
+        )
+
+        robot.junction_guard_hop = int(
+            hop_by_id.get(
+                robot_id,
+                -1,
+            )
+        )
+
+        robot.junction_guard_parent_id = (
+            parent_by_id.get(
+                robot_id
+            )
+        )
+
+        robot.is_branch_leader = bool(
+            leader_by_id.get(
+                robot_id,
+                False,
+            )
+        )
+
+        robot.integration_guard_final_anchor = (
+            original_anchor.copy()
+        )
+
+        robot.integration_guard_waypoints = (
+            []
+        )
+
+        robot.shepherd_anchor = None
+        robot.shepherd_origin = None
+        robot.shepherd_branch = None
+        robot.shepherd_return_direction = None
+        robot.frontier_local_lateral = None
+
+        robot.velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.commanded_velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.observed_velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+    descriptor.visit_state = (
+        "VISITED"
+    )
+
+    child.branch_states[
+        branch_uid
+    ] = "VISITED"
+
+    child.active_branch_uid = None
+
+    physical.active_branch_uid = None
+
+    lifecycle["state"] = (
+        "GUARD"
+    )
+
+    physical.integration_child_frontier_active_uid = (
+        None
+    )
+
+    physical.integration_child_frontier_ids = (
+        set()
+    )
+
+    physical.integration_child_frontier_offsets = (
+        {}
+    )
+
+    physical.integration_child_frontier_bootstrap_complete = (
+        False
+    )
+
+    physical.integration_child_frontier_ready_logged = (
+        False
+    )
+
+    physical.integration_child_dfs_phase = (
+        "IDLE"
+    )
+
+    print(
+        "[ChildBranchVisited] "
+        f"junction={child.junction_uid} "
+        f"branch={branch_uid} "
+        f"same_ids_returned={len(expected_ids)} "
+        f"max_guard_return_error={max_error:.6f}"
+    )
+
+    if all(
+        state == "VISITED"
+        for state
+        in child.branch_states.values()
+    ):
+        print(
+            "[ChildAllBranchesVisited] "
+            f"junction={child.junction_uid} "
+            f"branches={child.branch_order}"
+        )
+
+
+def update_child_shepherd_cycle(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    dt: float,
+) -> None:
+    """FILL -> PRESSURE_PUSH -> FLOW_BACKTRACK -> original Child Guard."""
+
+    branch_uid = getattr(
+        physical,
+        "integration_child_frontier_active_uid",
+        None,
+    )
+
+    if branch_uid is None:
+        return
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            branch_uid
+        )
+    )
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(
+            branch_uid
+        )
+    )
+
+    if descriptor is None or lifecycle is None:
+        return
+
+    child_phase = getattr(
+        physical,
+        "integration_child_dfs_phase",
+        "IDLE",
+    )
+
+    # =================================================
+    # FILL
+    # =================================================
+    if child_phase == "FILL":
+
+        metrics = child_branch_pack_metrics(
+            physical,
+            robots,
+            branch_uid,
+        )
+
+        baseline_density = max(
+            float(
+                physical.integration_child_fill_baseline_density
+                or physical.EPSILON
+            ),
+            physical.EPSILON,
+        )
+
+        baseline_pressure = max(
+            float(
+                physical.integration_child_fill_baseline_pressure
+                or physical.EPSILON
+            ),
+            physical.EPSILON,
+        )
+
+        density_ratio = (
+            float(metrics["mean_density"])
+            / baseline_density
+        )
+
+        pressure_ratio = (
+            float(metrics["mean_pressure"])
+            / baseline_pressure
+        )
+
+        cols = max(
+            1,
+            int(
+                lifecycle.get(
+                    "cols",
+                    1,
+                )
+            ),
+        )
+
+        min_pack_count = max(
+            int(
+                getattr(
+                    physical,
+                    "FLOW_MIN_NORMAL_COUNT",
+                    6,
+                )
+            ),
+            int(
+                math.ceil(
+                    2.0 * cols
+                )
+            ),
+        )
+
+        min_coverage = max(
+            0.80,
+            float(
+                getattr(
+                    physical,
+                    "SATURATION_PACKED_LATERAL_COVERAGE_RATIO",
+                    0.70,
+                )
+            ),
+        )
+
+        pack_ready = (
+            int(metrics["count"])
+            >= min_pack_count
+        )
+
+        coverage_ready = (
+            float(metrics["coverage"])
+            >= min_coverage
+        )
+
+        low_speed_ratio = float(
+            metrics["low_speed_ratio"]
+        )
+
+        # B0 로그에서 충분히 찼을 때 low_speed=0.432였으므로
+        # 지나치게 높은 0.60 대신 0.40 사용.
+        stall_ready = (
+            low_speed_ratio
+            >= 0.40
+        )
+
+        compression_ready = (
+            density_ratio
+            >= LOCAL_SATURATION_PRESSURE_RATIO
+            or pressure_ratio
+            >= LOCAL_SATURATION_PRESSURE_RATIO
+        )
+
+        ready = (
+            pack_ready
+            and coverage_ready
+            and stall_ready
+            and compression_ready
+        )
+
+
+
+        if ready:
+            physical.integration_child_fill_dwell += dt
+        else:
+            physical.integration_child_fill_dwell = 0.0
+
+        frame = getattr(
+            physical,
+            "integration_frame",
+            -1,
+        )
+
+        if frame % 20 == 0:
+            print(
+                "[ChildFill] "
+                f"branch={branch_uid} "
+                f"count={metrics['count']} "
+                f"required={min_pack_count} "
+                f"pack_ready={pack_ready} "
+                f"coverage="
+                f"{float(metrics['coverage']):.3f} "
+                f"coverage_ready={coverage_ready} "
+                f"density_ratio={density_ratio:.3f} "
+                f"pressure_ratio={pressure_ratio:.3f} "
+                f"compression_ready={compression_ready} "
+                f"low_speed={low_speed_ratio:.3f} "
+                f"stall_ready={stall_ready} "
+                f"ready={ready} "
+                f"dwell="
+                f"{physical.integration_child_fill_dwell:.3f}"
+            )
+
+        required_dwell = max(
+            0.18,
+            float(
+                getattr(
+                    physical,
+                    "SATURATION_DWELL_TIME",
+                    0.18,
+                )
+            ),
+        )
+
+        if (
+            physical.integration_child_fill_dwell
+            < required_dwell
+        ):
+            return
+
+        physical.integration_child_dfs_phase = (
+            "PRESSURE_PUSH"
+        )
+
+        lifecycle["state"] = (
+            "PRESSURE_PUSH"
+        )
+
+        physical.integration_child_flow_dwell = (
+            0.0
+        )
+
+        print(
+            "[ChildPressurePush] "
+            f"branch={branch_uid} "
+            f"count={metrics['count']} "
+            f"coverage="
+            f"{float(metrics['coverage']):.3f} "
+            f"density_ratio={density_ratio:.3f} "
+            f"pressure_ratio={pressure_ratio:.3f}"
+        )
+
+        return
+
+    # =================================================
+    # PRESSURE_PUSH / FLOW_BACKTRACK
+    # =================================================
+    if child_phase not in {
+        "PRESSURE_PUSH",
+        "FLOW_BACKTRACK",
+    }:
+        return
+
+    offsets = (
+        physical.integration_child_frontier_offsets
+    )
+
+    axial_offsets = [
+        float(value[0])
+        for value
+        in offsets.values()
+    ]
+
+    minimum_axial_offset = min(
+        axial_offsets,
+        default=0.0,
+    )
+
+    current_depth = float(
+        physical.integration_child_frontier_depth
+    )
+
+    return_depth = float(
+        lifecycle.get(
+            "original_guard_centroid_axial",
+            lifecycle.get(
+                "centroid_axial",
+                current_depth,
+            ),
+        )
+    )
+
+    usable_half = (
+        physical.local_physical_usable_half_width(
+            descriptor
+        )
+    )
+
+    # Junction-facing Shepherd row.
+    junction_face_depth = (
+        current_depth
+        + minimum_axial_offset
+    )
+
+    branch_normals = []
+
+    for robot in robots:
+
+        if (
+            robot.role != "NORMAL"
+            or robot.base_reserve
+            or bool(
+                getattr(
+                    robot,
+                    "is_fixed_anchor",
+                    False,
+                )
+            )
+        ):
+            continue
+
+        axial, lateral = (
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        )
+
+        # Shepherd보다 Junction 쪽에 있는
+        # 실제 branch pack만 사용.
+        if (
+            0.0
+            < axial
+            <= junction_face_depth
+            + physical.ROBOT_RADIUS
+            and abs(lateral)
+            <= usable_half
+            + 2.0 * physical.ROBOT_RADIUS
+        ):
+            branch_normals.append(
+                (
+                    robot,
+                    float(axial),
+                )
+            )
+
+    normal_front = None
+
+    if branch_normals:
+
+        normal_front = (
+            physical.linear_quantile(
+                [
+                    axial
+                    for _, axial
+                    in branch_normals
+                ],
+                0.98,
+            )
+        )
+
+        # =================================================
+    # PRESSURE_PUSH와 FLOW_BACKTRACK은 같은 동작이 아니다.
+    #
+    # PRESSURE_PUSH:
+    #   빠른 piston stroke
+    #   → 순간 compression 생성
+    #
+    # FLOW_BACKTRACK:
+    #   이미 형성된 return flow를 지속적으로 미는 단계
+    # =================================================
+
+    if child_phase == "PRESSURE_PUSH":
+
+        return_speed = float(
+            physical.integration_child_pressure_push_speed
+        )
+
+    else:
+
+        return_speed = float(
+            physical.integration_child_flow_backtrack_speed
+        )
+
+    desired_depth = max(
+        return_depth,
+        current_depth
+        - return_speed * dt,
+    )
+
+    # -------------------------------------------------
+    # NORMAL pack을 관통하지 않는 hard floor.
+    #
+    # Shepherd의 Junction-facing row가
+    # NORMAL front보다 최소 center gap만큼
+    # dead-end 쪽에 남아 있어야 한다.
+    # -------------------------------------------------
+    if normal_front is not None:
+
+        active_gap_ratio = float(
+            getattr(
+                physical,
+                "integration_child_active_min_center_gap_ratio",
+                1.50,
+            )
+        )
+
+        minimum_center_gap = (
+            active_gap_ratio
+            * physical.ROBOT_RADIUS
+        )
+
+        hard_floor = (
+            float(normal_front)
+            + minimum_center_gap
+            - minimum_axial_offset
+        )
+
+        # 절대 다시 dead-end 방향으로 증가하지 않는다.
+        hard_floor = min(
+            current_depth,
+            hard_floor,
+        )
+
+        next_depth = max(
+            desired_depth,
+            hard_floor,
+            return_depth,
+        )
+
+    else:
+
+        next_depth = (
+            desired_depth
+        )
+
+    physical.integration_child_frontier_depth = (
+        next_depth
+    )
+
+    # -------------------------------------------------
+    # 실제 NORMAL backflow 관찰.
+    # -------------------------------------------------
+    return_direction = (
+        descriptor.local_return_direction.normalize()
+    )
+
+    signed_speeds = [
+        robot.velocity.dot(
+            return_direction
+        )
+        for robot, _
+        in branch_normals
+    ]
+
+    flow_speed_threshold = float(
+        getattr(
+            physical,
+            "FLOW_SPEED_THRESHOLD",
+            1.5,
+        )
+    )
+
+    moving_speeds = [
+        speed
+        for speed in signed_speeds
+        if speed
+        >= flow_speed_threshold
+    ]
+
+    if signed_speeds:
+
+        moving_ratio = (
+            len(moving_speeds)
+            / len(signed_speeds)
+        )
+
+        mean_return_speed = (
+            sum(
+                max(
+                    0.0,
+                    speed,
+                )
+                for speed
+                in signed_speeds
+            )
+            / len(signed_speeds)
+        )
+
+    else:
+
+        moving_ratio = 1.0
+        mean_return_speed = 0.0
+
+    flow_ratio_threshold = float(
+        getattr(
+            physical,
+            "FLOW_RATIO_THRESHOLD",
+            0.45,
+        )
+    )
+
+    flow_average_threshold = float(
+        getattr(
+            physical,
+            "FLOW_AVERAGE_SPEED_THRESHOLD",
+            1.8,
+        )
+    )
+
+    flow_established = (
+        not branch_normals
+        or (
+            moving_ratio
+            >= flow_ratio_threshold
+            and mean_return_speed
+            >= flow_average_threshold
+        )
+    )
+
+    if (
+        child_phase == "PRESSURE_PUSH"
+    ):
+
+        if flow_established:
+            physical.integration_child_flow_dwell += dt
+        else:
+            physical.integration_child_flow_dwell = 0.0
+
+        required_flow_dwell = float(
+            getattr(
+                physical,
+                "FLOW_ESTABLISH_DWELL_TIME",
+                0.12,
+            )
+        )
+
+        if (
+            physical.integration_child_flow_dwell
+            >= required_flow_dwell
+        ):
+            physical.integration_child_dfs_phase = (
+                "FLOW_BACKTRACK"
+            )
+
+            lifecycle["state"] = (
+                "FLOW_BACKTRACK"
+            )
+
+            print(
+                "[ChildFlowBacktrack] "
+                f"branch={branch_uid} "
+                f"moving_ratio={moving_ratio:.3f} "
+                f"mean_speed="
+                f"{mean_return_speed:.3f}"
+            )
+
+    frame = getattr(
+        physical,
+        "integration_frame",
+        -1,
+    )
+
+    if frame % 10 == 0:
+
+        child_contact_robots = [
+            robot
+            for robot in robots
+            if (
+                robot.role == "NORMAL"
+                and int(
+                    getattr(
+                        robot,
+                        "last_child_shepherd_contact_count",
+                        0,
+                    )
+                )
+                > 0
+            )
+        ]
+
+        max_contact_force = max(
+            (
+                float(
+                    getattr(
+                        robot,
+                        "last_child_shepherd_contact_force",
+                        0.0,
+                    )
+                )
+                for robot
+                in child_contact_robots
+            ),
+            default=0.0,
+        )
+
+        print(
+            "[ChildPistonContact] "
+            f"branch={branch_uid} "
+            f"phase={child_phase} "
+            f"return_speed={return_speed:.3f} "
+            f"active_gap="
+            f"{minimum_center_gap if normal_front is not None else -1.0:.3f} "
+            f"contact_normals="
+            f"{len(child_contact_robots)} "
+            f"max_contact_force="
+            f"{max_contact_force:.3f}"
+        )
+
+    if frame % 20 == 0:
+        
+        print(
+            "[ChildReturnPiston] "
+            f"branch={branch_uid} "
+            f"phase="
+            f"{physical.integration_child_dfs_phase} "
+            f"depth={current_depth:.3f}"
+            f"->{next_depth:.3f} "
+            f"return_depth={return_depth:.3f} "
+            f"normal_front="
+            f"{float(normal_front) if normal_front is not None else -1.0:.3f} "
+            f"branch_normals={len(branch_normals)} "
+            f"moving_ratio={moving_ratio:.3f} "
+            f"mean_return_speed={mean_return_speed:.3f}"
+        )
+
+    # -------------------------------------------------
+    # Command가 원래 Guard centroid에 도달한 뒤,
+    # 실제 SAME Shepherd IDs도 원래 world anchors에
+    # 도착했는지 확인.
+    # -------------------------------------------------
+    if (
+        physical.integration_child_dfs_phase
+        != "FLOW_BACKTRACK"
+    ):
+        return
+
+    if (
+        next_depth
+        > return_depth
+        + physical.JUNCTION_GUARD_POSITION_TOLERANCE
+    ):
+        return
+
+    original_anchors = (
+        lifecycle.get(
+            "guard_anchor_by_id",
+            {},
+        )
+    )
+
+    expected_ids = set(
+        lifecycle.get(
+            "robot_ids",
+            [],
+        )
+    )
+
+    shepherds = {
+        robot.robot_id:
+            robot
+        for robot in robots
+        if (
+            robot.robot_id
+            in expected_ids
+            and robot.role
+            == "SHEPHERD"
+            and robot.shepherd_branch
+            == branch_uid
+        )
+    }
+
+    if (
+        set(shepherds)
+        != expected_ids
+    ):
+        return
+
+    if (
+        set(original_anchors)
+        != expected_ids
+    ):
+        return
+
+    all_returned = all(
+        shepherds[robot_id].position.distance_to(
+            original_anchors[
+                robot_id
+            ]
+        )
+        <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
+        for robot_id
+        in expected_ids
+    )
+
+    if not all_returned:
+        return
+
+    finish_child_branch_return(
+        physical,
+        robots,
+        branch_uid,
+    )
+
+
+def update_child_frontier_exploration(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    dt: float,
+) -> None:
+    """Continuously advance a Child Frontier after bootstrap."""
+
+    uid = getattr(
+        physical,
+        "integration_child_frontier_active_uid",
+        None,
+    )
+
+    if uid is None:
+        return
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(uid)
+    )
+
+    lifecycle = (
+        physical.integration_wall_lifecycle.get(uid)
+    )
+
+    if descriptor is None or lifecycle is None:
+        return
+
+    frontier_ids = set(
+        physical.integration_child_frontier_ids
+    )
+
+    frontier_members = [
+        robot
+        for robot in robots
+        if (
+            robot.robot_id in frontier_ids
+            and robot.role == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch == uid
+        )
+    ]
+
+    if not frontier_members:
+        return
+
+    # -------------------------------------------------
+    # 1. 현재 Branch 안의 NORMAL 군집 front를 구한다.
+    # -------------------------------------------------
+    usable_half = (
+        physical.local_physical_usable_half_width(
+            descriptor
+        )
+    )
+
+    normal_depths = []
+
+    for robot in robots:
+
+        if robot.role != "NORMAL":
+            continue
+
+        axial, lateral = (
+            physical.branch_local_coordinates(
+                robot.position,
+                descriptor,
+            )
+        )
+
+        if (
+            axial >= -physical.FRONTIER_LINE_LEAD_GAP
+            and abs(lateral) <= usable_half
+        ):
+            normal_depths.append(
+                float(axial)
+            )
+
+    if not normal_depths:
+        return
+
+    supported_front = (
+        physical.linear_quantile(
+            normal_depths,
+            float(
+                physical.integration_child_frontier_support_quantile
+            ),
+        )
+    )
+
+    # -------------------------------------------------
+    # 2. 3×N Frontier의 뒤쪽 row까지
+    # NORMAL 군집보다 앞에 있도록 target 계산.
+    # -------------------------------------------------
+    offsets = (
+        physical.integration_child_frontier_offsets
+    )
+
+    axial_offsets = [
+        float(value[0])
+        for value in offsets.values()
+    ]
+
+    trailing_offset = min(
+        axial_offsets,
+        default=0.0,
+    )
+
+    desired_depth = (
+        supported_front
+        + physical.FRONTIER_LINE_LEAD_GAP
+        - trailing_offset
+    )
+
+    current_depth = float(
+        physical.integration_child_frontier_depth
+    )
+
+    next_depth = min(
+        desired_depth,
+        current_depth
+        + float(
+            physical.integration_child_frontier_cruise_speed
+        )
+        * dt,
+    )
+
+    # 뒤로 움직이지 않음.
+    next_depth = max(
+        current_depth,
+        next_depth,
+    )
+
+    # -------------------------------------------------
+    # 3. 다음 step에서 leading row가 실제 dead-end에
+    # 닿는지 검사.
+    #
+    # 한 로봇만 벽에 닿았다고 전체를 멈추면 안 된다.
+    # -------------------------------------------------
+    layer_by_id = lifecycle.get(
+        "guard_layer_by_id",
+        {},
+    )
+
+    if layer_by_id:
+
+        leading_layer = max(
+            layer_by_id.values()
+        )
+
+        leading_ids = [
+            robot_id
+            for robot_id, layer
+            in layer_by_id.items()
+            if layer == leading_layer
+        ]
+
+    else:
+        # Child lifecycle에 layer 정보가 아직 없다면
+        # 일단 전체 Frontier를 검사.
+        leading_ids = list(
+            frontier_ids
+        )
+
+    tangent, normal = (
+        physical.descriptor_local_basis(
+            descriptor
+        )
+    )
+
+    mouth = (
+        descriptor.observed_mouth_position
+    )
+
+    centroid_lateral = float(
+        physical.integration_child_frontier_centroid_lateral
+    )
+
+    blocked_ids = []
+
+    for robot_id in leading_ids:
+
+        axial_offset, lateral_offset = (
+            offsets[robot_id]
+        )
+
+        probe = child_rigid_wall_target(
+            physical,
+            descriptor,
+            lifecycle,
+            robot_id,
+            next_depth,
+        )
+
+        if not physical.is_walkable(
+            probe,
+            physical.ROBOT_RADIUS,
+        ):
+            blocked_ids.append(
+                robot_id
+            )
+
+    required_contact = max(
+        2,
+        int(
+            math.ceil(
+                0.5 * len(leading_ids)
+            )
+        ),
+    )
+
+    # -------------------------------------------------
+    # 4. leading row 절반 이상이 동시에 막혔으면
+    # 실제 dead-end contact 후보.
+    # 이때만 Frontier 이동을 멈춘다.
+    # -------------------------------------------------
+    if (
+        len(blocked_ids)
+        >= required_contact
+    ):
+
+        # 현재 실제로 적용된 마지막 안전 위치를
+        # dead-end Frontier 위치로 확정.
+        physical.integration_child_frontier_depth = (
+            current_depth
+        )
+
+        lifecycle[
+            "frontier_contact_centroid_depth"
+        ] = current_depth
+
+        print(
+            "[ChildFrontierDeadEndContact] "
+            f"branch={uid} "
+            f"blocked={len(blocked_ids)}/"
+            f"{len(leading_ids)} "
+            f"depth={current_depth:.3f}"
+        )
+
+        # SAME Frontier IDs를 그대로 Shepherd로 승격.
+        promote_child_frontier_to_shepherd(
+            physical,
+            robots,
+            uid,
+        )
+
+        return
+
+    physical.integration_child_frontier_depth = (
+        next_depth
+    )
+
+
+def update_child_frontier_transport(
+    physical: types.ModuleType,
+    robots: Sequence[Any],
+    dt: float,
+) -> None:
+    """Advance the active Child Frontier centroid until bootstrap is complete."""
+
+    uid = getattr(
+        physical,
+        "integration_child_frontier_active_uid",
+        None,
+    )
+
+    if uid is None:
+        return
+
+    child_phase = getattr(
+        physical,
+        "integration_child_dfs_phase",
+        "IDLE",
+    )
+
+    # -------------------------------------------------
+    # Frontier가 dead-end에서 Shepherd가 된 이후에는
+    # Frontier explorer가 아니라 Child Physical DFS
+    # return cycle을 실행한다.
+    # -------------------------------------------------
+    if child_phase in {
+        "FILL",
+        "PRESSURE_PUSH",
+        "FLOW_BACKTRACK",
+    }:
+        update_child_shepherd_cycle(
+            physical,
+            robots,
+            dt,
+        )
+        return
+
+    if getattr(
+        physical,
+        "integration_child_frontier_bootstrap_complete",
+        False,
+    ):
+        update_child_frontier_exploration(
+            physical,
+            robots,
+            dt,
+        )
+        return
+
+    current_depth = float(
+        physical.integration_child_frontier_depth
+    )
+
+    target_depth = float(
+        physical.integration_child_frontier_target_depth
+    )
+
+    # -------------------------------------------------
+    # centroid depth만 전진.
+    # 각 로봇은 Robot.update wrapper에서
+    # 저장된 relative offset을 유지하며 따라간다.
+    # -------------------------------------------------
+    next_depth = min(
+        target_depth,
+        current_depth
+        + float(
+            physical.integration_child_frontier_cruise_speed
+        )
+        * dt,
+    )
+
+    physical.integration_child_frontier_depth = (
+        next_depth
+    )
+
+    # 아직 command depth 자체가 target에 도착하지 않음.
+    if (
+        next_depth
+        + 1.0e-6
+        < target_depth
+    ):
+        return
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            uid
+        )
+    )
+
+    if descriptor is None:
+        raise RuntimeError(
+            "Child Frontier descriptor disappeared: "
+            f"uid={uid}"
+        )
+
+    expected_ids = set(
+        physical.integration_child_frontier_ids
+    )
+
+    frontier_members = [
+        robot
+        for robot in robots
+        if (
+            robot.robot_id
+            in expected_ids
+            and robot.role
+            == "FRONTIER_SHEPHERD"
+            and robot.shepherd_branch
+            == uid
+        )
+    ]
+
+    live_ids = {
+        robot.robot_id
+        for robot in frontier_members
+    }
+
+    if live_ids != expected_ids:
+        raise RuntimeError(
+            "Child Frontier bootstrap lost lineage: "
+            f"branch={uid} "
+            f"expected={len(expected_ids)} "
+            f"live={len(live_ids)}"
+        )
+
+    tangent, normal = (
+        physical.descriptor_local_basis(
+            descriptor
+        )
+    )
+
+    offsets = (
+        physical.integration_child_frontier_offsets
+    )
+
+    centroid_lateral = float(
+        physical.integration_child_frontier_centroid_lateral
+    )
+
+    # -------------------------------------------------
+    # command depth만 도착한 것으로 끝내지 않는다.
+    # 실제 3×N 로봇 전체가 최종 target에 settle될 때까지 기다린다.
+    # -------------------------------------------------
+    max_error = 0.0
+
+    for robot in frontier_members:
+
+        axial_offset, lateral_offset = (
+            offsets[robot.robot_id]
+        )
+
+        final_target = (
+            descriptor.observed_mouth_position
+            + tangent
+            * (
+                target_depth
+                + float(axial_offset)
+            )
+            + normal
+            * (
+                centroid_lateral
+                + float(lateral_offset)
+            )
+        )
+
+        max_error = max(
+            max_error,
+            robot.position.distance_to(
+                final_target
+            ),
+        )
+
+    if (
+        max_error
+        > physical.JUNCTION_GUARD_POSITION_TOLERANCE
+    ):
+        return
+
+    physical.integration_child_frontier_bootstrap_complete = (
+        True
+    )
+
+    if not getattr(
+        physical,
+        "integration_child_frontier_ready_logged",
+        False,
+    ):
+
+        physical.integration_child_frontier_ready_logged = (
+            True
+        )
+
+        child = multi_dfs.current
+
+        print(
+            "[ChildFrontierBootstrapReady] "
+            f"junction="
+            f"{child.junction_uid if child is not None else '?'} "
+            f"branch={uid} "
+            f"robots={len(expected_ids)} "
+            "same_ids=True "
+            f"max_error={max_error:.3f}"
+        )
+
 
 def mean_nearest_spacing(robots: Sequence[Any]) -> float:
     values: list[float] = []
@@ -12959,7 +17719,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     install_local_forward_ingress(physical)
     install_thick_wall_readiness_audit(physical)
     install_continuous_guard_settling(physical)
-    install_local_physical_saturation_bridge(physical)
+
+    # Root/J0 authoritative Physical DFS bridge
+    install_local_physical_saturation_bridge(
+        physical
+    )
+
+    # Dynamic Child 3×N Frontier/Shepherd motion
+    install_child_frontier_transport_runtime(
+        physical
+    )
+
+    # Dynamic Child NORMAL swarm route + real Shepherd contact
+    install_child_branch_physical_drive(
+        physical
+    )
     def integration_log_sink(active_robots: Sequence[Any], reason: str) -> Path:
         """Keep the reference module's legacy CSV untouched."""
         physical.metrics.saved = True
@@ -13068,8 +17842,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 robots,
             )
 
+            if (
+                multi_dfs.current is not None
+                and multi_dfs.current.parent_junction_uid
+                is not None
+            ):
+                update_child_frontier_transport(
+                    physical,
+                    robots,
+                    dt,
+                )
+
             if perception.state == PerceptionState.JUNCTION_APPROACH:
                 perception.leader.acceleration *= 0.35
+
             for robot in robots:
                 if perception.anchor_fixed and robot is perception.leader:
                     continue
@@ -13162,6 +17948,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             update_provisional_wall_settling_audit(
                 physical, perception, robots
             )
+
+            if is_child_junction:
+                prepare_child_frontier_handoff(
+                    physical,
+                    perception,
+                    robots,
+                )
+
+                activate_child_frontier_transport(
+                    physical,
+                    perception,
+                    robots,
+                )
+
             log_wall_ready_blockers(physical, perception, robots)
             if (
                 perception.state
