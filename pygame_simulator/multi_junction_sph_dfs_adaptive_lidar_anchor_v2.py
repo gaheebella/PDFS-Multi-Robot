@@ -6,13 +6,24 @@ Pebbles, backtracking, and return-to-base logic.  This integration module loads
 only the definition section of that file and supplies one sensor/perception
 front-end plus one dark renderer.  No second SimulatorWorld or robot set exists.
 
-Localization audit
-------------------
-Fixture labels are unavailable to the detector and persistent-opening tracker.
-Localization is opened only for branch-local shallow Guard readiness and
-slot-to-robot WHO assignment.  It is closed before Physical DFS handoff;
-persistent opening angles are used only by the LiDAR refinement adapter, while
-DFS choice, saturation, and backtracking never receive localization input.
+Localization policy
+-------------------
+Localization is allowed ONLY for Shepherd cohort detection:
+selecting which robot IDs will form the physical Shepherd/Guard cohort
+near a detected branch mouth.
+
+After those robot IDs are frozen, localization must not be used for:
+- DFS branch choice,
+- Junction detection,
+- dead-end recognition,
+- saturation recognition,
+- Frontier/Shepherd phase transitions,
+- backtracking decisions,
+- branch completion,
+- or return-to-Junction completion.
+
+The elected SAME robot IDs are preserved through
+Guard -> Frontier -> Shepherd -> return.
 """
 
 from __future__ import annotations
@@ -802,35 +813,12 @@ def retain_parent_completion_markers(
                 {},
             ).get(branch_uid)
 
-            mouth = (
-                getattr(
-                    descriptor,
-                    "observed_mouth_position",
-                    None,
-                )
-                if descriptor is not None
-                else None
-            )
 
             if candidates:
-                if mouth is not None:
-                    marker = min(
-                        candidates,
-                        key=lambda robot: (
-                            robot.position.distance_squared_to(
-                                mouth
-                            ),
-                            robot.robot_id,
-                        ),
-                    )
-                else:
-                    # Deterministic fallback inside the SAME
-                    # original Guard lineage only.
-                    marker = min(
-                        candidates,
-                        key=lambda robot:
-                            robot.robot_id,
-                    )
+                marker = min(
+                    candidates,
+                    key=lambda robot: robot.robot_id,
+                )
 
         if marker is None:
             raise RuntimeError(
@@ -1045,8 +1033,8 @@ def create_parent_return_marker(
     )
 
     candidates: list[
-        tuple[float, int, Any]
-    ] = []
+            tuple[int, Any]
+        ] = []
 
     for robot in robots:
 
@@ -1088,32 +1076,8 @@ def create_parent_return_marker(
         if branch_uid not in parent_branch_uids:
             continue
 
-        descriptor = (
-            physical.branch_descriptors_by_uid.get(
-                branch_uid
-            )
-        )
-
-        if descriptor is None:
-            continue
-
-        try:
-            axial, _ = (
-                physical.branch_local_coordinates(
-                    robot.position,
-                    descriptor,
-                )
-            )
-        except (
-            ValueError,
-            AttributeError,
-        ):
-            continue
-
-        # mouth 근처 Guard를 우선 선택한다.
         candidates.append(
             (
-                abs(float(axial)),
                 robot.robot_id,
                 robot,
             )
@@ -1125,8 +1089,9 @@ def create_parent_return_marker(
             "for Junction Return Marker"
         )
 
-    _, _, marker = min(
-        candidates
+    _, marker = min(
+        candidates,
+        key=lambda item: item[0],
     )
 
     # -------------------------------------------------
@@ -10221,11 +10186,17 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         robots: Sequence[Any],
         branch: str | None = None,
     ) -> bool:
-        """SAME Shepherd IDs가 최초 Guard 위치에 실제로 돌아왔는지 확인."""
+        """Return completion without frozen world-position localization."""
 
         target_branch = branch or physical.active_branch
 
-        if physical.phase != physical.SimulationPhase.FLOW_BACKTRACK:
+        if (
+            physical.phase
+            != physical.SimulationPhase.FLOW_BACKTRACK
+        ):
+            return False
+
+        if target_branch is None:
             return False
 
         lifecycle = getattr(
@@ -10241,15 +10212,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             lifecycle.get("robot_ids", [])
         )
 
-        original_anchors = lifecycle.get(
-            "guard_anchor_by_id",
-            {},
-        )
-
-        if (
-            not expected_ids
-            or set(original_anchors) != expected_ids
-        ):
+        if not expected_ids:
             return False
 
         shepherds = {
@@ -10261,17 +10224,44 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
         }
 
+        # SAME elected Shepherd IDs must be preserved.
         if set(shepherds) != expected_ids:
             return False
 
-        tolerance = physical.JUNCTION_GUARD_POSITION_TOLERANCE
+        descriptor = descriptor_for(
+            target_branch
+        )
 
-        return all(
-            shepherds[robot_id].position.distance_to(
-                original_anchors[robot_id]
+        if descriptor is None:
+            return False
+
+        # Exact frozen Guard coordinates are NOT used.
+        #
+        # Return is complete when the intact Shepherd wall
+        # physically reaches the shallow Junction-mouth region.
+        current_line_depth = max(
+            physical.observed_branch_axial_depth(
+                robot.position,
+                descriptor,
             )
-            <= tolerance
-            for robot_id in expected_ids
+            for robot in shepherds.values()
+        )
+
+        return_floor = float(
+            physical.JUNCTION_GUARD_BRANCH_INSET
+            + (
+                int(lifecycle.get("rows", 1)) - 1
+            )
+            * physical.THICK_MOUTH_GUARD_LAYER_SPACING
+        )
+
+        tolerance = float(
+            physical.SHEPHERD_JUNCTION_DEPTH_TOLERANCE
+        )
+
+        return (
+            current_line_depth
+            <= return_floor + tolerance
         )
 
     def backtrack_pack_support(
@@ -10582,7 +10572,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
 
         herd_return_speed_scale = float(
-            getattr(physical, "integration_herd_return_speed_scale", 0.65)
+            getattr(physical, "integration_herd_return_speed_scale", 1.00)
         )
         forward_speed = min(
             physical.SHEPHERD_LINE_BACKTRACK_SPEED,
@@ -11287,29 +11277,69 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         )
         return promoted
 
-    def returned_guard_wall_ready(robots: Sequence[Any], branch: str) -> bool:
-        """True only when the returned SAME-ID wall is back on its frozen mouth slots."""
-        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
-        if lifecycle is None:
-            return False
-        expected_ids = set(lifecycle.get("robot_ids", []))
-        anchors = lifecycle.get("guard_anchor_by_id", {})
-        if not expected_ids or set(anchors) != expected_ids:
-            return False
-        guards = {
-            robot.robot_id: robot
-            for robot in robots
-            if robot.robot_id in expected_ids
-            and robot.role == "JUNCTION_GUARD"
-            and robot.junction_guard_branch == branch
-        }
-        if set(guards) != expected_ids:
-            return False
-        return all(
-            guards[robot_id].position.distance_to(anchors[robot_id])
-            <= physical.JUNCTION_GUARD_POSITION_TOLERANCE
-            for robot_id in expected_ids
-        )
+    def returned_guard_wall_ready(
+            robots: Sequence[Any],
+            branch: str,
+        ) -> bool:
+            """Return readiness without frozen world-position localization.
+
+            The SAME elected cohort must still exist as a Guard wall.
+            Completion is based on branch-local mouth/Junction return,
+            not distance to previously stored global positions.
+            """
+
+            lifecycle = getattr(
+                physical,
+                "integration_wall_lifecycle",
+                {},
+            ).get(branch)
+
+            if lifecycle is None:
+                return False
+
+            expected_ids = set(
+                lifecycle.get("robot_ids", [])
+            )
+
+            if not expected_ids:
+                return False
+
+            guards = {
+                robot.robot_id: robot
+                for robot in robots
+                if (
+                    robot.robot_id in expected_ids
+                    and robot.role == "JUNCTION_GUARD"
+                    and robot.junction_guard_branch == branch
+                )
+            }
+
+            # SAME Shepherd/Guard IDs must be preserved.
+            if set(guards) != expected_ids:
+                return False
+
+            descriptor = descriptor_for(branch)
+
+            if descriptor is None:
+                return False
+
+            # The returned wall only needs to be back in the shallow
+            # Junction-mouth region. It does NOT need to match the
+            # exact frozen Guard coordinates.
+            maximum_depth = max(
+                physical.observed_branch_axial_depth(
+                    robot.position,
+                    descriptor,
+                )
+                for robot in guards.values()
+            )
+
+            return (
+                maximum_depth
+                <= physical.SHEPHERD_JUNCTION_DEPTH_TOLERANCE
+            )
+
+
 
     def continuous_release_line(robots: Sequence[Any]) -> int:
         """Dissolve a returned Shepherd line at the Junction, as in baseline DFS.
@@ -11827,32 +11857,17 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                     f"missing branch UID at Shepherd return: {completed_branch}"
                 )
 
-            original_anchors = (lifecycle or {}).get(
-                "guard_anchor_by_id",
-                {},
+            same_ids_at_return = bool(
+                shepherd_ids_before
             )
-            same_ids_at_return = (
-                bool(shepherd_ids_before)
-                and set(original_anchors) == shepherd_ids_before
-            )
-            max_original_guard_error_before_release = max(
-                (
-                    robot.position.distance_to(
-                        original_anchors[robot.robot_id]
-                    )
-                    for robot in shepherds_before
-                    if robot.robot_id in original_anchors
-                ),
-                default=float("inf"),
-            )
+
             print(
-                f"[OriginalGuardReturnComplete] "
+                f"[ShepherdJunctionReturnComplete] "
                 f"branch={completed_branch} "
                 f"same_ids={same_ids_at_return} "
-                f"max_anchor_error="
-                f"{max_original_guard_error_before_release:.6f} "
-                f"tolerance="
-                f"{physical.JUNCTION_GUARD_POSITION_TOLERANCE:.6f}"
+                f"shepherd_count={len(shepherd_ids_before)} "
+                "completion_source=PHYSICAL_JUNCTION_ARRIVAL "
+                "frozen_world_anchor_check=False"
             )
 
             # Exact lifecycle requested:
@@ -11877,53 +11892,21 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 robot.robot_id for robot in returned_guards
             }
 
-            original_anchor_by_id = (lifecycle or {}).get(
-                "guard_anchor_by_id",
-                {},
-            )
-            missing_original_anchors = sorted(
-                robot.robot_id
-                for robot in returned_guards
-                if robot.robot_id not in original_anchor_by_id
-            )
-            if missing_original_anchors:
-                raise RuntimeError(
-                    "returned Guard has no frozen initial Guard anchor: "
-                    f"branch={completed_branch} "
-                    f"robots={missing_original_anchors}"
-                )
-
-            max_original_guard_error = max(
-                (
-                    robot.position.distance_to(
-                        original_anchor_by_id[robot.robot_id]
-                    )
-                    for robot in returned_guards
-                ),
-                default=0.0,
-            )
-            if max_original_guard_error > 1e-7:
-                raise RuntimeError(
-                    "returned Shepherd wall did not restore exact initial "
-                    f"Guard positions: branch={completed_branch} "
-                    f"max_error={max_original_guard_error:.9f}"
-                )
-
-            if returned_guard_ids != shepherd_ids_before:
-                raise RuntimeError(
-                    "Guard->Frontier->Shepherd->Guard lineage mismatch: "
-                    f"before={sorted(shepherd_ids_before)} "
-                    f"after={sorted(returned_guard_ids)}"
-                )
 
             expected_ids = set(
-                (lifecycle or {}).get("robot_ids", shepherd_ids_before)
+                (lifecycle or {}).get(
+                    "robot_ids",
+                    shepherd_ids_before,
+                )
             )
-            if expected_ids and returned_guard_ids != expected_ids:
+
+            if returned_guard_ids != expected_ids:
                 raise RuntimeError(
-                    "returned visited Guard IDs differ from original Guard wall: "
+                    "returned Guard IDs changed during "
+                    "Guard -> Frontier -> Shepherd -> Guard lifecycle: "
+                    f"branch={completed_branch} "
                     f"expected={sorted(expected_ids)} "
-                    f"returned={sorted(returned_guard_ids)}"
+                    f"actual={sorted(returned_guard_ids)}"
                 )
 
             # Returned SAME-ID Guard wall is the completion evidence.
@@ -11967,9 +11950,9 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"branch={completed_branch} "
                 f"robots={len(returned_guard_ids)} "
                 "GUARD->FRONTIER->SHEPHERD->GUARD "
-                f"same_ids=True original_guard_error="
-                f"{max_original_guard_error:.9f} "
-                "restored_exact_initial_guard_pose=True"
+                "same_ids=True "
+                "completion_source=SHEPHERD_JUNCTION_ARRIVAL "
+                "frozen_world_anchor_check=False"
             )
 
             discovered, visited, remaining_uids = remaining_dfs_branch_uids(robots)
@@ -13261,10 +13244,10 @@ def handoff_to_physical_dfs(
             "sealing_lateral_min": float(geometry.sealing_lateral_min),
             "sealing_lateral_max": float(geometry.sealing_lateral_max),
             "slot_spacing": float(geometry.slot_spacing),
-            # Freeze the original LiDAR mouth Guard anchors before any branch
-            # is promoted to Frontier.  A returned Shepherd wall comes back to
-            # these exact physical targets and remains there until every child
-            # branch of this Junction has been explored.
+
+            
+            # Temporary formation reference only.
+            # This must NOT be used as a DFS return-completion criterion.
             "guard_anchor_by_id": {
                 robot.robot_id: (
                     robot.integration_guard_final_anchor.copy()
