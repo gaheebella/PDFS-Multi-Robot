@@ -165,6 +165,7 @@ CHILD_APPROACH_SLOWDOWN_W_RATIO = 0.35
 # Child stationary Junction verification
 CHILD_STATIONARY_PERSISTENCE_RATIO = 0.60
 CHILD_STATIONARY_MIN_OUTGOING = 2
+LIDAR_ROBOT_ID = 675
 
 
 class PerceptionState(Enum):
@@ -3900,17 +3901,10 @@ def install_local_forward_ingress(physical: types.ModuleType) -> None:
         # ingress_lane_x is a deployment-local transverse reference, not a
         # Junction/world target. For the present -90 degree deployment yaw it
         # is exactly the body-local lateral coordinate.
-        lateral_error = robot.ingress_lane_x - robot.position.x
-        lane_force = max(
-            -physical.INITIAL_INGRESS_LANE_MAX_FORCE,
-            min(
-                physical.INITIAL_INGRESS_LANE_MAX_FORCE,
-                physical.INITIAL_INGRESS_LANE_GAIN * lateral_error,
-            ),
-        )
         return (
-            forward * adaptive.LOCAL_FORWARD_DRIVE_FORCE * weight
-            + lateral * lane_force
+            forward
+            * adaptive.LOCAL_FORWARD_DRIVE_FORCE
+            * weight
         )
 
     def normal_equilibrium_radius(robot: Any) -> float:
@@ -4052,7 +4046,17 @@ class AdaptivePerception:
         self.anchor_fixed_mean_normal_forward_speed = 0.0
         self.pre_topology_normal_forward_speeds: list[float] = []
         self.robots = robots
-        self.leader = self._select_leader(robots)
+        def _select_leader(
+            self,
+            robots: Sequence[Any],
+        ) -> Any:
+            for robot in robots:
+                if robot.robot_id == LIDAR_ROBOT_ID:
+                    return robot
+
+            raise RuntimeError(
+                f"LiDAR robot {LIDAR_ROBOT_ID} not found"
+            )
         self.initial_leader_position = self.leader.position.copy()
         self.leader.is_lidar_robot = True
         self.leader.is_fixed_anchor = False
