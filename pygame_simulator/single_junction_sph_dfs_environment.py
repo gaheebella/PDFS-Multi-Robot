@@ -2341,7 +2341,7 @@ class Robot:
         self.observed_velocity = (
             self.position - old_position
         ) / max(dt, EPSILON)
-        maybe_stage_pebble_at_return_crossing(self, old_position)
+        #maybe_stage_pebble_at_return_crossing(self, old_position)
         update_indirect_contact_state(self, dt)
         self.acceleration.update(0.0, 0.0)
         self.previous_position = old_position
@@ -7069,73 +7069,6 @@ def maybe_stage_pebble_at_return_crossing(
     return True
 
 
-def stage_pebble_from_returned_shepherd_line(
-    robots,
-    branch: str,
-) -> Optional["Robot"]:
-    """Use an actually returned Shepherd when completion follows immediately."""
-    global pending_pebble_robot_ids
-    branch_uid = branch_uid_for_fixture(branch)
-    if branch_uid is None:
-        return None
-    if branch in pending_pebble_robot_ids:
-        return next(
-            (
-                robot for robot in robots
-                if robot.robot_id == pending_pebble_robot_ids[branch]
-            ),
-            None,
-        )
-    candidates = [
-        robot for robot in robots
-        if robot.role == "SHEPHERD"
-        and robot.shepherd_branch == branch
-        and branch in robot.local_ingress_tangents
-        and branch in robot.local_branch_ingress_points
-        and robot.position.distance_to(
-            robot.local_branch_ingress_points[branch]
-        ) <= PEBBLE_MOUTH_RADIUS
-    ]
-    if not candidates:
-        return None
-    pebble = min(
-        candidates,
-        key=lambda robot: (
-            robot.position.distance_squared_to(
-                robot.local_branch_ingress_points[branch]
-            ),
-            robot.robot_id,
-        ),
-    )
-    ingress = locally_consensed_ingress_direction(pebble, branch)
-    if ingress is None or ingress.length_squared() <= EPSILON:
-        return None
-    ingress = ingress.normalize()
-    pebble.local_return_mouth_crossings[branch] = pebble.position.copy()
-    pebble.role = "PEBBLE"
-    pebble.pebble_anchor = pebble.position.copy()
-    pebble.pebble_branch_uid = branch_uid
-    pebble.pebble_branch_key = branch
-    pebble.pebble_state = "PENDING_RETURN_CONFIRMATION"
-    pebble.pebble_ingress_direction_local = ingress.copy()
-    pebble.pebble_return_direction_local = -ingress
-    pebble.pebble_completion_epoch = 0
-    pebble.shepherd_anchor = None
-    pebble.shepherd_origin = None
-    pebble.frontier_local_lateral = None
-    pebble.shepherd_branch = None
-    pebble.transfer_target = None
-    pebble.velocity.update(0.0, 0.0)
-    pebble.acceleration.update(0.0, 0.0)
-    pebble.filtered_acceleration.update(0.0, 0.0)
-    pending_pebble_robot_ids[branch] = pebble.robot_id
-    print(
-        f"[Pebble] branch={pebble.pebble_branch_uid} "
-        f"robot={pebble.robot_id} staged from returned Shepherd crossing"
-    )
-    return pebble
-
-
 def create_branch_pebble(robots, branch_uid: str) -> Optional["Robot"]:
     """Promote a marker by UID; adapt to fixture only for local geometry."""
     global branch_completion_epoch, pending_pebble_robot_ids
@@ -9220,13 +9153,7 @@ def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
             "missing ACTIVE/dead-end/backflow/return evidence"
         )
         return False
-    pebble = create_branch_pebble(robots, branch_uid)
-    if pebble is None:
-        print(
-            "[BranchComplete] waiting for local Pebble candidate "
-            f"branch={branch_identity_label(branch_uid)}"
-        )
-        return False
+   
     set_branch_descriptor_state(branch_uid, "VISITED")
     distributed_consensus_branch = None
     active_branch_uid = None
@@ -9243,9 +9170,7 @@ def complete_active_branch(branch, robots, cohort_return_confirmed: bool):
     previous_branch_direction = get_backtrack_direction(branch)
     metrics.branch_events.append({"branch": branch, "completed_at": simulation_time})
     visited_count = len(observed_visited_branch_uids(robots))
-    print(
-        f"[BranchComplete] uid={pebble.pebble_branch_uid} fixture={branch}"
-    )
+
     print(
         f"[JunctionComplete] visited={visited_count}/"
         f"{len(discovered_branch_uids()) or len(BRANCHES)}"
@@ -11260,7 +11185,6 @@ def release_shepherd_line_at_junction(
 
     # Legacy compatibility path: a caller may still explicitly dissolve the
     # returned line into NORMAL flow.
-    stage_pebble_from_returned_shepherd_line(robots, branch)
     released = 0
     for robot in list(shepherds):
         if robot.role != "SHEPHERD":
