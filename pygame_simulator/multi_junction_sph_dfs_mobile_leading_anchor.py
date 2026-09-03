@@ -89,6 +89,7 @@ COLORS = {
 
 RAY_COUNT = adaptive.LIDAR_RAYS
 MAX_RANGE = adaptive.LIDAR_MAX_RANGE
+LIDAR_ROBOT_ID = 675
 SMOOTHING_WINDOW = 5
 ALPHA = 0.5
 NOISE_FRACTION = adaptive.DEFAULT_NOISE_FRACTION
@@ -288,11 +289,13 @@ class ChildObservationSession:
 
     lidar_id: int
     start_frame: int
-    start_position: pygame.Vector2
 
-    # Frozen local ingress frame from the Parent branch.
     ingress_t: pygame.Vector2
     ingress_n: pygame.Vector2
+
+    # Localization-free local odometry.
+    probe_axial_odometry: float = 0.0
+    odometry_last_time: float | None = None
 
     samples: int = 0
     valid_samples: int = 0
@@ -305,12 +308,11 @@ class ChildObservationSession:
     structural_streak: int = 0
 
     candidate_frame: int | None = None
-    candidate_position: pygame.Vector2 | None = None
     candidate_depth_local: float | None = None
     candidate_selected_threshold: float | None = None
     candidate_lidar_frame: LidarFrame | None = None
 
-    candidate_last_position: pygame.Vector2 | None = None
+    candidate_odometry_origin: float | None = None
     candidate_traveled_axial: float = 0.0
     candidate_remaining_depth: float | None = None
 
@@ -396,8 +398,24 @@ class MultiJunctionManager:
         self.child_probe_branch_uid: str | None = None
         self.child_probe_start_frame: int | None = None
         self.child_probe_lidar_id: int | None = None
-        self.child_probe_start_position: pygame.Vector2 | None = None
         self.child_session: ChildObservationSession | None = None
+
+        # -------------------------------------------------
+        # Localization-free next-Branch Anchor handoff.
+        #
+        # Branch completion does NOT immediately start
+        # the next Branch.
+        #
+        # The same LiDAR Anchor first returns physically,
+        # faces the next local Branch direction, and
+        # re-establishes itself as the local front robot.
+        # -------------------------------------------------
+        self.next_branch_pending_uid: str | None = None
+        self.next_branch_pending_fixture: str | None = None
+        self.next_branch_source_fixture: str | None = None
+
+        self.next_branch_ready_streak: int = 0
+        self.next_branch_ready: bool = False
 
     @property
     def current(self) -> MultiJunctionFrame | None:
@@ -672,7 +690,6 @@ def sync_multi_dfs_from_physical(
         multi_dfs.child_probe_branch_uid = None
         multi_dfs.child_probe_start_frame = None
         multi_dfs.child_probe_lidar_id = None
-        multi_dfs.child_probe_start_position = None
 
         multi_dfs.child_candidate_active = False
         multi_dfs.child_session = None
@@ -2141,110 +2158,104 @@ def prepare_child_frontier_handoff(
     )
 
 
+
 def hold_normal_swarm_before_branch_release(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     robots: Sequence[Any],
 ) -> None:
-    """Keep a moving NORMAL queue behind the fixed LiDAR Anchor.
+    """Queue NORMAL robots behind the fixed LiDAR Anchor.
 
-    While Junction verification / Guard formation is active:
+    Policy
+    ------
+    1. Junction stationary verification 전:
+       모든 NORMAL을 정지시킨다.
 
-        - Anchor stays fixed.
-        - NORMAL robots behind the Anchor may continue moving forward.
-        - Only the front row is stopped behind the Anchor.
-        - Guard-selected robots automatically leave this queue because
-          their role changes NORMAL -> JUNCTION_GUARD.
+    2. Topology ready 후 Guard formation 중:
+       Guard가 빠져나간 공간만큼 rear NORMAL이
+       자연스럽게 앞으로 공급되게 한다.
 
-    Therefore robots naturally refill the space vacated by Guard robots.
+       Anchor 가까이에 도달한 NORMAL만 다시 정지한다.
+
+    No global localization is used for NORMAL control.
+    Only local Anchor-relative sensing is used.
     """
 
-    # Branch exploration started -> no Junction queue control.
+    launch_alignment_active = bool(
+        getattr(
+            perception,
+            "branch_launch_alignment_active",
+            False,
+        )
+    )
+
+    next_branch_preparation_active = (
+        physical.phase
+        == physical.SimulationPhase.JUNCTION_SWITCH
+        and multi_dfs.next_branch_pending_uid
+        is not None
+    )
+
+    # -------------------------------------------------
+    # 두 경우에 NORMAL swarm을 정지시킨다.
+    #
+    # 1. Junction에서 Anchor가 FIXED인 동안
+    # 2. 새 Branch 시작 전 Anchor가
+    #    front + corridor center를 맞추는 동안
+    #
+    # Guard / Frontier / Shepherd와 Anchor 자체는
+    # 아래 loop에서 제외되므로 계속 움직일 수 있다.
+    # -------------------------------------------------
     if (
         not perception.anchor_fixed
-        or physical.phase
+        and not launch_alignment_active
+        and not next_branch_preparation_active
+    ):
+        return
+
+    if (
+        physical.phase
         == physical.SimulationPhase.EXPLORE_BRANCH
+        and not launch_alignment_active
     ):
         return
 
     anchor = perception.leader
 
-    # Current ingress direction.
-    forward = pygame.Vector2(
-        math.cos(
-            math.radians(
-                perception.yaw_deg
-            )
-        ),
-        math.sin(
-            math.radians(
-                perception.yaw_deg
-            )
-        ),
-    )
-
-    if (
-        forward.length_squared()
-        <= physical.EPSILON
-    ):
-        return
-
-    forward = forward.normalize()
-
-    anchor_progress = float(
-        anchor.position.dot(
-            forward
-        )
-    )
-
-    # -------------------------------------------------
-    # Anchor = row 1
-    # NORMAL front = row 2
+        # =====================================================
+    # BRANCH LAUNCH ALIGNMENT
     #
-    # The front NORMAL row may approach this line,
-    # but it may never pass it.
-    # -------------------------------------------------
-    desired_gap = float(
-        physical.GRID_ROW_SPACING
-    )
+    # Guard formation은 이미 끝났고,
+    # 선택된 Guard는 Frontier가 된 상태다.
+    #
+    # SAME LiDAR Anchor가
+    #   1. NORMAL swarm의 최전방 한 row 앞
+    #   2. 선택 Branch corridor center
+    #
+    # 를 잡는 동안 ordinary NORMAL은 전부 기다린다.
+    #
+    # 그렇지 않으면 NORMAL front 자체가 계속 이동해서
+    # Anchor가 영원히 front를 따라잡지 못한다.
+    #
+    # Guard / Frontier / Shepherd는 role != NORMAL이므로
+    # 이 HOLD의 영향을 받지 않는다.
+    # =====================================================
+    if launch_alignment_active:
 
-    normal_stop_line = (
-        anchor_progress
-        - desired_gap
-    )
+        held = 0
 
-    stopped = 0
-    moving = 0
+        for robot in robots:
 
-    for robot in robots:
+            # SAME LiDAR Anchor는 반드시 자유롭게 움직인다.
+            if robot is anchor:
+                continue
 
-        if robot is anchor:
-            continue
+            # ordinary NORMAL만 정지.
+            if robot.role != "NORMAL":
+                continue
 
-        # Guard-selected robots are NOT controlled here.
-        #
-        # The instant a robot becomes JUNCTION_GUARD,
-        # it is free to leave the swarm for its Guard slot.
-        if robot.role != "NORMAL":
-            continue
-
-        if robot.base_reserve:
-            continue
-
-        progress = float(
-            robot.position.dot(
-                forward
-            )
-        )
-
-        # -------------------------------------------------
-        # Only robots that have reached the Anchor's
-        # second-row boundary are stopped.
-        #
-        # Robots farther behind remain under ordinary
-        # SPH + ingress propulsion and keep advancing.
-        # -------------------------------------------------
-        if progress >= normal_stop_line:
+            if robot.base_reserve:
+                continue
 
             robot.velocity.update(
                 0.0,
@@ -2270,10 +2281,276 @@ def hold_normal_swarm_before_branch_release(
                     0.0,
                 )
 
-            stopped += 1
+            held += 1
 
-        else:
-            moving += 1
+        if (
+            physical.integration_frame
+            % 10
+            == 0
+        ):
+            print(
+                "[BranchLaunchNormalHold] "
+                f"frame={physical.integration_frame} "
+                f"branch="
+                f"{perception.branch_launch_alignment_uid} "
+                f"held={held} "
+                "anchor_free=True"
+            )
+
+        return
+
+    # =====================================================
+    # STEP 1
+        # =====================================================
+    # JUNCTION_SWITCH
+    #
+    # 이전 Branch의 backtracking이 끝난 뒤에는
+    # ordinary NORMAL swarm을 Junction에 기다리게 한다.
+    #
+    # SAME LiDAR Anchor만 다음 Branch의 입구 쪽으로
+    # 이동하여 다음 Branch의 local front를 다시 잡는다.
+    #
+    # Guard / Frontier / Shepherd는 건드리지 않는다.
+    # =====================================================
+    if next_branch_preparation_active:
+
+        held = 0
+
+        for robot in robots:
+
+            if robot is anchor:
+                continue
+
+            if robot.role != "NORMAL":
+                continue
+
+            if robot.base_reserve:
+                continue
+
+            robot.velocity.update(
+                0.0,
+                0.0,
+            )
+
+            robot.acceleration.update(
+                0.0,
+                0.0,
+            )
+
+            robot.filtered_acceleration.update(
+                0.0,
+                0.0,
+            )
+
+            if hasattr(
+                robot,
+                "commanded_velocity",
+            ):
+                robot.commanded_velocity.update(
+                    0.0,
+                    0.0,
+                )
+
+            held += 1
+
+        if (
+            physical.integration_frame
+            % 10
+            == 0
+        ):
+            print(
+                "[NextBranchNormalHold] "
+                f"frame="
+                f"{physical.integration_frame} "
+                f"pending="
+                f"{multi_dfs.next_branch_pending_uid} "
+                f"held={held}"
+            )
+
+        return
+
+    # =====================================================
+    # STEP 1
+    #
+    # 아직 stationary topology verification이 끝나지 않았다.
+    #
+    # 사용자 요구:
+    # Junction을 마주치면 Anchor + 전체 swarm이 같이 멈춘다.
+    # =====================================================
+    if perception.topology_ready_frame is None:
+
+        held = 0
+
+        for robot in robots:
+
+            if robot is anchor:
+                continue
+
+            if robot.role != "NORMAL":
+                continue
+
+            if robot.base_reserve:
+                continue
+
+            robot.velocity.update(
+                0.0,
+                0.0,
+            )
+
+            robot.acceleration.update(
+                0.0,
+                0.0,
+            )
+
+            robot.filtered_acceleration.update(
+                0.0,
+                0.0,
+            )
+
+            if hasattr(
+                robot,
+                "commanded_velocity",
+            ):
+                robot.commanded_velocity.update(
+                    0.0,
+                    0.0,
+                )
+
+            held += 1
+
+        if (
+            physical.integration_frame
+            % 20
+            == 0
+        ):
+            print(
+            "[JunctionNormalHold] "
+            f"frame={physical.integration_frame} "
+            f"phase={physical.phase.name} "
+            f"anchor_fixed="
+            f"{perception.anchor_fixed} "
+            f"launch_align="
+            f"{launch_alignment_active} "
+            f"held_normals={held}"
+        )
+
+        return
+
+    # =====================================================
+    # STEP 2
+    #
+    # Topology는 확인됐고 이제 Guard를 만드는 중.
+    #
+    # 모든 NORMAL을 묶어두면 안 된다.
+    #
+    # Anchor 근처에 도달한 로봇만 local HOLD.
+    # 뒤쪽 로봇은 SPH + 기존 propulsion으로 계속 올라온다.
+    # =====================================================
+
+    local_neighbor_ids = {
+        getattr(
+            neighbor,
+            "robot_id",
+            -1,
+        )
+        for neighbor in getattr(
+            anchor,
+            "comm_neighbors",
+            [],
+        )
+    }
+
+    # Anchor 바로 뒤 약 2~3개 row를 정지 queue로 사용.
+    hold_depth = (
+        2.5
+        * float(
+            physical.GRID_ROW_SPACING
+        )
+    )
+
+    held = 0
+    feeding = 0
+
+    for robot in robots:
+
+        if robot is anchor:
+            continue
+
+        # Guard로 선발되는 순간 role이 바뀌므로
+        # 자동으로 이 HOLD에서 빠져나간다.
+        if robot.role != "NORMAL":
+            continue
+
+        if robot.base_reserve:
+            continue
+
+        # -------------------------------------------------
+        # Anchor의 local communication/sensing 범위 밖:
+        # 뒤에서 자연스럽게 계속 전진.
+        # -------------------------------------------------
+        if (
+            robot.robot_id
+            not in local_neighbor_ids
+        ):
+            feeding += 1
+            continue
+
+        # -------------------------------------------------
+        # Local relative measurement only.
+        #
+        # global x/y를 이용해 "어디에 있다"를 판단하지 않는다.
+        # Anchor 기준 상대 range/bearing을 sensor backend가 제공.
+        # -------------------------------------------------
+        (
+            relative_axial,
+            _relative_lateral,
+        ) = sense_relative_neighbor_in_anchor_frame(
+            anchor,
+            robot,
+            perception.yaw_deg,
+        )
+
+        # 아직 Anchor에서 충분히 뒤에 있으면 계속 전진.
+        if (
+            relative_axial
+            < -hold_depth
+        ):
+            feeding += 1
+            continue
+
+        # -------------------------------------------------
+        # Anchor 바로 뒤 queue에 도달.
+        #
+        # 여기서 정지.
+        #
+        # Guard로 선발되면 다음 frame부터
+        # JUNCTION_GUARD가 되어 자유롭게 빠져나간다.
+        # -------------------------------------------------
+        robot.velocity.update(
+            0.0,
+            0.0,
+        )
+
+        robot.acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        robot.filtered_acceleration.update(
+            0.0,
+            0.0,
+        )
+
+        if hasattr(
+            robot,
+            "commanded_velocity",
+        ):
+            robot.commanded_velocity.update(
+                0.0,
+                0.0,
+            )
+
+        held += 1
 
     if (
         physical.integration_frame
@@ -2281,14 +2558,13 @@ def hold_normal_swarm_before_branch_release(
         == 0
     ):
         print(
-            "[JunctionNormalQueue] "
+            "[JunctionNormalHold] "
             f"frame={physical.integration_frame} "
-            f"phase={physical.phase.name} "
-            f"anchor_fixed={perception.anchor_fixed} "
-            f"stop_line={normal_stop_line:.2f} "
-            f"stopped_front={stopped} "
-            f"moving_behind={moving}"
+            "mode=GUARD_FEED_QUEUE "
+            f"held_front={held} "
+            f"feeding_rear={feeding}"
         )
+
 
 def update_child_lidar_probe(
     physical: types.ModuleType,
@@ -2333,18 +2609,72 @@ def update_child_lidar_probe(
 
         lidar_robot = perception.leader
 
+        # -------------------------------------------------
+        # Do not start the new Branch front-lock while the
+        # SAME LiDAR is still physically beside the previous
+        # Branch.
+        #
+        # Until it reaches the new Branch corridor, it remains
+        # an ordinary NORMAL and moves naturally with SPH.
+        # -------------------------------------------------
+
         try:
-            axial, lateral = physical.branch_local_coordinates(
-                lidar_robot.position,
-                descriptor,
+            tangent, normal = (
+                physical.descriptor_local_basis(
+                    descriptor
+                )
             )
-
-            tangent, normal = physical.descriptor_local_basis(
-                descriptor
-            )
-
-        except (ValueError, AttributeError):
+        except (
+            ValueError,
+            AttributeError,
+        ):
             return
+
+        tangent = tangent.normalize()
+        normal = normal.normalize()
+
+        session = multi_dfs.child_session
+
+        if session is None:
+            return
+
+        if session.anchor_stopped:
+            return
+
+        now = float(
+            physical.simulation_time
+        )
+
+        if session.odometry_last_time is None:
+            session.odometry_last_time = now
+
+        else:
+            local_dt = max(
+                0.0,
+                now - session.odometry_last_time,
+            )
+
+            measured_velocity = getattr(
+                lidar_robot,
+                "observed_velocity",
+                lidar_robot.velocity,
+            )
+
+            axial_speed = float(
+                measured_velocity.dot(
+                    session.ingress_t
+                )
+            )
+
+            session.probe_axial_odometry = max(
+                0.0,
+                session.probe_axial_odometry
+                + axial_speed * local_dt,
+            )
+
+            session.odometry_last_time = now
+
+    
 
         tangent = tangent.normalize()
         normal = normal.normalize()
@@ -2374,10 +2704,9 @@ def update_child_lidar_probe(
         # -------------------------------------------------
         # Lateral centerline restoration.
         # -------------------------------------------------
-        lateral_command = (
-            -3.0 * lateral
-            -2.2 * lateral_velocity
-        )
+                # No global Branch-centerline correction.
+        # SPH/local interaction handles lateral motion.
+        lateral_command = 0.0
 
         lateral_command = max(
             -55.0,
@@ -2399,7 +2728,7 @@ def update_child_lidar_probe(
             multi_dfs.child_candidate_active
             and session is not None
             and session.candidate_depth_local is not None
-            and session.candidate_last_position is not None
+            and session.candidate_odometry_origin is not None
         )
 
         # -------------------------------------------------
@@ -2424,11 +2753,11 @@ def update_child_lidar_probe(
         #     - signed local odometry
         # -------------------------------------------------
         if (
-            multi_dfs.child_candidate_active
-            and session is not None
-            and session.candidate_depth_local is not None
-            and session.candidate_last_position is not None
-        ):
+                multi_dfs.child_candidate_active
+                and session is not None
+                and session.candidate_depth_local is not None
+                and session.candidate_odometry_origin is not None
+            ):
 
             # ---------------------------------------------
             # Candidate-start-relative local odometry.
@@ -2437,20 +2766,11 @@ def update_child_lidar_probe(
             # Candidate position instead of accumulating
             # frame-to-frame steps.
             # ---------------------------------------------
-            if session.candidate_position is None:
-                return
-
-            displacement_from_candidate = (
-                lidar_robot.position
-                - session.candidate_position
-            )
-
             session.candidate_traveled_axial = max(
                 0.0,
                 float(
-                    displacement_from_candidate.dot(
-                        session.ingress_t
-                    )
+                    session.probe_axial_odometry
+                    - session.candidate_odometry_origin
                 ),
             )
 
@@ -2460,33 +2780,17 @@ def update_child_lidar_probe(
                 - session.candidate_traveled_axial,
             )
 
-            # Use the W measured at Candidate time as the
-            # scale reference. Later unstable scans must not
-            # move the stopping criterion.
             if (
                 session.candidate_lidar_frame
-                is not None
+                is None
             ):
-                candidate_width = float(
-                    session.candidate_lidar_frame.adaptive_w
-                )
-            elif session.last_valid_w is not None:
-                candidate_width = float(
-                    session.last_valid_w
-                )
-            else:
-                candidate_width = float(
-                    lidar_frame.adaptive_w
-                )
-            # Use the SAME entrance-stop tolerance as J0.
-            #
-            # J0:
-            #   entrance_depth <= ANCHOR_ENTRANCE_STOP_TOLERANCE
-            #
-            # Child Junctions must use the same geometric
-            # stopping rule instead of driving almost to
-            # zero remaining depth.
-            # SAME entrance-stop rule as J0.
+                return
+
+            candidate_width = float(
+                session.candidate_lidar_frame.adaptive_w
+            )
+
+
             stop_tolerance = float(
                 ANCHOR_ENTRANCE_STOP_TOLERANCE
             )
@@ -2707,7 +3011,11 @@ def update_child_lidar_probe(
             + normal * lateral_command
         )
 
-        if physical.integration_frame % 20 == 0:
+        if (
+            physical.integration_frame
+            % 20
+            == 0
+        ):
             comm_parent = getattr(
                 lidar_robot,
                 "comm_parent",
@@ -2720,24 +3028,20 @@ def update_child_lidar_probe(
                 None,
             )
 
-            comm_parent_distance = (
-                lidar_robot.position.distance_to(
-                    comm_parent.position
+            probe_acc = float(
+                lidar_robot.acceleration.length()
+            )
+
+            local_axial_speed = float(
+                lidar_robot.velocity.dot(
+                    session.ingress_t
                 )
-                if comm_parent is not None
-                else float("nan")
             )
 
-            probe_acc = lidar_robot.acceleration.length()
-
-            forward_test_position = (
-                lidar_robot.position
-                + tangent * physical.ROBOT_RADIUS
-            )
-
-            forward_walkable = physical.is_walkable(
-                forward_test_position,
-                lidar_robot.radius,
+            local_lateral_speed = float(
+                lidar_robot.velocity.dot(
+                    session.ingress_n
+                )
             )
 
             print(
@@ -2746,24 +3050,24 @@ def update_child_lidar_probe(
                 f"branch={active_uid} "
                 f"lidar_id={lidar_robot.robot_id} "
                 f"role={lidar_robot.role} "
-                f"axial={axial:.2f} "
-                f"lateral={lateral:.2f} "
-                f"lateral_v={lateral_velocity:.2f} "
-                f"center_cmd={lateral_command:.2f} "
+                f"odometry_axial="
+                f"{session.probe_axial_odometry:.2f} "
+                f"axial_v="
+                f"{local_axial_speed:.2f} "
+                f"lateral_v="
+                f"{local_lateral_speed:.2f} "
                 f"acc={probe_acc:.2f} "
-                f"anchor_fixed={perception.anchor_fixed} "
+                f"anchor_fixed="
+                f"{perception.anchor_fixed} "
                 f"is_fixed_anchor="
                 f"{lidar_robot.is_fixed_anchor} "
-                f"base_reserve={lidar_robot.base_reserve} "
+                f"base_reserve="
+                f"{lidar_robot.base_reserve} "
                 f"connected="
                 f"{lidar_robot.connected_to_base} "
-                f"comm_parent={comm_parent_id} "
-                f"comm_dist={comm_parent_distance:.2f} "
-                f"comm_hard="
-                f"{physical.COMM_GUARD_HARD_LIMIT:.2f} "
-                f"forward_walkable={forward_walkable}"
+                f"comm_parent="
+                f"{comm_parent_id}"
             )
-
         return
 
         # =====================================================
@@ -2852,9 +3156,7 @@ def update_child_lidar_probe(
     multi_dfs.child_probe_lidar_id = (
         lidar_robot.robot_id
     )
-    multi_dfs.child_probe_start_position = (
-        lidar_robot.position.copy()
-    )
+    
 
     # Freeze LiDAR orientation to the active Branch's
     # already-observed local tangent.
@@ -2871,6 +3173,16 @@ def update_child_lidar_probe(
         )
     )
 
+        # -------------------------------------------------
+    # 지금 yaw가 새 Branch 방향으로 바뀌었다.
+    #
+    # perception.last_frame은 이전 yaw에서 측정했을 수
+    # 있으므로, 다음 LiDAR scan부터 corridor-centering에
+    # 사용한다.
+    # -------------------------------------------------
+    perception.branch_launch_lidar_min_frame = (
+        perception.frame
+    )
 
 
     # -----------------------------------------------------
@@ -2883,7 +3195,6 @@ def update_child_lidar_probe(
         parent_branch_uid=active_uid,
         lidar_id=lidar_robot.robot_id,
         start_frame=physical.integration_frame,
-        start_position=lidar_robot.position.copy(),
         ingress_t=tangent.copy(),
         ingress_n=normal.copy(),
     )
@@ -2918,26 +3229,956 @@ def update_child_lidar_probe(
         "position_snap=False"
     )
 
+def sense_relative_neighbor_in_anchor_frame(
+    anchor: Any,
+    neighbor: Any,
+    yaw_deg: float,
+) -> tuple[float, float]:
+    """Simulator backend for local relative range/bearing sensing.
+
+    IMPORTANT:
+    The controller receives only relative axial/lateral measurements.
+    No absolute world position is exposed to the control algorithm.
+
+    On a real robot this is replaced by relative range/bearing sensing.
+    """
+
+    # Simulator-only sensor emulation.
+    relative = (
+        neighbor.position
+        - anchor.position
+    )
+
+    yaw = math.radians(
+        yaw_deg
+    )
+
+    forward = pygame.Vector2(
+        math.cos(yaw),
+        math.sin(yaw),
+    )
+
+    lateral_axis = pygame.Vector2(
+        -forward.y,
+        forward.x,
+    )
+
+    return (
+        float(
+            relative.dot(forward)
+        ),
+        float(
+            relative.dot(lateral_axis)
+        ),
+    )
+
+def enforce_anchor_frontier_shepherd_physical_collision(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+    anchor_old_position: pygame.Vector2,
+) -> None:
+    """Hard physical non-penetration between LiDAR Anchor and front wall.
+
+    This is a simulator physics constraint, NOT localization-based control.
+
+    The LiDAR Anchor may physically contact the current
+    FRONTIER / SHEPHERD wall, but it can never pass through it.
+
+    Protected roles:
+        FRONTIER_SHEPHERD
+        PRE_SHEPHERD
+        SHEPHERD
+
+    No virtual full-width wall is created.
+    Collision exists only at actual robot disks.
+    """
+
+    anchor = perception.leader
+
+    if anchor is None:
+        return
+
+    if getattr(anchor, "role", None) != "NORMAL":
+        return
+
+    active_branch = getattr(
+        physical,
+        "active_branch",
+        None,
+    )
+
+    pending_uid = (
+        multi_dfs.next_branch_pending_uid
+    )
+
+    pending_fixture = (
+        multi_dfs.next_branch_pending_fixture
+    )
+
+    protect_pending_guard = (
+        physical.phase
+        == physical.SimulationPhase.JUNCTION_SWITCH
+        and pending_uid is not None
+    )
+
+    barriers = []
+
+    for robot in robots:
+
+        if robot is anchor:
+            continue
+
+        role = getattr(
+            robot,
+            "role",
+            None,
+        )
+
+        # -------------------------------------------------
+        # 현재 탐색 Branch의 Frontier / Shepherd.
+        # -------------------------------------------------
+        if (
+            role
+            in {
+                "FRONTIER_SHEPHERD",
+                "PRE_SHEPHERD",
+                "SHEPHERD",
+            }
+            and active_branch is not None
+            and getattr(
+                robot,
+                "shepherd_branch",
+                None,
+            )
+            == active_branch
+        ):
+            barriers.append(
+                robot
+            )
+            continue
+
+        # -------------------------------------------------
+        # JUNCTION_SWITCH 중 아직 열리지 않은
+        # NEXT Branch Guard.
+        #
+        # Guard -> Frontier 전환 전에는
+        # Anchor가 물리적으로 통과할 수 없다.
+        # -------------------------------------------------
+        if (
+            protect_pending_guard
+            and role == "JUNCTION_GUARD"
+        ):
+
+            guard_uid = getattr(
+                robot,
+                "junction_guard_branch_uid",
+                None,
+            )
+
+            guard_fixture = getattr(
+                robot,
+                "junction_guard_branch",
+                None,
+            )
+
+            if (
+                guard_uid == pending_uid
+                or guard_fixture
+                == pending_fixture
+            ):
+                barriers.append(
+                    robot
+                )
+
+    if not barriers:
+        return
+
+    start = anchor_old_position.copy()
+    end = anchor.position.copy()
+
+    movement = end - start
+
+    if movement.length_squared() <= physical.EPSILON:
+        return
+
+    # Small numerical margin so two disks do not remain
+    # exactly tangent and repeatedly cross because of float error.
+    contact_margin = 0.05
+
+    earliest_t = 1.0
+    hit_robot = None
+    hit_normal = None
+
+    # -------------------------------------------------
+    # Swept-circle collision.
+    #
+    # Instead of checking only the final position,
+    # inspect the whole Anchor motion segment:
+    #
+    # old Anchor --------------------> new Anchor
+    #
+    # Therefore even a fast Anchor cannot tunnel through
+    # the Shepherd wall in one frame.
+    # -------------------------------------------------
+    for barrier in barriers:
+
+        minimum_distance = (
+            float(anchor.radius)
+            + float(barrier.radius)
+            + contact_margin
+        )
+
+        relative_start = (
+            start
+            - barrier.position
+        )
+
+        a = float(
+            movement.dot(
+                movement
+            )
+        )
+
+        b = float(
+            2.0
+            * relative_start.dot(
+                movement
+            )
+        )
+
+        c = float(
+            relative_start.dot(
+                relative_start
+            )
+            - minimum_distance
+            * minimum_distance
+        )
+
+        # -------------------------------------------------
+        # Already overlapping at the beginning of the frame.
+        # Handle separately below.
+        # -------------------------------------------------
+        if c <= 0.0:
+            continue
+
+        discriminant = (
+            b * b
+            - 4.0 * a * c
+        )
+
+        if discriminant < 0.0:
+            continue
+
+        sqrt_disc = math.sqrt(
+            max(
+                0.0,
+                discriminant,
+            )
+        )
+
+        denominator = (
+            2.0 * a
+        )
+
+        if denominator <= physical.EPSILON:
+            continue
+
+        t1 = (
+            -b - sqrt_disc
+        ) / denominator
+
+        t2 = (
+            -b + sqrt_disc
+        ) / denominator
+
+        candidates = [
+            t
+            for t in (
+                t1,
+                t2,
+            )
+            if (
+                0.0
+                <= t
+                <= 1.0
+            )
+        ]
+
+        if not candidates:
+            continue
+
+        t_hit = min(
+            candidates
+        )
+
+        if t_hit >= earliest_t:
+            continue
+
+        contact_position = (
+            start
+            + movement * t_hit
+        )
+
+        normal = (
+            contact_position
+            - barrier.position
+        )
+
+        if (
+            normal.length_squared()
+            <= physical.EPSILON
+        ):
+            continue
+
+        earliest_t = t_hit
+        hit_robot = barrier
+        hit_normal = (
+            normal.normalize()
+        )
+
+    # -------------------------------------------------
+    # Swept collision found:
+    # stop immediately before physical contact.
+    # -------------------------------------------------
+    if (
+        hit_robot is not None
+        and hit_normal is not None
+    ):
+
+        stop_t = max(
+            0.0,
+            earliest_t - 1.0e-4,
+        )
+
+        anchor.position = (
+            start
+            + movement * stop_t
+        )
+
+        # Remove only velocity directed INTO the wall.
+        inward_speed = float(
+            anchor.velocity.dot(
+                -hit_normal
+            )
+        )
+
+        if inward_speed > 0.0:
+            anchor.velocity += (
+                hit_normal
+                * inward_speed
+            )
+
+        anchor.commanded_velocity = (
+            anchor.velocity.copy()
+        )
+
+        anchor.observed_velocity = (
+            anchor.position
+            - start
+        )
+
+        print(
+            "[AnchorPhysicalWallContact] "
+            f"frame={physical.integration_frame} "
+            f"lidar_id={anchor.robot_id} "
+            f"wall_robot={hit_robot.robot_id} "
+            f"wall_role={hit_robot.role} "
+            "crossing_blocked=True"
+        )
+
+    # -------------------------------------------------
+    # Second safety pass:
+    # resolve any numerical overlap that already exists.
+    #
+    # This is standard collision penetration correction,
+    # not a navigation teleport.
+    # -------------------------------------------------
+    for barrier in barriers:
+
+        delta = (
+            anchor.position
+            - barrier.position
+        )
+
+        distance = float(
+            delta.length()
+        )
+
+        minimum_distance = (
+            float(anchor.radius)
+            + float(barrier.radius)
+            + contact_margin
+        )
+
+        if (
+            distance
+            >= minimum_distance
+        ):
+            continue
+
+        if distance > physical.EPSILON:
+
+            normal = (
+                delta / distance
+            )
+
+        else:
+
+            # Degenerate exact-center overlap:
+            # use previous-frame separation.
+            normal = (
+                start
+                - barrier.position
+            )
+
+            if (
+                normal.length_squared()
+                <= physical.EPSILON
+            ):
+
+                yaw = math.radians(
+                    perception.yaw_deg
+                )
+
+                normal = -pygame.Vector2(
+                    math.cos(yaw),
+                    math.sin(yaw),
+                )
+
+            normal = normal.normalize()
+
+        penetration = (
+            minimum_distance
+            - distance
+        )
+
+        anchor.position += (
+            normal
+            * penetration
+        )
+
+        inward_speed = float(
+            anchor.velocity.dot(
+                -normal
+            )
+        )
+
+        if inward_speed > 0.0:
+            anchor.velocity += (
+                normal
+                * inward_speed
+            )
+
+
+def update_next_branch_anchor_preparation_local(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+) -> None:
+    """Prepare the same LiDAR Anchor for the next DFS Branch.
+
+    Localization-free control.
+
+    Controller input:
+    - stored local outgoing Branch direction
+    - Anchor-relative Guard range/bearing
+    - Anchor-relative NORMAL range/bearing
+    - Anchor local velocity
+
+    Never uses:
+    - Junction world position
+    - Guard world target position
+    - robot global x/y as a navigation target
+    - Branch mouth world coordinate
+    """
+
+    # 이 controller는 Branch 사이 전환 중에만 동작한다.
+    if (
+        physical.phase
+        != physical.SimulationPhase.JUNCTION_SWITCH
+    ):
+        return
+
+    pending_uid = (
+        multi_dfs.next_branch_pending_uid
+    )
+
+    pending_fixture = (
+        multi_dfs.next_branch_pending_fixture
+    )
+
+    if (
+        pending_uid is None
+        or pending_fixture is None
+    ):
+        return
+
+    anchor = perception.leader
+
+    if anchor.role != "NORMAL":
+        multi_dfs.next_branch_ready_streak = 0
+        multi_dfs.next_branch_ready = False
+        return
+
+    descriptor = (
+        physical.branch_descriptors_by_uid.get(
+            pending_uid
+        )
+    )
+
+    if descriptor is None:
+        raise RuntimeError(
+            "next Branch Anchor preparation has "
+            "no Branch descriptor: "
+            f"{pending_uid}"
+        )
+
+    # -------------------------------------------------
+    # 1. Use ONLY the already observed local Branch
+    #    direction.
+    #
+    # No Junction coordinate / mouth coordinate.
+    # -------------------------------------------------
+    tangent = getattr(
+        descriptor,
+        "local_outgoing_direction",
+        None,
+    )
+
+    if (
+        tangent is None
+        or tangent.length_squared()
+        <= physical.EPSILON
+    ):
+        raise RuntimeError(
+            "next Branch has no valid "
+            "local_outgoing_direction: "
+            f"{pending_uid}"
+        )
+
+    tangent = tangent.normalize()
+
+    lateral_axis = pygame.Vector2(
+        -tangent.y,
+        tangent.x,
+    )
+
+    desired_yaw_deg = math.degrees(
+        math.atan2(
+            tangent.y,
+            tangent.x,
+        )
+    )
+
+    # Local Branch heading only.
+    perception.yaw_deg = (
+        desired_yaw_deg
+    )
+
+    # Anchor는 이제 Junction verification용
+    # fixed Anchor가 아니다.
+    perception.anchor_fixed = False
+    anchor.is_fixed_anchor = False
+    anchor.base_reserve = False
+
+    # -------------------------------------------------
+    # 2. Observe ONLY the selected next-Branch Guard
+    #    relative to the Anchor.
+    #
+    # robot.position 자체를 controller 계산에
+    # 직접 넣지 않는다.
+    # -------------------------------------------------
+    guard_observations: list[
+        tuple[float, float]
+    ] = []
+
+    for robot in robots:
+
+        if (
+            getattr(robot, "role", None)
+            != "JUNCTION_GUARD"
+        ):
+            continue
+
+        robot_uid = getattr(
+            robot,
+            "junction_guard_branch_uid",
+            None,
+        )
+
+        robot_fixture = getattr(
+            robot,
+            "junction_guard_branch",
+            None,
+        )
+
+        if (
+            robot_uid != pending_uid
+            and robot_fixture
+            != pending_fixture
+        ):
+            continue
+
+        (
+            relative_axial,
+            relative_lateral,
+        ) = sense_relative_neighbor_in_anchor_frame(
+            anchor,
+            robot,
+            desired_yaw_deg,
+        )
+
+        relative_range = math.hypot(
+            relative_axial,
+            relative_lateral,
+        )
+
+        if relative_range > MAX_RANGE:
+            continue
+
+        guard_observations.append(
+            (
+                relative_axial,
+                relative_lateral,
+            )
+        )
+
+    # -------------------------------------------------
+    # Guard가 아직 local sensing range 안에 없으면
+    # next Branch 방향으로 천천히 접근한다.
+    # -------------------------------------------------
+    if not guard_observations:
+
+        multi_dfs.next_branch_ready_streak = 0
+        multi_dfs.next_branch_ready = False
+
+        # 기존 SPH의 진행축 성분을 제거한다.
+        anchor.acceleration -= (
+            tangent
+            * anchor.acceleration.dot(
+                tangent
+            )
+        )
+
+        # 다음 Branch local direction으로만
+        # 천천히 이동한다.
+        anchor.acceleration += (
+            tangent
+            * (
+                0.08
+                * physical.MAX_ACCELERATION
+            )
+        )
+
+        if (
+            physical.integration_frame
+            % 10
+            == 0
+        ):
+            print(
+                "[NextBranchAnchorPrep] "
+                f"frame="
+                f"{physical.integration_frame} "
+                f"branch={pending_uid} "
+                "guard_visible=False "
+                "ready=False"
+            )
+
+        return
+
+    # Guard wall 전체를 Anchor 기준 상대좌표로만 본다.
+    guard_axial = float(
+        np.median([
+            item[0]
+            for item in guard_observations
+        ])
+    )
+
+    guard_lateral = float(
+        np.median([
+            item[1]
+            for item in guard_observations
+        ])
+    )
+
+    # -------------------------------------------------
+    # 3. NORMAL swarm도 Anchor 기준 상대좌표로만 본다.
+    # -------------------------------------------------
+    rear_count = 0
+    ahead_count = 0
+
+    rear_limit = (
+        8.0
+        * physical.GRID_ROW_SPACING
+    )
+
+    lateral_support_limit = (
+        0.35 * MAX_RANGE
+    )
+
+    for robot in robots:
+
+        if robot is anchor:
+            continue
+
+        if (
+            getattr(robot, "role", None)
+            != "NORMAL"
+        ):
+            continue
+
+        if getattr(
+            robot,
+            "base_reserve",
+            False,
+        ):
+            continue
+
+        (
+            relative_axial,
+            relative_lateral,
+        ) = sense_relative_neighbor_in_anchor_frame(
+            anchor,
+            robot,
+            desired_yaw_deg,
+        )
+
+        relative_range = math.hypot(
+            relative_axial,
+            relative_lateral,
+        )
+
+        if relative_range > MAX_RANGE:
+            continue
+
+        if (
+            abs(relative_lateral)
+            > lateral_support_limit
+        ):
+            continue
+
+        # Anchor 뒤의 swarm support.
+        if (
+            -rear_limit
+            <= relative_axial
+            <= -0.5 * physical.ROBOT_RADIUS
+        ):
+            rear_count += 1
+
+        # Anchor 앞에 NORMAL이 있으면
+        # 아직 Anchor가 선두가 아니다.
+        if (
+            relative_axial
+            > 0.5 * physical.ROBOT_RADIUS
+        ):
+            ahead_count += 1
+
+    # -------------------------------------------------
+    # 4. Anchor target:
+    #
+    # next Guard wall 바로 뒤,
+    # 그러나 Guard를 통과하지 않는다.
+    #
+    # target은 world position이 아니라
+    # 상대 거리 오차이다.
+    # -------------------------------------------------
+    desired_guard_gap = max(
+        physical.GRID_ROW_SPACING,
+        2.0 * physical.ROBOT_RADIUS
+        + 0.5 * physical.GRID_ROW_SPACING,
+    )
+
+    axial_error = (
+        guard_axial
+        - desired_guard_gap
+    )
+
+    anchor_axial_speed = float(
+        anchor.velocity.dot(
+            tangent
+        )
+    )
+
+    anchor_lateral_speed = float(
+        anchor.velocity.dot(
+            lateral_axis
+        )
+    )
+
+    target_axial_speed = max(
+        -8.0,
+        min(
+            16.0,
+            1.5 * axial_error,
+        ),
+    )
+
+    axial_command = (
+        3.0
+        * (
+            target_axial_speed
+            - anchor_axial_speed
+        )
+    )
+
+    axial_command_limit = (
+        0.15
+        * physical.MAX_ACCELERATION
+    )
+
+    axial_command = max(
+        -axial_command_limit,
+        min(
+            axial_command_limit,
+            axial_command,
+        ),
+    )
+
+    # Guard wall의 상대 중앙으로 정렬.
+    target_lateral_speed = max(
+        -8.0,
+        min(
+            8.0,
+            1.5 * guard_lateral,
+        ),
+    )
+
+    lateral_command = (
+        2.5
+        * (
+            target_lateral_speed
+            - anchor_lateral_speed
+        )
+    )
+
+    lateral_command_limit = (
+        0.08
+        * physical.MAX_ACCELERATION
+    )
+
+    lateral_command = max(
+        -lateral_command_limit,
+        min(
+            lateral_command_limit,
+            lateral_command,
+        ),
+    )
+
+    # 기존 SPH의 axial/lateral 성분 제거.
+    anchor.acceleration -= (
+        tangent
+        * anchor.acceleration.dot(
+            tangent
+        )
+    )
+
+    anchor.acceleration -= (
+        lateral_axis
+        * anchor.acceleration.dot(
+            lateral_axis
+        )
+    )
+
+    # local controller command.
+    anchor.acceleration += (
+        tangent * axial_command
+        + lateral_axis
+        * lateral_command
+    )
+
+    # -------------------------------------------------
+    # 5. Next-Branch start gate.
+    # -------------------------------------------------
+    distance_ready = (
+        guard_axial > 0.0
+        and abs(axial_error)
+        <= 1.5
+        * physical.GRID_ROW_SPACING
+    )
+
+    lateral_ready = (
+        abs(guard_lateral)
+        <= 2.0
+        * physical.GRID_ROW_SPACING
+    )
+
+    front_ready = (
+        ahead_count == 0
+    )
+
+    rear_ready = (
+        rear_count >= 8
+    )
+
+    speed_ready = (
+        abs(anchor_axial_speed)
+        <= 6.0
+    )
+
+    instantaneous_ready = (
+        distance_ready
+        and lateral_ready
+        and front_ready
+        and rear_ready
+        and speed_ready
+    )
+
+    if instantaneous_ready:
+        multi_dfs.next_branch_ready_streak += 1
+    else:
+        multi_dfs.next_branch_ready_streak = 0
+
+    multi_dfs.next_branch_ready = (
+        multi_dfs.next_branch_ready_streak
+        >= 8
+    )
+
+    if (
+        physical.integration_frame
+        % 10
+        == 0
+        or multi_dfs.next_branch_ready
+    ):
+        print(
+            "[NextBranchAnchorPrep] "
+            f"frame="
+            f"{physical.integration_frame} "
+            f"branch={pending_uid} "
+            f"guard_axial={guard_axial:.2f} "
+            f"guard_lateral={guard_lateral:.2f} "
+            f"target_gap={desired_guard_gap:.2f} "
+            f"rear={rear_count} "
+            f"ahead={ahead_count} "
+            f"speed={anchor_axial_speed:.2f} "
+            f"stable="
+            f"{multi_dfs.next_branch_ready_streak}/8 "
+            f"ready="
+            f"{multi_dfs.next_branch_ready}"
+        )
+
 def maintain_mobile_anchor_at_normal_front(
     physical: types.ModuleType,
     perception: AdaptivePerception,
     robots: Sequence[Any],
 ) -> None:
-    """Keep LiDAR Anchor at the front-center of the NORMAL swarm.
+    """Keep the LiDAR robot locally ahead of the NORMAL swarm.
 
-    Branch exploration order:
+    Localization-free controller.
 
-        FRONTIER
-            |
-          ANCHOR
-            |
-        NORMAL swarm
+    Uses only:
+    - Anchor heading
+    - local communication neighbors
+    - relative range/bearing
+    - robot velocities
 
-    This controller is active only during forward EXPLORE_BRANCH.
+    It never uses:
+    - Branch mouth world position
+    - robot world axial coordinate
+    - global swarm centroid
+    - global front position
     """
 
-    # Only forward Branch exploration.
-    # Backtracking is owned by the original Physical DFS.
     if (
         physical.phase
         != physical.SimulationPhase.EXPLORE_BRANCH
@@ -2952,28 +4193,12 @@ def maintain_mobile_anchor_at_normal_front(
     if session is None:
         return
 
-    # Once Child Junction evidence exists,
-    # the existing Candidate approach controller takes over.
+    # Child Junction candidate가 생긴 뒤에는
+    # Child approach controller가 담당한다.
     if (
         multi_dfs.child_candidate_active
         or session.anchor_stopped
     ):
-        return
-
-    active_uid = (
-        multi_dfs.child_probe_branch_uid
-    )
-
-    if active_uid is None:
-        return
-
-    descriptor = (
-        physical.branch_descriptors_by_uid.get(
-            active_uid
-        )
-    )
-
-    if descriptor is None:
         return
 
     anchor = perception.leader
@@ -2981,444 +4206,699 @@ def maintain_mobile_anchor_at_normal_front(
     if anchor.role != "NORMAL":
         return
 
-    tangent, normal = (
-        physical.descriptor_local_basis(
-            descriptor
-        )
+    yaw = math.radians(
+        perception.yaw_deg
+    )
+
+    forward = pygame.Vector2(
+        math.cos(yaw),
+        math.sin(yaw),
     )
 
     if (
-        tangent.length_squared()
-        <= physical.EPSILON
-        or normal.length_squared()
+        forward.length_squared()
         <= physical.EPSILON
     ):
         return
 
-    tangent = tangent.normalize()
-    normal = normal.normalize()
+    forward = forward.normalize()
 
-    try:
-        (
-            anchor_axial,
-            anchor_lateral,
-        ) = physical.branch_local_coordinates(
-            anchor.position,
-            descriptor,
-        )
-
-    except (
-        ValueError,
-        AttributeError,
-    ):
-        return
-
-    # -------------------------------------------------
-    # Collect the moving NORMAL swarm only.
-    # Frontier / Guard / Shepherd / Relay / Pebble
-    # are not part of the Anchor reference.
-    # -------------------------------------------------
-
-    usable_half = (
-        physical.local_physical_usable_half_width(
-            descriptor
-        )
+    lateral_axis = pygame.Vector2(
+        -forward.y,
+        forward.x,
     )
 
-    normal_samples = []
+    # -------------------------------------------------
+    # Only locally observable NORMAL neighbors.
+    # -------------------------------------------------
+
+    local_normals = []
+
+    # -------------------------------------------------
+    # Local robot sensing around the LiDAR Anchor.
+    #
+    # IMPORTANT:
+    # Do NOT depend only on comm_neighbors.
+    #
+    # COMM_RANGE can be narrower than the corridor width,
+    # so a NORMAL on the opposite side of the corridor
+    # could pass the Anchor without ever entering the
+    # Anchor's direct communication-neighbor set.
+    #
+    # The controller receives ONLY Anchor-relative
+    # range/bearing measurements.
+    # -------------------------------------------------
+
+    local_sensing_range = float(
+        MAX_RANGE
+    )
+
+    if (
+        session.last_valid_w is not None
+        and session.last_valid_w > 0.0
+    ):
+        local_half_width = max(
+            2.0 * float(
+                physical.GRID_SPACING
+            ),
+            0.60 * float(
+                session.last_valid_w
+            ),
+        )
+    else:
+        local_half_width = (
+            0.50 * local_sensing_range
+        )
 
     for robot in robots:
 
         if robot is anchor:
             continue
 
-        if robot.role != "NORMAL":
+        if getattr(
+            robot,
+            "role",
+            None,
+        ) != "NORMAL":
             continue
 
-        if robot.base_reserve:
-            continue
-
-        try:
-            axial, lateral = (
-                physical.branch_local_coordinates(
-                    robot.position,
-                    descriptor,
-                )
-            )
-
-        except (
-            ValueError,
-            AttributeError,
+        if getattr(
+            robot,
+            "base_reserve",
+            False,
         ):
             continue
 
+        (
+            relative_axial,
+            relative_lateral,
+        ) = sense_relative_neighbor_in_anchor_frame(
+            anchor,
+            robot,
+            perception.yaw_deg,
+        )
+
+        relative_range = math.hypot(
+            relative_axial,
+            relative_lateral,
+        )
+
+        # Anchor local sensing range 밖.
         if (
-            abs(float(lateral))
-            >
-            usable_half
-            + 2.0 * physical.ROBOT_RADIUS
+            relative_range
+            > local_sensing_range
         ):
             continue
 
-        normal_samples.append(
+        # 현재 Branch 진행축 주변의 swarm만 사용.
+        # 다른 Branch의 NORMAL은 front 판단에서 제외.
+        if (
+            abs(relative_lateral)
+            > local_half_width
+        ):
+            continue
+
+        local_normals.append(
             (
-                float(axial),
-                float(lateral),
+                float(relative_axial),
+                float(relative_lateral),
                 float(
                     robot.velocity.dot(
-                        tangent
+                        forward
                     )
                 ),
                 robot,
             )
         )
 
-    if len(normal_samples) < 4:
+    if not local_normals:
         return
 
     # -------------------------------------------------
-    # NORMAL swarm front.
+    # Anchor 기준:
     #
-    # Do not use one single outlier robot.
-    # -------------------------------------------------
-
-    axial_values = np.asarray(
-        [
-            item[0]
-            for item in normal_samples
-        ],
-        dtype=float,
-    )
-
-    front_threshold = float(
-        np.quantile(
-            axial_values,
-            0.98,
-        )
-    )
-
-    front_band = max(
-        float(
-            physical.GRID_ROW_SPACING
-        ),
-        2.5
-        * float(
-            physical.ROBOT_RADIUS
-        ),
-    )
-
-    front_cohort = [
-        item
-        for item in normal_samples
-        if (
-            item[0]
-            >= front_threshold
-            - front_band
-        )
-    ]
-
-    if not front_cohort:
-        return
-
-    front_axial = float(
-        np.median(
-            [
-                item[0]
-                for item in front_cohort
-            ]
-        )
-    )
-
-    front_lateral = float(
-        np.median(
-            [
-                item[1]
-                for item in front_cohort
-            ]
-        )
-    )
-
-    front_forward_velocity = float(
-        np.median(
-            [
-                item[2]
-                for item in front_cohort
-            ]
-        )
-    )
-
-    # -------------------------------------------------
-    # Desired formation:
+    # NORMAL이 뒤에 있으면 relative_axial < 0
+    # NORMAL이 Anchor를 추월하면 relative_axial > 0
     #
-    #       Anchor
-    #         |
-    #       one normal row spacing
-    #         |
-    #     NORMAL front
+    # 원하는 상태:
+    #
+    #        Anchor
+    #          ↑
+    #       gap 1 row
+    #          ↓
+    #       NORMAL front
     # -------------------------------------------------
+
+    front_relative_axial = max(
+        item[0]
+        for item in local_normals
+    )
 
     desired_gap = float(
         physical.GRID_ROW_SPACING
     )
 
-    target_axial = (
-        front_axial
+    # 원하는 값:
+    #
+    # front_relative_axial = -desired_gap
+    #
+    # NORMAL이 Anchor 앞으로 나오면 error > 0
+    # -> Anchor 가속
+    lead_error = (
+        front_relative_axial
         + desired_gap
     )
 
-    # LiDAR Anchor defines the center of the moving formation.
-    # It must not follow lateral drift of the NORMAL swarm.
-    target_lateral = 0.0
+    front_band = (
+        2.0 * desired_gap
+    )
 
-    # -------------------------------------------------
-    # Frontier remains in front.
+    front_neighbors = [
+        item
+        for item in local_normals
+        if (
+            item[0]
+            >= front_relative_axial
+            - front_band
+        )
+    ]
+
+    swarm_forward_speed = float(
+        np.median(
+            [
+                item[2]
+                for item
+                in front_neighbors
+            ]
+        )
+    )
+
+    anchor_forward_speed = float(
+        anchor.velocity.dot(
+            forward
+        )
+    )
+
+    speed_error = (
+        swarm_forward_speed
+        - anchor_forward_speed
+    )
+
+        # -------------------------------------------------
+    # Leading Anchor control
     #
-    # The Anchor target is based on NORMAL front,
-    # but Anchor must not cross the Frontier.
+    # AXIAL:
+    #   local NORMAL relative sensing
+    #   -> NORMAL swarm보다 정확히 한 row 앞
+    #
+    # LATERAL:
+    #   LiDAR +90 / -90 wall ranges
+    #   -> physical corridor center
+    #
+    # 절대로 swarm lateral centroid를
+    # corridor center로 사용하지 않는다.
     # -------------------------------------------------
 
-    active_fixture = getattr(
-        physical,
-        "active_branch",
+    anchor_lateral_speed = float(
+        anchor.velocity.dot(
+            lateral_axis
+        )
+    )
+
+    max_axial_control = (
+        0.20
+        * physical.MAX_ACCELERATION
+    )
+
+    max_lateral_control = (
+        0.06
+        * physical.MAX_ACCELERATION
+    )
+
+    # =================================================
+    # A. NORMAL swarm front tracking
+    # =================================================
+
+    axial_command = float(
+        np.clip(
+            (
+                physical.DAMPING
+                * speed_error
+                + physical.DAMPING
+                * physical.DAMPING
+                * lead_error
+            ),
+            -max_axial_control,
+            max_axial_control,
+        )
+    )
+
+    # =================================================
+    # B. LiDAR corridor centering
+    #
+    # LidarFrame.left
+    #   = body-relative +90 deg wall distance
+    #
+    # LidarFrame.right
+    #   = body-relative -90 deg wall distance
+    #
+    # 따라서:
+    #
+    # center_error = (left - right) / 2
+    #
+    # left == right
+    #   -> corridor center
+    # =================================================
+
+    lidar_frame = (
+        perception.last_frame
+    )
+
+    launch_alignment_active = bool(
+        getattr(
+            perception,
+            "branch_launch_alignment_active",
+            False,
+        )
+    )
+
+    min_lidar_frame = getattr(
+        perception,
+        "branch_launch_lidar_min_frame",
         None,
     )
 
-    if active_fixture is not None:
+    lidar_frame_fresh = (
+        lidar_frame is not None
+        and (
+            not launch_alignment_active
+            or min_lidar_frame is None
+            or lidar_frame.frame
+            >= min_lidar_frame
+        )
+    )
 
-        frontiers = (
-            physical.get_frontier_shepherds(
-                robots,
-                active_fixture,
+    left_range = (
+        lidar_frame.left
+        if lidar_frame_fresh
+        else None
+    )
+
+    right_range = (
+        lidar_frame.right
+        if lidar_frame_fresh
+        else None
+    )
+
+    if (
+        left_range is not None
+        and right_range is not None
+        and math.isfinite(
+            float(left_range)
+        )
+        and math.isfinite(
+            float(right_range)
+        )
+    ):
+
+        corridor_center_error = (
+            0.5
+            * (
+                float(left_range)
+                - float(right_range)
             )
         )
 
-        frontier_axials = []
-
-        for frontier in frontiers:
-
-            try:
-                frontier_axial, _ = (
-                    physical.branch_local_coordinates(
-                        frontier.position,
-                        descriptor,
-                    )
-                )
-
-            except (
-                ValueError,
-                AttributeError,
-            ):
-                continue
-
-            frontier_axials.append(
-                float(frontier_axial)
-            )
-
-        if frontier_axials:
-
-            frontier_rear_axial = min(
-                frontier_axials
-            )
-
-            frontier_clearance = max(
-                desired_gap,
-                2.0
-                * float(
-                    physical.ROBOT_RADIUS
+        lateral_command = float(
+            np.clip(
+                (
+                    0.5
+                    * physical.DAMPING
+                    * physical.DAMPING
+                    * corridor_center_error
+                    - physical.DAMPING
+                    * anchor_lateral_speed
                 ),
+                -max_lateral_control,
+                max_lateral_control,
             )
+        )
 
-            target_axial = min(
-                target_axial,
-                frontier_rear_axial
-                - frontier_clearance,
+    else:
+
+        # 양쪽 wall을 동시에 신뢰할 수 없으면
+        # 임의의 corridor center를 만들지 않는다.
+        #
+        # 횡속도만 감쇠한다.
+        corridor_center_error = None
+
+        lateral_command = float(
+            np.clip(
+                (
+                    -physical.DAMPING
+                    * anchor_lateral_speed
+                ),
+                -max_lateral_control,
+                max_lateral_control,
             )
-
-    # -------------------------------------------------
-    # Physical acceleration control.
-    # No position overwrite / no teleport.
-    # -------------------------------------------------
-
-    axial_error = (
-        target_axial
-        - float(anchor_axial)
-    )
-
-    lateral_error = (
-        target_lateral
-        - float(anchor_lateral)
-    )
-
-    anchor_forward_velocity = float(
-        anchor.velocity.dot(
-            tangent
         )
-    )
 
-    anchor_lateral_velocity = float(
-        anchor.velocity.dot(
-            normal
-        )
-    )
-
-    axial_velocity_error = (
-        front_forward_velocity
-        - anchor_forward_velocity
-    )
-
-       # -------------------------------------------------
-    # The Leading Anchor owns its motion in the
-    # current Branch local frame.
+       # =================================================
+    # C. Leading Anchor owns its LOCAL motion axes.
     #
-    # compute_sph_forces() has already run before this
-    # function, so remove the ordinary SPH/route
-    # acceleration from the Anchor before applying
-    # the leading controller.
+    # compute_sph_forces()가 이 함수보다 먼저 실행되므로
+    # Anchor에는 이미 SPH / route acceleration이 들어 있다.
     #
-    # No position overwrite. No teleport.
-    # -------------------------------------------------
+    # 그 힘을 그대로 둔 채 controller 힘만 더하면
+    # 밀집된 swarm의 압력과 controller가 서로 싸울 수 있다.
+    #
+    # 따라서 SAME LiDAR Anchor에 대해서만
+    # 현재 local axial/lateral acceleration을 제거하고,
+    # local front + LiDAR centering controller가
+    # 새 acceleration을 결정한다.
+    #
+    # position overwrite 없음.
+    # teleport 없음.
+    # global localization 없음.
+    # =================================================
 
     existing_axial_acc = float(
         anchor.acceleration.dot(
-            tangent
+            forward
         )
     )
 
     existing_lateral_acc = float(
         anchor.acceleration.dot(
-            normal
+            lateral_axis
         )
     )
 
     anchor.acceleration -= (
-        tangent * existing_axial_acc
-        + normal * existing_lateral_acc
-    )
-
-    # Preserve the existing PD law,
-    # but give the Anchor enough authority to
-    # actually hold row 1.
-    max_control_acc = float(
-        physical.MAX_ACCELERATION
-    )
-
-    axial_command = float(
-        np.clip(
-            physical.DAMPING
-            * axial_velocity_error
-            + physical.DAMPING
-            * physical.DAMPING
-            * axial_error,
-            -max_control_acc,
-            max_control_acc,
-        )
-    )
-
-    lateral_command = float(
-        np.clip(
-            physical.DAMPING
-            * (
-                -anchor_lateral_velocity
-            )
-            + physical.DAMPING
-            * physical.DAMPING
-            * lateral_error,
-            -max_control_acc,
-            max_control_acc,
-        )
+        forward
+        * existing_axial_acc
+        + lateral_axis
+        * existing_lateral_acc
     )
 
     anchor.acceleration += (
-        tangent * axial_command
-        + normal * lateral_command
+        forward
+        * axial_command
+        + lateral_axis
+        * lateral_command
     )
 
-    # -------------------------------------------------
-    # NORMAL row 2 cannot overtake the Anchor row 1.
+    # =================================================
+    # D. New-Branch launch gate
     #
-    # Maintain one full GRID_ROW_SPACING.
+    # 다음 두 조건을 8 frame 연속 만족해야
+    # ordinary NORMAL swarm을 풀어준다.
+    #
+    # 1. Anchor = NORMAL front + one row
+    # 2. Anchor = LiDAR corridor center
+    # =================================================
+
+    if (
+        launch_alignment_active
+        and getattr(
+            perception,
+            "branch_launch_alignment_uid",
+            None,
+        )
+        == session.parent_branch_uid
+    ):
+
+        gap_tolerance = max(
+            float(
+                physical.ROBOT_RADIUS
+            ),
+            0.40
+            * desired_gap,
+        )
+
+        center_tolerance = max(
+            2.0
+            * float(
+                physical.ROBOT_RADIUS
+            ),
+            0.75
+            * desired_gap,
+        )
+
+        front_ready = (
+            front_relative_axial < 0.0
+            and abs(
+                lead_error
+            )
+            <= gap_tolerance
+        )
+
+        center_ready = (
+            corridor_center_error
+            is not None
+            and abs(
+                corridor_center_error
+            )
+            <= center_tolerance
+        )
+
+        if (
+            front_ready
+            and center_ready
+        ):
+            perception.branch_launch_alignment_streak += 1
+
+        else:
+            perception.branch_launch_alignment_streak = 0
+
+        if (
+            physical.integration_frame
+            % 10
+            == 0
+        ):
+
+            center_error_text = (
+                f"{corridor_center_error:.2f}"
+                if corridor_center_error
+                is not None
+                else "NO_WALL_PAIR"
+            )
+
+            left_text = (
+                f"{float(left_range):.2f}"
+                if left_range is not None
+                else "NONE"
+            )
+
+            right_text = (
+                f"{float(right_range):.2f}"
+                if right_range is not None
+                else "NONE"
+            )
+
+            print(
+                "[LeadingAnchorLaunchAlign] "
+                f"branch="
+                f"{session.parent_branch_uid} "
+                f"lidar_id={anchor.robot_id} "
+                f"relative_front="
+                f"{front_relative_axial:.2f} "
+                f"target_front="
+                f"{-desired_gap:.2f} "
+                f"lidar_left="
+                f"{left_text} "
+                f"lidar_right="
+                f"{right_text} "
+                f"center_error="
+                f"{center_error_text} "
+                f"front_ready="
+                f"{front_ready} "
+                f"center_ready="
+                f"{center_ready} "
+                f"stable="
+                f"{perception.branch_launch_alignment_streak}/8"
+            )
+
+        if (
+            perception.branch_launch_alignment_streak
+            >= 8
+        ):
+
+            ready_uid = (
+                perception.branch_launch_alignment_uid
+            )
+
+            perception.branch_launch_alignment_active = False
+            perception.branch_launch_alignment_uid = None
+            perception.branch_launch_alignment_streak = 0
+            perception.branch_launch_lidar_min_frame = None
+
+            print(
+                "[LeadingAnchorLaunchReady] "
+                f"branch={ready_uid} "
+                f"lidar_id={anchor.robot_id} "
+                "front_ready=True "
+                "corridor_center_ready=True "
+                "normal_release=True"
+            )
+
+       # -------------------------------------------------
+    # LOCAL LEADING-ANCHOR INVARIANT
+    #
+    # Desired formation:
+    #
+    #               Anchor
+    #                  A
+    #
+    #             ●   ●
+    #          ●   ●   ●
+    #       ●   ●   ●   ●
+    #
+    # NORMALs keep natural SPH distribution behind it.
+    #
+    # No rigid second row.
+    # No global stop line.
+    #
+    # But a NORMAL is NOT allowed to remain beside or
+    # ahead of the LiDAR Anchor.
     # -------------------------------------------------
 
-    normal_front_limit = (
-        float(anchor_axial)
-        - desired_gap
+    minimum_rear_gap = (
+        0.50
+        * desired_gap
     )
+
+    ahead_count = 0
 
     for (
-        robot_axial,
+        relative_axial,
         _,
-        robot_forward_velocity,
+        normal_forward_speed,
         robot,
-    ) in normal_samples:
+    ) in local_normals:
 
-        if robot_axial <= normal_front_limit:
+        # Desired:
+        #
+        # relative_axial <= -minimum_rear_gap
+        #
+        # Example:
+        #
+        # Anchor = 0
+        # NORMAL = -2 px  -> behind, okay
+        #
+        # NORMAL = +2 px  -> ahead, violation
+        #
+        rear_boundary = (
+            -minimum_rear_gap
+        )
+
+        if (
+            relative_axial
+            <= rear_boundary
+        ):
+            # Properly behind Anchor.
+            # Leave normal SPH completely untouched.
             continue
 
-        row_violation = (
-            robot_axial
-            - normal_front_limit
+        ahead_count += 1
+
+        violation = (
+            relative_axial
+            - rear_boundary
         )
 
-        # Remove any further forward acceleration from
-        # a NORMAL robot that has entered the Anchor row.
-        robot_forward_acc = float(
+        # ---------------------------------------------
+        # 1. A violating NORMAL may not accelerate
+        #    farther forward.
+        # ---------------------------------------------
+        forward_acceleration = float(
             robot.acceleration.dot(
-                tangent
+                forward
             )
         )
 
-        if robot_forward_acc > 0.0:
+        if forward_acceleration > 0.0:
             robot.acceleration -= (
-                tangent
-                * robot_forward_acc
+                forward
+                * forward_acceleration
             )
 
+        # ---------------------------------------------
+        # 2. Even if the NORMAL is slower than Anchor,
+        #    it is already too far forward.
+        #
+        #    Therefore position violation itself creates
+        #    a backward recovery acceleration.
+        # ---------------------------------------------
         velocity_excess = max(
             0.0,
-            robot_forward_velocity
-            - anchor_forward_velocity,
+            normal_forward_speed
+            - anchor_forward_speed,
         )
 
-        brake = min(
-            float(
-                physical.MAX_ACCELERATION
-            ),
+        recovery_brake = min(
+            0.30
+            * physical.MAX_ACCELERATION,
+
             physical.DAMPING
             * velocity_excess
+
             + physical.DAMPING
             * physical.DAMPING
-            * row_violation,
+            * violation,
         )
 
         robot.acceleration -= (
-            tangent * brake
+            forward
+            * recovery_brake
+        )
+
+    # -------------------------------------------------
+    # If even one locally sensed NORMAL has reached
+    # the Anchor row, give the Anchor extra forward
+    # authority until it owns the front again.
+    #
+    # Still based only on relative observation.
+    # -------------------------------------------------
+
+    if ahead_count > 0:
+
+        catchup_boost = min(
+            0.18
+            * physical.MAX_ACCELERATION,
+
+            physical.DAMPING
+            * physical.DAMPING
+            * max(
+                0.0,
+                front_relative_axial
+                + minimum_rear_gap,
+            ),
+        )
+
+        anchor.acceleration += (
+            forward
+            * catchup_boost
         )
 
     if (
         physical.integration_frame
-        % 20
+        % 10
         == 0
     ):
         print(
-            "[MobileAnchorFront] "
-            f"branch={active_uid} "
+            "[MobileAnchorLocal] "
             f"lidar_id={anchor.robot_id} "
-            f"anchor_axial="
-            f"{float(anchor_axial):.2f} "
-            f"normal_front="
-            f"{front_axial:.2f} "
-            f"gap="
-            f"{float(anchor_axial) - front_axial:.2f} "
-            f"target_gap="
-            f"{desired_gap:.2f} "
-            f"anchor_lateral="
-            f"{float(anchor_lateral):.2f} "
-            f"front_lateral="
-            f"{front_lateral:.2f} "
-            f"front_cohort="
-            f"{len(front_cohort)}"
+            f"relative_front="
+            f"{front_relative_axial:.2f} "
+            f"target_relative_front="
+            f"{-desired_gap:.2f} "
+            f"lead_error="
+            f"{lead_error:.2f} "
+            f"ahead_count={ahead_count} "
+            f"local_normals="
+            f"{len(local_normals)}"
         )
-
 
 def update_child_observation_session(
     physical: types.ModuleType,
@@ -3967,22 +5447,9 @@ def update_child_moving_candidate(
     # Prevent the already-known Parent Junction J0
     # from being detected again as a Child Junction.
     # -----------------------------------------------------
-    descriptor = physical.branch_descriptors_by_uid.get(
-        session.parent_branch_uid
+    current_axial = float(
+        session.probe_axial_odometry
     )
-
-    if descriptor is None:
-        return
-
-    try:
-        current_axial, current_lateral = (
-            physical.branch_local_coordinates(
-                perception.leader.position,
-                descriptor,
-            )
-        )
-    except (ValueError, AttributeError):
-        return
 
     width_reference = session.last_valid_w
 
@@ -4005,8 +5472,7 @@ def update_child_moving_candidate(
                 f"parent={session.parent_junction_uid} "
                 f"branch={session.parent_branch_uid} "
                 f"lidar_id={session.lidar_id} "
-                f"axial={current_axial:.2f} "
-                f"lateral={current_lateral:.2f} "
+                f"odometry_axial={current_axial:.2f} "
                 f"required={parent_clearance_depth:.2f} "
                 "cleared=False"
             )
@@ -4069,9 +5535,6 @@ def update_child_moving_candidate(
         physical.integration_frame
     )
 
-    session.candidate_position = (
-        perception.leader.position.copy()
-    )
 
     session.candidate_depth_local = (
         candidate_depth
@@ -4092,8 +5555,8 @@ def update_child_moving_candidate(
     # by local odometry along the stored ingress axis.
     # Do not recompute the Child position from later scans.
     # -----------------------------------------------------
-    session.candidate_last_position = (
-        perception.leader.position.copy()
+    session.candidate_odometry_origin = float(
+        session.probe_axial_odometry
     )
 
     session.candidate_traveled_axial = 0.0
@@ -4386,22 +5849,15 @@ def install_local_forward_ingress(physical: types.ModuleType) -> None:
         weight = float(
             getattr(robot, "propulsion_weight", adaptive.LOCAL_FOLLOWER_DRIVE_WEIGHT)
         )
-        forward = pygame.Vector2(math.cos(yaw), math.sin(yaw))
-        lateral = pygame.Vector2(-forward.y, forward.x)
-        # ingress_lane_x is a deployment-local transverse reference, not a
-        # Junction/world target. For the present -90 degree deployment yaw it
-        # is exactly the body-local lateral coordinate.
-        lateral_error = robot.ingress_lane_x - robot.position.x
-        lane_force = max(
-            -physical.INITIAL_INGRESS_LANE_MAX_FORCE,
-            min(
-                physical.INITIAL_INGRESS_LANE_MAX_FORCE,
-                physical.INITIAL_INGRESS_LANE_GAIN * lateral_error,
-            ),
+        forward = pygame.Vector2(
+            math.cos(yaw),
+            math.sin(yaw),
         )
+
         return (
-            forward * adaptive.LOCAL_FORWARD_DRIVE_FORCE * weight
-            + lateral * lane_force
+            forward
+            * adaptive.LOCAL_FORWARD_DRIVE_FORCE
+            * weight
         )
 
     def normal_equilibrium_radius(robot: Any) -> float:
@@ -4501,9 +5957,33 @@ class AdaptivePerception:
         self.guard_up_activation_frame: int | None = None
         self.frame = 0
         self.yaw_deg = -90.0
+
         self.last_valid_w: float | None = None
         self.last_frame: LidarFrame | None = None
+
+        # -------------------------------------------------
+        # Leading Anchor Branch-launch alignment.
+        #
+        # Guard -> Frontier 전환 후에도 ordinary NORMAL은
+        # 바로 풀지 않는다.
+        #
+        # SAME LiDAR Anchor가
+        #
+        # 1. NORMAL swarm 최전방
+        # 2. LiDAR로 측정한 corridor 중앙
+        #
+        # 을 동시에 만족한 뒤 NORMAL flow를 시작한다.
+        # -------------------------------------------------
+        self.branch_launch_alignment_active = False
+        self.branch_launch_alignment_uid: str | None = None
+        self.branch_launch_alignment_streak = 0
+
+        # Branch 방향으로 yaw를 바꾼 직후에는
+        # 이전 yaw로 찍힌 last_frame을 사용하면 안 된다.
+        self.branch_launch_lidar_min_frame: int | None = None
+
         self.junction_confirmed = False
+
         self.junction_candidate_detected = False
         self.junction_candidate_frame: int | None = None
         self.junction_candidate_time: float | None = None
@@ -4548,49 +6028,34 @@ class AdaptivePerception:
         self.leader.is_lidar_robot = True
         self.leader.is_fixed_anchor = False
         self.leader.body_yaw = math.radians(self.yaw_deg)
-        forward = pygame.Vector2(
-            math.cos(math.radians(self.yaw_deg)),
-            math.sin(math.radians(self.yaw_deg)),
-        )
-        front_progress = max(robot.position.dot(forward) for robot in robots)
-        front_row = [
-            robot for robot in robots
-            if abs(robot.position.dot(forward) - front_progress) <= 1.0e-6
-        ]
-        lateral_offset = self.leader.position.x - self.physical.center_x
-        print(f"front_row_progress={front_progress:.3f}")
-        print(f"front_row_robot_count={len(front_row)}")
-        print(f"lidar_id={self.leader.robot_id}")
-        print(
-            f"lidar_initial_position=({self.initial_leader_position.x:.3f}, "
-            f"{self.initial_leader_position.y:.3f})"
-        )
-        print(f"lateral_offset={lateral_offset:.6f}")
+
+        
         print(f"[LiDAR] leader_id={self.leader.robot_id}")
         print(
             f"[LiDAR] initial_position=({self.initial_leader_position.x:.3f},"
             f"{self.initial_leader_position.y:.3f})"
         )
 
-    def _select_leader(self, robots: Sequence[Any]) -> Any:
-        forward = pygame.Vector2(
-            math.cos(math.radians(self.yaw_deg)),
-            math.sin(math.radians(self.yaw_deg)),
-        )
-        lateral = pygame.Vector2(-forward.y, forward.x)
-        front_progress = max(robot.position.dot(forward) for robot in robots)
-        front = [
-            robot for robot in robots
-            if abs(robot.position.dot(forward) - front_progress) <= 1.0e-6
+    def _select_leader(
+        self,
+        robots: Sequence[Any],
+    ) -> Any:
+
+        matches = [
+            robot
+            for robot in robots
+            if robot.robot_id
+            == LIDAR_ROBOT_ID
         ]
-        corridor_lateral = pygame.Vector2(
-            self.physical.center_x,
-            self.physical.center_y,
-        ).dot(lateral)
-        return min(front, key=lambda robot: (
-            abs(robot.position.dot(lateral) - corridor_lateral),
-            robot.robot_id,
-        ))
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Configured LiDAR robot ID "
+                f"{LIDAR_ROBOT_ID} "
+                f"matched {len(matches)} robots"
+            )
+
+        return matches[0]
 
     def reset(self, robots: Sequence[Any]) -> None:
         self.__init__(self.physical, robots)
@@ -8210,6 +9675,10 @@ def update_guard_readiness_and_activation(
     # 기존 group 순차 활성화는 사용하지 않는다.
     # LEFT / RIGHT / UP가 각각 독립적으로 선착순 Guard를 만든다.
     perception.guard_activation_groups = []
+
+    perception.guard_activation_stage = (
+        "INCREMENTAL_FORMING"
+    )
 
     for geometry in perception.provisional_guards:
 
@@ -12398,6 +13867,28 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                         )
                     )
 
+            if selected_uid is None:
+                raise RuntimeError(
+                    "Initial Branch launch has no selected UID"
+                )
+
+            # -------------------------------------------------
+            # Guard -> Frontier는 이미 완료.
+            #
+            # 하지만 ordinary NORMAL swarm은 아직 풀지 않는다.
+            #
+            # SAME LiDAR Anchor가
+            #   1. NORMAL front
+            #   2. corridor center
+            # 를 모두 만족한 뒤 풀어준다.
+            # -------------------------------------------------
+            perception.branch_launch_alignment_active = True
+            perception.branch_launch_alignment_uid = (
+                selected_uid
+            )
+            perception.branch_launch_alignment_streak = 0
+            perception.branch_launch_lidar_min_frame = None
+
             # -------------------------------------------------
             # Start Branch exploration NOW.
             # -------------------------------------------------
@@ -12425,7 +13916,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"selected={selected} "
                 "all_physical_guards_ready=True "
                 "anchor_released=True "
-                "anchor_preposition=False "
+                "normal_release_waits_for_lidar_center=True "
                 "second_guard_dwell=False"
             )
 
@@ -12609,92 +14100,306 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             physical.integration_backtrack_support_count = 0
             physical.integration_backtrack_lateral_coverage = 0.0
 
-            physical.phase = physical.SimulationPhase.JUNCTION_SWITCH
+            physical.phase = (
+                physical.SimulationPhase.JUNCTION_SWITCH
+            )
+
             physical.junction_switch_timer = 0.0
             physical.junction_consensus_tracker.reset()
 
-            print(
-                f"[DFSNextBranchSameFrame] frame={arrival_frame} "
-                f"completed_branch={completed_branch} "
-                "visited_guard_persisted=True "
-                "trigger=SHEPHERD_JUNCTION_ARRIVAL"
+            # -------------------------------------------------
+            # DO NOT start the next Branch in this frame.
+            #
+            # The next UID is only reserved.
+            # It remains UNVISITED until the same LiDAR Anchor
+            # locally re-establishes the front position.
+            # -------------------------------------------------
+            next_uid = remaining_uids[0]
+
+            next_fixture = (
+                physical.branch_fixture_for_uid(
+                    next_uid
+                )
             )
 
-            # SAME FRAME:
-            # completed branch's returned wall stays JUNCTION_GUARD,
-            # while the next unvisited branch's pre-existing Guard becomes
-            # Frontier and immediately starts exploration.
-            integrated_update_state(
-                robots,
-                0.0,
-                reference_density,
-                spatial_grid,
+            if next_fixture is None:
+                raise RuntimeError(
+                    "completed Branch has a next UID "
+                    "without fixture: "
+                    f"{next_uid}"
+                )
+
+            multi_dfs.next_branch_pending_uid = (
+                next_uid
             )
+
+            multi_dfs.next_branch_pending_fixture = (
+                next_fixture
+            )
+
+            multi_dfs.next_branch_source_fixture = (
+                completed_branch
+            )
+
+            multi_dfs.next_branch_ready_streak = 0
+            multi_dfs.next_branch_ready = False
+
+            print(
+                "[DFSNextBranchPending] "
+                f"frame={arrival_frame} "
+                f"completed_branch="
+                f"{completed_branch} "
+                f"next_uid={next_uid} "
+                f"next_fixture={next_fixture} "
+                "next_branch_started=False "
+                "waiting_for_local_anchor_front=True"
+            )
+
             return
 
-        if physical.phase == physical.SimulationPhase.JUNCTION_SWITCH:
-            # Immediate LiDAR-DFS handoff, entered on the exact Shepherd-arrival
-            # frame. Reuse the next branch's persistent physical Guard wall as
-            # Frontier immediately; there is no second gather/formation dwell.
+        if (
+            physical.phase
+            == physical.SimulationPhase.JUNCTION_SWITCH
+        ):
             physical.junction_switch_timer += dt
-            discovered, visited, remaining_uids = remaining_dfs_branch_uids(robots)
-            if discovered and not remaining_uids:
-                start_final_return_pipeline(robots, "JUNCTION_SWITCH_NO_REMAINING")
+
+            discovered, visited, remaining_uids = (
+                remaining_dfs_branch_uids(
+                    robots
+                )
+            )
+
+            if (
+                discovered
+                and not remaining_uids
+            ):
+                start_final_return_pipeline(
+                    robots,
+                    "JUNCTION_SWITCH_NO_REMAINING",
+                )
                 return
 
-            voted_branch = remaining_uids[0]
-            requested_fixture = physical.branch_fixture_for_uid(voted_branch)
-            if requested_fixture is None:
+            pending_uid = (
+                multi_dfs.next_branch_pending_uid
+            )
+
+            pending_fixture = (
+                multi_dfs.next_branch_pending_fixture
+            )
+
+            if (
+                pending_uid is None
+                or pending_fixture is None
+            ):
                 raise RuntimeError(
-                    f"JUNCTION_SWITCH: no fixture for next UID {voted_branch}"
+                    "JUNCTION_SWITCH entered without "
+                    "pending next Branch"
+                )
+
+            if pending_uid not in remaining_uids:
+                raise RuntimeError(
+                    "pending next Branch is no longer "
+                    "UNVISITED: "
+                    f"pending={pending_uid} "
+                    f"remaining={remaining_uids}"
                 )
 
             selected_guard_count = sum(
-                robot.role == "JUNCTION_GUARD"
-                and robot.junction_guard_branch == requested_fixture
+                robot.role
+                == "JUNCTION_GUARD"
+                and (
+                    getattr(
+                        robot,
+                        "junction_guard_branch_uid",
+                        None,
+                    )
+                    == pending_uid
+                    or getattr(
+                        robot,
+                        "junction_guard_branch",
+                        None,
+                    )
+                    == pending_fixture
+                )
                 for robot in robots
             )
+
             if selected_guard_count <= 0:
-                # Do not block the next valid branch because some *other* future
-                # branch wall is missing. Only the wall we are activating now is
-                # required at this instant.
-                print(
-                    f"[NextBranchWait] frame={getattr(physical, 'integration_frame', -1)} "
-                    f"reason=SELECTED_GUARD_MISSING uid={voted_branch} "
-                    f"branch={requested_fixture}"
-                )
+
+                if (
+                    physical.integration_frame
+                    % 10
+                    == 0
+                ):
+                    print(
+                        "[NextBranchWait] "
+                        f"frame="
+                        f"{physical.integration_frame} "
+                        f"uid={pending_uid} "
+                        "reason=SELECTED_GUARD_MISSING"
+                    )
+
                 return
 
-            source_branch = physical.active_branch
-            selected = commit_branch_uid_to_frontier(
-                robots,
-                reference_density,
-                voted_branch,
-                context="JUNCTION_SWITCH_IMMEDIATE",
+            # -------------------------------------------------
+            # CRITICAL GATE:
+            #
+            # Do not promote Guard -> Frontier yet.
+            #
+            # The same LiDAR Anchor must first:
+            # - face this Branch,
+            # - reach the Guard from the Junction side,
+            # - have no NORMAL ahead,
+            # - have NORMAL support behind,
+            # - remain stable for 8 frames.
+            # -------------------------------------------------
+            if not multi_dfs.next_branch_ready:
+
+                if (
+                    physical.integration_frame
+                    % 10
+                    == 0
+                ):
+                    print(
+                        "[NextBranchWait] "
+                        f"frame="
+                        f"{physical.integration_frame} "
+                        f"uid={pending_uid} "
+                        "reason=WAIT_LOCAL_ANCHOR_FRONT "
+                        f"stable="
+                        f"{multi_dfs.next_branch_ready_streak}/8"
+                    )
+
+                return
+
+            source_branch = (
+                multi_dfs.next_branch_source_fixture
             )
-            selected_uid = physical.branch_uid_for_fixture(selected)
+
+            # -------------------------------------------------
+            # NOW the next Branch may become ACTIVE.
+            #
+            # SAME pre-existing Guard IDs become Frontier.
+            # -------------------------------------------------
+            selected = (
+                commit_branch_uid_to_frontier(
+                    robots,
+                    reference_density,
+                    pending_uid,
+                    context=(
+                        "JUNCTION_SWITCH_"
+                        "LOCAL_ANCHOR_READY"
+                    ),
+                )
+            )
+
+            selected_uid = (
+                physical.branch_uid_for_fixture(
+                    selected
+                )
+            )
+
             if selected_uid in visited:
                 raise RuntimeError(
-                    f"visited branch re-selected during Junction switch: {selected_uid}"
+                    "visited Branch re-selected "
+                    "during Junction switch: "
+                    f"{selected_uid}"
                 )
 
-            # Preserve the source return velocity and turn it into a short
-            # propulsion boost along the newly selected branch.
-            arm_cross_branch_carry(robots, source_branch, selected)
+            if selected_uid != pending_uid:
+                raise RuntimeError(
+                    "pending/selected Branch mismatch: "
+                    f"pending={pending_uid} "
+                    f"selected={selected_uid}"
+                )
+
+            # -------------------------------------------------
+            # IMPORTANT:
+            # arm_cross_branch_carry() is intentionally NOT
+            # called here.
+            #
+            # We do not convert old return momentum into an
+            # immediate next-Branch propulsion command.
+            # -------------------------------------------------
 
             physical.pending_branch_start = None
-            physical.integration_ready_guard_handoff = False
-            physical.integration_handoff_dwell = 0.0
-            physical.junction_guard_formation_timer = 0.0
-            physical.junction_guard_stable_dwell = 0.0
-            physical.branch_entry_timer = 0.0
-            physical.phase = physical.SimulationPhase.EXPLORE_BRANCH
-            print(
-                f"[ImmediateNextBranch] frame={getattr(physical, 'integration_frame', -1)} "
-                f"{source_branch}->{selected} uid={selected_uid} "
-                f"frontier_committed=True guard_count={selected_guard_count} "
-                "formation_dwell=0"
+
+            physical.integration_ready_guard_handoff = (
+                False
             )
+
+            physical.integration_handoff_dwell = 0.0
+
+            physical.junction_guard_formation_timer = (
+                0.0
+            )
+
+            physical.junction_guard_stable_dwell = (
+                0.0
+            )
+
+            physical.branch_entry_timer = 0.0
+
+            # Same LiDAR Anchor is now released as the
+            # local leader of the selected Branch.
+            anchor = perception.leader
+
+            perception.anchor_fixed = False
+            anchor.is_fixed_anchor = False
+            anchor.base_reserve = False
+
+            physical.phase = (
+                physical.SimulationPhase.EXPLORE_BRANCH
+            )
+
+                        # -------------------------------------------------
+            # Next Branch LiDAR launch alignment.
+            #
+            # JUNCTION_SWITCH에서 Anchor가 다음 Guard의
+            # Junction-side까지 왔다고 끝이 아니다.
+            #
+            # Guard -> Frontier가 된 뒤 SAME LiDAR Anchor가
+            # 실제 corridor 안에서:
+            #
+            #   1. NORMAL swarm보다 한 row 앞
+            #   2. LiDAR left/right가 같은 corridor center
+            #
+            # 를 다시 만족해야 ordinary NORMAL을 풀어준다.
+            # -------------------------------------------------
+
+            perception.branch_launch_alignment_active = True
+
+            perception.branch_launch_alignment_uid = (
+                selected_uid
+            )
+
+            perception.branch_launch_alignment_streak = 0
+
+            # 새 Branch yaw에서 찍힌 fresh LiDAR frame을
+            # update_child_lidar_probe()가 다음 frame에 지정한다.
+            perception.branch_launch_lidar_min_frame = None
+
+            print(
+                "[NextBranchExploreStart] "
+                f"frame="
+                f"{physical.integration_frame} "
+                f"{source_branch}->{selected} "
+                f"uid={selected_uid} "
+                f"guard_count="
+                f"{selected_guard_count} "
+                "anchor_local_front_ready=True "
+                "localization=False "
+                "cross_branch_carry=False"
+            )
+
+            # Clear pending handoff state only AFTER
+            # EXPLORE_BRANCH has been committed.
+            multi_dfs.next_branch_pending_uid = None
+            multi_dfs.next_branch_pending_fixture = None
+            multi_dfs.next_branch_source_fixture = None
+            multi_dfs.next_branch_ready_streak = 0
+            multi_dfs.next_branch_ready = False
+
             return
 
         branch = physical.active_branch
@@ -18471,6 +20176,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 robots,
             )
 
+            update_next_branch_anchor_preparation_local(
+                physical,
+                perception,
+                robots,
+            )
+
             if (
                 multi_dfs.current is not None
                 and multi_dfs.current.parent_junction_uid
@@ -18484,6 +20195,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if perception.state == PerceptionState.JUNCTION_APPROACH:
                 perception.leader.acceleration *= 0.35
+
+            anchor_before_physics = (
+                perception.leader.position.copy()
+            )
 
             for robot in robots:
                 if perception.anchor_fixed and robot is perception.leader:
@@ -18507,6 +20222,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         physical.integration_shepherd_max_step,
                         displacement,
                     )
+
+            enforce_anchor_frontier_shepherd_physical_collision(
+                physical,
+                perception,
+                robots,
+                anchor_before_physics,
+            )
             perception.enforce_anchor()
             spatial_grid = physical.build_spatial_grid(robots)
             physical.update_communication_system(robots, spatial_grid)
