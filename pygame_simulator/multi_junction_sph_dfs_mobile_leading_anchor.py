@@ -1836,7 +1836,8 @@ def initialize_child_guard_lifecycle(
 
             # -------------------------------------------------
             # 최초 Guard의 실제 world pose 보존.
-            # 나중에 SAME IDs → 원래 Guard 위치 복귀 검증에 사용.
+            # Guard-stage audit snapshot only; downstream return uses local
+            # odometry/topology and never treats this as a motion target.
             # -------------------------------------------------
             "guard_anchor_by_id": {
                 robot.robot_id: robot.position.copy()
@@ -3897,10 +3898,6 @@ def install_local_forward_ingress(physical: types.ModuleType) -> None:
             getattr(robot, "propulsion_weight", adaptive.LOCAL_FOLLOWER_DRIVE_WEIGHT)
         )
         forward = pygame.Vector2(math.cos(yaw), math.sin(yaw))
-        lateral = pygame.Vector2(-forward.y, forward.x)
-        # ingress_lane_x is a deployment-local transverse reference, not a
-        # Junction/world target. For the present -90 degree deployment yaw it
-        # is exactly the body-local lateral coordinate.
         return (
             forward
             * adaptive.LOCAL_FORWARD_DRIVE_FORCE
@@ -4046,39 +4043,16 @@ class AdaptivePerception:
         self.anchor_fixed_mean_normal_forward_speed = 0.0
         self.pre_topology_normal_forward_speeds: list[float] = []
         self.robots = robots
-        def _select_leader(
-            self,
-            robots: Sequence[Any],
-        ) -> Any:
-            for robot in robots:
-                if robot.robot_id == LIDAR_ROBOT_ID:
-                    return robot
-
-            raise RuntimeError(
-                f"LiDAR robot {LIDAR_ROBOT_ID} not found"
-            )
+        self.leader = self._select_leader(robots)
         self.initial_leader_position = self.leader.position.copy()
         self.leader.is_lidar_robot = True
         self.leader.is_fixed_anchor = False
         self.leader.body_yaw = math.radians(self.yaw_deg)
-        forward = pygame.Vector2(
-            math.cos(math.radians(self.yaw_deg)),
-            math.sin(math.radians(self.yaw_deg)),
-        )
-        front_progress = max(robot.position.dot(forward) for robot in robots)
-        front_row = [
-            robot for robot in robots
-            if abs(robot.position.dot(forward) - front_progress) <= 1.0e-6
-        ]
-        lateral_offset = self.leader.position.x - self.physical.center_x
-        print(f"front_row_progress={front_progress:.3f}")
-        print(f"front_row_robot_count={len(front_row)}")
         print(f"lidar_id={self.leader.robot_id}")
         print(
             f"lidar_initial_position=({self.initial_leader_position.x:.3f}, "
             f"{self.initial_leader_position.y:.3f})"
         )
-        print(f"lateral_offset={lateral_offset:.6f}")
         print(f"[LiDAR] leader_id={self.leader.robot_id}")
         print(
             f"[LiDAR] initial_position=({self.initial_leader_position.x:.3f},"
@@ -4086,24 +4060,13 @@ class AdaptivePerception:
         )
 
     def _select_leader(self, robots: Sequence[Any]) -> Any:
-        forward = pygame.Vector2(
-            math.cos(math.radians(self.yaw_deg)),
-            math.sin(math.radians(self.yaw_deg)),
+        for robot in robots:
+            if robot.robot_id == LIDAR_ROBOT_ID:
+                return robot
+
+        raise RuntimeError(
+            f"LiDAR robot {LIDAR_ROBOT_ID} not found"
         )
-        lateral = pygame.Vector2(-forward.y, forward.x)
-        front_progress = max(robot.position.dot(forward) for robot in robots)
-        front = [
-            robot for robot in robots
-            if abs(robot.position.dot(forward) - front_progress) <= 1.0e-6
-        ]
-        corridor_lateral = pygame.Vector2(
-            self.physical.center_x,
-            self.physical.center_y,
-        ).dot(lateral)
-        return min(front, key=lambda robot: (
-            abs(robot.position.dot(lateral) - corridor_lateral),
-            robot.robot_id,
-        ))
 
     def reset(self, robots: Sequence[Any]) -> None:
         self.__init__(self.physical, robots)
@@ -4445,6 +4408,7 @@ def observe_local_neighbors(
             continue
         axial = float(relative.dot(forward))
         lateral_value = float(relative.dot(lateral))
+        observer_velocity = getattr(observer, "velocity", pygame.Vector2())
         observations.append(LocalNeighborObservation(
             robot=robot,
             relative_range=relative_range,
@@ -4452,7 +4416,7 @@ def observe_local_neighbors(
             relative_axial=axial,
             relative_lateral=lateral_value,
             relative_axial_velocity=float(
-                (robot.velocity - observer.velocity).dot(forward)
+                (robot.velocity - observer_velocity).dot(forward)
             ),
         ))
     return observations
@@ -8435,6 +8399,29 @@ def install_lidar_relay_protection(
         ):
             return
 
+        # -------------------------------------------------
+        # 절대 world path-progress(relay_path_progress)로 후보를
+        # 순위 매기지 않는다.  last_node(마지막 breadcrumb, 없으면
+        # BaseStation)가 직접 관측하는 로컬 range/bearing만으로
+        # 다음 Breadcrumb 후보를 고른다.
+        #
+        # LiDAR 675는 후보에서 제외한다 (Breadcrumb가 되지 않음).
+        # -------------------------------------------------
+        descriptor = physical.branch_motion_descriptor(
+            physical.active_branch
+        )
+        if descriptor is None:
+            return
+        tangent = descriptor.local_outgoing_direction
+
+        if (
+            tangent.length_squared()
+            <= physical.EPSILON
+        ):
+            return
+
+        tangent = tangent.normalize()
+
         breadcrumbs = (
             physical.get_active_branch_relays(
                 robots
@@ -8447,138 +8434,49 @@ def install_lidar_relay_protection(
             else physical.base_station
         )
 
-        last_progress = (
-            physical.relay_path_progress(
-                last_node.relay_anchor,
-                physical.active_branch,
-            )
-            if (
-                breadcrumbs
-                and last_node.relay_anchor is not None
-            )
-            else 0.0
-        )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        #
-        # LiDAR 675 stays NORMAL here.
-        # Therefore it contributes to front_progress.
-        # -------------------------------------------------
-        mobile = [
-            robot
-            for robot in robots
-            if robot.role == "NORMAL"
-            and not robot.base_reserve
-            and robot.connected_to_base
-            and physical.get_robot_region(
-                robot.position
-            )
-            in {
-                "BOTTOM",
-                "JUNCTION",
-                physical.active_branch,
-            }
-        ]
-
-        ahead = [
-            (
-                physical.relay_path_progress(
-                    robot.position,
-                    physical.active_branch,
-                ),
-                robot,
-            )
-            for robot in mobile
-            if physical.relay_path_progress(
-                robot.position,
-                physical.active_branch,
-            )
-            > last_progress + physical.EPSILON
-        ]
-
-        if not ahead:
+        if last_node is None:
             return
 
-        ahead.sort(
-            key=lambda item: (
-                item[0],
-                item[1].robot_id,
-            )
-        )
-
-        front_progress = ahead[-1][0]
-
-        # -------------------------------------------------
-        # Reactive Breadcrumb trigger based on the actual
-        # explored FRONT, not on the slowest NORMAL tail.
-        #
-        # A few NORMAL robots may remain close to the last
-        # breadcrumb while the LiDAR/front has already
-        # stretched the communication chain.
-        #
-        # Waiting for the absolute rear-most NORMAL to move
-        # BREADCRUMB_SPACING creates a deadlock:
-        #
-        # front stops for communication
-        #     -> rear-most NORMAL does not clear
-        #     -> no breadcrumb
-        #     -> front can never resume
-        # -------------------------------------------------
-        required_front_progress = (
-            last_progress
-            + physical.BREADCRUMB_SPACING
-            + physical.BREADCRUMB_FRONT_CLEARANCE
-        )
-
-        if front_progress < required_front_progress:
-            return
-
-        target_progress = (
-            last_progress
-            + physical.BREADCRUMB_SPACING
-        )
-
-        # Select an already-existing physical NORMAL robot
-        # near the desired local spacing.
-        #
-        # No robot is teleported. The selected robot stops
-        # exactly where it already is.
-        tail_band = [
-            (progress, robot)
-            for progress, robot in ahead
-            if robot is not lidar_robot
-            and progress
-            <= (
-                front_progress
-                - physical.BREADCRUMB_FRONT_CLEARANCE
-            )
-            and physical.BREADCRUMB_DEPLOY_DISTANCE
-            <= robot.position.distance_to(
-                last_node.position
-            )
-            <= physical.COMM_RANGE * 0.88
-        ]
-
-        if not tail_band:
-            return
-
-        tail_progress, tail_robot = min(
-            tail_band,
-            key=lambda item: (
-                abs(
-                    item[0]
-                    - target_progress
-                ),
-                abs(
-                    item[1].position.distance_to(
-                        last_node.position
-                    )
-                    - physical.BREADCRUMB_SPACING
-                ),
-                item[1].robot_id,
+        observations = observe_local_neighbors(
+            last_node,
+            robots,
+            tangent,
+            max_range=physical.COMM_RANGE,
+            predicate=lambda robot: (
+                robot.role == "NORMAL"
+                and not robot.base_reserve
+                and robot.connected_to_base
+                and robot is not lidar_robot
             ),
         )
+
+        candidates = [
+            observation
+            for observation in observations
+            if (
+                observation.relative_axial
+                > 0.0
+                and physical.BREADCRUMB_DEPLOY_DISTANCE
+                <= observation.relative_range
+                <= physical.COMM_RANGE * 0.88
+            )
+        ]
+
+        if not candidates:
+            return
+
+        selected = min(
+            candidates,
+            key=lambda observation: (
+                abs(
+                    observation.relative_range
+                    - physical.BREADCRUMB_SPACING
+                ),
+                observation.robot.robot_id,
+            ),
+        )
+
+        tail_robot = selected.robot
 
 
         if (
@@ -8589,9 +8487,10 @@ def install_lidar_relay_protection(
 
         tail_robot.role = "RELAY"
 
-        tail_robot.relay_anchor = (
-            tail_robot.position.copy()
-        )
+        # The role transition itself freezes the Breadcrumb at its current
+        # physical pose.  Do not retain that pose as a controller target.
+        tail_robot.relay_anchor = None
+        tail_robot.relay_hold_local = True
 
         tail_robot.relay_index = (
             breadcrumbs[-1].relay_index + 1
@@ -8614,24 +8513,6 @@ def install_lidar_relay_protection(
             0.0,
         )
 
-        physical.relay_slots.append(
-            {
-                "index": tail_robot.relay_index,
-                "position": (
-                    tail_robot.relay_anchor.copy()
-                ),
-                "path_distance": tail_progress,
-            }
-        )
-
-        guards = (
-            physical.assign_breadcrumb_front_guards(
-                robots,
-                tail_robot,
-                tail_progress,
-            )
-        )
-
         physical.relay_deploy_cooldown = (
             physical.BREADCRUMB_DEPLOY_COOLDOWN
         )
@@ -8640,8 +8521,8 @@ def install_lidar_relay_protection(
             "[Breadcrumb] "
             f"tail robot={tail_robot.robot_id}, "
             f"index={tail_robot.relay_index}, "
-            f"progress={tail_progress:.1f}, "
-            f"static_guards={len(guards)} "
+            f"local_parent_range={selected.relative_range:.1f}, "
+            "static_guards=0 "
             f"lidar_front_visible=True "
             f"lidar_selected=False"
         )
@@ -8649,6 +8530,23 @@ def install_lidar_relay_protection(
     physical.update_relay_deployment = (
         protected_update_relay_deployment
     )
+
+    previous_robot_update = physical.Robot.update
+
+    def hold_local_breadcrumb(self: Any, dt: float) -> None:
+        if self.role != "RELAY" or not getattr(self, "relay_hold_local", False):
+            previous_robot_update(self, dt)
+            return
+        old_position = self.position.copy()
+        self.velocity.update(0.0, 0.0)
+        self.commanded_velocity.update(0.0, 0.0)
+        self.observed_velocity.update(0.0, 0.0)
+        self.acceleration.update(0.0, 0.0)
+        self.filtered_acceleration.update(0.0, 0.0)
+        self.previous_position = old_position
+        self._record_motion()
+
+    physical.Robot.update = hold_local_breadcrumb
 
     print(
         "[LiDARRoleProtection] "
@@ -8691,9 +8589,16 @@ def update_child_probe_relay_support(
     if parent is None:
         return
 
-    parent_distance = lidar_robot.position.distance_to(
-        parent.position
+    local_axis = _body_local_unit(perception, 0.0)
+    parent_observation = observe_local_neighbors(
+        lidar_robot,
+        [parent],
+        local_axis,
+        max_range=physical.COMM_RANGE,
     )
+    if not parent_observation:
+        return
+    parent_distance = parent_observation[0].relative_range
 
     hard_limit = float(
         physical.COMM_GUARD_HARD_LIMIT
@@ -8731,6 +8636,15 @@ def update_child_probe_relay_support(
     # No Child global position or J1 fixture coordinate
     # is used here.
     # -------------------------------------------------
+    candidate_observations = {
+        observation.robot.robot_id: observation
+        for observation in observe_local_neighbors(
+            lidar_robot,
+            getattr(lidar_robot, "comm_neighbors", []),
+            local_axis,
+            max_range=physical.COMM_RANGE,
+        )
+    }
     for candidate in getattr(
         lidar_robot,
         "comm_neighbors",
@@ -8763,11 +8677,10 @@ def update_child_probe_relay_support(
         ):
             continue
 
-        candidate_distance = (
-            lidar_robot.position.distance_to(
-                candidate.position
-            )
-        )
+        observation = candidate_observations.get(candidate.robot_id)
+        if observation is None:
+            continue
+        candidate_distance = observation.relative_range
 
         if (
             candidate_distance
@@ -8859,9 +8772,8 @@ def update_child_probe_relay_support(
     )
 
     relay_robot.role = "RELAY"
-    relay_robot.relay_anchor = (
-        relay_robot.position.copy()
-    )
+    relay_robot.relay_anchor = None
+    relay_robot.relay_hold_local = True
     relay_robot.relay_index = relay_index
 
     if hasattr(
@@ -8912,7 +8824,7 @@ def update_child_probe_relay_support(
         f"{getattr(parent, 'robot_id', None)} "
         f"old_parent_dist={parent_distance:.2f} "
         f"relay_dist="
-        f"{lidar_robot.position.distance_to(relay_robot.position):.2f} "
+        f"{candidate_observations.get(relay_robot.robot_id).relative_range if candidate_observations.get(relay_robot.robot_id) else float('nan'):.2f} "
         "position_snap=False"
     )
 
@@ -9168,40 +9080,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             f"line_speed={physical.SHEPHERD_LINE_BACKTRACK_SPEED:.3f} "
             "cross_branch_transfer=False invisible_curtain=False"
         )
-
-    def thick_frontier_slot_target(
-        robot: Any, centroid_depth: float
-    ) -> pygame.Vector2 | None:
-        """Move the complete frozen LiDAR Guard wall without changing its shape."""
-        lifecycle = getattr(
-            physical, "integration_wall_lifecycle", {}
-        ).get(robot.shepherd_branch)
-        descriptor = descriptor_for(robot.shepherd_branch)
-        if lifecycle is None or descriptor is None:
-            return None
-        offset = lifecycle["relative_offsets"].get(robot.robot_id)
-        if offset is None:
-            return None
-        axial_offset, lateral_offset = offset
-
-        center = lifecycle.get("mouth_center_world")
-        tangent = lifecycle.get("branch_tangent_unit")
-        lateral = lifecycle.get("mouth_lateral_unit")
-        if center is not None and tangent is not None and lateral is not None:
-            return (
-                center
-                + tangent * (centroid_depth + axial_offset)
-                + lateral * lateral_offset
-            )
-
-        # Compatibility fallback only.  Normal integration runs should always
-        # have the frozen LiDAR mouth frame above.
-        return physical.local_coordinates_to_world(
-            descriptor,
-            centroid_depth + axial_offset,
-            physical.frontier_line_lateral_center + lateral_offset,
-        )
-
 
     def audited_commit_guard_roles(
         robots: Sequence[Any], selected_branch: str
@@ -9507,65 +9385,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         lifecycle["frontier_odometry_time"] = float(physical.simulation_time)
         return centroid_axial, centroid_lateral, relative
 
-    def lifecycle_target(
-        lifecycle: dict[str, Any],
-        centroid_depth: float,
-        axial_offset: float,
-        lateral_offset: float,
-    ) -> pygame.Vector2:
-        center = lifecycle.get("mouth_center_world")
-        tangent = lifecycle.get("branch_tangent_unit")
-        lateral_axis = lifecycle.get("mouth_lateral_unit")
-        if center is None or tangent is None or lateral_axis is None:
-            raise RuntimeError("lifecycle target requires a transport frame")
-        return (
-            center
-            + tangent * (centroid_depth + axial_offset)
-            + lateral_axis * lateral_offset
-        )
-
-    def resolve_common_shepherd_centroid_depth(
-        branch: str,
-        lifecycle: dict[str, Any],
-        desired_centroid_depth: float,
-    ) -> float | None:
-        """Find the deepest common 3xN cross-section that is fully walkable."""
-        relative = lifecycle.get("relative_offsets", {})
-        if not relative:
-            return None
-
-        def formation_is_walkable(centroid_depth: float) -> bool:
-            return all(
-                physical.is_walkable(
-                    lifecycle_target(lifecycle, centroid_depth, axial, lateral),
-                    physical.ROBOT_RADIUS,
-                )
-                for axial, lateral in relative.values()
-            )
-
-        desired_centroid_depth = max(0.0, float(desired_centroid_depth))
-        if formation_is_walkable(desired_centroid_depth):
-            return desired_centroid_depth
-
-        # Search continuously back toward the Junction until the complete 3xN
-        # formation fits.  v13 limited this search to only ~10 robot radii; when
-        # the dead-end contact was oblique or the three rows were compressed,
-        # saturation could be TRUE while promotion returned [] forever, leaving
-        # the phase stuck in EXPLORE_BRANCH.  The current robot positions are
-        # already physically inside the corridor, so a common safe cross-section
-        # must be sought over the whole traversed branch, not an arbitrary short
-        # retreat window.
-        step = max(0.20, float(physical.ROBOT_RADIUS) * 0.20)
-        candidate = desired_centroid_depth - step
-        while candidate >= -physical.EPSILON:
-            candidate = max(0.0, candidate)
-            if formation_is_walkable(candidate):
-                return candidate
-            if candidate <= physical.EPSILON:
-                break
-            candidate -= step
-        return None
-
     def local_frontier_progress(
         robots: Sequence[Any], branch: str, dt: float
     ) -> None:
@@ -9598,37 +9417,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 physical.frontier_line_continuous = True
         if not physical.frontier_line_row_ready:
             return
-
-        # Before translating down the branch, let the selected Guard IDs settle
-        # onto the straight corridor cross-section at the current scalar depth.
-        # Without this bounded settle, LEFT/RIGHT rows can begin moving while
-        # still carrying the perspective skew of the mouth chord and the lower
-        # edge can scrape the side wall.
-        if lifecycle is not None and lifecycle.get("regularized_wall"):
-            target_errors = []
-            for robot in frontiers:
-                target = thick_frontier_slot_target(
-                    robot, physical.frontier_line_depth
-                )
-                if target is not None:
-                    target_errors.append(robot.position.distance_to(target))
-            max_straighten_error = max(target_errors, default=0.0)
-            straighten_tolerance = max(
-                float(physical.JUNCTION_GUARD_POSITION_TOLERANCE),
-                1.25 * float(physical.ROBOT_RADIUS),
-            )
-            if max_straighten_error > straighten_tolerance:
-                if getattr(physical, "integration_frame", 0) % 20 == 0:
-                    print(
-                        f"[FrontierAlignmentCorrection] branch={branch} "
-                        f"max_error={max_straighten_error:.3f} "
-                        f"tol={straighten_tolerance:.3f} "
-                        "advance=True coupled_translation=True"
-                    )
-                # Do NOT return. The Guard was already generated perpendicular;
-                # any residual error is only physical settling.  Advancing the
-                # scalar centroid at the same time keeps this wall at the front
-                # instead of letting the NORMAL SPH body pass it.
 
         usable_half = physical.local_physical_usable_half_width(descriptor)
         relative_offsets = (
@@ -9712,56 +9500,10 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         if lifecycle is not None and axial_offsets:
             frozen_depth = lifecycle.get("frontier_contact_centroid_depth")
             if frozen_depth is not None:
-                # A confirmed dead-end contact is sticky for this branch.
+                # A confirmed dead-end contact (set by sample_local_state()'s
+                # stall/density/pressure/dwell evidence, not by an is_walkable
+                # map probe) is sticky for this branch.
                 next_depth = physical.frontier_line_depth
-            else:
-                layer_by_id = lifecycle.get("guard_layer_by_id", {})
-                leading_layer = max(layer_by_id.values(), default=-1)
-                leading_ids = [
-                    robot_id for robot_id, layer in layer_by_id.items()
-                    if layer == leading_layer
-                ]
-                center = lifecycle.get("mouth_center_world")
-                tangent = lifecycle.get("branch_tangent_unit")
-                lateral_axis = lifecycle.get("mouth_lateral_unit")
-                blocked_leading = []
-                if (
-                    leading_ids
-                    and center is not None
-                    and tangent is not None
-                    and lateral_axis is not None
-                    and next_depth > physical.frontier_line_depth + physical.EPSILON
-                ):
-                    for robot_id in leading_ids:
-                        axial_offset, lateral_offset = lifecycle["relative_offsets"].get(
-                            robot_id, (0.0, 0.0)
-                        )
-                        probe_target = lifecycle_target(
-                            lifecycle, next_depth, axial_offset, lateral_offset
-                        )
-                        if not physical.is_walkable(
-                            probe_target, physical.ROBOT_RADIUS
-                        ):
-                            blocked_leading.append(robot_id)
-
-                # One edge robot grazing a side wall is not a dead-end.  Require
-                # at least half of the leading row (and at least two robots) to
-                # agree in the same predicted step before freezing the entire
-                # 3-row formation.
-                required_contact = max(2, int(math.ceil(0.5 * len(leading_ids))))
-                if blocked_leading and len(blocked_leading) >= required_contact:
-                    lifecycle["frontier_contact_centroid_depth"] = float(
-                        physical.frontier_line_depth
-                    )
-                    next_depth = physical.frontier_line_depth
-                    print(
-                        f"[FrontierRigidContact] branch={branch} "
-                        f"centroid_depth={physical.frontier_line_depth:.3f} "
-                        f"leading_blocked={len(blocked_leading)}/{len(leading_ids)} "
-                        f"rows={lifecycle.get('rows', 0)} "
-                        f"cols={lifecycle.get('cols', 0)} "
-                        "freeze_complete_wall=True monotonic_depth=True"
-                    )
 
         # Never command a backward axial target during EXPLORE_BRANCH.
         physical.frontier_line_depth = max(
@@ -9786,7 +9528,24 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             physical, "integration_wall_lifecycle", {}
         ).get(branch)
         if any(robot.role == "FRONTIER_SHEPHERD" for robot in line):
-            depth = float(physical.frontier_line_depth)
+            now = float(physical.simulation_time)
+            depth = float(
+                (lifecycle or {}).get(
+                    "frontier_odometry_depth",
+                    physical.frontier_line_depth,
+                )
+            )
+            previous_time = float(
+                (lifecycle or {}).get("frontier_odometry_time", now)
+            )
+            elapsed = max(0.0, now - previous_time)
+            if lifecycle is not None and elapsed > 0.0:
+                tangent = descriptor.local_outgoing_direction.normalize()
+                depth += float(np.median([
+                    robot.velocity.dot(tangent) for robot in line
+                ])) * elapsed
+                lifecycle["frontier_odometry_depth"] = depth
+                lifecycle["frontier_odometry_time"] = now
         else:
             measured_depth = shepherd_line_leading_depth(
                 robots, branch, descriptor
@@ -9947,16 +9706,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         }
         diagnostics.cross_section_fill = len(occupied) / max(bin_count, 1)
         travelled = diagnostics.maximum_depth - diagnostics.start_depth
-        # There are two valid local saturation paths.  The original density path
-        # remains available, but a physically confirmed rigid Frontier contact
-        # is stronger dead-end evidence than a small density-ratio rise.  In the
-        # latter case the 3-row leading layer has already found the map wall with
-        # majority contact, so do not leave EXPLORE_BRANCH waiting forever for
-        # rho_ratio >= 1.02 while the packed body is visibly stalled behind it.
-        contact_confirmed = bool(
-            lifecycle is not None
-            and lifecycle.get("frontier_contact_centroid_depth") is not None
-        )
         common_saturation_evidence = (
             len(cohort) >= physical.SATURATION_MIN_TIP_ROBOTS
             and travelled >= max(
@@ -9969,16 +9718,11 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             and diagnostics.cross_section_fill
             >= physical.SATURATION_PACKED_LATERAL_COVERAGE_RATIO
         )
-        density_saturation = (
+        conditions = (
             common_saturation_evidence
             and diagnostics.local_density_ratio
             >= physical.SATURATION_DENSITY_RATIO
         )
-        contact_saturation = (
-            common_saturation_evidence
-            and contact_confirmed
-        )
-        conditions = density_saturation or contact_saturation
         diagnostics.dwell = diagnostics.dwell + dt if conditions else 0.0
         diagnostics.saturated = (
             diagnostics.dwell >= physical.SATURATION_DWELL_TIME
@@ -9996,8 +9740,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"pressure={diagnostics.local_pressure:.2f} "
                 f"pressure_ratio={diagnostics.local_pressure_ratio:.2f} "
                 f"cross_fill={diagnostics.cross_section_fill:.2f} "
-                f"contact={contact_confirmed} "
-                f"mode={'CONTACT' if contact_saturation else ('DENSITY' if density_saturation else '-')} "
+                f"mode={'LOCAL_STALL_DENSITY_PRESSURE' if conditions else '-'} "
                 f"dwell={diagnostics.dwell:.2f} "
                 f"saturated={diagnostics.saturated}"
             )
@@ -10729,119 +10472,13 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             float(command),
         )
 
-        # V28: the complete Shepherd wall is one rigid body.  The old baseline
-        # clamps every Shepherd independently to its current communication parent;
-        # on a horizontal branch that can collapse all three axial rows onto one
-        # vertical line.  Validate the COMMON scalar target instead.  Either every
-        # Shepherd can take the step while preserving its stored robot-id offset,
-        # or the whole wall holds this frame.
-        rigid_targets: dict[int, pygame.Vector2] = {}
-        rigid_geometry_safe = True
-        shepherd_offsets = lifecycle.get(
-            "shepherd_relative_offsets",
-            lifecycle.get("relative_offsets", {}),
-        )
-        for shepherd in branch_shepherds:
-            stored = shepherd_offsets.get(shepherd.robot_id)
-            if stored is None:
-                rigid_geometry_safe = False
-                break
-            axial_offset, lateral_offset = stored
-            target = lifecycle_target(
-                lifecycle,
-                command,
-                float(axial_offset),
-                float(lateral_offset),
-            )
-            rigid_targets[shepherd.robot_id] = target
-            if not physical.is_walkable(target, shepherd.radius):
-                rigid_geometry_safe = False
-                break
-
-        # V30 communication rule: the 3xN Shepherd is one rigid local mesh, not
-        # 33 independent robots tied forever to their *previous* comm_parent.
-        # update_communication_system() rebuilds neighbors/parents after motion,
-        # so rejecting the common piston step because one stale parent distance
-        # increases by epsilon creates a permanent deadlock.  Instead validate the
-        # geometry that the next communication update can actually realize:
-        #   1) all proposed Shepherd slots remain one COMM_RANGE-connected mesh;
-        #   2) that mesh has at least one LOS tether to a currently Base-connected
-        #      non-Shepherd robot (NORMAL/relay/anchor/etc.).
-        # A single external tether is enough because the 3xN wall is internally
-        # connected and can re-parent locally on the next communication update.
-        rigid_internal_connected = False
-        rigid_external_tethers = 0
-        rigid_comm_safe = False
-        if rigid_geometry_safe and branch_shepherds:
-            comm_range = float(physical.COMM_RANGE)
-            comm_range_sq = comm_range * comm_range
-            shepherd_ids = {robot.robot_id for robot in branch_shepherds}
-            target_ids = list(rigid_targets)
-
-            adjacency: dict[int, list[int]] = {robot_id: [] for robot_id in target_ids}
-            for index, left_id in enumerate(target_ids):
-                left_target = rigid_targets[left_id]
-                for right_id in target_ids[index + 1:]:
-                    right_target = rigid_targets[right_id]
-                    if left_target.distance_squared_to(right_target) > comm_range_sq:
-                        continue
-                    if not physical.has_line_of_sight(left_target, right_target):
-                        continue
-                    adjacency[left_id].append(right_id)
-                    adjacency[right_id].append(left_id)
-
-            if target_ids:
-                visited = {target_ids[0]}
-                stack = [target_ids[0]]
-                while stack:
-                    current_id = stack.pop()
-                    for neighbor_id in adjacency[current_id]:
-                        if neighbor_id in visited:
-                            continue
-                        visited.add(neighbor_id)
-                        stack.append(neighbor_id)
-                rigid_internal_connected = len(visited) == len(target_ids)
-
-            external_candidates = [
-                robot for robot in robots
-                if robot.robot_id not in shepherd_ids
-                and robot.role != "PEBBLE"
-                and getattr(robot, "connected_to_base", False)
-            ]
-            tethered_shepherds: set[int] = set()
-            for shepherd_id, target in rigid_targets.items():
-                for other in external_candidates:
-                    if target.distance_squared_to(other.position) > comm_range_sq:
-                        continue
-                    if not physical.has_line_of_sight(target, other.position):
-                        continue
-                    tethered_shepherds.add(shepherd_id)
-                    break
-            rigid_external_tethers = len(tethered_shepherds)
-            rigid_comm_safe = (
-                rigid_internal_connected
-                and rigid_external_tethers >= 1
-            )
-
-        if not rigid_geometry_safe:
-         # 3xN 벽 자체가 벽/장애물에 들어가는 경우만 실제로 정지.
-            command = previous_command
-            mode = "HOLD_RIGID_3XN_GEOMETRY"
-
-        elif not rigid_internal_connected:
-            # Shepherd 3xN 내부 communication mesh가 깨지는 경우도 정지.
-            command = previous_command
-            mode = "HOLD_RIGID_3XN_INTERNAL_COMM"
-
-        elif not rigid_comm_safe:
-            # 외부 Base-connected tether가 순간적으로 없어졌다는 이유만으로
-            # Shepherd 전체 piston을 영구 정지시키지 않는다.
-            #
-            # 3xN 내부 mesh와 physical geometry가 유지된다면
-            # 이미 계산된 command를 그대로 실행하고,
-            # 다음 communication update에서 재연결을 허용한다.
-            mode = f"{mode}_EXTERNAL_TETHER_REPARENT"
-
+        # command는 이미 local rear-support/contact-floor 계산에서 나온
+        # scalar depth다.  절대 world target을 미리 만들어
+        # is_walkable()/distance_squared_to()/has_line_of_sight()로
+        # 검증(rigid_geometry_safe/rigid_internal_connected/rigid_comm_safe)
+        # 하지 않는다.  실제 벽/로봇 충돌과 communication 재연결은
+        # 매 frame 다시 도는 physics/update_communication_system()이
+        # 그대로 처리한다.
         physical.integration_backtrack_command_depth = command
         physical.integration_backtrack_pack_rear_depth = rear_depth
         physical.integration_backtrack_support_depth = support_depth
@@ -10878,9 +10515,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"compression_allowance={compression_allowance:.3f} "
                 f"active_min_gap={active_min_center_gap:.3f} "
                 f"hard_floor={hard_contact_floor if hard_contact_floor is not None else -1.0:.3f} "
-                f"rigid_internal={rigid_internal_connected} "
-                f"rigid_tethers={rigid_external_tethers} "
-                f"rigid_comm_safe={rigid_comm_safe} mode={mode}"
+                f"mode={mode}"
             )
 
 
@@ -11133,32 +10768,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             f"curtain_active={physical.integration_return_curtain_active}"
         )
 
-    def local_slot_at_depth(
-        anchor: pygame.Vector2, branch: str, depth: float
-    ) -> pygame.Vector2:
-        """Reference-style backtracking: keep transverse slot, reduce depth only."""
-        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
-        descriptor = descriptor_for(branch)
-        if lifecycle is None or descriptor is None:
-            return anchor.copy()
-        stored = physical.integration_shepherd_anchor_offsets.get(id(anchor))
-        if stored is None:
-            center = lifecycle.get("mouth_center_world")
-            tangent = lifecycle.get("branch_tangent_unit")
-            lateral_axis = lifecycle.get("mouth_lateral_unit")
-            if center is None or tangent is None or lateral_axis is None:
-                return anchor.copy()
-            delta = anchor - center
-            # Without a stored leading-edge offset, keep the anchor's own
-            # cross-section identity and treat it as the leading row.
-            axial_offset = 0.0
-            lateral = float(delta.dot(lateral_axis))
-        else:
-            axial_offset, lateral = stored
-        return lifecycle_target(
-            lifecycle, max(0.0, float(depth)), float(axial_offset), float(lateral)
-        )
-
     def promote_thick_frontier_wall(
         robots: Sequence[Any], branch: str,
         observed_boundary_depth: float | None = None,
@@ -11401,18 +11010,15 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             candidate for candidate in robots
             if candidate.role == "NORMAL" and not candidate.base_reserve
         ]
-        flow_radius_sq = (2.0 * physical.SMOOTHING_LENGTH) ** 2
         for shepherd in remaining_shepherds:
-            neighbors = sorted(
-                (
-                    candidate for candidate in ordinary_normals
-                    if candidate.position.distance_squared_to(shepherd.position)
-                    <= flow_radius_sq
-                ),
-                key=lambda candidate: candidate.position.distance_squared_to(
-                    shepherd.position
-                ),
-            )[:10]
+            observations = observe_local_neighbors(
+                shepherd,
+                ordinary_normals,
+                return_direction,
+                max_range=2.0 * physical.SMOOTHING_LENGTH,
+            )
+            observations.sort(key=lambda observation: observation.relative_range)
+            neighbors = [observation.robot for observation in observations[:10]]
             if neighbors:
                 velocity = pygame.Vector2()
                 for candidate in neighbors:
@@ -11543,12 +11149,29 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         target_branch: str,
     ) -> None:
         """Convert residual Junction return speed into next-branch propulsion."""
+        # Estimate residual flow from a LiDAR robot's local neighborhood.  No
+        # global region label or map coordinate is consulted at branch switch.
+        reference = next(
+            (robot for robot in robots if getattr(robot, "is_lidar_robot", False)),
+            None,
+        )
+        if reference is None:
+            reference = next((robot for robot in robots if robot.role == "NORMAL"), None)
+        incoming = getattr(
+            physical,
+            "integration_incoming_direction_local",
+            pygame.Vector2(0.0, -1.0),
+        )
+        observations = observe_local_neighbors(
+            reference,
+            robots,
+            incoming,
+            max_range=physical.COMM_RANGE,
+            predicate=lambda robot: robot.role == "NORMAL" and not robot.base_reserve,
+        ) if reference is not None else []
         junction_speeds = [
-            robot.velocity.length()
-            for robot in robots
-            if robot.role == "NORMAL"
-            and physical.get_robot_region(robot.position) == "JUNCTION"
-            and not robot.base_reserve
+            observation.robot.velocity.length()
+            for observation in observations
         ]
         mean_speed = float(np.mean(junction_speeds)) if junction_speeds else 0.0
         raw_scale = (
@@ -11688,10 +11311,69 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             "RETURN_TO_BASE -> ALL_ROBOTS_DONE"
         )
 
+    def update_root_shepherd_formation(
+        robots: Sequence[Any], dt: float,
+    ) -> None:
+        """Advance Root Shepherd formation using only local relative sensing."""
+        branch = physical.active_branch
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        descriptor = descriptor_for(branch) if branch is not None else None
+        if lifecycle is None or descriptor is None:
+            return
+        physical.update_relay_deployment(robots, dt)
+        physical.shepherd_form_timer += dt
+        shepherds = [
+            robot for robot in physical.get_shepherds(robots)
+            if robot.shepherd_branch == branch
+        ]
+        expected = int(lifecycle.get("rows", 0)) * int(lifecycle.get("cols", 0))
+        offsets = lifecycle.get("relative_offsets", {})
+        formation_error = 0.0
+        if shepherds and offsets:
+            tangent, lateral = physical.descriptor_local_basis(descriptor)
+            reference = min(
+                shepherds,
+                key=lambda robot: sum(abs(float(value)) for value in offsets.get(robot.robot_id, (0.0, 0.0))),
+            )
+            reference_offset = offsets.get(reference.robot_id, (0.0, 0.0))
+            for observation in observe_local_neighbors(
+                reference, shepherds, tangent, lateral_axis=lateral,
+            ):
+                expected_offset = offsets.get(observation.robot.robot_id, reference_offset)
+                formation_error = max(
+                    formation_error,
+                    math.hypot(
+                        observation.relative_axial - (float(expected_offset[0]) - float(reference_offset[0])),
+                        observation.relative_lateral - (float(expected_offset[1]) - float(reference_offset[1])),
+                    ),
+                )
+        formed = (
+            expected > 0
+            and len(shepherds) == expected
+            and formation_error <= float(physical.SHEPHERD_FORM_TOLERANCE)
+        )
+        if not formed:
+            return
+        physical.phase = physical.SimulationPhase.FILL_BEHIND_SHEPHERD
+        physical.saturation_tracker.reset(branch)
+        physical.branch_continuity_tracker.reset(branch)
+        current_depth = shepherd_line_leading_depth(robots, branch, descriptor)
+        diagnostics.reset(branch, float(current_depth or 0.0))
+        physical.integration_shepherd_pack_ready_dwell = 0.0
+        print(
+            f"[ShepherdBoundaryReady] frame={getattr(physical, 'integration_frame', -1)} "
+            f"branch={branch} robots={len(shepherds)}/{expected} "
+            f"local_formation_error={formation_error:.3f} "
+            "teleport=False -> FILL_BEHIND_SHEPHERD"
+        )
+
     def integrated_update_state(
         robots: Sequence[Any], dt: float, reference_density: float,
         spatial_grid: Any,
     ) -> None:
+        if physical.phase == physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY:
+            update_root_shepherd_formation(robots, dt)
+            return
         # Adaptive-LiDAR handoff already has every detected physical Guard wall.
         # Mirror the authoritative Physical DFS start lifecycle explicitly:
         # vote -> choose -> SAME Guard IDs become Frontier -> pending dwell.
@@ -12122,14 +11804,32 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             local_frontier_progress(robots, branch, dt)
 
             # V31 state order:
-            #   Frontier travels -> distributed rigid dead-end contact ->
-            #   SAME IDs become Shepherd immediately -> Shepherd waits in FILL.
-            # Saturation is intentionally NOT required while the robots still have
-            # the Frontier role.  Packing is measured only after role transition.
+            #   Frontier travels -> local stall/density/pressure dwell
+            #   saturation confirmed -> SAME IDs become Shepherd immediately
+            #   -> Shepherd waits in FILL.
+            #
+            # dead-end 확정은 map/is_walkable 조회가 아니라
+            # sample_local_state()의 stall + local density/pressure + dwell
+            # 증거(diagnostics.saturated)만으로 판정한다.
             state = sample_local_state(robots, branch, reference_density, dt)
             lifecycle = getattr(
                 physical, "integration_wall_lifecycle", {}
             ).get(branch)
+            if (
+                lifecycle is not None
+                and state.saturated
+                and lifecycle.get("frontier_contact_centroid_depth") is None
+            ):
+                lifecycle["frontier_contact_centroid_depth"] = float(
+                    physical.frontier_line_depth
+                )
+                print(
+                    f"[FrontierSaturationDeadEnd] branch={branch} "
+                    f"centroid_depth={physical.frontier_line_depth:.3f} "
+                    f"density_ratio={state.local_density_ratio:.2f} "
+                    f"pressure_ratio={state.local_pressure_ratio:.2f} "
+                    f"dwell={state.dwell:.2f}"
+                )
             dead_end_contact = bool(
                 lifecycle is not None
                 and lifecycle.get("frontier_contact_centroid_depth") is not None
@@ -12226,9 +11926,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
             # Same robots, same world positions, same 3xN shape. Only the role
             # changes. Hand control back to the Environment at its native
-            # FORM_SHEPHERD_BOUNDARY entry point. Since every Shepherd anchor is
-            # exactly its current position, shepherd_boundary_formed() is already
-            # true and the Environment advances to FILL on its next state update.
+            # FORM_SHEPHERD_BOUNDARY entry point. The downstream readiness check
+            # uses only the local formation error of the intact wall.
             physical.phase = physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY
             physical.shepherd_form_timer = 0.0
 
@@ -12249,7 +11948,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"baseline_cross_fill={baseline_cross_fill:.3f} "
                 "same_ids_in_place=True -> FORM_SHEPHERD_BOUNDARY -> ENVIRONMENT_FILL"
             )
-            return
+            # Continue into the local FORM_SHEPHERD_BOUNDARY settle handler
+            # below in this same integration update.
   
             # Keep the SAME thick Shepherd wall and let it settle continuously
             # onto its frozen targets.  Do not fall through to the legacy timeout
@@ -12264,29 +11964,49 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             ]
             lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch, {})
             expected = int(lifecycle.get("rows", 0)) * int(lifecycle.get("cols", 0))
+            frozen_offsets = lifecycle.get("relative_offsets", {})
+            tangent, lateral = physical.descriptor_local_basis(
+                descriptor_for(branch)
+            ) if descriptor_for(branch) is not None else (
+                pygame.Vector2(1.0, 0.0), pygame.Vector2(0.0, 1.0)
+            )
+            formation_error = 0.0
+            if shepherds and frozen_offsets:
+                reference = min(
+                    shepherds,
+                    key=lambda robot: sum(
+                        abs(float(value))
+                        for value in frozen_offsets.get(robot.robot_id, (0.0, 0.0))
+                    ),
+                )
+                reference_offset = frozen_offsets.get(reference.robot_id, (0.0, 0.0))
+                for observation in observe_local_neighbors(
+                    reference,
+                    shepherds,
+                    tangent,
+                    lateral_axis=lateral,
+                ):
+                    expected_offset = frozen_offsets.get(
+                        observation.robot.robot_id,
+                        reference_offset,
+                    )
+                    formation_error = max(
+                        formation_error,
+                        math.hypot(
+                            observation.relative_axial
+                            - (float(expected_offset[0]) - float(reference_offset[0])),
+                            observation.relative_lateral
+                            - (float(expected_offset[1]) - float(reference_offset[1])),
+                        ),
+                    )
             formed = (
                 expected > 0
                 and len(shepherds) == expected
-                and all(
-                    robot.shepherd_anchor is not None
-                    and robot.position.distance_to(robot.shepherd_anchor)
-                    <= physical.SHEPHERD_FORM_TOLERANCE
-                    for robot in shepherds
-                )
+                and formation_error <= float(physical.SHEPHERD_FORM_TOLERANCE)
             )
-            anchors_walkable = (
-                expected > 0
-                and len(shepherds) == expected
-                and all(
-                    robot.shepherd_anchor is not None
-                    and physical.is_walkable(robot.shepherd_anchor, robot.radius)
-                    for robot in shepherds
-                )
-            )
-            timed_settle_ready = (
-                anchors_walkable
-                and physical.shepherd_form_timer >= physical.SHEPHERD_FORM_TIMEOUT
-            )
+            # The Frontier->Shepherd transition is in-place.  Walkability of a
+            # remembered anchor is not a post-Guard control signal; actual wall
+            # collision is handled only while integrating commanded velocity.
             # V26: never start packing around a half-settled Shepherd wall.
             # Every SAME-ID Shepherd must be physically inside its frozen 3xN slot
             # tolerance before NORMAL robots are allowed to fill behind it.
@@ -12308,14 +12028,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 current_shepherd_depth = float(current_shepherd_depth or 0.0)
                 diagnostics.reset(branch, current_shepherd_depth)
                 physical.integration_shepherd_pack_ready_dwell = 0.0
-                max_error = max(
-                    (
-                        robot.position.distance_to(robot.shepherd_anchor)
-                        for robot in shepherds
-                        if robot.shepherd_anchor is not None
-                    ),
-                    default=0.0,
-                )
+                max_error = formation_error
                 print(
                     f"[ShepherdBoundaryReady] frame={getattr(physical, 'integration_frame', -1)} "
                     f"branch={branch} robots={len(shepherds)}/{expected} "
@@ -12327,18 +12040,11 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 physical.shepherd_form_timer >= physical.SHEPHERD_FORM_TIMEOUT
                 and getattr(physical, "integration_frame", 0) % 30 == 0
             ):
-                max_error = max(
-                    (
-                        robot.position.distance_to(robot.shepherd_anchor)
-                        for robot in shepherds
-                        if robot.shepherd_anchor is not None
-                    ),
-                    default=float("inf"),
-                )
+                max_error = formation_error
                 print(
                     f"[ShepherdBoundaryWait] frame={getattr(physical, 'integration_frame', -1)} "
                     f"branch={branch} robots={len(shepherds)}/{expected} "
-                    f"max_error={max_error:.3f} anchors_walkable={anchors_walkable} "
+                    f"max_error={max_error:.3f} local_formation=True "
                     "destructive_reset=False"
                 )
             return
@@ -12526,14 +12232,12 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
     physical.update_frontier_line_progress = local_frontier_progress
     physical.commit_junction_guard_roles = audited_commit_guard_roles
-    physical.frontier_shepherd_slot_target = thick_frontier_slot_target
     physical.promote_existing_frontier_line = promote_thick_frontier_wall
     physical.prepare_branch_candidate_scores = pebble_filtered_candidate_scores
 
     # Geometry adapters: map Environment's return hooks onto the Adaptive LiDAR
     # branch-local frame while leaving the state-machine structure unchanged.
     physical.get_backtrack_direction = local_return_direction
-    physical.shepherd_slot_position_at_depth = local_slot_at_depth
 
     # Restore the exact Environment fill/transport logic.
     physical.update_transfer_continuity_control = original_transfer_control
@@ -12573,8 +12277,175 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             physical.integration_original_shepherd_pressure_factor
         )
 
-    # Use Environment Robot.update(), not herd_locked_robot_update().
-    physical.Robot.update = original_robot_update
+    def relative_formation_velocity(
+        robot: Any,
+        members: Sequence[Any],
+        offsets: dict[int, tuple[float, float]],
+        tangent: pygame.Vector2,
+        lateral: pygame.Vector2,
+        maximum_speed: float,
+    ) -> pygame.Vector2:
+        """Restore the frozen 3xN shape from local peer range/bearing only."""
+        own = offsets.get(robot.robot_id)
+        if own is None:
+            return pygame.Vector2()
+        observations = observe_local_neighbors(
+            robot,
+            members,
+            tangent,
+            lateral_axis=lateral,
+            max_range=physical.COMM_RANGE,
+        )
+        errors: list[tuple[float, float]] = []
+        for observation in observations:
+            peer = offsets.get(observation.robot.robot_id)
+            if peer is None:
+                continue
+            expected_axial = float(peer[0]) - float(own[0])
+            expected_lateral = float(peer[1]) - float(own[1])
+            if math.hypot(expected_axial, expected_lateral) > physical.COMM_RANGE:
+                continue
+            errors.append((
+                observation.relative_axial - expected_axial,
+                observation.relative_lateral - expected_lateral,
+            ))
+        if not errors:
+            return pygame.Vector2()
+        gain = 4.0
+        correction = (
+            tangent * (gain * float(np.mean([item[0] for item in errors])))
+            + lateral * (gain * float(np.mean([item[1] for item in errors])))
+        )
+        physical.limit_vector(correction, maximum_speed)
+        return correction
+
+    def integrate_boundary_velocity(
+        robot: Any,
+        commanded_velocity: pygame.Vector2,
+        dt: float,
+    ) -> None:
+        """Apply a local velocity command through the ordinary collision layer."""
+        old_position = robot.position.copy()
+        robot.commanded_velocity = commanded_velocity.copy()
+        robot.velocity = commanded_velocity.copy()
+        physical.apply_communication_velocity_guard(robot, dt)
+
+        # These are immediate physics integration candidates, not controller
+        # targets or look-ahead map queries.  The collision layer alone decides
+        # whether each component of the commanded physical step is realised.
+        x_position = pygame.Vector2(
+            robot.position.x + robot.velocity.x * dt,
+            robot.position.y,
+        )
+        if physical.is_walkable(x_position, robot.radius):
+            robot.position.x = x_position.x
+        else:
+            robot.velocity.x = physical.wall_collision_velocity(robot.velocity.x)
+        y_position = pygame.Vector2(
+            robot.position.x,
+            robot.position.y + robot.velocity.y * dt,
+        )
+        if physical.is_walkable(y_position, robot.radius):
+            robot.position.y = y_position.y
+        else:
+            robot.velocity.y = physical.wall_collision_velocity(robot.velocity.y)
+
+        physical.constrain_communication_parent_separation(robot, old_position)
+        robot.observed_velocity = (
+            robot.position - old_position
+        ) / max(dt, physical.EPSILON)
+        robot.velocity = robot.observed_velocity.copy()
+        robot.acceleration.update(0.0, 0.0)
+        robot.filtered_acceleration.update(0.0, 0.0)
+        physical.update_indirect_contact_state(robot, dt)
+        robot.previous_position = old_position
+        robot._record_motion()
+
+    def localization_free_root_boundary_update(self: Any, dt: float) -> None:
+        branch = getattr(self, "shepherd_branch", None)
+        lifecycle = getattr(physical, "integration_wall_lifecycle", {}).get(branch)
+        descriptor = descriptor_for(branch) if branch is not None else None
+        current_robots = tuple(
+            getattr(physical, "integration_current_robots", ())
+        )
+        is_root_frontier = bool(
+            self.role == "FRONTIER_SHEPHERD"
+            and lifecycle is not None
+            and descriptor is not None
+            and branch == physical.frontier_line_branch
+        )
+        is_root_shepherd = bool(
+            self.role == "SHEPHERD"
+            and lifecycle is not None
+            and descriptor is not None
+            and branch == physical.active_branch
+        )
+        if not (is_root_frontier or is_root_shepherd) or not current_robots:
+            original_robot_update(self, dt)
+            return
+
+        members = [
+            robot for robot in current_robots
+            if robot.role == self.role and robot.shepherd_branch == branch
+        ]
+        tangent, lateral = transport_basis(branch, lifecycle, descriptor)[:2]
+        if is_root_frontier:
+            offsets = lifecycle.get("relative_offsets", {})
+            measured_depth = float(lifecycle.get(
+                "frontier_odometry_depth", physical.frontier_line_depth
+            ))
+            requested_depth = float(physical.frontier_line_depth)
+            axial_speed = physical.clamp(
+                (requested_depth - measured_depth) / max(dt, physical.EPSILON),
+                0.0,
+                float(physical.FRONTIER_LINE_FORM_SPEED),
+            )
+            correction_limit = 0.45 * float(physical.FRONTIER_LINE_FORM_SPEED)
+        else:
+            offsets = lifecycle.get(
+                "shepherd_relative_offsets",
+                lifecycle.get("relative_offsets", {}),
+            )
+            measured_depth = float(lifecycle.get(
+                "shepherd_odometry_depth",
+                lifecycle.get("shepherd_leading_edge_depth", 0.0),
+            ))
+            requested_depth = float(getattr(
+                physical, "integration_backtrack_command_depth", measured_depth
+            ) or measured_depth)
+            moving = physical.phase in {
+                physical.SimulationPhase.PRESSURE_PUSH,
+                physical.SimulationPhase.FLOW_BACKTRACK,
+            }
+            speed_limit = (
+                float(physical.SHEPHERD_PISTON_SPEED)
+                if physical.phase == physical.SimulationPhase.PRESSURE_PUSH
+                else float(physical.SHEPHERD_LINE_BACKTRACK_SPEED)
+            )
+            axial_speed = physical.clamp(
+                (requested_depth - measured_depth) / max(dt, physical.EPSILON),
+                -speed_limit,
+                speed_limit,
+            ) if moving else 0.0
+            correction_limit = 0.35 * speed_limit
+
+        formation_velocity = relative_formation_velocity(
+            self,
+            members,
+            offsets,
+            tangent,
+            lateral,
+            correction_limit,
+        )
+        integrate_boundary_velocity(
+            self,
+            tangent * axial_speed + formation_velocity,
+            dt,
+        )
+
+    physical.integration_relative_formation_velocity = relative_formation_velocity
+    physical.integration_integrate_boundary_velocity = integrate_boundary_velocity
+    physical.Robot.update = localization_free_root_boundary_update
 
     def _final_base_return_direction() -> pygame.Vector2:
         direction = getattr(
@@ -12749,15 +12620,18 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
         base_direction = _final_base_return_direction()
         frame = getattr(physical, "integration_frame", -1)
-        base_normal = pygame.Vector2(-base_direction.y, base_direction.x)
-        base_mouth = getattr(
+
+        # 절대 world "Base mouth anchor"는 더 이상 저장/조회하지 않는다.
+        # BaseStation이 직접 관측하는(observe_local_neighbors) NORMAL만으로
+        # base-향 flow를 판정한다.
+        base_station = getattr(
             physical,
-            "integration_base_mouth_anchor",
+            "base_station",
             None,
         )
-        if base_mouth is None:
+        if base_station is None:
             raise RuntimeError(
-                "final Base flow requested without stored Base mouth anchor"
+                "final Base flow requested without BaseStation"
             )
 
         normals = [
@@ -12766,29 +12640,26 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             if robot.role == "NORMAL" and not robot.base_reserve
         ]
         min_speed = float(physical.integration_final_base_flow_min_speed)
-        corridor_half_width = 0.65 * physical.corridor_width
-        moving_baseward = 0
-        crossed_base_mouth = 0
-        for robot in normals:
-            delta = robot.position - base_mouth
-            axial = float(delta.dot(base_direction))
-            lateral = abs(float(delta.dot(base_normal)))
-            if lateral > corridor_half_width:
-                continue
-            base_speed = float(robot.velocity.dot(base_direction))
-            if base_speed >= min_speed:
-                moving_baseward += 1
-            if axial >= 0.0 and base_speed > 0.0:
-                crossed_base_mouth += 1
+
+        base_observations = observe_local_neighbors(
+            base_station,
+            normals,
+            -base_direction,
+            max_range=physical.COMM_RANGE,
+        )
+
+        moving_baseward = sum(
+            1
+            for observation in base_observations
+            if observation.robot.velocity.dot(base_direction) >= min_speed
+        )
 
         minimum_flow_count = max(
             8,
             int(math.ceil(0.06 * max(len(normals), 1))),
         )
-        minimum_crossed_count = max(4, minimum_flow_count // 2)
         flow_now = (
             moving_baseward >= minimum_flow_count
-            and crossed_base_mouth >= minimum_crossed_count
         )
         if flow_now:
             physical.integration_final_base_flow_dwell += dt
@@ -12825,10 +12696,9 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             print(
                 f"[FinalBaseFlow] frame={frame} "
                 f"normals={len(normals)} "
+                f"base_visible={len(base_observations)} "
                 f"moving_baseward={moving_baseward} "
-                f"crossed_base_mouth={crossed_base_mouth} "
                 f"required_moving={minimum_flow_count} "
-                f"required_crossed={minimum_crossed_count} "
                 f"dwell={physical.integration_final_base_flow_dwell:.3f} "
                 f"required_dwell="
                 f"{physical.integration_final_base_flow_dwell_required:.2f} "
@@ -12849,7 +12719,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         physical.integration_final_base_flow_established = True
         print(
             f"[FinalBaseFlowEstablished] frame={frame} "
-            f"moving={moving_baseward} crossed={crossed_base_mouth} "
+            f"base_visible={len(base_observations)} "
+            f"moving_baseward={moving_baseward} "
             f"dwell={physical.integration_final_base_flow_dwell:.3f}"
         )
 
@@ -12933,11 +12804,18 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 physical.SimulationPhase.FLOW_BACKTRACK,
             }
         )
+        lidar_shepherd_formation = (
+            physical.phase == physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY
+            and getattr(physical, "integration_wall_lifecycle", {}).get(
+                physical.active_branch
+            ) is not None
+        )
 
         if (
             lidar_guard_handoff
             or lidar_next_branch_switch
             or lidar_thick_frontier_explore
+            or lidar_shepherd_formation
             or lidar_shepherd_return
         ):
             # EXPLORE_BRANCH stays in the Adaptive adapter only long enough to
@@ -13153,10 +13031,18 @@ def handoff_to_physical_dfs(
 ) -> None:
     """Refine LiDAR WHERE, retain provisional WHO, and enable Physical DFS."""
     eligible = [r for r in robots if r.role == "NORMAL" and not r.base_reserve]
-    centers = [g.mouth_center_world for g in perception.provisional_guards if g.mouth_center_world is not None]
     scale = float(np.median([g.mouth_span for g in perception.provisional_guards if g.mouth_span > 0.0]) if perception.provisional_guards else 1.0)
-    junction_center = sum(centers, pygame.Vector2()) / max(len(centers), 1)
-    local_count = sum(r.position.distance_to(junction_center) <= 2.0 * scale for r in eligible)
+    # Handoff readiness is a local sensing gate.  Use the fixed LiDAR robot's
+    # current neighbor observations instead of reconstructing a world junction
+    # center from Guard geometry and robot coordinates.
+    incoming_axis = _body_local_unit(perception, 0.0)
+    arrival_observations = observe_local_neighbors(
+        perception.leader,
+        eligible,
+        incoming_axis,
+        max_range=2.0 * scale,
+    )
+    local_count = len(arrival_observations)
     arrival_ratio = local_count / max(len(eligible), 1)
     junction_arrived = arrival_ratio >= JUNCTION_ARRIVAL_RATIO_THRESHOLD
     
@@ -13250,11 +13136,6 @@ def handoff_to_physical_dfs(
     incoming_direction_local = incoming_direction_local.normalize()
     physical.integration_incoming_direction_local = incoming_direction_local.copy()
     physical.integration_base_return_direction_local = -incoming_direction_local
-    physical.integration_base_mouth_anchor = (
-        perception.anchor_position.copy()
-        if perception.anchor_position is not None
-        else None
-    )
     print(
         f"[FinalReturnFrameStored] "
         f"incoming=({incoming_direction_local.x:.3f},"
@@ -14099,57 +13980,6 @@ def advance_guard_settling_waypoints(
             waypoints.pop(0)
             robot.junction_guard_anchor = waypoints[0].copy()
 
-def child_rigid_wall_target(
-    physical: types.ModuleType,
-    descriptor: Any,
-    lifecycle: dict[str, Any],
-    robot_id: int,
-    centroid_depth: float,
-) -> pygame.Vector2:
-    """Translate the exact original Child Guard wall without deformation."""
-
-    tangent, _ = (
-        physical.descriptor_local_basis(
-            descriptor
-        )
-    )
-
-    anchor_by_id = lifecycle.get(
-        "guard_anchor_by_id",
-        {},
-    )
-
-    original_anchor = anchor_by_id.get(
-        robot_id
-    )
-
-    if original_anchor is None:
-        raise RuntimeError(
-            "Child rigid wall missing original Guard anchor: "
-            f"uid={descriptor.uid} "
-            f"robot={robot_id}"
-        )
-
-    original_depth = float(
-        lifecycle[
-            "original_guard_centroid_axial"
-        ]
-    )
-
-    translation = (
-        tangent
-        * (
-            float(centroid_depth)
-            - original_depth
-        )
-    )
-
-    return (
-        original_anchor.copy()
-        + translation
-    )
-
-
 def install_child_frontier_transport_runtime(
     physical: types.ModuleType,
 ) -> None:
@@ -14172,6 +14002,19 @@ def install_child_frontier_transport_runtime(
 
     physical.integration_child_frontier_bootstrap_complete = False
     physical.integration_child_frontier_ready_logged = False
+
+    # -------------------------------------------------
+    # Child Frontier EXPLORE dead-end saturation state.
+    #
+    # map/is_walkable 예측이 아니라 Root의 sample_local_state()와
+    # 동일한 정책(실제 전진 속도 저하 + local density/pressure
+    # 상승 + dwell)으로만 dead-end를 판정하기 위한 상태.
+    # -------------------------------------------------
+    physical.integration_child_explore_uid = None
+    physical.integration_child_explore_progress_history = []
+    physical.integration_child_explore_dwell = 0.0
+    physical.integration_child_explore_baseline_density = None
+    physical.integration_child_explore_baseline_pressure = None
 
     # -------------------------------------------------
     # Child Physical DFS state.
@@ -14450,14 +14293,19 @@ def install_child_frontier_transport_runtime(
                 f"uid={uid}"
             )
 
-        anchor_by_id = lifecycle.get(
-            "guard_anchor_by_id",
+        # -------------------------------------------------
+        # 절대 world anchor(guard_anchor_by_id)는 더 이상 읽지 않는다.
+        # Guard freeze 시점에 얼려둔 "wall 중심 대비 상대 offset"
+        # (relative_offsets)만 사용한다.
+        # -------------------------------------------------
+        relative_offsets = lifecycle.get(
+            "relative_offsets",
             {},
         )
 
-        if self.robot_id not in anchor_by_id:
+        if self.robot_id not in relative_offsets:
             raise RuntimeError(
-                "Child rigid wall original Guard anchor missing: "
+                "Child rigid wall relative offset missing: "
                 f"uid={uid} "
                 f"robot={self.robot_id}"
             )
@@ -14579,288 +14427,18 @@ def install_child_frontier_transport_runtime(
                     applied_depth
                 )
 
-            candidate_positions: dict[
-                int,
-                pygame.Vector2,
-            ] = {}
-
-            for member in boundary_members:
-
-                candidate_positions[
-                    member.robot_id
-                ] = child_rigid_wall_target(
-                    physical,
-                    descriptor,
-                    lifecycle,
-                    member.robot_id,
-                    requested_depth,
-                )
-
+            # Depth is the only controller state.  Communication continuity
+            # and physical collisions are resolved from current observations
+            # and the collision layer during velocity integration.
+            committed_depth = requested_depth
             wall_allowed = True
             blocking_reason = "NONE"
-
-            # =================================================
-            # 1. Static wall collision
-            #
-            # 한 robot이라도 불가능하면
-            # 96대 전체가 이번 frame HOLD.
-            # =================================================
-            for member in boundary_members:
-
-                candidate = (
-                    candidate_positions[
-                        member.robot_id
-                    ]
-                )
-
-                if not physical.is_walkable(
-                    candidate,
-                    member.radius,
-                ):
-                    wall_allowed = False
-                    blocking_reason = (
-                        "STATIC_WALL"
-                    )
-                    break
-
-            # =================================================
-            # 2. Communication constraint
-            #
-            # 같은 3×N wall 내부 parent는 같이 움직이므로
-            # 내부 link는 검사하지 않는다.
-            #
-            # wall 외부 parent와의 연결만 검사한다.
-            #
-            # 하나라도 끊기면 wall 전체 HOLD.
-            # =================================================
-            if wall_allowed:
-
-                hard_limit = float(
-                    physical.COMM_GUARD_HARD_LIMIT
-                )
-
-                for member in boundary_members:
-
-                    if not bool(
-                        getattr(
-                            member,
-                            "connected_to_base",
-                            False,
-                        )
-                    ):
-                        continue
-
-                    parent = getattr(
-                        member,
-                        "comm_parent",
-                        None,
-                    )
-
-                    if parent is None:
-                        continue
-
-                    parent_id = getattr(
-                        parent,
-                        "robot_id",
-                        None,
-                    )
-
-                    # 같은 rigid wall의 parent라면
-                    # 상대거리가 변하지 않으므로 skip.
-                    if parent_id in boundary_ids:
-                        continue
-
-                    candidate = (
-                        candidate_positions[
-                            member.robot_id
-                        ]
-                    )
-
-                    parent_position = getattr(
-                        parent,
-                        "position",
-                        None,
-                    )
-
-                    if parent_position is None:
-                        continue
-
-                    proposed_distance = (
-                        candidate.distance_to(
-                            parent_position
-                        )
-                    )
-
-                    if (
-                        proposed_distance
-                        > hard_limit
-                    ):
-                        wall_allowed = False
-                        blocking_reason = (
-                            "COMM_EXTERNAL_PARENT"
-                        )
-                        break
-
-            # =================================================
-            # 3. Robot collision
-            #
-            # 개별 robot의 위치를 따로 제한하지 않는다.
-            #
-            # 대신 모든 boundary member에 대해
-            # proposed rigid position이 가능한지만 검사하고,
-            # 하나라도 막히면 3×N 전체가 HOLD.
-            #
-            # PRESSURE_PUSH/FLOW_BACKTRACK에서는
-            # child_boundary_robot_swept_limit() 내부의
-            # 1.50R soft compression rule이 사용된다.
-            # =================================================
-                        # =================================================
-            # 3. Robot contact
-            #
-            # 중요:
-            # NORMAL과 접촉했다고 wall 전체를 HOLD하지 않는다.
-            #
-            # 각 Shepherd가 이번 frame에 갈 수 있는 비율을 계산하고
-            # 가장 작은 비율을 3xN 전체에 공통 적용한다.
-            #
-            # 따라서:
-            #
-            # - Guard 원래 형상 유지
-            # - NORMAL 관통 없음
-            # - NORMAL과 실제 접촉 가능
-            # - 접촉한 만큼 계속 piston advance 가능
-            # =================================================
-
             contact_limited = False
-            common_progress = 1.0
-
-            if wall_allowed:
-
-                for member in boundary_members:
-
-                    old_member_position = (
-                        member.position.copy()
-                    )
-
-                    candidate = (
-                        candidate_positions[
-                            member.robot_id
-                        ]
-                    )
-
-                    requested_motion = (
-                        candidate
-                        - old_member_position
-                    )
-
-                    requested_length_sq = (
-                        requested_motion.length_squared()
-                    )
-
-                    if (
-                        requested_length_sq
-                        <= physical.EPSILON
-                    ):
-                        continue
-
-                    limited_candidate = (
-                        child_boundary_robot_swept_limit(
-                            member,
-                            old_member_position,
-                            candidate,
-                        )
-                    )
-
-                    limited_motion = (
-                        limited_candidate
-                        - old_member_position
-                    )
-
-                    member_progress = (
-                        limited_motion.dot(
-                            requested_motion
-                        )
-                        / requested_length_sq
-                    )
-
-                    member_progress = max(
-                        0.0,
-                        min(
-                            1.0,
-                            member_progress,
-                        ),
-                    )
-
-                    common_progress = min(
-                        common_progress,
-                        member_progress,
-                    )
-
-            if (
-                wall_allowed
-                and common_progress
-                < 1.0 - 1.0e-6
-            ):
-
-                contact_limited = True
-
-                requested_depth = (
-                    applied_depth
-                    + (
-                        requested_depth
-                        - applied_depth
-                    )
-                    * common_progress
-                )
-
-            # =================================================
-            # 4. 공통 wall depth commit
-            # =================================================
-            if wall_allowed:
-
-                committed_depth = (
-                    requested_depth
-                )
-
-            else:
-
-                committed_depth = (
-                    applied_depth
-                )
             # Controller상의 depth와 실제 rigid wall 위치를
             # 항상 동일하게 유지한다.
             physical.integration_child_frontier_depth = (
                 committed_depth
             )
-            # -------------------------------------------------
-            # 최종 위치를 다시 ORIGINAL Guard anchors에서
-            # 공통 translation으로 생성.
-            #
-            # 그러므로 상대 위치는 항상:
-            #
-            #   Pi - Pj
-            #     =
-            #   GuardPi - GuardPj
-            #
-            # 가 된다.
-            # -------------------------------------------------
-            committed_positions: dict[
-                int,
-                pygame.Vector2,
-            ] = {}
-
-            for member in boundary_members:
-
-                committed_positions[
-                    member.robot_id
-                ] = child_rigid_wall_target(
-                    physical,
-                    descriptor,
-                    lifecycle,
-                    member.robot_id,
-                    committed_depth,
-                )
-
             physical.integration_child_rigid_wall_plan_frame = (
                 frame
             )
@@ -14869,13 +14447,12 @@ def install_child_frontier_transport_runtime(
                 uid
             )
 
-            physical.integration_child_rigid_wall_plan_positions = (
-                committed_positions
-            )
 
-            physical.integration_child_rigid_applied_depth = (
-                committed_depth
+            physical.integration_child_rigid_wall_plan_depth = committed_depth
+            physical.integration_child_rigid_wall_plan_velocity = (
+                (committed_depth - applied_depth) / max(dt, physical.EPSILON)
             )
+            physical.integration_child_rigid_applied_depth = committed_depth
 
             physical.integration_child_rigid_wall_blocked = (
                 not wall_allowed
@@ -14922,59 +14499,31 @@ def install_child_frontier_transport_runtime(
         # 개별 collision clamp X
         # =================================================
 
-        plan_positions = getattr(
-            physical,
-            "integration_child_rigid_wall_plan_positions",
-            {},
-        )
-
-        target = plan_positions.get(
-            self.robot_id
-        )
-
-        if target is None:
-            raise RuntimeError(
-                "Child rigid wall planned position missing: "
-                f"uid={uid} "
-                f"robot={self.robot_id}"
+        old_position = self.position.copy()
+        plan_depth = float(
+            getattr(
+                physical,
+                "integration_child_rigid_wall_plan_depth",
+                physical.integration_child_frontier_depth,
             )
-
-        old_position = (
-            self.position.copy()
         )
-
-        # -------------------------------------------------
-        # 실제 이동.
-        #
-        # target 자체가 이미:
-        #   - common depth
-        #   - communication test
-        #   - robot collision test
-        #   - static-wall test
-        #
-        # 를 통과한 rigid-wall 위치다.
-        # -------------------------------------------------
-        self.position = (
-            target.copy()
+        tangent, lateral = physical.descriptor_local_basis(descriptor)
+        offsets = lifecycle.get("relative_offsets", {})
+        formation = physical.integration_relative_formation_velocity(
+            self,
+            boundary_members,
+            offsets,
+            tangent,
+            lateral,
+            float(physical.integration_child_frontier_cruise_speed),
         )
-
-        self.observed_velocity = (
-            self.position
-            - old_position
-        ) / max(
-            dt,
-            physical.EPSILON,
+        axial_velocity = tangent * float(
+            getattr(physical, "integration_child_rigid_wall_plan_velocity", 0.0)
         )
+        integrate = physical.integration_integrate_boundary_velocity
+        integrate(self, axial_velocity + formation, dt)
 
-        self.velocity = (
-            self.observed_velocity.copy()
-        )
-
-        self.commanded_velocity = (
-            self.observed_velocity.copy()
-        )
-
-        # 이 wall은 target-controlled rigid boundary.
+        # This wall is velocity-controlled; no position target is retained.
         self.acceleration.update(
             0.0,
             0.0,
@@ -14985,20 +14534,6 @@ def install_child_frontier_transport_runtime(
             0.0,
         )
 
-        if hasattr(
-            physical,
-            "update_indirect_contact_state",
-        ):
-            physical.update_indirect_contact_state(
-                self,
-                dt,
-            )
-
-        self.previous_position = (
-            old_position
-        )
-
-        self._record_motion()
 
     physical.Robot.update = (
         child_frontier_robot_update
@@ -15402,131 +14937,6 @@ def install_child_branch_physical_drive(
         child_branch_route_force
     )
 
-def compute_child_frontier_walkable_target_depth(
-    physical: types.ModuleType,
-    descriptor: Any,
-    relative_offsets: dict[int, tuple[float, float]],
-    centroid_lateral: float,
-    start_depth: float,
-    requested_target_depth: float,
-) -> float:
-    """Return the deepest common centroid depth where the whole 3xN wall is walkable."""
-
-    tangent, normal = (
-        physical.descriptor_local_basis(
-            descriptor
-        )
-    )
-
-    mouth = (
-        descriptor.observed_mouth_position
-    )
-
-    if mouth is None:
-        raise RuntimeError(
-            "Child Frontier walkability check requires mouth: "
-            f"uid={descriptor.uid}"
-        )
-
-    def whole_wall_walkable(
-        centroid_depth: float,
-    ) -> bool:
-
-        for (
-            axial_offset,
-            lateral_offset,
-        ) in relative_offsets.values():
-
-            target = (
-                mouth
-                + tangent
-                * (
-                    float(centroid_depth)
-                    + float(axial_offset)
-                )
-                + normal
-                * (
-                    float(centroid_lateral)
-                    + float(lateral_offset)
-                )
-            )
-
-            if not physical.is_walkable(
-                target,
-                physical.ROBOT_RADIUS,
-            ):
-                return False
-
-        return True
-
-    if requested_target_depth <= start_depth:
-        return float(start_depth)
-
-    # 현재 Guard 위치는 이미 READY였으므로 반드시 walkable이어야 한다.
-    if not whole_wall_walkable(
-        start_depth
-    ):
-        raise RuntimeError(
-            "Current Child Guard wall is not walkable before Frontier start: "
-            f"uid={descriptor.uid} "
-            f"depth={start_depth:.3f}"
-        )
-
-    # 요청한 최종 위치까지 3xN 전체가 들어가면 그대로 사용.
-    if whole_wall_walkable(
-        requested_target_depth
-    ):
-        return float(
-            requested_target_depth
-        )
-
-    # -------------------------------------------------
-    # start -> requested target 구간에서
-    # 3xN 전체가 함께 들어갈 수 있는 최대 깊이를 찾는다.
-    #
-    # 개별 robot target을 clamp하지 않는다.
-    # wall 전체의 centroid depth만 줄인다.
-    # -------------------------------------------------
-    low = float(start_depth)
-    high = float(requested_target_depth)
-
-    for _ in range(32):
-
-        mid = 0.5 * (
-            low + high
-        )
-
-        if whole_wall_walkable(
-            mid
-        ):
-            low = mid
-        else:
-            high = mid
-
-    # 수치 경계 바로 위에 걸리지 않도록 아주 작은 여유를 둔다.
-    safety_margin = max(
-        0.10,
-        0.10 * physical.ROBOT_RADIUS,
-    )
-
-    safe_depth = max(
-        float(start_depth),
-        float(low)
-        - safety_margin,
-    )
-
-    print(
-        "[ChildFrontierTargetClamped] "
-        f"uid={descriptor.uid} "
-        f"requested={requested_target_depth:.3f} "
-        f"safe={safe_depth:.3f} "
-        f"reduction="
-        f"{requested_target_depth - safe_depth:.3f}"
-    )
-
-    return safe_depth
-
-
 def activate_child_frontier_transport(
     physical: types.ModuleType,
     perception: AdaptivePerception,
@@ -15816,16 +15226,9 @@ def activate_child_frontier_transport(
         + bootstrap_distance
     )
 
-    target_depth = (
-        compute_child_frontier_walkable_target_depth(
-            physical,
-            descriptor,
-            relative_offsets,
-            centroid_lateral,
-            centroid_axial,
-            requested_target_depth,
-        )
-    )
+    # Bootstrap depth is an odometry scalar.  The physics collision layer will
+    # resolve any immediate wall contact while integrating the velocity command.
+    target_depth = max(centroid_axial, requested_target_depth)
 
     # -------------------------------------------------
     # 반드시 Controller state를 먼저 만든다.
@@ -16394,20 +15797,9 @@ def finish_child_branch_return(
         )
     )
 
-    original_anchors = (
-        lifecycle.get(
-            "guard_anchor_by_id",
-            {},
-        )
-    )
-
-    if (
-        not expected_ids
-        or set(original_anchors)
-        != expected_ids
-    ):
+    if not expected_ids:
         raise RuntimeError(
-            "Original Child Guard anchors missing: "
+            "Child Guard lineage is empty: "
             f"branch={branch_uid}"
         )
 
@@ -16466,30 +15858,13 @@ def finish_child_branch_return(
         )
     )
 
-    max_error = 0.0
-
     for robot_id, robot in shepherds.items():
-
-        original_anchor = (
-            original_anchors[
-                robot_id
-            ]
-        )
-
-        max_error = max(
-            max_error,
-            robot.position.distance_to(
-                original_anchor
-            ),
-        )
 
         robot.role = (
             "JUNCTION_GUARD"
         )
 
-        robot.junction_guard_anchor = (
-            original_anchor.copy()
-        )
+        robot.junction_guard_anchor = None
 
         robot.junction_guard_branch_uid = (
             branch_uid
@@ -16528,9 +15903,11 @@ def finish_child_branch_return(
             )
         )
 
-        robot.integration_guard_final_anchor = (
-            original_anchor.copy()
-        )
+        if hasattr(
+            robot,
+            "integration_guard_final_anchor",
+        ):
+            robot.integration_guard_final_anchor = None
 
         robot.integration_guard_waypoints = (
             []
@@ -16611,8 +15988,7 @@ def finish_child_branch_return(
         "[ChildBranchVisited] "
         f"junction={child.junction_uid} "
         f"branch={branch_uid} "
-        f"same_ids_returned={len(expected_ids)} "
-        f"max_guard_return_error={max_error:.6f}"
+        f"same_ids_returned={len(expected_ids)}"
     )
 
     if all(
@@ -17432,95 +16808,140 @@ def update_child_frontier_exploration(
     )
 
     # -------------------------------------------------
-    # 3. 다음 step에서 leading row가 실제 dead-end에
-    # 닿는지 검사.
+    # 3. Dead-end 판정.
     #
-    # 한 로봇만 벽에 닿았다고 전체를 멈추면 안 된다.
+    # map/is_walkable로 미래 위치를 미리 조회하지 않는다.
+    # Root의 sample_local_state()와 동일한 정책으로만 판정한다:
+    #
+    #   실제 전진 속도 저하(stall)
+    #   + local NORMAL density/pressure 상승
+    #   + dwell
+    #   → dead-end 확정
+    #
+    # leading row NORMAL cohort는 위에서 이미 구한
+    # normal_observations를 그대로 재사용한다.
     # -------------------------------------------------
-    layer_by_id = lifecycle.get(
-        "guard_layer_by_id",
-        {},
+    explore_uid = getattr(
+        physical,
+        "integration_child_explore_uid",
+        None,
     )
 
-    if layer_by_id:
+    if explore_uid != uid:
+        physical.integration_child_explore_uid = uid
+        physical.integration_child_explore_progress_history = []
+        physical.integration_child_explore_dwell = 0.0
+        physical.integration_child_explore_baseline_density = None
+        physical.integration_child_explore_baseline_pressure = None
 
-        leading_layer = max(
-            layer_by_id.values()
+    history = list(
+        physical.integration_child_explore_progress_history
+    )
+    history.append(
+        (physical.simulation_time, next_depth)
+    )
+    history = [
+        item
+        for item in history
+        if physical.simulation_time - item[0]
+        <= physical.SATURATION_FRONT_WINDOW
+    ]
+    physical.integration_child_explore_progress_history = history
+
+    if len(history) >= 2:
+        time_span = history[-1][0] - history[0][0]
+        progress_rate = (
+            (history[-1][1] - history[0][1])
+            / max(time_span, physical.EPSILON)
+            if time_span >= 0.75 * physical.SATURATION_FRONT_WINDOW
+            else float("inf")
         )
-
-        leading_ids = [
-            robot_id
-            for robot_id, layer
-            in layer_by_id.items()
-            if layer == leading_layer
-        ]
-
     else:
-        # Child lifecycle에 layer 정보가 아직 없다면
-        # 일단 전체 Frontier를 검사.
-        leading_ids = list(
-            frontier_ids
+        progress_rate = float("inf")
+
+    frontier_stalled = (
+        progress_rate <= physical.SATURATION_LOW_SPEED_THRESHOLD
+    )
+
+    cohort = [
+        observation.robot
+        for observation in normal_observations
+    ]
+
+    local_density = (
+        float(np.mean([robot.density for robot in cohort]))
+        if cohort
+        else 0.0
+    )
+
+    baseline_density = physical.integration_child_explore_baseline_density
+    if local_density > 0.0:
+        baseline_density = (
+            local_density
+            if not baseline_density
+            else min(baseline_density, local_density)
+        )
+        physical.integration_child_explore_baseline_density = (
+            baseline_density
         )
 
-    tangent, normal = (
-        physical.descriptor_local_basis(
-            descriptor
+    local_density_ratio = local_density / max(
+        baseline_density or physical.EPSILON,
+        physical.EPSILON,
+    )
+
+    local_pressure = (
+        float(np.mean([max(0.0, robot.pressure) for robot in cohort]))
+        if cohort
+        else 0.0
+    )
+
+    baseline_pressure = physical.integration_child_explore_baseline_pressure
+    if local_pressure > 0.0:
+        baseline_pressure = (
+            local_pressure
+            if not baseline_pressure
+            else min(baseline_pressure, local_pressure)
+        )
+        physical.integration_child_explore_baseline_pressure = (
+            baseline_pressure
+        )
+
+    local_pressure_ratio = local_pressure / max(
+        baseline_pressure or physical.EPSILON,
+        physical.EPSILON,
+    )
+
+    travelled = current_depth - float(
+        lifecycle.get(
+            "original_guard_centroid_axial",
+            current_depth,
         )
     )
 
-    mouth = (
-        descriptor.observed_mouth_position
-    )
-
-    centroid_lateral = float(
-        physical.integration_child_frontier_centroid_lateral
-    )
-
-    blocked_ids = []
-
-    for robot_id in leading_ids:
-
-        axial_offset, lateral_offset = (
-            offsets[robot_id]
+    saturation_evidence = (
+        len(cohort) >= physical.SATURATION_MIN_TIP_ROBOTS
+        and travelled >= max(
+            physical.JUNCTION_COHORT_MIN_TRAVEL,
+            descriptor.observed_physical_width,
         )
-
-        probe = child_rigid_wall_target(
-            physical,
-            descriptor,
-            lifecycle,
-            robot_id,
-            next_depth,
-        )
-
-        if not physical.is_walkable(
-            probe,
-            physical.ROBOT_RADIUS,
-        ):
-            blocked_ids.append(
-                robot_id
-            )
-
-    required_contact = max(
-        2,
-        int(
-            math.ceil(
-                0.5 * len(leading_ids)
-            )
-        ),
+        and frontier_stalled
+        and local_pressure_ratio >= LOCAL_SATURATION_PRESSURE_RATIO
+        and local_density_ratio >= physical.SATURATION_DENSITY_RATIO
     )
+
+    dwell = physical.integration_child_explore_dwell
+    dwell = dwell + dt if saturation_evidence else 0.0
+    physical.integration_child_explore_dwell = dwell
+
+    dead_end_confirmed = dwell >= physical.SATURATION_DWELL_TIME
 
     # -------------------------------------------------
-    # 4. leading row 절반 이상이 동시에 막혔으면
-    # 실제 dead-end contact 후보.
-    # 이때만 Frontier 이동을 멈춘다.
+    # 4. dead-end가 확정되면 Frontier 이동을 멈추고
+    # SAME Frontier IDs를 그대로 Shepherd로 승격한다.
     # -------------------------------------------------
-    if (
-        len(blocked_ids)
-        >= required_contact
-    ):
+    if dead_end_confirmed:
 
-        # 현재 실제로 적용된 마지막 안전 위치를
-        # dead-end Frontier 위치로 확정.
         physical.integration_child_frontier_depth = (
             current_depth
         )
@@ -17530,11 +16951,12 @@ def update_child_frontier_exploration(
         ] = current_depth
 
         print(
-            "[ChildFrontierDeadEndContact] "
+            "[ChildFrontierDeadEndSaturation] "
             f"branch={uid} "
-            f"blocked={len(blocked_ids)}/"
-            f"{len(leading_ids)} "
-            f"depth={current_depth:.3f}"
+            f"depth={current_depth:.3f} "
+            f"density_ratio={local_density_ratio:.2f} "
+            f"pressure_ratio={local_pressure_ratio:.2f} "
+            f"dwell={dwell:.2f}"
         )
 
         # SAME Frontier IDs를 그대로 Shepherd로 승격.
@@ -17688,41 +17110,56 @@ def update_child_frontier_transport(
         physical.integration_child_frontier_offsets
     )
 
-    centroid_lateral = float(
-        physical.integration_child_frontier_centroid_lateral
-    )
-
     # -------------------------------------------------
     # command depth만 도착한 것으로 끝내지 않는다.
-    # 실제 3×N 로봇 전체가 최종 target에 settle될 때까지 기다린다.
+    #
+    # 절대 world target과의 거리가 아니라, 3×N 로봇들 사이의
+    # 상대 formation이 Guard freeze 당시 얼려둔 relative_offsets와
+    # 얼마나 일치하는지(local range/bearing)로만 판정한다.
     # -------------------------------------------------
+    reference = frontier_members[0]
+
+    reference_offset = offsets.get(
+        reference.robot_id,
+        (0.0, 0.0),
+    )
+
+    relative_observations = observe_local_neighbors(
+        reference,
+        frontier_members,
+        tangent,
+        lateral_axis=normal,
+    )
+
     max_error = 0.0
 
-    for robot in frontier_members:
+    for observation in relative_observations:
 
-        axial_offset, lateral_offset = (
-            offsets[robot.robot_id]
+        member_offset = offsets.get(
+            observation.robot.robot_id,
+            (0.0, 0.0),
         )
 
-        final_target = (
-            descriptor.observed_mouth_position
-            + tangent
-            * (
-                target_depth
-                + float(axial_offset)
-            )
-            + normal
-            * (
-                centroid_lateral
-                + float(lateral_offset)
-            )
+        expected_axial = (
+            float(member_offset[0])
+            - float(reference_offset[0])
+        )
+
+        expected_lateral = (
+            float(member_offset[1])
+            - float(reference_offset[1])
+        )
+
+        error = math.hypot(
+            observation.relative_axial
+            - expected_axial,
+            observation.relative_lateral
+            - expected_lateral,
         )
 
         max_error = max(
             max_error,
-            robot.position.distance_to(
-                final_target
-            ),
+            error,
         )
 
     if (
