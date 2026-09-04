@@ -7495,24 +7495,8 @@ def build_guard_entry_waypoints(
 
     waypoints: list[pygame.Vector2] = []
 
-    # First gather into the LiDAR-estimated Junction interior.  LEFT/RIGHT
-    # Guards otherwise cut the corner diagonally from the incoming corridor
-    # and can get permanently blocked at the wall edge.
-    junction_core = getattr(
-        physical,
-        "integration_lidar_junction_estimate",
-        None,
-    )
-    if (
-        junction_core is not None
-        and physical.is_walkable(
-            junction_core,
-            physical.ROBOT_RADIUS,
-        )
-    ):
-        waypoints.append(junction_core.copy())
-
-    # Then gather onto the branch-local centerline on the Junction side.
+    # First gather onto the branch-local centerline on the
+    # Junction side. This prevents diagonal corner clipping.
     if physical.is_walkable(
         staging,
         physical.ROBOT_RADIUS,
@@ -7722,7 +7706,7 @@ def activate_guard_cohort(
     leader = min((item[0] for item in selected), key=lambda robot: robot.robot_id)
     maximum_jump = 0.0
     selected_ids = []
-    for rank, (robot, slot, slot_index) in enumerate(selected):
+    for robot, slot, slot_index in selected:
         before = robot.position.copy()
         robot.role = "JUNCTION_GUARD"
         robot.integration_guard_waypoints = build_guard_entry_waypoints(
@@ -7730,11 +7714,6 @@ def activate_guard_cohort(
             geometry,
             slot,
         )
-        robot.integration_guard_entry_waypoints = [
-            waypoint.copy() for waypoint in robot.integration_guard_waypoints
-        ]
-        robot.integration_guard_release_rank = rank
-        robot.integration_guard_state = "DEPLOYING"
         robot.integration_guard_final_anchor = slot.copy()
         robot.integration_guard_slot_index = slot_index
         robot.junction_guard_anchor = (
@@ -7869,20 +7848,12 @@ def update_guard_readiness_and_activation(
 
         physical.integration_guard_who_localization_enabled = True
 
-        # Guard WHO selection is the localization-allowed stage. Select the
-        # required NORMAL pool directly; all other NORMALs remain staged.
-        candidates = [
-            robot for robot in robots
-            if robot is not perception.leader
-            and robot.role == "NORMAL"
-            and not robot.base_reserve
-            and physical.is_walkable(robot.position, robot.radius)
-        ]
-        candidates.sort(
-            key=lambda robot: min(
-                robot.position.distance_to(slot)
-                for slot in geometry.slots
-            )
+        # 해당 branch 입구 근처까지 먼저 온 NORMAL들
+        candidates = collect_shallow_guard_candidates_with_localization(
+            physical,
+            perception,
+            robots,
+            geometry,
         )
 
         # 이미 Guard가 차지한 slot
@@ -11202,27 +11173,6 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         prep_uid = getattr(physical, "integration_anchor_prep_request_uid", None)
         leading_uid = getattr(physical, "integration_leading_anchor_uid", None)
         anchor_flow_uid = prep_uid or leading_uid
-        guard_staging = bool(
-            physical.phase in {
-                physical.SimulationPhase.FORM_JUNCTION_GUARDS,
-                physical.SimulationPhase.JUNCTION_SWITCH,
-            }
-            and anchor_flow_uid is None
-        )
-        if guard_staging and robot.role == "NORMAL" and not robot.base_reserve:
-            if is_lidar:
-                return pygame.Vector2()
-            hold_force = -8.0 * robot.velocity
-            physical.limit_vector(
-                hold_force,
-                float(getattr(
-                    physical,
-                    "ROUTE_FORCE",
-                    adaptive.LOCAL_FORWARD_DRIVE_FORCE,
-                )),
-            )
-            return hold_force
-
         force = original_compute_route_force(robot)
         setattr(robot, "last_physical_only_route_axial", 0.0)
         if (
