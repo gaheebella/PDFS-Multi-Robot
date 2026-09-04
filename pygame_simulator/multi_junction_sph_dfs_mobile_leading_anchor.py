@@ -4529,6 +4529,251 @@ def update_anchor_follow_tree(
         )
 
 
+
+def apply_anchor_prep_corridor_yield(
+    physical: types.ModuleType,
+    perception: AdaptivePerception,
+    robots: Sequence[Any],
+    dt: float,
+) -> None:
+    """Physically clear a narrow local lane in front of the LiDAR Anchor.
+
+    Universal collision remains fully active.  NORMAL robots are never
+    teleported and never allowed to pass through the Anchor.  Instead, robots
+    that are physically in the Anchor's immediate forward lane receive a local
+    side-yield / separation command so the Anchor can reach the selected Guard
+    standoff exactly as a real robot would through a crowd.
+
+    This uses only branch-local direction plus local relative observations.
+    """
+    branch_uid = getattr(
+        physical,
+        "integration_anchor_prep_request_uid",
+        None,
+    )
+
+    if branch_uid is None:
+        return
+
+    if physical.phase not in {
+        physical.SimulationPhase.FORM_JUNCTION_GUARDS,
+        physical.SimulationPhase.JUNCTION_SWITCH,
+    }:
+        return
+
+    descriptor = physical.branch_descriptors_by_uid.get(
+        branch_uid
+    )
+    if descriptor is None:
+        return
+
+    anchor = perception.leader
+
+    forward, lateral = physical.descriptor_local_basis(
+        descriptor
+    )
+    if (
+        forward.length_squared()
+        <= physical.EPSILON
+        or lateral.length_squared()
+        <= physical.EPSILON
+    ):
+        return
+
+    forward = forward.normalize()
+    lateral = lateral.normalize()
+
+    yield_half_width = max(
+        3.6 * float(physical.ROBOT_RADIUS),
+        1.20 * float(physical.GRID_SPACING),
+    )
+
+    yield_depth = min(
+        float(physical.COMM_RANGE),
+        max(
+            10.0 * float(physical.ROBOT_RADIUS),
+            3.5 * float(
+                physical.integration_anchor_target_gap
+            ),
+        ),
+    )
+
+    observations = observe_local_neighbors(
+        anchor,
+        robots,
+        forward,
+        lateral_axis=lateral,
+        max_range=yield_depth,
+        predicate=lambda robot: (
+            robot is not anchor
+            and robot.role == "NORMAL"
+            and not robot.base_reserve
+        ),
+    )
+
+    affected = 0
+    nearest = float("inf")
+
+    for observation in observations:
+        axial = float(
+            observation.relative_axial
+        )
+        lateral_offset = float(
+            observation.relative_lateral
+        )
+
+        # Only robots physically ahead of the Anchor can block its prep path.
+        if axial <= 0.0:
+            continue
+
+        # Do not reorganize the whole swarm: clear only a narrow centre tube.
+        if abs(lateral_offset) > yield_half_width:
+            continue
+
+        robot = observation.robot
+        affected += 1
+        nearest = min(
+            nearest,
+            float(observation.relative_range),
+        )
+
+        # Pick the shortest local side exit.  Exactly centred robots use a
+        # deterministic ID parity only to break the left/right tie.
+        if abs(lateral_offset) > 0.20 * physical.ROBOT_RADIUS:
+            side_sign = (
+                1.0
+                if lateral_offset >= 0.0
+                else -1.0
+            )
+        else:
+            side_sign = (
+                1.0
+                if robot.robot_id % 2 == 0
+                else -1.0
+            )
+
+        desired_lateral = (
+            side_sign
+            * 1.35
+            * yield_half_width
+        )
+
+        lateral_error = (
+            desired_lateral
+            - lateral_offset
+        )
+
+        lateral_speed = float(
+            robot.velocity.dot(
+                lateral
+            )
+        )
+
+        lateral_accel = float(
+            np.clip(
+                8.0 * lateral_error
+                - 3.0 * lateral_speed,
+                -0.50 * physical.MAX_ACCELERATION,
+                0.50 * physical.MAX_ACCELERATION,
+            )
+        )
+
+        robot.acceleration += (
+            lateral
+            * lateral_accel
+        )
+
+        # Real contact-separation assist: push the blocker away from the
+        # Anchor, never through it.  This is a local pairwise physical response.
+        relative_vector = (
+            forward * axial
+            + lateral * lateral_offset
+        )
+
+        if (
+            relative_vector.length_squared()
+            > physical.EPSILON
+        ):
+            clearance = max(
+                float(
+                    getattr(
+                        anchor,
+                        "radius",
+                        physical.ROBOT_RADIUS,
+                    )
+                )
+                + float(
+                    getattr(
+                        robot,
+                        "radius",
+                        physical.ROBOT_RADIUS,
+                    )
+                ),
+                2.05
+                * float(
+                    physical.ROBOT_RADIUS
+                ),
+            )
+
+            separation_range = (
+                clearance
+                + 1.5
+                * physical.ROBOT_RADIUS
+            )
+
+            distance = float(
+                observation.relative_range
+            )
+
+            if distance < separation_range:
+                separation_scale = (
+                    1.0
+                    - distance
+                    / max(
+                        separation_range,
+                        physical.EPSILON,
+                    )
+                )
+
+                robot.acceleration += (
+                    relative_vector.normalize()
+                    * (
+                        0.35
+                        * physical.MAX_ACCELERATION
+                        * separation_scale
+                    )
+                )
+
+        # During prep, do not let a blocker keep accelerating hard toward the
+        # sealed Guard wall.  Preserve current forward motion but remove only
+        # extra positive axial acceleration.
+        forward_accel = float(
+            robot.acceleration.dot(
+                forward
+            )
+        )
+
+        if forward_accel > 0.0:
+            robot.acceleration -= (
+                forward
+                * forward_accel
+                * 0.70
+            )
+
+    if (
+        affected > 0
+        and physical.integration_frame % 10 == 0
+    ):
+        print(
+            "[AnchorPrepYield] "
+            f"frame={physical.integration_frame} "
+            f"branch={branch_uid} "
+            f"affected={affected} "
+            f"nearest={nearest:.2f} "
+            f"half_width={yield_half_width:.2f}"
+        )
+
+
 def enforce_anchor_fan_no_overtake(
     physical: types.ModuleType,
     perception: AdaptivePerception,
@@ -4576,12 +4821,33 @@ def enforce_anchor_fan_no_overtake(
             continue
         anchor_speed = float(anchor.velocity.dot(forward))
         robot_speed = float(robot.velocity.dot(forward))
-        if gap <= 0.0:
-            # The robot is already on or beyond the Anchor axial line.  Do not
-            # let route/SPH drive carry it farther forward.  Back it away
-            # until a positive rear gap is re-established.
-            recovery_speed = float(np.clip(4.0 * (minimum_gap - gap), 2.0, 12.0))
-            max_robot_speed = min(-recovery_speed, anchor_speed - recovery_speed)
+        prep_mode = (
+            getattr(
+                physical,
+                "integration_anchor_prep_request_uid",
+                None,
+            )
+            is not None
+        )
+
+        if gap <= 0.0 and prep_mode:
+            # During ANCHOR_PREP this NORMAL is physically AHEAD of the Anchor.
+            # Sending it backward would require it to pass through the Anchor,
+            # which is impossible under universal hard collision.  The local
+            # corridor-yield controller moves it sideways instead.
+            continue
+        elif gap <= 0.0:
+            recovery_speed = float(
+                np.clip(
+                    4.0 * (minimum_gap - gap),
+                    2.0,
+                    12.0,
+                )
+            )
+            max_robot_speed = min(
+                -recovery_speed,
+                anchor_speed - recovery_speed,
+            )
         elif gap >= minimum_gap:
             max_robot_speed = anchor_speed + max(0.0, gap - minimum_gap) / max(dt, physical.EPSILON)
         else:
@@ -4594,11 +4860,19 @@ def enforce_anchor_fan_no_overtake(
         predicted = float((robot.velocity + robot.acceleration * dt).dot(forward))
         anchor_predicted = float((anchor.velocity + anchor.acceleration * dt).dot(forward))
         if gap <= 0.0:
-            # If a discrete integration step has already carried the robot
-            # across the Anchor line, make it back up until a rear gap is
-            # restored instead of leaving it stopped in front of the Anchor.
-            recovery_speed = float(np.clip(4.0 * (minimum_gap - gap), 2.0, 12.0))
-            max_predicted = min(-recovery_speed, anchor_predicted - recovery_speed)
+            # Non-prep recovery only.  ANCHOR_PREP blockers already continued
+            # above and are handled by physical side-yield.
+            recovery_speed = float(
+                np.clip(
+                    4.0 * (minimum_gap - gap),
+                    2.0,
+                    12.0,
+                )
+            )
+            max_predicted = min(
+                -recovery_speed,
+                anchor_predicted - recovery_speed,
+            )
         elif gap < minimum_gap:
             max_predicted = anchor_predicted - float(np.clip(4.0 * (minimum_gap - gap), 2.0, 12.0))
         else:
@@ -7413,21 +7687,26 @@ def build_guard_entry_waypoints(
     physical: types.ModuleType,
     geometry: ProvisionalGuardGeometry,
     slot: pygame.Vector2,
+    slot_index: int | None = None,
 ) -> list[pygame.Vector2]:
-    """Cross the branch mouth through a safe interior lane,
-    then spread to the final Guard slot.
-    """
+    """Build a collision-aware, lane-preserving path into one Guard slot.
 
+    Guard selection/placement is the one stage where world-position geometry is
+    permitted. The path uses the frozen LiDAR mouth frame to route each selected
+    robot through its own lateral lane instead of forcing every robot through one
+    common centre staging point.
+
+    For the rows of the same column, the deeper row is queued closest to the
+    mouth and the shallower rows are queued progressively farther back.
+    """
     center = (
         geometry.mouth_center_world
         or geometry.descriptor.observed_mouth_position
     )
-
     tangent = (
         geometry.branch_tangent_unit
         or geometry.descriptor.local_outgoing_direction
     )
-
     normal = (
         geometry.mouth_lateral_unit
         or geometry.descriptor.motion_n
@@ -7444,13 +7723,10 @@ def build_guard_entry_waypoints(
         or geometry.descriptor.observed_physical_width
     )
 
-    final_lateral = float(
-        (slot - center).dot(normal)
-    )
+    final_delta = slot - center
+    final_axial = float(final_delta.dot(tangent))
+    final_lateral = float(final_delta.dot(normal))
 
-    # While crossing the mouth, stay slightly inside the
-    # mouth corners. After entering the branch, spread to
-    # the final 3xN Guard slot.
     crossing_half_width = max(
         0.0,
         0.5 * mouth_span
@@ -7465,26 +7741,86 @@ def build_guard_entry_waypoints(
         )
     )
 
-    staging = (
-        center
-        - tangent * (4.5 * physical.ROBOT_RADIUS)
+    if slot_index is None:
+        slot_index = min(
+            range(len(geometry.slots)),
+            key=lambda index:
+                geometry.slots[index].distance_squared_to(slot),
+        )
+
+    layer = int(
+        slot_index
+        // max(geometry.columns, 1)
+    )
+    layer = int(
+        np.clip(
+            layer,
+            0,
+            max(geometry.layers - 1, 0),
+        )
     )
 
-    # Junction-side waypoint immediately before the mouth.
+    # Highest layer index is the deeper Guard row.
+    # Deepest row gets the front of the lane queue.
+    queue_rank = max(
+        0,
+        geometry.layers - 1 - layer,
+    )
+
+    queue_spacing = max(
+        2.35 * physical.ROBOT_RADIUS,
+        0.70 * float(
+            getattr(
+                physical,
+                "THICK_MOUTH_GUARD_LAYER_SPACING",
+                3.0 * physical.ROBOT_RADIUS,
+            )
+        ),
+    )
+
+    lane_join_backoff = (
+        7.0 * physical.ROBOT_RADIUS
+        + queue_rank * queue_spacing
+    )
+
+    approach_backoff = (
+        3.2 * physical.ROBOT_RADIUS
+        + queue_rank * queue_spacing
+    )
+
+    # First align with the final lateral lane well before the mouth.
+    lane_join = (
+        center
+        - tangent * lane_join_backoff
+        + normal * crossing_lateral
+    )
+
+    # Then queue in that same lane immediately before the mouth.
     approach = (
         center
-        - tangent * (2.5 * physical.ROBOT_RADIUS)
+        - tangent * approach_backoff
         + normal * crossing_lateral
     )
 
-    # Branch-side waypoint immediately after crossing the mouth.
+    # Cross the mouth without changing lane.
+    inside_depth = max(
+        2.5 * physical.ROBOT_RADIUS,
+        min(
+            max(
+                final_axial
+                - 1.25 * physical.ROBOT_RADIUS,
+                0.0,
+            ),
+            4.0 * physical.ROBOT_RADIUS,
+        ),
+    )
+
     inside = (
         center
-        + tangent * (2.5 * physical.ROBOT_RADIUS)
+        + tangent * inside_depth
         + normal * crossing_lateral
     )
 
-    # A robot must never be assigned to an invalid final Guard slot.
     if not physical.is_walkable(
         slot,
         physical.ROBOT_RADIUS,
@@ -7495,30 +7831,39 @@ def build_guard_entry_waypoints(
 
     waypoints: list[pygame.Vector2] = []
 
-    # First gather onto the branch-local centerline on the
-    # Junction side. This prevents diagonal corner clipping.
-    if physical.is_walkable(
-        staging,
-        physical.ROBOT_RADIUS,
-    ):
-        waypoints.append(staging)
-
-    # Then spread laterally while still on the Junction side.
-    if physical.is_walkable(
+    for waypoint in (
+        lane_join,
         approach,
-        physical.ROBOT_RADIUS,
-    ):
-        waypoints.append(approach)
-
-    # Cross the mouth at the already-safe lateral coordinate.
-    if physical.is_walkable(
         inside,
-        physical.ROBOT_RADIUS,
+        slot.copy(),
     ):
-        waypoints.append(inside)
+        if physical.is_walkable(
+            waypoint,
+            physical.ROBOT_RADIUS,
+        ):
+            if (
+                not waypoints
+                or waypoint.distance_squared_to(
+                    waypoints[-1]
+                )
+                > physical.EPSILON
+            ):
+                waypoints.append(
+                    waypoint.copy()
+                )
 
-    # Finally move to the frozen 3xN physical Guard slot.
-    waypoints.append(slot.copy())
+    if not waypoints:
+        waypoints.append(
+            slot.copy()
+        )
+    elif (
+        waypoints[-1]
+        .distance_squared_to(slot)
+        > physical.EPSILON
+    ):
+        waypoints.append(
+            slot.copy()
+        )
 
     return waypoints
 
@@ -7562,13 +7907,39 @@ def compute_full_guard_slot_assignment(
                 or path_distance > GUARD_ASSIGN_MAX_PATH_WIDTH_RATIO * width
             ):
                 continue
+            opposite_side_penalty = float(
+                lateral
+                * slot_lateral
+                < 0.0
+                and min(
+                    abs(lateral),
+                    abs(slot_lateral),
+                )
+                > 2.0
+                * physical.ROBOT_RADIUS
+            )
+
             cost = (
-                GUARD_WHO_AXIAL_WEIGHT
-                * axial_delta / max(width, physical.EPSILON)
-                + GUARD_WHO_LATERAL_WEIGHT
-                * lateral_delta / max(width, physical.EPSILON)
+                4.0 * opposite_side_penalty
+                + GUARD_WHO_AXIAL_WEIGHT
+                * axial_delta
+                / max(
+                    width,
+                    physical.EPSILON,
+                )
+                + 3.0
+                * GUARD_WHO_LATERAL_WEIGHT
+                * lateral_delta
+                / max(
+                    width,
+                    physical.EPSILON,
+                )
                 + GUARD_WHO_PATH_WEIGHT
-                * path_distance / max(width, physical.EPSILON)
+                * path_distance
+                / max(
+                    width,
+                    physical.EPSILON,
+                )
             )
             ranked.append((cost, robot))
         options[slot_index] = sorted(
@@ -7713,6 +8084,7 @@ def activate_guard_cohort(
             physical,
             geometry,
             slot,
+            slot_index,
         )
         robot.integration_guard_final_anchor = slot.copy()
         robot.integration_guard_slot_index = slot_index
@@ -7911,17 +8283,67 @@ def update_guard_readiness_and_activation(
 
             slot = geometry.slots[slot_index]
 
-            # 해당 slot에 가장 가까운 선두 NORMAL을 사용
+            # -------------------------------------------------
+            # Collision-aware WHO -> lane assignment.
+            #
+            # Prefer the candidate already close to this slot's lateral lane.
+            # This keeps lateral order as much as possible and avoids assigning
+            # two Guards to trajectories that needlessly cross each other.
+            # -------------------------------------------------
+            slot_axial, slot_lateral = (
+                guard_mouth_coordinates(
+                    slot,
+                    geometry,
+                )
+            )
+
+            def guard_lane_key(
+                candidate: Any,
+            ) -> tuple[float, ...]:
+                (
+                    candidate_axial,
+                    candidate_lateral,
+                ) = guard_mouth_coordinates(
+                    candidate.position,
+                    geometry,
+                )
+
+                lateral_error = abs(
+                    candidate_lateral
+                    - slot_lateral
+                )
+
+                axial_error = abs(
+                    candidate_axial
+                    - slot_axial
+                )
+
+                opposite_side_penalty = float(
+                    candidate_lateral
+                    * slot_lateral
+                    < 0.0
+                    and min(
+                        abs(candidate_lateral),
+                        abs(slot_lateral),
+                    )
+                    > 2.0
+                    * physical.ROBOT_RADIUS
+                )
+
+                return (
+                    opposite_side_penalty,
+                    lateral_error,
+                    0.35 * axial_error,
+                    candidate.position.distance_to(
+                        slot
+                    ),
+                    -candidate_axial,
+                    float(candidate.robot_id),
+                )
+
             robot = min(
                 available,
-                key=lambda candidate: (
-                    candidate.position.distance_to(slot),
-                    -guard_mouth_coordinates(
-                        candidate.position,
-                        geometry,
-                    )[0],
-                    candidate.robot_id,
-                ),
+                key=guard_lane_key,
             )
 
             available.remove(robot)
@@ -7933,6 +8355,7 @@ def update_guard_readiness_and_activation(
                 physical,
                 geometry,
                 slot,
+                slot_index,
             )
 
             robot.integration_guard_final_anchor = (
@@ -13643,6 +14066,642 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         return proposed_position.copy()
 
 
+    def _same_rigid_boundary_cohort(
+        first: Any,
+        second: Any,
+    ) -> bool:
+        if first is second:
+            return True
+
+        boundary_roles = {
+            "FRONTIER_SHEPHERD",
+            "SHEPHERD",
+        }
+
+        if (
+            getattr(first, "role", None)
+            not in boundary_roles
+            or getattr(second, "role", None)
+            not in boundary_roles
+        ):
+            return False
+
+        first_branch = getattr(
+            first,
+            "shepherd_branch",
+            None,
+        )
+        second_branch = getattr(
+            second,
+            "shepherd_branch",
+            None,
+        )
+
+        return bool(
+            first_branch is not None
+            and first_branch == second_branch
+        )
+
+
+    def _root_rigid_frontier_member(
+        robot: Any,
+    ) -> bool:
+        branch = getattr(
+            robot,
+            "shepherd_branch",
+            None,
+        )
+
+        return bool(
+            getattr(
+                robot,
+                "role",
+                None,
+            )
+            == "FRONTIER_SHEPHERD"
+            and branch is not None
+            and branch
+            == getattr(
+                physical,
+                "frontier_line_branch",
+                None,
+            )
+            and getattr(
+                physical,
+                "integration_wall_lifecycle",
+                {},
+            ).get(branch)
+            is not None
+        )
+
+
+    def _collision_other_frame_segment(
+        other: Any,
+        dt: float,
+    ) -> tuple[
+        pygame.Vector2,
+        pygame.Vector2,
+    ]:
+        start_by_id = getattr(
+            physical,
+            "integration_collision_frame_start_by_id",
+            {},
+        )
+        velocity_by_id = getattr(
+            physical,
+            "integration_collision_frame_velocity_by_id",
+            {},
+        )
+        updated_ids = getattr(
+            physical,
+            "integration_collision_updated_ids",
+            set(),
+        )
+
+        start = pygame.Vector2(
+            start_by_id.get(
+                other.robot_id,
+                other.position,
+            )
+        )
+
+        if other.robot_id in updated_ids:
+            end = other.position.copy()
+        else:
+            velocity = pygame.Vector2(
+                velocity_by_id.get(
+                    other.robot_id,
+                    getattr(
+                        other,
+                        "velocity",
+                        pygame.Vector2(),
+                    ),
+                )
+            )
+            end = start + velocity * dt
+
+        return start, end
+
+
+    def _first_universal_swept_hit(
+        robot: Any,
+        start: pygame.Vector2,
+        movement: pygame.Vector2,
+        dt: float,
+        *,
+        time_start: float,
+        time_span: float,
+    ) -> tuple[
+        float,
+        Any | None,
+        pygame.Vector2 | None,
+    ]:
+        current_robots = tuple(
+            getattr(
+                physical,
+                "integration_current_robots",
+                (),
+            )
+        )
+
+        if not current_robots:
+            return 1.0, None, None
+
+        mover_radius = float(
+            getattr(
+                robot,
+                "radius",
+                physical.ROBOT_RADIUS,
+            )
+        )
+
+        best_alpha = 1.0
+        best_other = None
+        best_other_at_hit = None
+
+        for other in current_robots:
+            if other is robot:
+                continue
+
+            if _same_rigid_boundary_cohort(
+                robot,
+                other,
+            ):
+                continue
+
+            other_radius = float(
+                getattr(
+                    other,
+                    "radius",
+                    physical.ROBOT_RADIUS,
+                )
+            )
+
+            minimum_distance = (
+                mover_radius
+                + other_radius
+            )
+
+            (
+                other_frame_start,
+                other_frame_end,
+            ) = _collision_other_frame_segment(
+                other,
+                dt,
+            )
+
+            other_total_movement = (
+                other_frame_end
+                - other_frame_start
+            )
+
+            other_segment_start = (
+                other_frame_start
+                + other_total_movement
+                * time_start
+            )
+
+            other_segment_movement = (
+                other_total_movement
+                * time_span
+            )
+
+            relative_start = (
+                start
+                - other_segment_start
+            )
+
+            relative_movement = (
+                movement
+                - other_segment_movement
+            )
+
+            reach = (
+                movement.length()
+                + other_segment_movement.length()
+                + minimum_distance
+            )
+
+            if (
+                relative_start.length_squared()
+                > reach * reach
+            ):
+                continue
+
+            c = (
+                relative_start.length_squared()
+                - minimum_distance
+                * minimum_distance
+            )
+
+            if c <= 0.0:
+                if (
+                    relative_start.dot(
+                        relative_movement
+                    )
+                    < 0.0
+                ):
+                    hit_alpha = 0.0
+                else:
+                    continue
+            else:
+                a = (
+                    relative_movement
+                    .length_squared()
+                )
+
+                if a <= physical.EPSILON:
+                    continue
+
+                b = (
+                    2.0
+                    * relative_start.dot(
+                        relative_movement
+                    )
+                )
+
+                discriminant = (
+                    b * b
+                    - 4.0 * a * c
+                )
+
+                if discriminant < 0.0:
+                    continue
+
+                sqrt_discriminant = (
+                    math.sqrt(
+                        discriminant
+                    )
+                )
+
+                hit_alpha = (
+                    -b
+                    - sqrt_discriminant
+                ) / (
+                    2.0 * a
+                )
+
+                if not (
+                    0.0
+                    <= hit_alpha
+                    <= 1.0
+                ):
+                    continue
+
+            if hit_alpha < best_alpha:
+                best_alpha = float(
+                    hit_alpha
+                )
+                best_other = other
+                best_other_at_hit = (
+                    other_segment_start
+                    + other_segment_movement
+                    * hit_alpha
+                )
+
+        return (
+            best_alpha,
+            best_other,
+            best_other_at_hit,
+        )
+
+
+    def universal_robot_motion_limit(
+        robot: Any,
+        old_position: pygame.Vector2,
+        proposed_position: pygame.Vector2,
+        dt: float,
+    ) -> pygame.Vector2:
+        """Universal hard disc collision with collision-aware move-and-slide."""
+        # Root Frontier is already resolved group-wide so one member cannot
+        # deform the rigid 3xN wall independently.
+        if _root_rigid_frontier_member(
+            robot
+        ):
+            return proposed_position.copy()
+
+        movement = (
+            proposed_position
+            - old_position
+        )
+
+        if (
+            movement.length_squared()
+            <= physical.EPSILON
+        ):
+            return proposed_position.copy()
+
+        current = old_position.copy()
+        remaining = movement.copy()
+
+        time_start = 0.0
+        time_span = 1.0
+
+        collision_count = 0
+        slide_count = 0
+        first_blocker = None
+
+        for _ in range(4):
+            if (
+                remaining.length_squared()
+                <= physical.EPSILON
+                or time_span
+                <= physical.EPSILON
+            ):
+                break
+
+            (
+                hit_alpha,
+                blocker,
+                blocker_at_hit,
+            ) = _first_universal_swept_hit(
+                robot,
+                current,
+                remaining,
+                dt,
+                time_start=time_start,
+                time_span=time_span,
+            )
+
+            if blocker is None:
+                current += remaining
+                remaining.update(
+                    0.0,
+                    0.0,
+                )
+                break
+
+            collision_count += 1
+
+            if first_blocker is None:
+                first_blocker = blocker
+
+            safe_alpha = max(
+                0.0,
+                hit_alpha - 1.0e-3,
+            )
+
+            current += (
+                remaining
+                * safe_alpha
+            )
+
+            old_remaining = (
+                remaining.copy()
+            )
+
+            residual = (
+                old_remaining
+                * max(
+                    0.0,
+                    1.0 - hit_alpha,
+                )
+            )
+
+            hit_global = (
+                time_start
+                + time_span
+                * hit_alpha
+            )
+
+            time_span = (
+                time_span
+                * max(
+                    0.0,
+                    1.0 - hit_alpha,
+                )
+            )
+
+            time_start = hit_global
+
+            if blocker_at_hit is None:
+                remaining.update(
+                    0.0,
+                    0.0,
+                )
+                break
+
+            normal = (
+                current
+                - blocker_at_hit
+            )
+
+            if (
+                normal.length_squared()
+                <= physical.EPSILON
+            ):
+                if (
+                    old_remaining
+                    .length_squared()
+                    <= physical.EPSILON
+                ):
+                    break
+
+                normal = (
+                    -old_remaining
+                ).normalize()
+            else:
+                normal = (
+                    normal.normalize()
+                )
+
+            inward = float(
+                residual.dot(
+                    normal
+                )
+            )
+
+            slide = residual.copy()
+
+            if inward < 0.0:
+                slide -= (
+                    normal
+                    * inward
+                )
+
+            is_lidar_anchor = bool(
+                getattr(
+                    robot,
+                    "is_lidar_robot",
+                    False,
+                )
+                or robot.robot_id
+                == LIDAR_ROBOT_ID
+            )
+
+            anchor_prep_active = (
+                getattr(
+                    physical,
+                    "integration_anchor_prep_request_uid",
+                    None,
+                )
+                is not None
+            )
+
+            if (
+                is_lidar_anchor
+                and anchor_prep_active
+                and getattr(
+                    blocker,
+                    "role",
+                    None,
+                )
+                == "NORMAL"
+            ):
+                # Keep the Anchor centred.  It does not tunnel and it does not
+                # sidestep around the crowd; NORMAL blockers physically yield.
+                slide.update(
+                    0.0,
+                    0.0,
+                )
+
+            # Guard placement may use its assigned Guard waypoint.
+            # If it is exactly head-on, choose a deterministic local bypass.
+            if (
+                getattr(
+                    robot,
+                    "role",
+                    None,
+                )
+                == "JUNCTION_GUARD"
+                and slide.length_squared()
+                <= max(
+                    physical.EPSILON,
+                    0.04
+                    * residual.length_squared(),
+                )
+            ):
+                target = getattr(
+                    robot,
+                    "junction_guard_anchor",
+                    None,
+                )
+
+                if target is not None:
+                    target_vector = (
+                        pygame.Vector2(target)
+                        - current
+                    )
+
+                    tangent = pygame.Vector2(
+                        -normal.y,
+                        normal.x,
+                    )
+
+                    tangent_score = float(
+                        target_vector.dot(
+                            tangent
+                        )
+                    )
+
+                    if (
+                        abs(tangent_score)
+                        <= physical.EPSILON
+                    ):
+                        tangent_score = (
+                            1.0
+                            if robot.robot_id
+                            < blocker.robot_id
+                            else -1.0
+                        )
+
+                    tangent *= (
+                        1.0
+                        if tangent_score >= 0.0
+                        else -1.0
+                    )
+
+                    bypass_length = min(
+                        residual.length(),
+                        max(
+                            0.55
+                            * residual.length(),
+                            0.75
+                            * physical.ROBOT_RADIUS,
+                        ),
+                    )
+
+                    slide = (
+                        tangent
+                        * bypass_length
+                    )
+
+            if (
+                slide.length_squared()
+                <= physical.EPSILON
+            ):
+                remaining.update(
+                    0.0,
+                    0.0,
+                )
+                break
+
+            remaining = (
+                slide * 0.97
+            )
+            slide_count += 1
+
+        if collision_count:
+            stats = getattr(
+                physical,
+                "integration_universal_collision_stats",
+                None,
+            )
+
+            if isinstance(
+                stats,
+                dict,
+            ):
+                stats["contacts"] = int(
+                    stats.get(
+                        "contacts",
+                        0,
+                    )
+                ) + collision_count
+
+                stats["robots"] = int(
+                    stats.get(
+                        "robots",
+                        0,
+                    )
+                ) + 1
+
+                stats["slides"] = int(
+                    stats.get(
+                        "slides",
+                        0,
+                    )
+                ) + slide_count
+
+                samples = stats.setdefault(
+                    "samples",
+                    [],
+                )
+
+                if (
+                    first_blocker is not None
+                    and len(samples) < 6
+                ):
+                    samples.append(
+                        (
+                            robot.robot_id,
+                            getattr(
+                                robot,
+                                "role",
+                                None,
+                            ),
+                            first_blocker.robot_id,
+                            getattr(
+                                first_blocker,
+                                "role",
+                                None,
+                            ),
+                        )
+                    )
+
+        return current
+
+
     def integrate_boundary_velocity(
         robot: Any,
         commanded_velocity: pygame.Vector2,
@@ -13668,78 +14727,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
             robot.integration_boundary_contact = False
 
-        # ============================================================
-        # ROOT SHEPHERD -> LiDAR Anchor swept collision.
-        #
-        # The Shepherd wall is kinematically integrated, so SPH/contact
-        # force alone cannot guarantee non-tunnelling.  Clamp the actual
-        # physical step against the Anchor disc before x/y integration.
-        # ============================================================
-        is_anchor_blocking_boundary = bool(
-            (
-                robot.role
-                == "FRONTIER_SHEPHERD"
-                and physical.phase
-                == physical.SimulationPhase.EXPLORE_BRANCH
-                and robot.shepherd_branch
-                == physical.frontier_line_branch
-            )
-            or (
-                robot.role
-                == "SHEPHERD"
-                and physical.phase
-                in {
-                    physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-                    physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
-                    physical.SimulationPhase.PRESSURE_PUSH,
-                    physical.SimulationPhase.FLOW_BACKTRACK,
-                }
-                and robot.shepherd_branch
-                == physical.active_branch
-            )
-        )
-
-        if is_anchor_blocking_boundary:
-            current_robots = tuple(
-                getattr(
-                    physical,
-                    "integration_current_robots",
-                    (),
-                )
-            )
-            lidar_anchor = next(
-                (
-                    candidate
-                    for candidate in current_robots
-                    if (
-                        bool(getattr(candidate, "is_lidar_robot", False))
-                        or candidate.robot_id == LIDAR_ROBOT_ID
-                    )
-                ),
-                None,
-            )
-
-            if lidar_anchor is not None and lidar_anchor is not robot:
-                desired_position = (
-                    old_position
-                    + robot.velocity * dt
-                )
-                limited_position = _swept_pair_no_cross(
-                    robot,
-                    old_position,
-                    desired_position,
-                    lidar_anchor,
-                    minimum_distance=max(
-                        float(getattr(robot, "radius", physical.ROBOT_RADIUS))
-                        + float(getattr(lidar_anchor, "radius", physical.ROBOT_RADIUS)),
-                        2.05 * float(physical.ROBOT_RADIUS),
-                    ),
-                )
-                if limited_position.distance_squared_to(desired_position) > 1.0e-12:
-                    robot.integration_boundary_contact = True
-                    robot.velocity = (
-                        limited_position - old_position
-                    ) / max(dt, physical.EPSILON)
+        # Robot-vs-robot collision is resolved by the universal physical
+        # body layer after this role-specific kinematic update.
 
         # For rigid Frontier motion this candidate was already validated
         # group-wide.  Keep the ordinary collision layer as a final safety
@@ -13936,6 +14925,17 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
         )
 
+        external_robots = [
+            other
+            for other in getattr(
+                physical,
+                "integration_current_robots",
+                (),
+            )
+            if other.robot_id
+            not in frontier_ids
+        ]
+
         def group_step_is_safe(
             fraction: float,
         ) -> bool:
@@ -13958,6 +14958,42 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                     member.radius,
                 ):
                     return False
+
+                # Physical robot collision is checked group-wide.
+                for other in external_robots:
+                    other_radius = float(
+                        getattr(
+                            other,
+                            "radius",
+                            physical.ROBOT_RADIUS,
+                        )
+                    )
+
+                    other_candidate = (
+                        other.position
+                        + getattr(
+                            other,
+                            "velocity",
+                            pygame.Vector2(),
+                        )
+                        * dt
+                        * fraction
+                    )
+
+                    minimum_distance = (
+                        float(member.radius)
+                        + other_radius
+                    )
+
+                    if (
+                        candidate
+                        .distance_squared_to(
+                            other_candidate
+                        )
+                        < minimum_distance
+                        * minimum_distance
+                    ):
+                        return False
 
                 parent = getattr(
                     member,
@@ -14169,324 +15205,8 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
             or not current_robots
         ):
-            is_lidar_anchor = bool(
-                getattr(self, "is_lidar_robot", False)
-                or self.robot_id == LIDAR_ROBOT_ID
-            )
-            protected_boundary_phase = (
-                physical.phase
-                in {
-                    physical.SimulationPhase.EXPLORE_BRANCH,
-                    physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
-                    physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
-                    physical.SimulationPhase.PRESSURE_PUSH,
-                    physical.SimulationPhase.FLOW_BACKTRACK,
-                }
-            )
-
-            if (
-                is_lidar_anchor
-                and protected_boundary_phase
-                and current_robots
-            ):
-                old_anchor_position = (
-                    self.position.copy()
-                )
-
-                boundary_branches = {
-                    getattr(
-                        physical,
-                        "frontier_line_branch",
-                        None,
-                    ),
-                    getattr(
-                        physical,
-                        "active_branch",
-                        None,
-                    ),
-                }
-                boundary_branches.discard(None)
-
-                active_boundaries = [
-                    boundary
-                    for boundary
-                    in current_robots
-                    if (
-                        boundary.role
-                        in {
-                            "FRONTIER_SHEPHERD",
-                            "SHEPHERD",
-                        }
-                        and getattr(
-                            boundary,
-                            "shepherd_branch",
-                            None,
-                        )
-                        in boundary_branches
-                    )
-                ]
-
-                # -------------------------------------------------
-                # Local barrier-plane limit BEFORE Robot.update.
-                #
-                # This keeps the Anchor on the Junction side of the
-                # sealed 3xN wall.  The pairwise swept collision
-                # below remains a second physical safety layer.
-                # -------------------------------------------------
-                barrier_tangent = None
-                barrier_forward_limit = None
-                barrier_gap = None
-
-                boundary_branch = (
-                    getattr(
-                        physical,
-                        "frontier_line_branch",
-                        None,
-                    )
-                    if any(
-                        boundary.role
-                        == "FRONTIER_SHEPHERD"
-                        for boundary
-                        in active_boundaries
-                    )
-                    else getattr(
-                        physical,
-                        "active_branch",
-                        None,
-                    )
-                )
-
-                boundary_descriptor = (
-                    descriptor_for(
-                        boundary_branch
-                    )
-                    if boundary_branch
-                    is not None
-                    else None
-                )
-
-                if (
-                    boundary_descriptor
-                    is not None
-                    and active_boundaries
-                ):
-                    barrier_tangent = (
-                        boundary_descriptor
-                        .local_outgoing_direction
-                        .normalize()
-                    )
-                    barrier_lateral = getattr(
-                        boundary_descriptor,
-                        "motion_n",
-                        None,
-                    )
-                    if (
-                        barrier_lateral
-                        is None
-                        or barrier_lateral
-                        .length_squared()
-                        <= physical.EPSILON
-                    ):
-                        barrier_lateral = pygame.Vector2(
-                            -barrier_tangent.y,
-                            barrier_tangent.x,
-                        )
-                    else:
-                        barrier_lateral = (
-                            barrier_lateral
-                            .normalize()
-                        )
-
-                    boundary_observations = [
-                        observation
-                        for observation
-                        in observe_local_neighbors(
-                            self,
-                            active_boundaries,
-                            barrier_tangent,
-                            lateral_axis=barrier_lateral,
-                            max_range=physical.COMM_RANGE,
-                        )
-                        if (
-                            observation.relative_axial
-                            > 0.0
-                        )
-                    ]
-
-                    if boundary_observations:
-                        barrier_gap = min(
-                            float(
-                                observation
-                                .relative_axial
-                            )
-                            for observation
-                            in boundary_observations
-                        )
-                        barrier_standoff = max(
-                            2.20
-                            * float(
-                                physical.ROBOT_RADIUS
-                            ),
-                            0.85
-                            * float(
-                                getattr(
-                                    physical,
-                                    "integration_anchor_target_gap",
-                                    2.20
-                                    * physical.ROBOT_RADIUS,
-                                )
-                            ),
-                        )
-                        barrier_forward_limit = max(
-                            0.0,
-                            barrier_gap
-                            - barrier_standoff,
-                        )
-
-                original_robot_update(
-                    self,
-                    dt,
-                )
-
-                proposed_anchor_position = (
-                    self.position.copy()
-                )
-                limited_anchor_position = (
-                    proposed_anchor_position
-                    .copy()
-                )
-
-                # Hard local wall-plane clamp.
-                if (
-                    barrier_tangent
-                    is not None
-                    and barrier_forward_limit
-                    is not None
-                ):
-                    attempted_displacement = (
-                        limited_anchor_position
-                        - old_anchor_position
-                    )
-                    attempted_forward = float(
-                        attempted_displacement.dot(
-                            barrier_tangent
-                        )
-                    )
-                    if (
-                        attempted_forward
-                        > barrier_forward_limit
-                    ):
-                        limited_anchor_position -= (
-                            barrier_tangent
-                            * (
-                                attempted_forward
-                                - barrier_forward_limit
-                            )
-                        )
-
-                # Hard swept-circle collision against every real
-                # Frontier/Shepherd robot in the active wall.
-                for boundary in active_boundaries:
-                    limited_anchor_position = (
-                        _swept_pair_no_cross(
-                            self,
-                            old_anchor_position,
-                            limited_anchor_position,
-                            boundary,
-                            minimum_distance=max(
-                                float(
-                                    getattr(
-                                        self,
-                                        "radius",
-                                        physical.ROBOT_RADIUS,
-                                    )
-                                )
-                                + float(
-                                    getattr(
-                                        boundary,
-                                        "radius",
-                                        physical.ROBOT_RADIUS,
-                                    )
-                                ),
-                                2.05
-                                * float(
-                                    physical.ROBOT_RADIUS
-                                ),
-                            ),
-                        )
-                    )
-
-                if (
-                    limited_anchor_position
-                    .distance_squared_to(
-                        proposed_anchor_position
-                    )
-                    > 1.0e-12
-                ):
-                    self.position = (
-                        limited_anchor_position
-                        .copy()
-                    )
-                    actual_velocity = (
-                        self.position
-                        - old_anchor_position
-                    ) / max(
-                        dt,
-                        physical.EPSILON,
-                    )
-                    self.velocity = (
-                        actual_velocity.copy()
-                    )
-                    self.observed_velocity = (
-                        actual_velocity.copy()
-                    )
-                    self.commanded_velocity = (
-                        actual_velocity.copy()
-                    )
-                    self.previous_position = (
-                        old_anchor_position
-                    )
-
-                    # Kill residual forward acceleration so the
-                    # next frame does not immediately re-enter
-                    # the same physical wall.
-                    if barrier_tangent is not None:
-                        forward_accel = float(
-                            self.acceleration.dot(
-                                barrier_tangent
-                            )
-                        )
-                        if forward_accel > 0.0:
-                            self.acceleration -= (
-                                barrier_tangent
-                                * forward_accel
-                            )
-
-                    frame = int(
-                        getattr(
-                            physical,
-                            "integration_frame",
-                            -1,
-                        )
-                    )
-                    if frame % 5 == 0:
-                        print(
-                            "[AnchorBoundaryNoCross] "
-                            f"frame={frame} "
-                            f"phase={physical.phase.name} "
-                            f"branch={boundary_branch} "
-                            f"boundaries="
-                            f"{len(active_boundaries)} "
-                            f"barrier_gap="
-                            f"{barrier_gap if barrier_gap is not None else -1.0:.3f} "
-                            f"requested_step="
-                            f"{proposed_anchor_position.distance_to(old_anchor_position):.3f} "
-                            f"applied_step="
-                            f"{self.position.distance_to(old_anchor_position):.3f}"
-                        )
-
-                return
-
+            # Ordinary roles use the same universal physical robot-body layer
+            # in the main integration loop.  No Anchor-only virtual wall plane.
             original_robot_update(
                 self,
                 dt,
@@ -14637,6 +15357,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
     physical.integration_relative_formation_velocity = relative_formation_velocity
     physical.integration_integrate_boundary_velocity = integrate_boundary_velocity
+    physical.integration_universal_robot_motion_limit = universal_robot_motion_limit
     physical.Robot.update = localization_free_root_boundary_update
 
     def _final_base_return_direction() -> pygame.Vector2:
@@ -16271,6 +16992,8 @@ def maintain_mobile_anchor_at_normal_front(
                 f"guard_standoff={guard_standoff:.2f} behind_guard={behind_guard} "
                 f"lateral_tol={guard_lateral_ready_tolerance:.2f} "
                 f"slow={slow_enough} "
+                f"axial_speed={axial_velocity:.2f} "
+                f"lateral_speed={lateral_velocity:.2f} "
                 f"target_speed={target_speed:.2f} stable={physical.integration_anchor_prep_stable_frames}"
                 f"/{ready_required_frames}"
             )
@@ -16917,43 +17640,15 @@ def install_child_frontier_transport_runtime(
             )
 
             # =================================================
-            # Frontier:
-            # 다른 로봇을 절대로 관통하지 않음.
+            # UNIVERSAL PHYSICAL BODY RULE
             #
-            # Shepherd PRESSURE_PUSH / FLOW_BACKTRACK:
-            # soft-body piston이므로 NORMAL과 약간의
-            # compliant overlap을 허용한다.
-            #
-            # center crossing은 여전히 절대 허용하지 않는다.
+            # Pressure is transferred by contact/SPH force, never by
+            # permitting robot-body interpenetration.
             # =================================================
-            if (
-                robot.role == "SHEPHERD"
-                and other.role == "NORMAL"
-                and child_phase in {
-                    "PRESSURE_PUSH",
-                    "FLOW_BACKTRACK",
-                }
-            ):
-
-                minimum_distance = (
-                    float(
-                        getattr(
-                            physical,
-                            "integration_child_active_min_center_gap_ratio",
-                            1.50,
-                        )
-                    )
-                    * float(
-                        physical.ROBOT_RADIUS
-                    )
-                )
-
-            else:
-
-                minimum_distance = (
-                    float(robot.radius)
-                    + other_radius
-                )
+            minimum_distance = (
+                float(robot.radius)
+                + other_radius
+            )
 
             relative = (
                 old_position
@@ -20257,6 +20952,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 perception,
                 robots,
             )
+
+            apply_anchor_prep_corridor_yield(
+                physical,
+                perception,
+                robots,
+                dt,
+            )
+
             enforce_anchor_fan_no_overtake(
                 physical,
                 perception,
@@ -20278,28 +20981,166 @@ def main(argv: Sequence[str] | None = None) -> int:
             if perception.state == PerceptionState.JUNCTION_APPROACH:
                 perception.leader.acceleration *= 0.35
 
+            # =========================================================
+            # UNIVERSAL PHYSICAL ROBOT-BODY COLLISION SNAPSHOT
+            # =========================================================
+            physical.integration_collision_frame_start_by_id = {
+                robot.robot_id:
+                    robot.position.copy()
+                for robot in robots
+            }
+
+            physical.integration_collision_frame_velocity_by_id = {
+                robot.robot_id: (
+                    pygame.Vector2()
+                    if (
+                        perception.anchor_fixed
+                        and robot is perception.leader
+                    )
+                    else robot.velocity.copy()
+                )
+                for robot in robots
+            }
+
+            physical.integration_collision_updated_ids = set()
+
+            physical.integration_universal_collision_stats = {
+                "contacts": 0,
+                "robots": 0,
+                "slides": 0,
+                "samples": [],
+            }
+
             for robot in robots:
-                if perception.anchor_fixed and robot is perception.leader:
+                if (
+                    perception.anchor_fixed
+                    and robot is perception.leader
+                ):
+                    physical.integration_collision_updated_ids.add(
+                        robot.robot_id
+                    )
                     continue
-                role_before_update = robot.role
-                before_update = robot.position.copy()
-                robot.update(dt)
-                displacement = robot.position.distance_to(before_update)
-                if robot.role == "JUNCTION_GUARD":
+
+                role_before_update = (
+                    robot.role
+                )
+
+                before_update = (
+                    robot.position.copy()
+                )
+
+                robot.update(
+                    dt
+                )
+
+                proposed_position = (
+                    robot.position.copy()
+                )
+
+                limited_position = (
+                    physical
+                    .integration_universal_robot_motion_limit(
+                        robot,
+                        before_update,
+                        proposed_position,
+                        dt,
+                    )
+                )
+
+                if (
+                    limited_position
+                    .distance_squared_to(
+                        proposed_position
+                    )
+                    > 1.0e-12
+                ):
+                    robot.position = (
+                        limited_position.copy()
+                    )
+
+                    actual_velocity = (
+                        robot.position
+                        - before_update
+                    ) / max(
+                        dt,
+                        physical.EPSILON,
+                    )
+
+                    robot.velocity = (
+                        actual_velocity.copy()
+                    )
+                    robot.observed_velocity = (
+                        actual_velocity.copy()
+                    )
+                    robot.commanded_velocity = (
+                        actual_velocity.copy()
+                    )
+                    robot.previous_position = (
+                        before_update
+                    )
+
+                physical.integration_collision_updated_ids.add(
+                    robot.robot_id
+                )
+
+                displacement = (
+                    robot.position
+                    .distance_to(
+                        before_update
+                    )
+                )
+
+                if (
+                    robot.role
+                    == "JUNCTION_GUARD"
+                ):
                     physical.integration_wall_max_step = max(
                         physical.integration_wall_max_step,
                         displacement,
                     )
-                if role_before_update == "FRONTIER_SHEPHERD":
+
+                if (
+                    role_before_update
+                    == "FRONTIER_SHEPHERD"
+                ):
                     physical.integration_frontier_max_step = max(
                         physical.integration_frontier_max_step,
                         displacement,
                     )
-                if role_before_update == "SHEPHERD":
+
+                if (
+                    role_before_update
+                    == "SHEPHERD"
+                ):
                     physical.integration_shepherd_max_step = max(
                         physical.integration_shepherd_max_step,
                         displacement,
                     )
+
+            collision_stats = getattr(
+                physical,
+                "integration_universal_collision_stats",
+                {},
+            )
+
+            if (
+                frame_count % 10 == 0
+                and int(
+                    collision_stats.get(
+                        "contacts",
+                        0,
+                    )
+                )
+                > 0
+            ):
+                print(
+                    "[UniversalCollisionSummary] "
+                    f"frame={frame_count} "
+                    f"contacts={collision_stats.get('contacts', 0)} "
+                    f"robots={collision_stats.get('robots', 0)} "
+                    f"slides={collision_stats.get('slides', 0)} "
+                    f"samples={collision_stats.get('samples', [])}"
+                )
             # Re-apply the local no-overtake clamp after Robot.update(), since
             # route/SPH integration may have regenerated forward velocity.
             enforce_anchor_fan_no_overtake(
