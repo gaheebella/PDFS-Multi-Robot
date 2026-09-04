@@ -10833,6 +10833,113 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             else 0.0
         )
 
+        # ============================================================
+        # HARD ANCHOR / SHEPHERD NO-CROSS GATE
+        #
+        # The LiDAR Anchor is a physical robot in the returning herd.
+        # It must never end up on the dead-end side of the Shepherd wall.
+        #
+        # This gate is localization-free at the control level:
+        # - choose the visible Junction-facing Shepherd row,
+        # - observe the LiDAR robot only through local relative bearing/range,
+        # - limit the ENTIRE wall's next axial command by the remaining
+        #   pairwise clearance.
+        #
+        # No world Junction target and no Anchor world target are created.
+        # ============================================================
+        anchor_step_limit: float | None = None
+        lidar_anchor = next(
+            (
+                candidate
+                for candidate in robots
+                if (
+                    bool(getattr(candidate, "is_lidar_robot", False))
+                    or candidate.robot_id == LIDAR_ROBOT_ID
+                )
+            ),
+            None,
+        )
+
+        if lidar_anchor is not None:
+            min_row_offset = min(
+                (
+                    float(relative.get(shepherd.robot_id, (0.0, 0.0))[0])
+                    for shepherd in branch_shepherds
+                ),
+                default=0.0,
+            )
+            row_tolerance = max(
+                0.25 * float(physical.ROBOT_RADIUS),
+                float(physical.EPSILON),
+            )
+            junction_face_row = [
+                shepherd
+                for shepherd in branch_shepherds
+                if abs(
+                    float(relative.get(shepherd.robot_id, (0.0, 0.0))[0])
+                    - min_row_offset
+                )
+                <= row_tolerance
+            ]
+
+            # If the exact Junction-facing row is temporarily outside
+            # the local observation range, any locally visible member
+            # of the intact 3xN wall is still a valid no-cross witness.
+            anchor_guard_members = (
+                junction_face_row
+                if junction_face_row
+                else branch_shepherds
+            )
+
+            minimum_pair_distance = max(
+                float(physical.ROBOT_RADIUS)
+                + float(getattr(lidar_anchor, "radius", physical.ROBOT_RADIUS)),
+                2.05 * float(physical.ROBOT_RADIUS),
+            )
+
+            local_step_limits: list[float] = []
+
+            for shepherd in anchor_guard_members:
+                observations = observe_local_neighbors(
+                    shepherd,
+                    [lidar_anchor],
+                    descriptor.local_outgoing_direction,
+                    lateral_axis=getattr(descriptor, "motion_n", None),
+                    max_range=physical.COMM_RANGE,
+                )
+                if not observations:
+                    continue
+
+                observation = observations[0]
+                relative_axial = float(observation.relative_axial)
+                relative_lateral = float(observation.relative_lateral)
+
+                # Anchor must be on the Junction side of the Shepherd row.
+                # Negative axial is toward the Junction in this local frame.
+                if relative_axial >= 0.0:
+                    continue
+
+                lateral_abs = abs(relative_lateral)
+                if lateral_abs >= minimum_pair_distance:
+                    continue
+
+                required_axial_separation = math.sqrt(
+                    max(
+                        0.0,
+                        minimum_pair_distance**2 - lateral_abs**2,
+                    )
+                )
+                current_axial_separation = -relative_axial
+                local_step_limits.append(
+                    max(
+                        0.0,
+                        current_axial_separation - required_axial_separation,
+                    )
+                )
+
+            if local_step_limits:
+                anchor_step_limit = min(local_step_limits)
+
         herd_return_speed_scale = float(
             getattr(physical, "integration_herd_return_speed_scale", 1.00)
         )
@@ -10966,6 +11073,22 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             float(command),
         )
 
+        # ------------------------------------------------------------
+        # Final Anchor hard floor.
+        #
+        # The normal pack quantile can legitimately ignore one robot.
+        # The LiDAR Anchor is therefore enforced separately as a hard
+        # physical ordering constraint.
+        # ------------------------------------------------------------
+        if anchor_step_limit is not None:
+            anchor_hard_floor = max(
+                return_floor,
+                previous_command - anchor_step_limit,
+            )
+            if command < anchor_hard_floor:
+                command = anchor_hard_floor
+                mode = f"{mode}_ANCHOR_HARD_STOP"
+
         # command는 이미 local rear-support/contact-floor 계산에서 나온
         # scalar depth다.  절대 world target을 미리 만들어
         # is_walkable()/distance_squared_to()/has_line_of_sight()로
@@ -11009,6 +11132,7 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 f"compression_allowance={compression_allowance:.3f} "
                 f"active_min_gap={active_min_center_gap:.3f} "
                 f"hard_floor={hard_contact_floor if hard_contact_floor is not None else -1.0:.3f} "
+                f"anchor_step_limit={anchor_step_limit if anchor_step_limit is not None else -1.0:.3f} "
                 f"mode={mode}"
             )
 
@@ -12371,17 +12495,18 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
         # are sufficient for the next DFS branch selection.
         if physical.phase == physical.SimulationPhase.FLOW_BACKTRACK:
             branch = physical.active_branch
-            current_uid = (
-                physical.active_branch_uid
-                or physical.branch_uid_for_fixture(branch)
-            )
-            if current_uid is not None and not getattr(
-                physical, "integration_anchor_breakout_active", False
-            ):
-                _, _, remaining_uids = remaining_dfs_branch_uids(robots)
-                next_uid = next((uid for uid in remaining_uids if uid != current_uid), None)
-                if next_uid is not None:
-                    start_anchor_breakout(physical, current_uid, next_uid)
+
+            # -------------------------------------------------
+            # Anchor/Shepherd physical-order invariant
+            #
+            # During FLOW_BACKTRACK the active 3xN Shepherd wall
+            # owns the return motion.  The LiDAR Anchor must NOT
+            # break out, overtake, or cross that physical wall.
+            #
+            # The Anchor waits for the Shepherd wall to reach the
+            # Junction.  Only after Shepherd -> Guard restoration
+            # and JUNCTION_SWITCH may normal Anchor prep resume.
+            # -------------------------------------------------
             lifecycle = getattr(
                 physical, "integration_wall_lifecycle", {}
             ).get(branch)
@@ -13465,6 +13590,59 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
 
         return correction
 
+    def _swept_pair_no_cross(
+        mover: Any,
+        old_position: pygame.Vector2,
+        proposed_position: pygame.Vector2,
+        obstacle: Any,
+        *,
+        minimum_distance: float | None = None,
+    ) -> pygame.Vector2:
+        """Clamp one physical step before two robot discs can cross.
+
+        This helper belongs to the simulator collision layer.  It uses only the
+        instantaneous pairwise relative displacement; it is not a navigation or
+        localization target.
+        """
+        movement = proposed_position - old_position
+        movement_sq = movement.length_squared()
+        if movement_sq <= physical.EPSILON:
+            return proposed_position.copy()
+
+        min_distance = float(
+            minimum_distance
+            if minimum_distance is not None
+            else (
+                float(getattr(mover, "radius", physical.ROBOT_RADIUS))
+                + float(getattr(obstacle, "radius", physical.ROBOT_RADIUS))
+            )
+        )
+
+        relative = old_position - obstacle.position
+        c = relative.length_squared() - min_distance**2
+
+        # Already touching/overlapping: forbid only deeper penetration.
+        if c <= 0.0:
+            if relative.dot(movement) < 0.0:
+                return old_position.copy()
+            return proposed_position.copy()
+
+        a = movement_sq
+        b = 2.0 * relative.dot(movement)
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            return proposed_position.copy()
+
+        sqrt_discriminant = math.sqrt(discriminant)
+        hit_alpha = (-b - sqrt_discriminant) / (2.0 * a)
+
+        if 0.0 <= hit_alpha <= 1.0:
+            safe_alpha = max(0.0, hit_alpha - 1.0e-3)
+            return old_position + movement * safe_alpha
+
+        return proposed_position.copy()
+
+
     def integrate_boundary_velocity(
         robot: Any,
         commanded_velocity: pygame.Vector2,
@@ -13489,6 +13667,79 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
                 dt,
             )
             robot.integration_boundary_contact = False
+
+        # ============================================================
+        # ROOT SHEPHERD -> LiDAR Anchor swept collision.
+        #
+        # The Shepherd wall is kinematically integrated, so SPH/contact
+        # force alone cannot guarantee non-tunnelling.  Clamp the actual
+        # physical step against the Anchor disc before x/y integration.
+        # ============================================================
+        is_anchor_blocking_boundary = bool(
+            (
+                robot.role
+                == "FRONTIER_SHEPHERD"
+                and physical.phase
+                == physical.SimulationPhase.EXPLORE_BRANCH
+                and robot.shepherd_branch
+                == physical.frontier_line_branch
+            )
+            or (
+                robot.role
+                == "SHEPHERD"
+                and physical.phase
+                in {
+                    physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+                    physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
+                    physical.SimulationPhase.PRESSURE_PUSH,
+                    physical.SimulationPhase.FLOW_BACKTRACK,
+                }
+                and robot.shepherd_branch
+                == physical.active_branch
+            )
+        )
+
+        if is_anchor_blocking_boundary:
+            current_robots = tuple(
+                getattr(
+                    physical,
+                    "integration_current_robots",
+                    (),
+                )
+            )
+            lidar_anchor = next(
+                (
+                    candidate
+                    for candidate in current_robots
+                    if (
+                        bool(getattr(candidate, "is_lidar_robot", False))
+                        or candidate.robot_id == LIDAR_ROBOT_ID
+                    )
+                ),
+                None,
+            )
+
+            if lidar_anchor is not None and lidar_anchor is not robot:
+                desired_position = (
+                    old_position
+                    + robot.velocity * dt
+                )
+                limited_position = _swept_pair_no_cross(
+                    robot,
+                    old_position,
+                    desired_position,
+                    lidar_anchor,
+                    minimum_distance=max(
+                        float(getattr(robot, "radius", physical.ROBOT_RADIUS))
+                        + float(getattr(lidar_anchor, "radius", physical.ROBOT_RADIUS)),
+                        2.05 * float(physical.ROBOT_RADIUS),
+                    ),
+                )
+                if limited_position.distance_squared_to(desired_position) > 1.0e-12:
+                    robot.integration_boundary_contact = True
+                    robot.velocity = (
+                        limited_position - old_position
+                    ) / max(dt, physical.EPSILON)
 
         # For rigid Frontier motion this candidate was already validated
         # group-wide.  Keep the ordinary collision layer as a final safety
@@ -13918,6 +14169,324 @@ def install_local_physical_saturation_bridge(physical: types.ModuleType) -> None
             )
             or not current_robots
         ):
+            is_lidar_anchor = bool(
+                getattr(self, "is_lidar_robot", False)
+                or self.robot_id == LIDAR_ROBOT_ID
+            )
+            protected_boundary_phase = (
+                physical.phase
+                in {
+                    physical.SimulationPhase.EXPLORE_BRANCH,
+                    physical.SimulationPhase.FORM_SHEPHERD_BOUNDARY,
+                    physical.SimulationPhase.FILL_BEHIND_SHEPHERD,
+                    physical.SimulationPhase.PRESSURE_PUSH,
+                    physical.SimulationPhase.FLOW_BACKTRACK,
+                }
+            )
+
+            if (
+                is_lidar_anchor
+                and protected_boundary_phase
+                and current_robots
+            ):
+                old_anchor_position = (
+                    self.position.copy()
+                )
+
+                boundary_branches = {
+                    getattr(
+                        physical,
+                        "frontier_line_branch",
+                        None,
+                    ),
+                    getattr(
+                        physical,
+                        "active_branch",
+                        None,
+                    ),
+                }
+                boundary_branches.discard(None)
+
+                active_boundaries = [
+                    boundary
+                    for boundary
+                    in current_robots
+                    if (
+                        boundary.role
+                        in {
+                            "FRONTIER_SHEPHERD",
+                            "SHEPHERD",
+                        }
+                        and getattr(
+                            boundary,
+                            "shepherd_branch",
+                            None,
+                        )
+                        in boundary_branches
+                    )
+                ]
+
+                # -------------------------------------------------
+                # Local barrier-plane limit BEFORE Robot.update.
+                #
+                # This keeps the Anchor on the Junction side of the
+                # sealed 3xN wall.  The pairwise swept collision
+                # below remains a second physical safety layer.
+                # -------------------------------------------------
+                barrier_tangent = None
+                barrier_forward_limit = None
+                barrier_gap = None
+
+                boundary_branch = (
+                    getattr(
+                        physical,
+                        "frontier_line_branch",
+                        None,
+                    )
+                    if any(
+                        boundary.role
+                        == "FRONTIER_SHEPHERD"
+                        for boundary
+                        in active_boundaries
+                    )
+                    else getattr(
+                        physical,
+                        "active_branch",
+                        None,
+                    )
+                )
+
+                boundary_descriptor = (
+                    descriptor_for(
+                        boundary_branch
+                    )
+                    if boundary_branch
+                    is not None
+                    else None
+                )
+
+                if (
+                    boundary_descriptor
+                    is not None
+                    and active_boundaries
+                ):
+                    barrier_tangent = (
+                        boundary_descriptor
+                        .local_outgoing_direction
+                        .normalize()
+                    )
+                    barrier_lateral = getattr(
+                        boundary_descriptor,
+                        "motion_n",
+                        None,
+                    )
+                    if (
+                        barrier_lateral
+                        is None
+                        or barrier_lateral
+                        .length_squared()
+                        <= physical.EPSILON
+                    ):
+                        barrier_lateral = pygame.Vector2(
+                            -barrier_tangent.y,
+                            barrier_tangent.x,
+                        )
+                    else:
+                        barrier_lateral = (
+                            barrier_lateral
+                            .normalize()
+                        )
+
+                    boundary_observations = [
+                        observation
+                        for observation
+                        in observe_local_neighbors(
+                            self,
+                            active_boundaries,
+                            barrier_tangent,
+                            lateral_axis=barrier_lateral,
+                            max_range=physical.COMM_RANGE,
+                        )
+                        if (
+                            observation.relative_axial
+                            > 0.0
+                        )
+                    ]
+
+                    if boundary_observations:
+                        barrier_gap = min(
+                            float(
+                                observation
+                                .relative_axial
+                            )
+                            for observation
+                            in boundary_observations
+                        )
+                        barrier_standoff = max(
+                            2.20
+                            * float(
+                                physical.ROBOT_RADIUS
+                            ),
+                            0.85
+                            * float(
+                                getattr(
+                                    physical,
+                                    "integration_anchor_target_gap",
+                                    2.20
+                                    * physical.ROBOT_RADIUS,
+                                )
+                            ),
+                        )
+                        barrier_forward_limit = max(
+                            0.0,
+                            barrier_gap
+                            - barrier_standoff,
+                        )
+
+                original_robot_update(
+                    self,
+                    dt,
+                )
+
+                proposed_anchor_position = (
+                    self.position.copy()
+                )
+                limited_anchor_position = (
+                    proposed_anchor_position
+                    .copy()
+                )
+
+                # Hard local wall-plane clamp.
+                if (
+                    barrier_tangent
+                    is not None
+                    and barrier_forward_limit
+                    is not None
+                ):
+                    attempted_displacement = (
+                        limited_anchor_position
+                        - old_anchor_position
+                    )
+                    attempted_forward = float(
+                        attempted_displacement.dot(
+                            barrier_tangent
+                        )
+                    )
+                    if (
+                        attempted_forward
+                        > barrier_forward_limit
+                    ):
+                        limited_anchor_position -= (
+                            barrier_tangent
+                            * (
+                                attempted_forward
+                                - barrier_forward_limit
+                            )
+                        )
+
+                # Hard swept-circle collision against every real
+                # Frontier/Shepherd robot in the active wall.
+                for boundary in active_boundaries:
+                    limited_anchor_position = (
+                        _swept_pair_no_cross(
+                            self,
+                            old_anchor_position,
+                            limited_anchor_position,
+                            boundary,
+                            minimum_distance=max(
+                                float(
+                                    getattr(
+                                        self,
+                                        "radius",
+                                        physical.ROBOT_RADIUS,
+                                    )
+                                )
+                                + float(
+                                    getattr(
+                                        boundary,
+                                        "radius",
+                                        physical.ROBOT_RADIUS,
+                                    )
+                                ),
+                                2.05
+                                * float(
+                                    physical.ROBOT_RADIUS
+                                ),
+                            ),
+                        )
+                    )
+
+                if (
+                    limited_anchor_position
+                    .distance_squared_to(
+                        proposed_anchor_position
+                    )
+                    > 1.0e-12
+                ):
+                    self.position = (
+                        limited_anchor_position
+                        .copy()
+                    )
+                    actual_velocity = (
+                        self.position
+                        - old_anchor_position
+                    ) / max(
+                        dt,
+                        physical.EPSILON,
+                    )
+                    self.velocity = (
+                        actual_velocity.copy()
+                    )
+                    self.observed_velocity = (
+                        actual_velocity.copy()
+                    )
+                    self.commanded_velocity = (
+                        actual_velocity.copy()
+                    )
+                    self.previous_position = (
+                        old_anchor_position
+                    )
+
+                    # Kill residual forward acceleration so the
+                    # next frame does not immediately re-enter
+                    # the same physical wall.
+                    if barrier_tangent is not None:
+                        forward_accel = float(
+                            self.acceleration.dot(
+                                barrier_tangent
+                            )
+                        )
+                        if forward_accel > 0.0:
+                            self.acceleration -= (
+                                barrier_tangent
+                                * forward_accel
+                            )
+
+                    frame = int(
+                        getattr(
+                            physical,
+                            "integration_frame",
+                            -1,
+                        )
+                    )
+                    if frame % 5 == 0:
+                        print(
+                            "[AnchorBoundaryNoCross] "
+                            f"frame={frame} "
+                            f"phase={physical.phase.name} "
+                            f"branch={boundary_branch} "
+                            f"boundaries="
+                            f"{len(active_boundaries)} "
+                            f"barrier_gap="
+                            f"{barrier_gap if barrier_gap is not None else -1.0:.3f} "
+                            f"requested_step="
+                            f"{proposed_anchor_position.distance_to(old_anchor_position):.3f} "
+                            f"applied_step="
+                            f"{self.position.distance_to(old_anchor_position):.3f}"
+                        )
+
+                return
+
             original_robot_update(
                 self,
                 dt,
@@ -15420,6 +15989,32 @@ def start_anchor_breakout(
 ) -> None:
     if not source_uid or not target_uid:
         return
+
+    # ---------------------------------------------------------
+    # SAFETY: never start Anchor breakout through an active
+    # Shepherd wall.  This is a physical-order invariant.
+    # ---------------------------------------------------------
+    if (
+        physical.phase in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }
+        or getattr(
+            physical,
+            "integration_child_dfs_phase",
+            "IDLE",
+        ) in {
+            "PRESSURE_PUSH",
+            "FLOW_BACKTRACK",
+        }
+    ):
+        print(
+            "[AnchorBreakoutBlocked] "
+            f"source={source_uid} target={target_uid} "
+            "reason=ACTIVE_SHEPHERD_WALL"
+        )
+        return
+
     disable_leading_anchor(physical)
     physical.integration_anchor_breakout_active = True
     physical.integration_anchor_breakout_source_uid = source_uid
@@ -15442,6 +16037,44 @@ def maintain_anchor_breakout(
 ) -> None:
     if not getattr(physical, "integration_anchor_breakout_active", False):
         return
+
+    # ---------------------------------------------------------
+    # SAFETY: an Anchor breakout may never coexist with an
+    # active Shepherd PRESSURE_PUSH / FLOW_BACKTRACK wall.
+    #
+    # Cancel only the breakout controller.  Do NOT overwrite
+    # Anchor position, velocity, or SPH/contact acceleration:
+    # the Anchor remains a normal physical member of the swarm.
+    # ---------------------------------------------------------
+    if (
+        physical.phase in {
+            physical.SimulationPhase.PRESSURE_PUSH,
+            physical.SimulationPhase.FLOW_BACKTRACK,
+        }
+        or getattr(
+            physical,
+            "integration_child_dfs_phase",
+            "IDLE",
+        ) in {
+            "PRESSURE_PUSH",
+            "FLOW_BACKTRACK",
+        }
+    ):
+        disable_leading_anchor(physical)
+        physical.integration_anchor_breakout_active = False
+        physical.integration_anchor_breakout_source_uid = None
+        physical.integration_anchor_breakout_target_uid = None
+        physical.integration_anchor_breakout_stage = "IDLE"
+        physical.integration_anchor_breakout_side_sign = 0.0
+        physical.integration_anchor_breakout_lateral_odometry = 0.0
+        physical.integration_anchor_breakout_return_odometry = 0.0
+
+        print(
+            "[AnchorBreakoutCancelled] "
+            "reason=ACTIVE_SHEPHERD_WALL"
+        )
+        return
+
     source_uid = getattr(physical, "integration_anchor_breakout_source_uid", None)
     target_uid = getattr(physical, "integration_anchor_breakout_target_uid", None)
     descriptor = physical.branch_descriptors_by_uid.get(source_uid)
@@ -15676,7 +16309,9 @@ def maintain_mobile_anchor_at_normal_front(
         ))
         center_ratio = 1.0
     half_width = max(4.0 * physical.ROBOT_RADIUS, 0.5 * min(side_sum, 2.0 * MAX_RANGE))
-    # Anchor follows the NORMAL swarm only; Frontier remains independent.
+
+    # NORMAL remains the Anchor-follow reference during EXPLORE.
+    # The active Frontier is NOT a follow target; it is a hard forward boundary.
     tracked_roles = {"JUNCTION_GUARD"} if prep_mode else {"NORMAL"}
 
     observations = [
@@ -15721,6 +16356,90 @@ def maintain_mobile_anchor_at_normal_front(
     target_gap = float(
         physical.integration_anchor_target_gap
     )
+
+    # =========================================================
+    # EXPLORE hard boundary: observe the SAME selected
+    # FRONTIER_SHEPHERD wall locally.
+    #
+    # The Anchor may lead the NORMAL body, but it must remain
+    # on the Junction side of this wall at all times.
+    # =========================================================
+    frontier_gap: float | None = None
+    frontier_speed = 0.0
+    frontier_count = 0
+
+    if (
+        not prep_mode
+        and physical.phase
+        == physical.SimulationPhase.EXPLORE_BRANCH
+    ):
+        selected_fixture = (
+            physical.branch_fixture_for_uid(
+                branch_uid
+            )
+        )
+
+        frontier_observations = [
+            observation
+            for observation
+            in observe_local_neighbors(
+                anchor,
+                robots,
+                tangent,
+                lateral_axis=left_axis,
+                max_range=physical.COMM_RANGE,
+                predicate=lambda robot: (
+                    robot is not anchor
+                    and robot.role
+                    == "FRONTIER_SHEPHERD"
+                    and (
+                        getattr(
+                            robot,
+                            "shepherd_branch",
+                            None,
+                        )
+                        == selected_fixture
+                        or getattr(
+                            robot,
+                            "shepherd_branch",
+                            None,
+                        )
+                        == branch_uid
+                    )
+                ),
+            )
+            if (
+                observation.relative_axial
+                > 0.0
+                and abs(
+                    observation.relative_lateral
+                )
+                <= half_width
+            )
+        ]
+
+        if frontier_observations:
+            frontier_gap = min(
+                float(
+                    observation.relative_axial
+                )
+                for observation
+                in frontier_observations
+            )
+            frontier_speed = float(
+                np.mean(
+                    [
+                        observation.robot.velocity.dot(
+                            tangent
+                        )
+                        for observation
+                        in frontier_observations
+                    ]
+                )
+            )
+            frontier_count = len(
+                frontier_observations
+            )
 
     if prep_mode:
         # Keep the positioning phase conservative.
@@ -15823,15 +16542,73 @@ def maintain_mobile_anchor_at_normal_front(
                 ),
             )
 
+        # -------------------------------------------------
+        # Frontier no-cross speed gate.
+        #
+        # If the wall is locally visible, cap the Anchor speed
+        # so it approaches only to a standoff behind the wall.
+        # If the wall has already become too close, actively
+        # brake/back away.  This is local relative sensing only.
+        # -------------------------------------------------
+        if frontier_gap is not None:
+            frontier_standoff = max(
+                4.0
+                * float(
+                    physical.ROBOT_RADIUS
+                ),
+                1.15 * target_gap,
+            )
+            frontier_hard_gap = max(
+                2.20
+                * float(
+                    physical.ROBOT_RADIUS
+                ),
+                0.65 * frontier_standoff,
+            )
+
+            frontier_limited_speed = (
+                frontier_speed
+                + 5.0
+                * (
+                    frontier_gap
+                    - frontier_standoff
+                )
+            )
+
+            target_speed = min(
+                target_speed,
+                frontier_limited_speed,
+            )
+
+            if (
+                frontier_gap
+                <= frontier_hard_gap
+            ):
+                target_speed = min(
+                    target_speed,
+                    -3.0,
+                )
+
+            # Strong braking is allowed only while the physical
+            # Frontier boundary is close.
+            if (
+                frontier_gap
+                <= 1.5
+                * frontier_standoff
+            ):
+                anchor_accel_fraction = 0.85
+            else:
+                anchor_accel_fraction = 0.50
+        else:
+            anchor_accel_fraction = 0.50
+
         target_speed = float(
             np.clip(
                 target_speed,
-                0.0,
+                -3.0,
                 cruise_speed,
             )
         )
-
-        anchor_accel_fraction = 0.50
 
     existing_axial = anchor.acceleration.dot(
         tangent
@@ -15880,6 +16657,9 @@ def maintain_mobile_anchor_at_normal_front(
             f"axial_speed={anchor.velocity.dot(tangent):.2f} "
             f"gap={gap if gap is not None else -1.0:.2f} "
             f"ahead_count={ahead_count} "
+            f"frontier_gap={frontier_gap if frontier_gap is not None else -1.0:.2f} "
+            f"frontier_speed={frontier_speed:.2f} "
+            f"frontier_count={frontier_count} "
             f"stable={physical.integration_anchor_prep_stable_frames}"
         )
 
